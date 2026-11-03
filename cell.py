@@ -8,9 +8,16 @@ duplicated in GLSL at the top of world.frag -- KEEP THE TWO IN SYNC.
         bits 9-30   entity id   row index into the entity SSBO   (22 bits)
         bit  31     unused -- deliberately left clear, see below
     .y              packed (local_x, local_y) for multi-cell entities
-    .z  bit  0      is_ghost
-        bits 1-31   reserved
+    .z  bits 0-1    ghost state  0=real, 1=ghost, 2=frustrated
+        bits 2-31   reserved
     .w              reserved
+
+GHOST_FRUSTRATED is an overlay, not an entity. A frustrated cell is one a
+pending build wants but cannot have, which means something is already there --
+and .x holds exactly one entity id, so a ghost entity cannot be spawned on top
+without destroying the occupant. Frustration therefore lives only in .z and
+leaves .x untouched, which is precisely what lets the renderer tint the cell
+red *over* the existing entity. See Gameboard.set_frustrated().
 
 Emptiness is `type == 0`, not `word == 0` -- a cell could in principle carry
 stale direction bits. pack_cell() refuses to produce such a word (type 0 packs
@@ -47,12 +54,46 @@ def step_to_dir(dx, dy):
     raise ValueError(f"not a unit axis step: {(dx, dy)}")
 
 
+def rotate_dir(direction, cw=True):
+    """Rotate a direction 90 degrees. Directions run CCW: +X, +Y, -X, -Y."""
+    return (direction - 1 if cw else direction + 1) % 4
+
+
+def rotate_dir_ccw_n(direction, turns):
+    """Rotate a direction CCW by `turns` quarter-turns.
+
+    Used to carry a type's authored face directions into its actual facing;
+    `turns` is itself a direction constant, since DIR_PX==0 means "no rotation"
+    and each successive direction is one more CCW quarter-turn.
+    """
+    return (direction + turns) % 4
+
+
+def rotate_offset(lx, ly, direction):
+    """Rotate an entity-local offset into a facing.
+
+    Local space is authored at DIR_PX (east) and rotated CCW by `direction`
+    quarter-turns, matching rotate_dir()'s convention so a footprint and its
+    faces stay consistent under rotation.
+    """
+    for _ in range(direction % 4):
+        lx, ly = -ly, lx
+    return lx, ly
+
+
 # --- entity types -------------------------------------------------------
 TYPE_EMPTY = 0
 TYPE_BELT = 1
-# 2..127 reserved for structures.
+TYPE_ADD = 2
+TYPE_MUL = 3
+# 4..127 reserved for future structures.
 
-TYPE_NAMES = {TYPE_EMPTY: "empty", TYPE_BELT: "belt"}
+TYPE_NAMES = {
+    TYPE_EMPTY: "empty",
+    TYPE_BELT: "belt",
+    TYPE_ADD: "add",
+    TYPE_MUL: "mul",
+}
 
 # --- bit field layout ---------------------------------------------------
 DIR_SHIFT, DIR_BITS = 0, 2
@@ -66,7 +107,20 @@ ID_MASK = (1 << ID_BITS) - 1
 MAX_TYPE = TYPE_MASK
 MAX_ENTITY_ID = ID_MASK
 
-GHOST_BIT = 1  # .z bit 0
+# .z bits 0-1: ghost state. Frustrated is an overlay on an occupied cell and
+# never clears the occupant's id in .x -- see the module docstring.
+GHOST_SHIFT, GHOST_BITS = 0, 2
+GHOST_MASK = (1 << GHOST_BITS) - 1
+
+GHOST_NONE = 0
+GHOST_PENDING = 1      # a ghost entity of our own, in a free cell
+GHOST_FRUSTRATED = 2   # a cell we wanted but cannot have; .x is someone else's
+
+GHOST_NAMES = {
+    GHOST_NONE: "real",
+    GHOST_PENDING: "ghost",
+    GHOST_FRUSTRATED: "frustrated",
+}
 
 EMPTY_WORD = 0
 
@@ -143,13 +197,33 @@ def unpack_local(word):
     return (word >> LOCAL_SHIFT) & LOCAL_MASK, word & LOCAL_MASK
 
 
-# --- .z: flags ----------------------------------------------------------
-def pack_flags(is_ghost=False):
-    return GHOST_BIT if is_ghost else 0
+# --- .z: ghost state ----------------------------------------------------
+def pack_flags(ghost_state=GHOST_NONE):
+    if not 0 <= ghost_state <= GHOST_MASK:
+        raise ValueError(f"bad ghost state {ghost_state}")
+    return ghost_state << GHOST_SHIFT
+
+
+def ghost_state(word):
+    return (int(word) >> GHOST_SHIFT) & GHOST_MASK
 
 
 def is_ghost(word):
-    return bool(int(word) & GHOST_BIT)
+    """True for a pending ghost entity. Frustration is NOT a ghost entity."""
+    return ghost_state(word) == GHOST_PENDING
+
+
+def is_frustrated(word):
+    return ghost_state(word) == GHOST_FRUSTRATED
+
+
+def with_ghost_state(word, state):
+    """Replace the ghost field of a .z word, preserving the reserved bits."""
+    return (int(word) & ~(GHOST_MASK << GHOST_SHIFT)) | pack_flags(state)
+
+
+def ghost_state_arr(words):
+    return np.right_shift(words, GHOST_SHIFT) & GHOST_MASK
 
 
 def _self_check():
@@ -175,10 +249,31 @@ def _self_check():
     for lx, ly in ((0, 0), (1, 2), (LOCAL_MASK, LOCAL_MASK)):
         assert unpack_local(pack_local(lx, ly)) == (lx, ly)
 
-    assert is_ghost(pack_flags(is_ghost=True))
-    assert not is_ghost(pack_flags(is_ghost=False))
+    assert is_ghost(pack_flags(GHOST_PENDING))
+    assert not is_ghost(pack_flags(GHOST_NONE))
+    assert is_frustrated(pack_flags(GHOST_FRUSTRATED))
+    assert not is_ghost(pack_flags(GHOST_FRUSTRATED)), "frustrated is not a ghost"
+    for s in (GHOST_NONE, GHOST_PENDING, GHOST_FRUSTRATED):
+        assert ghost_state(pack_flags(s)) == s
+        # Replacing the field must leave the reserved bits alone.
+        assert ghost_state(with_ghost_state(0xFF00 | 0x3, s)) == s
+        assert (with_ghost_state(0xFF00, s) >> 2) == (0xFF00 >> 2)
 
     assert step_to_dir(1, 0) == DIR_PX and step_to_dir(0, -1) == DIR_NY
+
+    # Rotation: four quarter-turns is identity, and cw/ccw are inverses.
+    for d in range(4):
+        assert rotate_dir(rotate_dir(rotate_dir(rotate_dir(d)))) == d
+        assert rotate_dir(rotate_dir(d, cw=True), cw=False) == d
+    assert rotate_dir(DIR_PX, cw=False) == DIR_PY, "ccw from east is north"
+    assert rotate_dir(DIR_PX, cw=True) == DIR_NY, "cw from east is south"
+
+    # Offsets rotate with the same convention as directions: rotating a unit
+    # step by d must give the same result as rotating the direction itself.
+    for d in range(4):
+        assert rotate_offset(1, 0, d) == DIR_STEPS[d], d
+    assert rotate_offset(2, 1, DIR_PX) == (2, 1)
+    assert rotate_offset(1, 0, DIR_PY) == (0, 1)
 
     words = np.array([EMPTY_WORD, pack_cell(TYPE_BELT, DIR_PX, 5)], dtype=np.int32)
     assert list(is_empty_arr(words)) == [True, False]

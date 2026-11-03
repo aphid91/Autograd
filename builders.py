@@ -1,0 +1,209 @@
+"""Entity builders: the single mechanism behind every placement tool.
+
+A builder turns a gesture (a drag, a click, eventually a pasted blueprint) into
+a `BuildPlan`: the set of entities it *wants* to create, split into placements
+that can happen and cells that are blocked. The engine then ghosts the plan,
+and on confirm commits it. Belt-drawing and structure-placement are not two
+systems -- they are two builders differing in how they generate placements and
+in one policy flag.
+
+    BeltBuilder       many 1x1 placements along a path, per-placement failure
+    StructureBuilder  one multi-cell placement, all-or-nothing
+
+Future tools fit the same shape: a blueprint paste is a builder emitting many
+multi-cell placements; undo can record the rows a committed plan produced.
+
+Frustration is a property of a *placement*, not of the board: a cell is
+frustrated because some placement wanted it and could not have it. Placements
+that fail still appear in the plan so the renderer can show you what blocked
+them -- that is what makes a frustrated cell different from an absent one.
+"""
+
+import cell
+from engine_paths import plan_path, path_directions, intent_dir
+from entity import Add, Belt, Mul
+
+
+class Placement:
+    """One entity a plan would create, and whether it can actually happen."""
+
+    __slots__ = ("entity_cls", "x", "y", "direction", "blocked_cells")
+
+    def __init__(self, entity_cls, x, y, direction, blocked_cells=()):
+        self.entity_cls = entity_cls
+        self.x = x
+        self.y = y
+        self.direction = direction
+        self.blocked_cells = list(blocked_cells)
+
+    @property
+    def frustrated(self):
+        return bool(self.blocked_cells)
+
+    def cells(self):
+        return self.entity_cls.cells_for(self.x, self.y, self.direction)
+
+    def __repr__(self):
+        state = "frustrated" if self.frustrated else "ok"
+        return (f"<Placement {self.entity_cls.__name__} ({self.x},{self.y}) "
+                f"{cell.DIR_NAMES[self.direction]} {state}>")
+
+
+class BuildPlan:
+    """What a builder wants to do, before anything is committed."""
+
+    __slots__ = ("placements", "all_or_nothing")
+
+    def __init__(self, placements, all_or_nothing=False):
+        self.placements = placements
+        self.all_or_nothing = all_or_nothing
+
+    @property
+    def frustrated_cells(self):
+        """Every cell to tint red, across all placements."""
+        out = []
+        for p in self.placements:
+            out.extend(p.blocked_cells)
+        return out
+
+    @property
+    def buildable(self):
+        """Placements that will actually be created on commit.
+
+        Under all_or_nothing a single frustrated placement voids the whole
+        plan, which is what makes a partially-overlapping structure refuse to
+        place while a belt run happily builds around an obstacle.
+        """
+        if self.all_or_nothing and any(p.frustrated for p in self.placements):
+            return []
+        return [p for p in self.placements if not p.frustrated]
+
+    @property
+    def ok(self):
+        """True if the plan would create everything it wanted."""
+        return bool(self.placements) and not any(
+            p.frustrated for p in self.placements
+        )
+
+    def __repr__(self):
+        return (f"<BuildPlan {len(self.placements)} placements, "
+                f"{len(self.buildable)} buildable, "
+                f"{len(self.frustrated_cells)} frustrated>")
+
+
+class EntityBuilder:
+    """Base class for placement tools.
+
+    A builder holds the tool's own transient state -- a belt's path mode, a
+    structure's rotation -- and interprets the per-tool keys. `R` and `shift+R`
+    mean whatever the active tool decides they mean.
+    """
+
+    name = "builder"
+    #: True if this tool needs a drag (press, move, release-click) rather than
+    #: acting on a single click.
+    drag_based = True
+
+    def plan(self, engine, start, end):
+        """Build a BuildPlan for a gesture from `start` to `end` cells."""
+        raise NotImplementedError
+
+    def cycle(self, backward=False):
+        """Handle the tool's R / shift+R key. Return True if state changed."""
+        return False
+
+    def status(self):
+        """One short line for the UI describing current tool state."""
+        return ""
+
+
+class BeltBuilder(EntityBuilder):
+    """Draw a run of 1x1 belts along a planned path.
+
+    Blocked cells are frustrated individually: the run still builds on both
+    sides of an obstacle, and only the overlapping cells are tinted. R cycles
+    the path shape.
+    """
+
+    name = "Belt"
+    drag_based = True
+
+    MODE_HORIZONTAL_FIRST = 0
+    MODE_VERTICAL_FIRST = 1
+    MODE_LINE = 2
+    MODE_COUNT = 3
+
+    MODE_NAMES = {
+        MODE_HORIZONTAL_FIRST: "Elbow: H then V",
+        MODE_VERTICAL_FIRST: "Elbow: V then H",
+        MODE_LINE: "Line (staircase)",
+    }
+
+    def __init__(self):
+        self.mode = self.MODE_HORIZONTAL_FIRST
+
+    def cycle(self, backward=False):
+        step = -1 if backward else 1
+        self.mode = (self.mode + step) % self.MODE_COUNT
+        return True
+
+    def status(self):
+        return self.MODE_NAMES[self.mode]
+
+    def plan(self, engine, start, end):
+        # Directions come from the unfiltered path so a belt's facing never
+        # depends on what is in the way -- see Engine.plan_oriented's history.
+        path = plan_path(start, end, self.mode)
+        dirs = path_directions(path, fallback=intent_dir(start, end))
+
+        placements = []
+        for (x, y), d in zip(path, dirs):
+            blocked = [] if engine.buildable(x, y) else [(x, y)]
+            placements.append(Placement(Belt, x, y, d, blocked))
+        return BuildPlan(placements, all_or_nothing=False)
+
+
+class StructureBuilder(EntityBuilder):
+    """Place a single structure, rotatable with R / shift+R.
+
+    All-or-nothing: if any cell of the footprint is occupied the whole
+    placement is frustrated and commits nothing, while still tinting every
+    blocked cell so the obstruction is visible.
+    """
+
+    drag_based = False
+
+    def __init__(self, entity_cls, name=None):
+        self.entity_cls = entity_cls
+        self.name = name or entity_cls.__name__
+        self.direction = cell.DIR_PX
+
+    def cycle(self, backward=False):
+        if not self.entity_cls.ROTATABLE:
+            return False
+        self.direction = cell.rotate_dir(self.direction, cw=not backward)
+        return True
+
+    def status(self):
+        w, h = self.entity_cls.footprint_for(self.direction)
+        return f"{w}x{h} facing {cell.DIR_NAMES[self.direction]}"
+
+    def plan(self, engine, start, end):
+        # A structure ignores the drag: it places at the cursor, which is
+        # `end` so that press-and-drag still previews under the cursor.
+        x, y = end
+        blocked = [
+            c for c in self.entity_cls.cells_for(x, y, self.direction)
+            if not engine.buildable(*c)
+        ]
+        placement = Placement(self.entity_cls, x, y, self.direction, blocked)
+        return BuildPlan([placement], all_or_nothing=True)
+
+
+def default_builders():
+    """The toolbelt's starting tools, in slot order."""
+    return [
+        BeltBuilder(),
+        StructureBuilder(Add, "Add"),
+        StructureBuilder(Mul, "Mul"),
+    ]

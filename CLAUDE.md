@@ -40,12 +40,17 @@ also run self-checks at import.
 | `WASD` | pan |
 | `Q` / `E` | zoom out / in |
 | `F` | frame the whole board |
-| Left-click | start a belt run; click again to confirm |
-| `R` | while planning, cycle elbow-H → elbow-V → line |
+| `1`-`9`, `0` | select a toolbelt slot (scroll wheel also works) |
+| Left-click | build with the active tool |
+| `R` / `shift+R` | **per-tool**: belt path shape, or structure rotation |
 | Right-click | cancel a plan, or drag to erase |
 | `Esc` | cancel a plan |
 | `F5` | reload `world.frag` |
 | `Delete` | clear the board |
+
+`R` deliberately means different things in different tools — the input manager
+reports only that it was pressed and the active builder decides. Adding a tool
+with its own notion of "cycle" needs no input-layer change.
 
 ## Architecture
 
@@ -56,16 +61,19 @@ returns requests, and the orchestrator applies both.
 
 | file | role |
 |---|---|
-| [cell.py](cell.py) | grid cell bit packing; constants for types and directions |
-| [entity.py](entity.py) | `Entity` view base, `Belt`, `Structure` stub, type registry |
+| [cell.py](cell.py) | grid cell bit packing; type, direction, and ghost-state constants |
+| [entity.py](entity.py) | `Entity` view base, `Belt`, `Structure`/`Add`/`Mul`, type registry |
 | [gameboard.py](gameboard.py) | grid array, entity table, free list, dirty tracking, device transfer |
-| [engine.py](engine.py) | path planning, place/erase, ghost lifecycle |
+| [engine_paths.py](engine_paths.py) | pure path geometry (elbows, Bresenham) |
+| [builders.py](builders.py) | `EntityBuilder`/`BuildPlan`; `BeltBuilder`, `StructureBuilder` |
+| [toolbelt.py](toolbelt.py) | ten slots, one active tool |
+| [engine.py](engine.py) | preview/commit a plan, erase, ghost lifecycle |
 | [camera.py](camera.py) | pan/zoom, world↔screen, the world render pass |
-| [input_manager.py](input_manager.py) | input → intents; the belt-planning state machine |
-| [ui.py](ui.py) | imgui panel |
+| [input_manager.py](input_manager.py) | input → intents; the gesture state machine |
+| [ui.py](ui.py) | imgui panel and the toolbelt bar |
 | [orchestrator.py](orchestrator.py) | wires the above; owns per-frame ordering |
 | [app.py](app.py) | GLFW/context setup and the main loop |
-| [world.frag](world.frag) | renders grid lines, belts, and ghosts from the grid texture |
+| [world.frag](world.frag) | renders grid lines, entities, ghosts, and frustration tints |
 
 ### Cell encoding
 
@@ -73,13 +81,15 @@ The grid is `(H, W, 4) int32`, uploaded as an `RGBA32I` texture. Channel `.x`:
 
 ```
 bits 0-1    direction   0=+X 1=+Y 2=-X 3=-Y
-bits 2-8    type        0=empty, 1=belt, 2.. structures
+bits 2-8    type        0=empty, 1=belt, 2=add, 3=mul, 4.. future
 bits 9-30   entity id   row index into the entity SSBO
 bit  31     unused — deliberately clear
 ```
 
 `.y` packs `(local_x, local_y)` so a multi-cell entity's cells each know their
-offset from the origin. `.z` bit 0 is `is_ghost`. `.w` is reserved.
+offset from the origin. `.z` bits 0-1 hold the ghost state
+(`0` real / `1` ghost / `2` frustrated — see "Frustrated cells" below). `.w` is
+reserved.
 
 Three things to know before touching this:
 
@@ -111,6 +121,11 @@ session; compacting it would require a grid-wide id remap and is not implemented
 the row (the renderer needs it per-cell). A view caches it in `_ghost` so it can
 be stamped before the cells exist; `None` there means "read the grid".
 
+Footprints and faces are **class** data rotated on demand
+(`footprint_for`, `cells_for`, `faces_for`), not per-instance storage. The row
+stores the already-rotated extent so `footprint_w/h` describe the entity as it
+actually sits on the board.
+
 ### Dirty tracking and device transfer
 
 `Gameboard` keeps a union rectangle for the grid and a union row-range for the
@@ -134,28 +149,96 @@ device sync sits after all mutation and before rendering, so what is drawn is
 always what the CPU believes. Input is polled before the UI is built so the
 panel shows current state rather than lagging a frame.
 
-### Belt planning
+### Builders: one mechanism for every placement tool
 
-The state machine lives in `InputManager` (IDLE / PLANNING / ERASING). Three path
-modes cycle with `R`: horizontal-first elbow, vertical-first elbow, and a
-Bresenham line. All paths are **4-connected** — belts cannot step diagonally, so
-`bresenham()` deliberately produces a staircase rather than diagonal steps.
-For an axis-aligned drag all three modes produce the same cells, so `R` appears
-to do nothing; this is correct, and the UI names the active mode to make it
-legible.
+**Belt-drawing and structure-placement are not separate systems.** Both are
+`EntityBuilder`s that turn a gesture into a `BuildPlan`; the engine knows only
+how to preview and commit a plan. Future tools — blueprint paste, copy/paste,
+undo — are meant to fit the same shape rather than grow beside it.
 
-Cells that are occupied or out of bounds are **skipped, not blocking**: a run
-drawn across an existing belt builds on both sides and leaves the crossing cell
-alone. A fully blocked path builds nothing.
+```
+EntityBuilder.plan(engine, start, end) -> BuildPlan
+BuildPlan.placements   every entity the gesture wants
+         .buildable    the subset that will actually be created
+         .frustrated_cells   cells to tint red
+         .all_or_nothing     policy flag
+```
+
+The two builders differ in exactly two ways:
+
+| | `BeltBuilder` | `StructureBuilder` |
+|---|---|---|
+| placements | many 1×1, one per path cell | one, possibly multi-cell |
+| `all_or_nothing` | `False` — build around obstacles | `True` — any clash blocks it |
+| `drag_based` | `True` (press, move, click) | `False` (hover, click) |
+| `R` means | cycle path shape | rotate 90° (`shift+R` reverses) |
+
+`drag_based` is the one place the gesture style leaks out: a click-based tool
+never enters `PLANNING`, it previews under the cursor while `IDLE` and commits
+on a press. Both styles hand the builder the same `(anchor, target)` pair, so
+builders do not care which produced them.
+
+### Frustrated cells are an overlay, not an entity
+
+This is the subtle part of the design. A frustrated cell is one a pending build
+wants but cannot have — which means **something is already there**. A grid cell
+holds exactly one entity id in `.x`, so spawning a ghost entity on top would
+destroy the occupant. Frustration therefore lives **only in `.z`** and leaves
+`.x` completely untouched, which is what lets the renderer tint the cell red
+*over* the existing entity instead of replacing it: you can see what is in your
+way.
+
+Consequences worth knowing:
+
+- `Engine.clear_ghosts()` clears **two** things — ghost entities (which own
+  rows and cells, and are despawned) and frustration overlays (which own
+  neither, and are unset without disturbing the occupant).
+- `Gameboard` tracks the frustrated cell list so it can clear them without
+  scanning the board.
+- A frustrated cell is *not* a ghost. `cell.is_ghost()` is false for it;
+  `cell.is_frustrated()` is the separate test.
+
+Because belts are 1×1 and not all-or-nothing, a belt run across an obstacle
+still commits — only the overlapping cells are frustrated. A structure with any
+cell blocked commits nothing but still tints every blocked cell. Same
+mechanism, different policy.
+
+### Belt path planning
+
+Three path modes cycle with `R`: horizontal-first elbow, vertical-first elbow,
+and a Bresenham line. All paths are **4-connected** — belts cannot step
+diagonally, so `bresenham()` deliberately produces a staircase. For an
+axis-aligned drag all three modes produce the same cells, so `R` appears to do
+nothing; this is correct, and the UI names the active mode to make it legible.
 
 **Directions are derived from the unfiltered path, then filtered alongside it**
-(`Engine.plan_oriented`). This ordering matters: a belt's facing must not depend
-on what happens to be in the way. Deriving directions after filtering means a
-cell whose successor was blocked has no step to read and falls back to `+X`,
-which is how "complete the last cell of a 2×2 loop" used to produce an
-east-facing belt instead of one that closes the loop. For a genuine single-cell
-path (a click with no drag) there is no step at all, so `plan_oriented` passes
-the drag's dominant axis as the fallback.
+(`BeltBuilder.plan`). This ordering matters: a belt's facing must not depend on
+what happens to be in the way. Deriving directions after filtering means a cell
+whose successor was blocked has no step to read and falls back to `+X`, which is
+how "complete the last cell of a 2×2 loop" used to produce an east-facing belt
+instead of one that closes the loop. For a genuine single-cell path (a click
+with no drag) there is no step at all, so the drag's dominant axis is the
+fallback.
+
+### Structures
+
+`Add` is 2×1 with two inputs on one long edge and two outputs on the other;
+`Mul` is 1×1 with two *adjacent* inputs (north, west) and two adjacent outputs
+(east, south), so material turns a corner through it. Both are authored at
+`DIR_PX` and rotated.
+
+- **Faces are derived, not stored** (`Entity.faces_for`). Every instance of a
+  type has the same port layout, so storing it per-row would be duplication.
+  If ports ever become per-instance configurable, that is where it changes.
+- **The origin is always the cell under the cursor**, at every rotation —
+  `cells_for()` extends the footprint in +X/+Y from the origin rather than
+  pivoting about an interior point, which keeps placement predictable.
+- **Erasing any cell of a multi-cell entity removes the whole entity.** There
+  is no such thing as half a structure.
+- The renderer recovers a footprint's extent by probing neighbours for a
+  matching entity id, so a multi-cell entity draws as one merged rectangle with
+  a single arrow. Merged edges extend slightly *past* the cell boundary —
+  stopping exactly at it leaves a visible antialiasing seam.
 
 Right-press is consumed by the cancel when PLANNING, so cancelling never also
 starts an erase. Erase drags interpolate between the previous and current cell,
@@ -170,7 +253,14 @@ so a fast drag leaves no gaps.
   mapping exactly, and `test_drive.py` asserts the two agree by rendering.
 - World `+Y` is up. Cell `(x, y)` covers world `[x, x+1) × [y, y+1)`.
 - `InputManager` is the **only** place that reads input or consults
-  `io.want_capture_keyboard` / `io.want_capture_mouse`.
+  `io.want_capture_keyboard` / `io.want_capture_mouse`. It reports *that* `R`
+  was pressed, never what `R` means.
+- The toolbelt always has `SLOT_COUNT` (10) slots; empty ones are selectable
+  and simply have no active tool. Switching tools cancels any in-flight gesture
+  and its preview — a half-drawn belt run means nothing to the structure tool.
+- Scroll is event-based, so `InputManager` installs a glfw scroll callback and
+  **chains to imgui's**; dropping the previous callback would break scrolling
+  in the UI panels.
 - Mouse *presses* are suppressed over imgui windows but *releases* are always
   honoured, so a gesture cannot get stuck on.
 - `dt` is clamped to 0.1s in the main loop so a hitch does not fling the camera.
@@ -178,9 +268,15 @@ so a fast drag leaves no gaps.
 
 ## Deferred
 
-Noted so they are not mistaken for oversights: belt item simulation; compute
-shader passes (the context is 4.3 and the SSBO is bound, but nothing dispatches);
+Noted so they are not mistaken for oversights: belt and structure *simulation*
+(nothing moves — `Add`/`Mul` have ports but no behaviour); compute shader passes
+(the context is 4.3 and the SSBO is bound, but nothing dispatches);
 topology-aware corner rendering (belts draw as a square + direction arrow, and
-corner curves would want the shader to read neighbour cells); multi-cell
-`Structure` placement UX (the *encoding* supports it already); entity-row
-compaction; a growable or chunked board (fixed 512×512); save/load.
+corner curves would want the shader to read neighbour cells); drawing input and
+output faces (ports are derived and testable but the renderer shows only an
+orientation arrow); entity-row compaction; a growable or chunked board (fixed
+512×512); save/load.
+
+Tools the builder abstraction is shaped for but which do not exist yet:
+blueprint capture/paste, and undo (which would record the rows a committed
+`BuildPlan` produced).

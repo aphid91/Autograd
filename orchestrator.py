@@ -17,9 +17,11 @@ moves and therefore exercises the partial-upload path continuously.
 
 import glfw
 
+from builders import default_builders
 from camera import Camera
 from engine import Engine
 from input_manager import InputManager, STATE_PLANNING
+from toolbelt import Toolbelt
 from ui import UI, UIRequests
 
 
@@ -33,7 +35,9 @@ class Orchestrator:
 
         self.camera = Camera(ctx, self.engine.board)
         self.input = InputManager(window, self.camera)
+        self.toolbelt = Toolbelt(default_builders())
         self.ui = UI()
+        self.last_plan = None
 
         self.cursor_cell = None
         # Headless test harnesses set this to skip the imgui panel, which needs
@@ -41,14 +45,35 @@ class Orchestrator:
         self.draw_ui = True
         self.camera.frame_board(glfw.get_framebuffer_size(window))
 
+    # --- tool plumbing --------------------------------------------------
+    def _on_tool_changed(self):
+        """Switching tools abandons any in-flight gesture and its preview."""
+        self.engine.clear_ghosts()
+        self.input.cancel()
+        self.last_plan = None
+
+    def _preview(self, tool):
+        """Rebuild the preview for the active tool's current gesture."""
+        anchor = self.input.anchor
+        target = self.input.target
+        if anchor is None or target is None:
+            return
+        plan = tool.plan(self.engine, anchor, target)
+        self.engine.preview_plan(plan)
+        self.last_plan = plan
+
     # --- frame ----------------------------------------------------------
     def frame(self, dt):
         viewport = glfw.get_framebuffer_size(self.window)
         engine = self.engine
         board = engine.board
 
-        # 1. input
-        intents = self.input.poll(dt, board)
+        # 1. input. The active tool decides the gesture style, so it has to be
+        # known before polling.
+        tool_now = self.toolbelt.active
+        intents = self.input.poll(
+            dt, board, drag_based=(tool_now.drag_based if tool_now else True)
+        )
         self.cursor_cell = intents.cursor_cell
 
         # 2. camera
@@ -61,22 +86,55 @@ class Orchestrator:
         if intents.clear_board:
             engine.clear_board()
 
-        # 3. build / erase
+        # 3. toolbelt selection. Changing tools drops any in-flight preview --
+        # a half-drawn belt run means nothing to the structure tool.
+        if intents.select_slot is not None:
+            if self.toolbelt.select(intents.select_slot):
+                self._on_tool_changed()
+        if intents.scroll:
+            if self.toolbelt.scroll(intents.scroll):
+                self._on_tool_changed()
+
+        tool = self.toolbelt.active
+
+        # 4. per-tool R / shift+R
+        if intents.cycle_tool and tool is not None:
+            tool.cycle(backward=intents.cycle_backward)
+
+        # 5. build / erase
         if intents.cancel_plan:
             engine.clear_ghosts()
+            self.last_plan = None
 
         if intents.commit_plan:
-            engine.commit_ghosts()
+            # A click-based tool has no PLANNING phase, so on the very first
+            # frame the cursor is over the board there may be no preview yet.
+            # Only build one if it is genuinely missing -- rebuilding an
+            # existing preview here would re-plan against a board that still
+            # contains our own ghosts.
+            if tool is not None and self.last_plan is None:
+                self._preview(tool)
 
-        if intents.update_plan and self.input.state == STATE_PLANNING:
-            anchor, target = self.input.anchor, self.input.target
-            if anchor is not None and target is not None:
-                engine.preview_belt_path(anchor, target, self.input.path_mode)
+            # An all-or-nothing plan that is frustrated must not commit, and
+            # must keep showing why: leave the tint in place.
+            plan = self.last_plan
+            blocked = plan is not None and plan.all_or_nothing and not plan.ok
+            if not blocked:
+                engine.commit_ghosts()
+                self.last_plan = None
+                # Re-preview so a click-based tool still shows a ghost under
+                # the cursor after placing, rather than blinking empty until
+                # the mouse moves. Now that the entity is real, this correctly
+                # reports the cells as frustrated.
+                if tool is not None and not tool.drag_based:
+                    self._preview(tool)
+        elif intents.update_plan and tool is not None:
+            self._preview(tool)
 
         for (x, y) in intents.erase_at:
             engine.erase(x, y)
 
-        # 4. UI (built mid-frame; drawn last)
+        # 6. UI (built mid-frame; drawn last)
         requests = self.ui.draw(self) if self.draw_ui else UIRequests()
         if requests.reload_shader:
             self.camera.reload_shader()
@@ -84,16 +142,17 @@ class Orchestrator:
             self.camera.frame_board(viewport)
         if requests.clear_board:
             engine.clear_board()
-        if requests.set_mode is not None:
-            self.input.path_mode = requests.set_mode
-            if self.input.state == STATE_PLANNING and self.input.anchor:
-                engine.preview_belt_path(
-                    self.input.anchor, self.input.target, self.input.path_mode
-                )
+        if requests.select_slot is not None:
+            if self.toolbelt.select(requests.select_slot):
+                self._on_tool_changed()
+        if requests.cycle_tool and self.toolbelt.active is not None:
+            self.toolbelt.active.cycle(backward=requests.cycle_backward)
+            if self.input.anchor is not None:
+                self._preview(self.toolbelt.active)
         if requests.verify_round_trip:
             self.ui.last_verify = board.verify_round_trip()
 
-        # 5. device sync, then render
+        # 7. device sync, then render
         self.ui.last_upload = engine.sync_to_device()
         self.camera.render(viewport)
 

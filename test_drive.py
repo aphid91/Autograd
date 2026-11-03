@@ -12,6 +12,8 @@ import input_manager
 from orchestrator import Orchestrator
 from input_manager import STATE_IDLE, STATE_PLANNING, STATE_ERASING
 from engine import MODE_HORIZONTAL_FIRST, MODE_VERTICAL_FIRST, MODE_LINE
+from builders import BeltBuilder, StructureBuilder
+from entity import Add, Mul
 
 W, H = 1024, 768
 
@@ -87,15 +89,16 @@ ok(f"planning from {orch.input.anchor}")
 put_cursor_at_cell(16, 14); step()    # move -> ghost preview
 nghost = len(engine.ghost_rows)
 assert nghost > 0, "no ghosts created"
-ghost_cells = int((board.grid[:, :, cell.CH_Z] & cell.GHOST_BIT).sum())
+ghost_cells = int((cell.ghost_state_arr(board.grid[:, :, cell.CH_Z]) == cell.GHOST_PENDING).sum())
 assert ghost_cells == nghost, (ghost_cells, nghost)
 ok(f"{nghost} ghost cells, all flagged in .z")
 assert cells_of_type(cell.TYPE_BELT) == nghost, "ghosts should occupy belt cells"
 
-mode_before = orch.input.path_mode
+tool = orch.toolbelt.active
+mode_before = tool.mode
 fake["keys"].add(glfw.KEY_R); step(); fake["keys"].discard(glfw.KEY_R); step()
-assert orch.input.path_mode != mode_before, "R did not cycle mode"
-ok(f"R cycled mode {mode_before} -> {orch.input.path_mode}")
+assert tool.mode != mode_before, "R did not cycle the belt tool's mode"
+ok(f"R cycled belt mode {mode_before} -> {tool.mode}")
 # Ghost count for an elbow is the same either way, but the cells differ.
 g_after = len(engine.ghost_rows)
 assert g_after == nghost, (nghost, g_after)
@@ -105,7 +108,7 @@ fake["left"] = True; step()           # second click -> commit
 fake["left"] = False; step()
 assert orch.input.state == STATE_IDLE
 assert not engine.ghost_rows, "ghosts should be consumed"
-remaining_ghost_cells = int((board.grid[:, :, cell.CH_Z] & cell.GHOST_BIT).sum())
+remaining_ghost_cells = int((cell.ghost_state_arr(board.grid[:, :, cell.CH_Z]) == cell.GHOST_PENDING).sum())
 assert remaining_ghost_cells == 0, remaining_ghost_cells
 assert board.live_count == nghost, (board.live_count, nghost)
 ok(f"committed {board.live_count} real belts, no ghost flags left")
@@ -125,7 +128,7 @@ assert orch.input.state == STATE_IDLE, orch.input.state
 assert not engine.ghost_rows, "cancel must drop ghosts"
 assert board.live_count == live_before, (
     f"cancel must restore the pre-plan count: {board.live_count} != {live_before}")
-assert int((board.grid[:, :, cell.CH_Z] & cell.GHOST_BIT).sum()) == 0
+assert int((cell.ghost_state_arr(board.grid[:, :, cell.CH_Z]) == cell.GHOST_PENDING).sum()) == 0
 ok("right-click cancelled, nothing built")
 
 # The cancelling right-press must NOT have started an erase.
@@ -142,7 +145,7 @@ put_cursor_at_cell(15, 14); step()
 fake["left"] = True; step(); fake["left"] = False
 put_cursor_at_cell(15, 26); step()
 gc = [(x, y) for x, y in
-      zip(*np.nonzero((board.grid[:, :, cell.CH_Z] & cell.GHOST_BIT))[::-1])]
+      zip(*np.nonzero(cell.ghost_state_arr(board.grid[:, :, cell.CH_Z]) == cell.GHOST_PENDING)[::-1])]
 assert (15, 20) not in gc, "ghosted on top of an existing belt!"
 ok(f"{len(gc)} ghost cells, crossing cell (15,20) skipped")
 fake["left"] = True; step(); fake["left"] = False; step()
@@ -160,16 +163,21 @@ engine.clear_board(); step()
 engine.place_belt(0, 1, cell.DIR_PX)
 engine.place_belt(1, 1, cell.DIR_NY)
 engine.place_belt(1, 0, cell.DIR_NX)
-path, dirs = engine.plan_oriented((0, 0), (0, 1), MODE_HORIZONTAL_FIRST)
-assert path == [(0, 0)] and dirs == [cell.DIR_PY], (path, dirs)
+_bb = BeltBuilder()
+_bb.mode = MODE_HORIZONTAL_FIRST
+plan = _bb.plan(engine, (0, 0), (0, 1))
+built = [(p.x, p.y, p.direction) for p in plan.buildable]
+assert built == [(0, 0, cell.DIR_PY)], built
 ok("2x2 loop completes facing +Y, not +X")
 
 for (s, t, blk, want) in [((2, 2), (2, 6), (2, 3), cell.DIR_PY),
                           ((6, 8), (2, 8), (5, 8), cell.DIR_NX)]:
     engine.clear_board()
     engine.place_belt(*blk)
-    p, d = engine.plan_oriented(s, t, MODE_HORIZONTAL_FIRST)
-    assert d and all(x == want for x in d), (s, t, [cell.DIR_NAMES[x] for x in d])
+    plan = _bb.plan(engine, s, t)
+    dirs = [p.direction for p in plan.buildable]
+    assert dirs and all(x == want for x in dirs), (
+        s, t, [cell.DIR_NAMES[x] for x in dirs])
 ok("drags through a blocker keep their heading")
 
 # And the same holds for what actually gets committed through the UI path.
@@ -212,6 +220,99 @@ fake["right"] = False; step()
 gaps = [x for x in range(2, 31) if not board.is_empty(x, 30)]
 assert not gaps, f"fast drag left belts behind at {gaps}"
 ok("interpolated erase across a 28-cell jump")
+
+print("=== toolbelt selection ===")
+engine.clear_board(); step()
+assert orch.toolbelt.active.name == "Belt", orch.toolbelt.active.name
+fake["keys"].add(glfw.KEY_2); step(); fake["keys"].discard(glfw.KEY_2); step()
+assert orch.toolbelt.active.name == "Add", orch.toolbelt.active.name
+ok("key 2 selected Add")
+fake["keys"].add(glfw.KEY_3); step(); fake["keys"].discard(glfw.KEY_3); step()
+assert orch.toolbelt.active.name == "Mul"
+ok("key 3 selected Mul")
+fake["keys"].add(glfw.KEY_0); step(); fake["keys"].discard(glfw.KEY_0); step()
+assert orch.toolbelt.selected == 9 and orch.toolbelt.active is None
+ok("key 0 selected empty slot 10")
+fake["keys"].add(glfw.KEY_1); step(); fake["keys"].discard(glfw.KEY_1); step()
+assert orch.toolbelt.active.name == "Belt"
+ok("key 1 back to Belt")
+
+print("=== structure placement is click-based and all-or-nothing ===")
+engine.clear_board(); step()
+fake["keys"].add(glfw.KEY_2); step(); fake["keys"].discard(glfw.KEY_2); step()
+add_tool = orch.toolbelt.active
+assert not add_tool.drag_based
+
+# Hovering alone must ghost, with no click at all.
+put_cursor_at_cell(20, 20); step()
+assert len(engine.ghost_rows) == 1, len(engine.ghost_rows)
+assert orch.input.state == STATE_IDLE, "structures never enter PLANNING"
+ok("Add ghosts on hover without a click")
+
+# One click places it; it covers two cells.
+fake["left"] = True; step(); fake["left"] = False; step()
+assert not board.is_empty(20, 20) and not board.is_empty(21, 20)
+placed_id = cell.cell_id(board.cell_word(20, 20))
+assert cell.cell_id(board.cell_word(21, 20)) == placed_id, "both cells, one entity"
+assert cell.cell_type(board.cell_word(20, 20)) == cell.TYPE_ADD
+ok("single click placed a 2x1 Add sharing one entity id")
+
+# Rotation changes the footprint orientation.
+before = add_tool.direction
+fake["keys"].add(glfw.KEY_R); step(); fake["keys"].discard(glfw.KEY_R); step()
+assert add_tool.direction != before
+put_cursor_at_cell(30, 30); step()
+fake["left"] = True; step(); fake["left"] = False; step()
+assert not board.is_empty(30, 30) and not board.is_empty(30, 31), "rotated = vertical"
+assert board.is_empty(31, 30)
+ok("R rotated the Add to 1x2")
+
+# Overlapping placement frustrates and builds nothing.
+live_before = board.live_count
+put_cursor_at_cell(30, 30); step()
+frustrated = int((cell.ghost_state_arr(board.grid[:, :, cell.CH_Z])
+                  == cell.GHOST_FRUSTRATED).sum())
+assert frustrated > 0, "overlap should tint"
+assert len(engine.ghost_rows) == 0, "all-or-nothing must ghost nothing"
+# The occupant survives underneath the tint.
+assert cell.cell_type(board.cell_word(30, 30)) == cell.TYPE_ADD
+fake["left"] = True; step(); fake["left"] = False; step()
+assert board.live_count == live_before, "blocked placement must build nothing"
+ok(f"overlap tinted {frustrated} cells, built nothing, occupant intact")
+
+print("=== frustration never destroys the occupant ===")
+engine.clear_board(); step()
+fake["keys"].add(glfw.KEY_1); step(); fake["keys"].discard(glfw.KEY_1); step()
+engine.place_belt(8, 8, cell.DIR_PY)
+want_id = cell.cell_id(board.cell_word(8, 8))
+put_cursor_at_cell(6, 8); step()
+fake["left"] = True; step(); fake["left"] = False
+put_cursor_at_cell(11, 8); step()
+assert cell.is_frustrated(int(board.grid[8, 8, cell.CH_Z])), "crossing cell tinted"
+assert cell.cell_id(board.cell_word(8, 8)) == want_id, "occupant id clobbered!"
+assert cell.cell_dir(board.cell_word(8, 8)) == cell.DIR_PY, "occupant dir clobbered!"
+ok("belt crossing tints the blocker without touching its entity")
+fake["left"] = True; step(); fake["left"] = False; step()
+assert int((cell.ghost_state_arr(board.grid[:, :, cell.CH_Z])
+            == cell.GHOST_FRUSTRATED).sum()) == 0, "commit must clear tints"
+assert cell.cell_id(board.cell_word(8, 8)) == want_id
+ok("commit cleared the tint, occupant still intact")
+
+print("=== switching tools drops an in-flight preview ===")
+engine.clear_board(); step()
+put_cursor_at_cell(12, 12); step()
+fake["left"] = True; step(); fake["left"] = False
+put_cursor_at_cell(18, 12); step()
+assert len(engine.ghost_rows) > 0
+fake["keys"].add(glfw.KEY_3); step(); fake["keys"].discard(glfw.KEY_3); step()
+assert orch.toolbelt.active.name == "Mul"
+assert orch.input.state == STATE_IDLE, "tool switch should cancel the gesture"
+belt_ghosts = [r for r in engine.ghost_rows
+               if board.is_row_alive(r)
+               and cell.cell_type(board.cell_word(*board.view(r).origin)) == cell.TYPE_BELT]
+assert not belt_ghosts, "belt preview should be gone"
+ok("tool switch cancelled the belt run")
+fake["keys"].add(glfw.KEY_1); step(); fake["keys"].discard(glfw.KEY_1); step()
 
 print("=== device round trip after all that ===")
 assert board.verify_round_trip(), "grid round trip mismatch"

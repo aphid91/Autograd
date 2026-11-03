@@ -7,8 +7,9 @@ Controls:
   WASD          pan
   Q / E         zoom out / in
   F             frame the whole board
-  Left-click    start a belt run; click again to confirm
-  R             while planning, cycle elbow-H / elbow-V / line
+  1-9, 0        select a toolbelt slot (scroll wheel also works)
+  Left-click    build with the active tool
+  R / shift+R   per-tool: belt path shape, or structure rotation
   Right-click   cancel a plan, or drag to erase
   Esc           cancel a plan
   F5            reload world.frag

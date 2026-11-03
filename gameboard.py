@@ -105,6 +105,9 @@ class Gameboard:
         self._next_row = 1
         self._free_rows = []
         self._live_count = 0
+        # Cells carrying a frustration overlay. Tracked so they can be cleared
+        # without scanning the board; they are not entities and own no row.
+        self._frustrated = []
 
         self.grid_dirty = DirtyRect()
         self.entities_dirty = DirtyRange()
@@ -225,7 +228,9 @@ class Gameboard:
         return view
 
     def _stamp_footprint(self, view):
-        word_z = cell.pack_flags(is_ghost=view.is_ghost)
+        word_z = cell.pack_flags(
+            cell.GHOST_PENDING if view.is_ghost else cell.GHOST_NONE
+        )
         word_x = cell.pack_cell(view.type_id, view.direction, view.row)
         ox, oy = view.origin
         for lx in range(view.footprint_w):
@@ -269,6 +274,38 @@ class Gameboard:
         view.is_ghost = is_ghost
         self.entities_dirty.add(row)
         self._stamp_footprint(view)
+
+    # --- frustration overlay --------------------------------------------
+    def set_frustrated(self, x, y):
+        """Mark a cell as wanted-but-unavailable, leaving its occupant intact.
+
+        This writes only the ghost field of .z. The cell's .x -- type,
+        direction, and the occupying entity's id -- is deliberately untouched,
+        so the renderer draws the existing entity and tints it rather than
+        replacing it. That is the whole point of a frustrated cell: you can see
+        what is in your way.
+        """
+        if not self.in_bounds(x, y):
+            return
+        z = int(self.grid[y, x, cell.CH_Z])
+        self.grid[y, x, cell.CH_Z] = cell.with_ghost_state(
+            z, cell.GHOST_FRUSTRATED
+        )
+        self._frustrated.append((x, y))
+        self.mark_dirty(x, y)
+
+    def clear_frustrated(self):
+        """Drop every frustration overlay. Does not touch entities."""
+        for (x, y) in self._frustrated:
+            if not self.in_bounds(x, y):
+                continue
+            z = int(self.grid[y, x, cell.CH_Z])
+            if cell.ghost_state(z) == cell.GHOST_FRUSTRATED:
+                self.grid[y, x, cell.CH_Z] = cell.with_ghost_state(
+                    z, cell.GHOST_NONE
+                )
+                self.mark_dirty(x, y)
+        self._frustrated.clear()
 
     # --- device ---------------------------------------------------------
     def create_device_resources(self, ctx):

@@ -35,12 +35,80 @@ ENTITY_STRIDE = 12
 class Entity:
     """Base view. Not spawnable directly -- TYPE_ID must be set by a subclass."""
 
+    # Footprint and faces are authored at DIR_PX (east) and rotated into the
+    # entity's actual facing. See footprint_for() / faces_for().
     TYPE_ID = cell.TYPE_EMPTY
     FOOTPRINT = (1, 1)
+
+    # Entity-local cell offsets that carry an input or output face, each as
+    # (local_x, local_y, face_direction), authored at DIR_PX. Empty means the
+    # type has no directional ports (a belt just moves along its direction).
+    INPUTS = ()
+    OUTPUTS = ()
+
+    # Whether R rotates this type at all. Belts take their facing from the
+    # path they are drawn along, so rotating one in isolation is meaningless.
+    ROTATABLE = False
 
     # Exposed for Gameboard, which pokes F_ALIVE/F_TYPE without a view.
     F_ALIVE = _F_ALIVE
     F_TYPE = _F_TYPE
+
+    @classmethod
+    def footprint_for(cls, direction):
+        """(w, h) of this type rotated into `direction`."""
+        w, h = cls.FOOTPRINT
+        return (h, w) if direction % 2 else (w, h)
+
+    @classmethod
+    def cells_for(cls, x, y, direction):
+        """Every (cx, cy) a placement at (x, y) facing `direction` would cover.
+
+        The origin stays at (x, y) and the footprint extends in +X/+Y from it,
+        so a rotated 2x1 occupies (x,y) and (x,y+1) rather than pivoting about
+        some interior point. That keeps "the cell under the cursor is the
+        origin" true at every rotation, which is what makes placement
+        predictable.
+        """
+        w, h = cls.footprint_for(direction)
+        return [(x + lx, y + ly) for lx in range(w) for ly in range(h)]
+
+    @classmethod
+    def faces_for(cls, x, y, direction):
+        """(inputs, outputs) in world space for a placement.
+
+        Each entry is ((cell_x, cell_y), face_direction). Faces are derived
+        from the type and its facing rather than stored per-instance -- every
+        instance of a type has the same port layout, so storage would be pure
+        duplication. If ports ever become per-instance configurable this is
+        where that changes.
+        """
+        def place(spec):
+            out = []
+            for (lx, ly, face) in spec:
+                rx, ry = cls._rotate_local(lx, ly, direction)
+                out.append(((x + rx, y + ry), cell.rotate_dir_ccw_n(face, direction)))
+            return out
+
+        return place(cls.INPUTS), place(cls.OUTPUTS)
+
+    @classmethod
+    def _rotate_local(cls, lx, ly, direction):
+        """Rotate a local offset, then shift it back into the +X/+Y quadrant.
+
+        Rotating (1,0) by a quarter turn gives (0,1) but rotating (0,0)..(1,0)
+        as a *block* gives offsets that can go negative; normalising against
+        the rotated footprint keeps every offset non-negative so it still packs
+        into .y's unsigned local field.
+        """
+        rx, ry = cell.rotate_offset(lx, ly, direction)
+        w, h = cls.FOOTPRINT
+        # The bounding box corners, rotated, give the shift needed.
+        corners = [cell.rotate_offset(cx, cy, direction)
+                   for cx in (0, w - 1) for cy in (0, h - 1)]
+        min_x = min(c[0] for c in corners)
+        min_y = min(c[1] for c in corners)
+        return rx - min_x, ry - min_y
 
     _registry = {}
 
@@ -76,7 +144,9 @@ class Entity:
 
     def initialise(self, x, y, direction, is_ghost=False):
         """Populate a freshly claimed row. Subclasses extend, calling super()."""
-        w, h = self.FOOTPRINT
+        # Store the *rotated* extent, so footprint_w/h describe the entity as
+        # it actually sits on the board.
+        w, h = self.footprint_for(direction)
         row = self.board.entities[self.row]
         row[:] = 0
         row[_F_ALIVE] = 1.0
@@ -170,16 +240,44 @@ class Belt(Entity):
 
 
 class Structure(Entity):
-    """Multi-cell building. Placement UX is not implemented this pass.
+    """Base for placed buildings: rotatable, with input and output faces.
 
-    The encoding supports it already: every cell of the footprint carries the
-    same entity id in .x and its own (local_x, local_y) in .y, so a frag shader
-    can draw a multi-cell sprite by reading the local offset. Subclass this and
-    set FOOTPRINT to something larger to use it.
+    Every cell of a footprint carries the same entity id in .x and its own
+    (local_x, local_y) in .y, so the renderer can draw a multi-cell sprite by
+    reading the local offset.
     """
 
-    TYPE_ID = 2
+    ROTATABLE = True
+
+
+class Add(Structure):
+    """2x1 splitter-like structure: two inputs on one long edge, two outputs
+    on the other.
+
+    Authored at DIR_PX as two cells side by side in X, inputs facing +Y (top)
+    and outputs facing -Y (bottom). Rotating makes it 1x2 with the faces
+    carried around accordingly.
+    """
+
+    TYPE_ID = cell.TYPE_ADD
+    FOOTPRINT = (2, 1)
+
+    INPUTS = ((0, 0, cell.DIR_PY), (1, 0, cell.DIR_PY))
+    OUTPUTS = ((0, 0, cell.DIR_NY), (1, 0, cell.DIR_NY))
+
+
+class Mul(Structure):
+    """1x1 structure with two adjacent inputs and two adjacent outputs.
+
+    Authored at DIR_PX with inputs on the north and west faces and outputs on
+    the east and south -- so material turns a corner through it.
+    """
+
+    TYPE_ID = cell.TYPE_MUL
     FOOTPRINT = (1, 1)
+
+    INPUTS = ((0, 0, cell.DIR_PY), (0, 0, cell.DIR_NX))
+    OUTPUTS = ((0, 0, cell.DIR_PX), (0, 0, cell.DIR_NY))
 
 
 def _self_check():
@@ -187,9 +285,46 @@ def _self_check():
     assert _COMMON_FIELDS <= ENTITY_STRIDE
     assert Belt.F_ITEM_COUNT < ENTITY_STRIDE, "belt fields overflow the stride"
     assert Entity.view_for(cell.TYPE_BELT) is Belt
-    assert Entity.view_for(Structure.TYPE_ID) is Structure
+    assert Entity.view_for(cell.TYPE_ADD) is Add
+    assert Entity.view_for(cell.TYPE_MUL) is Mul
     assert Entity.view_for(999) is Entity
-    assert Belt.TYPE_ID <= cell.MAX_TYPE and Structure.TYPE_ID <= cell.MAX_TYPE
+    for c in (Belt, Add, Mul):
+        assert c.TYPE_ID <= cell.MAX_TYPE
+
+    # Rotation swaps the extent of a non-square footprint and leaves a square
+    # one alone.
+    assert Add.footprint_for(cell.DIR_PX) == (2, 1)
+    assert Add.footprint_for(cell.DIR_PY) == (1, 2)
+    assert Add.footprint_for(cell.DIR_NX) == (2, 1)
+    assert Mul.footprint_for(cell.DIR_PY) == (1, 1)
+
+    # The origin is always the cell under the cursor, at every rotation.
+    for d in range(4):
+        assert (5, 5) in Add.cells_for(5, 5, d), d
+        assert len(Add.cells_for(5, 5, d)) == 2, d
+        assert len(set(Add.cells_for(5, 5, d))) == 2, "footprint cells must differ"
+        assert Mul.cells_for(5, 5, d) == [(5, 5)], d
+
+    # Faces land on cells the entity actually occupies, and rotate with it.
+    for d in range(4):
+        occupied = set(Add.cells_for(7, 7, d))
+        ins, outs = Add.faces_for(7, 7, d)
+        assert len(ins) == 2 and len(outs) == 2, d
+        for (c, _f) in ins + outs:
+            assert c in occupied, (d, c, occupied)
+        # Inputs and outputs always point in opposite directions for an Add.
+        assert {f for _c, f in ins} == {cell.rotate_dir_ccw_n(cell.DIR_PY, d)}
+        assert {f for _c, f in outs} == {cell.rotate_dir_ccw_n(cell.DIR_NY, d)}
+
+    # Mul's ports are adjacent (perpendicular), not opposed.
+    ins, outs = Mul.faces_for(0, 0, cell.DIR_PX)
+    in_dirs = {f for _c, f in ins}
+    out_dirs = {f for _c, f in outs}
+    assert in_dirs == {cell.DIR_PY, cell.DIR_NX}, in_dirs
+    assert out_dirs == {cell.DIR_PX, cell.DIR_NY}, out_dirs
+    assert not (in_dirs & out_dirs), "a face cannot be both input and output"
+
+    assert Belt.ROTATABLE is False and Add.ROTATABLE and Mul.ROTATABLE
 
 
 _self_check()
