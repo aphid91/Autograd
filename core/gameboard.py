@@ -13,8 +13,8 @@ life of that entity regardless of unrelated deletions.
 
 import numpy as np
 
-import cell
-from entity import ENTITY_STRIDE, Entity
+from core import cell
+from core.entity import ENTITY_STRIDE, Entity
 
 GRID_CHANNELS = 4
 

@@ -7,13 +7,13 @@ import numpy as np
 import glfw, moderngl
 from imgui_bundle import imgui
 
-import cell
-import input_manager
+from core import cell
+from ui import input_manager
 from orchestrator import Orchestrator
-from input_manager import STATE_IDLE, STATE_PLANNING, STATE_ERASING
+from ui.input_manager import STATE_IDLE, STATE_PLANNING, STATE_ERASING
 from engine import MODE_HORIZONTAL_FIRST, MODE_VERTICAL_FIRST, MODE_LINE
-from builders import BeltBuilder, StructureBuilder
-from entity import Add, Mul
+from core.builders import BeltBuilder, StructureBuilder
+from core.entity import Add, Mul
 
 W, H = 1024, 768
 
@@ -368,6 +368,42 @@ belt_ghosts = [r for r in engine.ghost_rows
 assert not belt_ghosts, "belt preview should be gone"
 ok("tool switch cancelled the belt run")
 fake["keys"].add(glfw.KEY_1); step(); fake["keys"].discard(glfw.KEY_1); step()
+
+print("=== shader loader ===")
+from render import shader_loader
+_src = shader_loader.load("world.frag")
+assert "#include" not in _src, "an include was left unresolved"
+assert "DIR_VECS" in _src and "sd_chevron" in _src, "common.glsl not spliced in"
+# The encoding constants must appear exactly once -- a second copy would be a
+# silent divergence from core/cell.py.
+assert _src.count("const int TYPE_SHIFT") == 1, "common.glsl included twice"
+_deps = [d.replace("\\", "/").rsplit("/", 1)[-1]
+         for d in shader_loader.dependencies("world.frag")]
+assert set(_deps) == {"world.frag", "common.glsl"}, _deps
+ok(f"world.frag resolves includes ({len(_src)} chars, deps {_deps})")
+
+# The shader-side encoding must agree with cell.py. Parse the constants back
+# out of the GLSL and compare -- this is the one place the two copies can
+# drift, so it is worth pinning.
+import re as _re
+def _glsl_int(name):
+    m = _re.search(rf"\b{name}\s*=\s*(0x[0-9A-Fa-f]+|\d+)", _src)
+    assert m, f"{name} not found in shader source"
+    return int(m.group(1), 0)
+
+for _name, _want in [
+    ("DIR_SHIFT", cell.DIR_SHIFT), ("DIR_MASK", cell.DIR_MASK),
+    ("TYPE_SHIFT", cell.TYPE_SHIFT), ("TYPE_MASK", cell.TYPE_MASK),
+    ("ID_SHIFT", cell.ID_SHIFT), ("ID_MASK", cell.ID_MASK),
+    ("GHOST_MASK", cell.GHOST_MASK), ("LOCAL_SHIFT", cell.LOCAL_SHIFT),
+    ("TYPE_BELT", cell.TYPE_BELT), ("TYPE_ADD", cell.TYPE_ADD),
+    ("TYPE_MUL", cell.TYPE_MUL),
+    ("GHOST_PENDING", cell.GHOST_PENDING),
+    ("GHOST_FRUSTRATED", cell.GHOST_FRUSTRATED),
+]:
+    assert _glsl_int(_name) == _want, (
+        f"{_name}: shader says {_glsl_int(_name)}, cell.py says {_want}")
+ok("GLSL cell encoding matches core/cell.py")
 
 print("=== device round trip after all that ===")
 assert board.verify_round_trip(), "grid round trip mismatch"

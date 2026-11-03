@@ -30,8 +30,9 @@ python test_drive.py
 ```
 
 `test_drive.py` is the only test; there is no pytest/linter configured. It needs
-a working GL 4.3 context but opens no visible window. `cell.py` and `entity.py`
-also run self-checks at import.
+a working GL 4.3 context but opens no visible window. `core/cell.py` and
+`core/entity.py` also run self-checks at import, and the harness checks that
+the GLSL cell encoding still agrees with `core/cell.py`.
 
 ## Controls
 
@@ -59,21 +60,30 @@ Ownership is a single chain: `app.py` → `Orchestrator` → {`Engine`, `Camera`
 `Engine` mutates board state** — the input manager produces intents, the UI
 returns requests, and the orchestrator applies both.
 
+The spine — `app.py`, `orchestrator.py`, `engine.py` — stays at the top level;
+everything else is grouped by layer.
+
 | file | role |
 |---|---|
-| [cell.py](cell.py) | grid cell bit packing; type, direction, and ghost-state constants |
-| [entity.py](entity.py) | `Entity` view base, `Belt`, `Structure`/`Add`/`Mul`, type registry |
-| [gameboard.py](gameboard.py) | grid array, entity table, free list, dirty tracking, device transfer |
-| [engine_paths.py](engine_paths.py) | pure path geometry (elbows, Bresenham) |
-| [builders.py](builders.py) | `EntityBuilder`/`BuildPlan`; `BeltBuilder`, `StructureBuilder` |
-| [toolbelt.py](toolbelt.py) | ten slots, one active tool |
+| [core/cell.py](core/cell.py) | grid cell bit packing; type, direction, and ghost-state constants |
+| [core/entity.py](core/entity.py) | `Entity` view base, `Belt`, `Structure`/`Add`/`Mul`, type registry |
+| [core/gameboard.py](core/gameboard.py) | grid array, entity table, free list, dirty tracking, device transfer |
+| [core/engine_paths.py](core/engine_paths.py) | pure path geometry (elbows, Bresenham) |
+| [core/builders.py](core/builders.py) | `EntityBuilder`/`BuildPlan`; `BeltBuilder`, `StructureBuilder` |
+| [core/toolbelt.py](core/toolbelt.py) | ten slots, one active tool |
 | [engine.py](engine.py) | preview/commit a plan, erase, ghost lifecycle |
-| [camera.py](camera.py) | pan/zoom, world↔screen, the world render pass |
-| [input_manager.py](input_manager.py) | input → intents; the gesture state machine |
-| [ui.py](ui.py) | imgui panel and the toolbelt bar |
+| [render/camera.py](render/camera.py) | pan/zoom, world↔screen, the world render pass |
+| [render/shader_loader.py](render/shader_loader.py) | reads `shaders/`, resolves `#include` |
+| [ui/input_manager.py](ui/input_manager.py) | input → intents; the gesture state machine |
+| [ui/panel.py](ui/panel.py) | imgui panel and the toolbelt bar |
 | [orchestrator.py](orchestrator.py) | wires the above; owns per-frame ordering |
 | [app.py](app.py) | GLFW/context setup and the main loop |
-| [world.frag](world.frag) | renders grid lines, entities, ghosts, and frustration tints |
+| [shaders/common.glsl](shaders/common.glsl) | cell encoding + SDF helpers, included by the rest |
+| [shaders/world.vert](shaders/world.vert) | fullscreen quad |
+| [shaders/world.frag](shaders/world.frag) | grid, belts, structures, ghosts, frustration tints |
+
+`ui/ui.py` is named `panel.py` so `from ui import …` is unambiguous inside the
+`ui` package.
 
 ### Cell encoding
 
@@ -99,10 +109,12 @@ Three things to know before touching this:
 - **Emptiness is `type == 0`, not `word == 0`.** `pack_cell()` collapses
   `TYPE_EMPTY` to exactly `0` so both tests agree in practice, but code should
   ask `cell.is_empty()`.
-- **The packing is duplicated in GLSL** at the top of [world.frag](world.frag).
-  There is no way to share it; change one and you must change the other.
-  `cell.py` runs round-trip assertions at import to catch drift on the Python
-  side.
+- **The packing is duplicated in GLSL**, in
+  [shaders/common.glsl](shaders/common.glsl) — the single GLSL copy, which
+  every shader `#include`s. `cell.py` runs round-trip assertions at import, and
+  `test_drive.py` parses the constants back out of the compiled shader source
+  and compares them against `cell.py`, so the two copies cannot silently
+  diverge.
 
 ### Entities are views, not objects
 
@@ -272,10 +284,73 @@ Right-press is consumed by the cancel when PLANNING, so cancelling never also
 starts an erase. Erase drags interpolate between the previous and current cell,
 so a fast drag leaves no gaps.
 
+## Rendering
+
+All visual constants — colours, line widths, chevron spacing, port geometry —
+live in one `TUNABLES` block at the top of
+[shaders/world.frag](shaders/world.frag) as `#define`s. They are expected to
+change often; nothing below that block hardcodes a number you would want to
+tweak. `F5` hot-reloads.
+
+GLSL has no `#include`, so [render/shader_loader.py](render/shader_loader.py)
+implements a minimal one by textual substitution, with an implicit include
+guard (a file already pulled in is skipped). That exists so the cell encoding
+has exactly one GLSL copy.
+
+### Belts read their 5-cell neighbourhood
+
+A belt draws as a thick spine through the cell plus chevrons showing travel
+direction. Topology comes from the cell and its 4 orthogonal neighbours — no
+lookup table, no precomputed tile index:
+
+- The **outgoing** arm always runs centre → the facing edge.
+- A neighbour contributes an **incoming** arm iff it is a belt whose direction
+  points at us. Since a belt only ever outputs along its own facing, nothing
+  diverges, so merges (T and PLUS) are the only junctions that exist.
+- With no incoming neighbour the spine extends backwards too, so an isolated
+  belt fills its cell rather than looking like a half tile.
+
+**Chevron phase comes from world position**, not from the cell: the lattice is
+a function of distance along the travel axis, so the pattern is continuous
+across cell boundaries and a run reads as one march. It necessarily resets at
+a corner, where the axis changes — which looks natural, since the belt visibly
+turns there. `CHEVRON_PERIOD` sets the spacing in cells; `1.0` gives one per
+cell, `0.5` two.
+
+At a **merge** (more than one incoming arm) tributary chevrons stop
+`MERGE_GAP` short of the centre so converging streams stay legible. The
+straight-through stream does not, so a plain run never breaks. A corner is
+deliberately *not* a merge: one stream arrives and one leaves, so it stays
+continuous.
+
+`same_layer()` decides what counts as a neighbour: currently ghosts chain only
+with ghosts and real belts only with real belts, so a preview reads as its own
+run instead of fusing with what is already built. That is a one-line predicate
+if you want to change it.
+
+### Structures
+
+`Add` draws one Plus centred on its whole 2×1 footprint; `Mul` draws an X.
+Both carry short port arrows — blue pointing inward at inputs, red pointing
+outward at outputs — derived from type and facing to match
+`Entity.faces_for()`.
+
+Multi-cell entities recover their extent by probing neighbours for a matching
+entity id, then draw in *footprint space* so the glyph is centred on the entity
+rather than on one of its cells. Two things matter here and both caused visible
+bugs:
+
+- Merged body edges extend slightly **past** the cell boundary. Stopping
+  exactly at it leaves both cells antialiasing the shared edge, which shows as
+  a seam.
+- The glyph's antialiasing width must **not** be scaled by the footprint size.
+  Scaling it made the Plus get antialiased twice at the interior boundary —
+  the same seam, in the glyph rather than the body.
+
 ## Conventions
 
-- `world.frag`'s path is resolved relative to `camera.py`, not the cwd, so the
-  app and hot-reload work from any directory.
+- Shader paths resolve relative to the package, not the cwd, so the app and
+  hot-reload work from any directory.
 - `mouse` picking scales window coords to framebuffer coords before converting,
   which matters on HiDPI displays; `Camera.screen_to_world` mirrors the shader's
   mapping exactly, and `test_drive.py` asserts the two agree by rendering.
@@ -297,13 +372,11 @@ so a fast drag leaves no gaps.
 ## Deferred
 
 Noted so they are not mistaken for oversights: belt and structure *simulation*
-(nothing moves — `Add`/`Mul` have ports but no behaviour); compute shader passes
-(the context is 4.3 and the SSBO is bound, but nothing dispatches);
-topology-aware corner rendering (belts draw as a square + direction arrow, and
-corner curves would want the shader to read neighbour cells); drawing input and
-output faces (ports are derived and testable but the renderer shows only an
-orientation arrow); entity-row compaction; a growable or chunked board (fixed
-512×512); save/load.
+(nothing moves — `Add`/`Mul` have ports and are drawn, but have no behaviour);
+compute shader passes (the context is 4.3 and the SSBO is bound, but nothing
+dispatches); curved corner geometry (corners are currently a right-angle join
+of two straight arms, which reads fine but is not a true curve); entity-row
+compaction; a growable or chunked board (fixed 512×512); save/load.
 
 Tools the builder abstraction is shaped for but which do not exist yet:
 blueprint capture/paste, and undo (which would record the rows a committed

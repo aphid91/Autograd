@@ -2,9 +2,9 @@
 
 from imgui_bundle import imgui
 
-import cell
-from input_manager import STATE_NAMES
-from toolbelt import SLOT_COUNT, SPLIT_AFTER
+from core import cell
+from ui.input_manager import STATE_NAMES
+from core.toolbelt import SLOT_COUNT, SPLIT_AFTER
 
 
 class UIRequests:

@@ -17,12 +17,12 @@ moves and therefore exercises the partial-upload path continuously.
 
 import glfw
 
-from builders import default_builders
-from camera import Camera
+from core.builders import default_builders
+from render.camera import Camera
 from engine import Engine
-from input_manager import InputManager, STATE_PLANNING
-from toolbelt import Toolbelt
-from ui import UI, UIRequests
+from ui.input_manager import InputManager, STATE_PLANNING
+from core.toolbelt import Toolbelt
+from ui.panel import UI, UIRequests
 
 
 class Orchestrator:

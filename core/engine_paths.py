@@ -5,7 +5,7 @@ Separated from engine.py so builders.py can use it without a circular import
 these functions know only about integer cell coordinates.
 """
 
-import cell
+from core import cell
 
 
 def _span(a, b):
@@ -21,7 +21,7 @@ def plan_path(start, end, mode):
     geometric -- it knows nothing about what occupies the board.
     """
     # Imported lazily to keep this module free of builder dependencies.
-    from builders import BeltBuilder
+    from core.builders import BeltBuilder
 
     sx, sy = start
     ex, ey = end

@@ -19,9 +19,9 @@ that fail still appear in the plan so the renderer can show you what blocked
 them -- that is what makes a frustrated cell different from an absent one.
 """
 
-import cell
-from engine_paths import plan_path, path_directions, intent_dir
-from entity import Add, Belt, Mul
+from core import cell
+from core.engine_paths import plan_path, path_directions, intent_dir
+from core.entity import Add, Belt, Mul
 
 
 class Placement:

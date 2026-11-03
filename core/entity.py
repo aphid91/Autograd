@@ -11,7 +11,7 @@ subclass Entity, set TYPE_ID, append field offsets after the common prefix,
 bump ENTITY_STRIDE if needed, and the registry picks it up automatically.
 """
 
-import cell
+from core import cell
 
 # Row layout, shared prefix for every entity type. Offsets are float32 slots.
 # Floats throughout, because this array is destined for an SSBO that compute

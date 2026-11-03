@@ -5,20 +5,15 @@ frame dt (see InputManager). Pan speed is specified in cells/second and
 divided by zoom so the apparent on-screen speed stays constant as you zoom.
 """
 
-import os
-
 import numpy as np
 import moderngl
 
-WORLD_VERT = """
-#version 430
-in vec2 in_pos;
-void main() { gl_Position = vec4(in_pos, 0.0, 1.0); }
-"""
+from render import shader_loader
 
-# Resolved against this file rather than the cwd, so the app runs from
-# anywhere -- and so hot-reload keeps working after a chdir.
-FRAG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "world.frag")
+# Shader files live in shaders/ and are resolved relative to the package, not
+# the cwd, so the app and hot-reload work from any directory.
+VERT_NAME = "world.vert"
+FRAG_NAME = "world.frag"
 
 MIN_ZOOM = 2.0      # pixels per cell
 MAX_ZOOM = 160.0
@@ -50,17 +45,17 @@ class Camera:
 
     # --- shader ---------------------------------------------------------
     def reload_shader(self):
-        """Recompile world.frag. Keeps the old program on failure."""
+        """Recompile the world shaders. Keeps the old program on failure."""
         try:
-            with open(FRAG_PATH) as f:
-                frag_src = f.read()
-        except FileNotFoundError:
-            self.compile_error = f"{FRAG_PATH} not found"
+            vert_src = shader_loader.load(VERT_NAME)
+            frag_src = shader_loader.load(FRAG_NAME)
+        except shader_loader.ShaderError as e:
+            self.compile_error = str(e)
             return False
 
         try:
             prog = self.ctx.program(
-                vertex_shader=WORLD_VERT, fragment_shader=frag_src
+                vertex_shader=vert_src, fragment_shader=frag_src
             )
         except Exception as e:
             self.compile_error = f"Shader compile error:\n{e}"

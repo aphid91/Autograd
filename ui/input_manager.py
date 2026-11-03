@@ -32,8 +32,8 @@ path shape, rotate a structure).
 import glfw
 from imgui_bundle import imgui
 
-from engine_paths import bresenham
-from toolbelt import SLOT_COUNT
+from core.engine_paths import bresenham
+from core.toolbelt import SLOT_COUNT
 
 STATE_IDLE = 0
 STATE_PLANNING = 1

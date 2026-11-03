@@ -9,11 +9,11 @@ The engine does not know what a belt run is; it knows how to preview a plan,
 commit a plan, and erase.
 """
 
-import cell
-from builders import BeltBuilder
-from engine_paths import bresenham, intent_dir, path_directions, plan_path
-from entity import Belt
-from gameboard import Gameboard
+from core import cell
+from core.builders import BeltBuilder
+from core.engine_paths import bresenham, intent_dir, path_directions, plan_path
+from core.entity import Belt
+from core.gameboard import Gameboard
 
 # Re-exported so existing callers and tests keep working after the path
 # functions moved into engine_paths.
