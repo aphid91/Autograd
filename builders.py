@@ -79,6 +79,18 @@ class BuildPlan:
         return [p for p in self.placements if not p.frustrated]
 
     @property
+    def previewable(self):
+        """Placements to *show* as ghosts, which is not the same set.
+
+        A frustrated multi-cell placement builds nothing, but the player still
+        wants to see the part that would fit -- the shape tells you how far to
+        move to clear the obstruction. So a blocked placement is still
+        previewed; only its blocked cells are tinted instead of ghosted, and
+        `preview_cells()` reports which is which.
+        """
+        return list(self.placements)
+
+    @property
     def ok(self):
         """True if the plan would create everything it wanted."""
         return bool(self.placements) and not any(

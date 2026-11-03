@@ -50,9 +50,11 @@ class Entity:
     # path they are drawn along, so rotating one in isolation is meaningless.
     ROTATABLE = False
 
-    # Exposed for Gameboard, which pokes F_ALIVE/F_TYPE without a view.
+    # Exposed for Gameboard, which pokes these without building a view.
     F_ALIVE = _F_ALIVE
     F_TYPE = _F_TYPE
+    F_W = _F_W
+    F_H = _F_H
 
     @classmethod
     def footprint_for(cls, direction):

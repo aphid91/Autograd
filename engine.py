@@ -33,7 +33,13 @@ __all__ = [
 class Engine:
     def __init__(self, width=512, height=512):
         self.board = Gameboard(width, height)
+        # Ghost rows that will become real on commit.
         self.ghost_rows = []
+        # Ghost rows that exist only to show the player what *would* fit, from
+        # a placement that is blocked and will build nothing. They are
+        # despawned on commit rather than promoted -- committing them would
+        # place a fragment of a structure.
+        self.preview_only_rows = []
         self.stats = {"placed": 0, "erased": 0}
 
     # --- queries --------------------------------------------------------
@@ -53,35 +59,87 @@ class Engine:
         for row in self.ghost_rows:
             self.board.despawn(row)
         self.ghost_rows.clear()
+        for row in self.preview_only_rows:
+            self.board.despawn(row)
+        self.preview_only_rows.clear()
         self.board.clear_frustrated()
 
-    def preview_plan(self, plan):
-        """Replace the current preview with `plan`.
+    def preview(self, builder, start, end):
+        """Replace the current preview with what `builder` plans for a gesture.
 
-        Ghosts the placements that can happen and tints the cells that cannot.
-        Under an all-or-nothing plan nothing is ghosted when any cell is
-        blocked, but the blocked cells are still tinted -- you see exactly what
-        is in the way.
+        The old preview is cleared *before* the new plan is computed. This
+        ordering is not incidental: ghosts are real entities occupying real
+        cells, so planning against a board that still holds the previous
+        frame's preview makes a tool collide with itself -- drag a structure
+        one cell sideways and the overlap with its own last position reads as
+        blocked. Clearing first means a plan only ever sees committed entities.
         """
         self.clear_ghosts()
-
-        for (x, y) in plan.frustrated_cells:
-            self.board.set_frustrated(x, y)
-
-        for p in plan.buildable:
-            view = self.board.spawn(
-                p.entity_cls, p.x, p.y, p.direction, is_ghost=True
-            )
-            self.ghost_rows.append(view.row)
-
+        plan = builder.plan(self, start, end)
+        self._apply_preview(plan)
         return plan
 
+    def preview_plan(self, plan):
+        """Show a pre-computed plan.
+
+        Prefer preview(builder, ...) -- a plan built while an old preview is
+        still on the board has already seen those ghosts as obstacles. This
+        exists for tests and for callers that genuinely have a plan in hand.
+        """
+        self.clear_ghosts()
+        self._apply_preview(plan)
+        return plan
+
+    def _apply_preview(self, plan):
+        """Ghost what the player would get, and tint what is in the way.
+
+        A placement that will commit is ghosted as a whole entity. A frustrated
+        one still shows the cells that *would* fit, so the player can see how
+        far to move to clear the obstruction -- but it cannot be spawned as an
+        entity, since its origin may be the blocked cell and a partial
+        footprint is not a valid entity. Those cells are stamped directly as
+        single-cell ghosts of the same type instead.
+        """
+        blocked = set(plan.frustrated_cells)
+
+        for p in plan.previewable:
+            if not p.frustrated:
+                view = self.board.spawn(
+                    p.entity_cls, p.x, p.y, p.direction, is_ghost=True
+                )
+                self.ghost_rows.append(view.row)
+                continue
+
+            # Partial preview: ghost only the cells that are actually free,
+            # one cell at a time. spawn() would stamp the whole footprint and
+            # so overwrite the very cells blocking this placement. These rows
+            # are preview-only -- this placement commits nothing.
+            for (cx, cy) in p.cells():
+                if (cx, cy) in blocked or not self.buildable(cx, cy):
+                    continue
+                view = self.board.spawn_cell_ghost(
+                    p.entity_cls, cx, cy, p.direction
+                )
+                if view is not None:
+                    self.preview_only_rows.append(view.row)
+
+        for (x, y) in blocked:
+            self.board.set_frustrated(x, y)
+
     def commit_ghosts(self):
-        """Turn the ghost preview into real entities. Returns the count."""
+        """Turn the ghost preview into real entities. Returns the count.
+
+        Preview-only rows are discarded rather than promoted: they are
+        fragments of a blocked placement, and half a structure is not a thing
+        that can exist.
+        """
         n = len(self.ghost_rows)
         for row in self.ghost_rows:
             self.board.set_ghost(row, False)
         self.ghost_rows.clear()
+        for row in self.preview_only_rows:
+            self.board.despawn(row)
+        self.preview_only_rows.clear()
         self.board.clear_frustrated()
         self.stats["placed"] += n
         return n
@@ -130,7 +188,7 @@ class Engine:
         row = self.board.entity_id_at(x, y)
         if row == 0 or not self.board.is_row_alive(row):
             return False
-        if row in self.ghost_rows:
+        if row in self.ghost_rows or row in self.preview_only_rows:
             return False
         self.board.despawn(row)
         self.stats["erased"] += 1

@@ -275,6 +275,36 @@ class Gameboard:
         self.entities_dirty.add(row)
         self._stamp_footprint(view)
 
+    def spawn_cell_ghost(self, entity_cls, x, y, direction):
+        """Ghost a *single cell* of a multi-cell entity's footprint.
+
+        Used to preview the part of a blocked placement that would still fit.
+        A normal spawn() stamps the entity's whole footprint, which here would
+        overwrite the very cells that are blocking it; this claims a row but
+        stamps exactly one cell, with an extent of 1x1 so nothing downstream
+        believes the entity is larger than what is on the board.
+
+        The row is a real entity row and must be despawned like any other
+        ghost -- clear_ghosts() handles that.
+        """
+        if not self.in_bounds(x, y) or not self.is_empty(x, y):
+            return None
+        row = self._claim_row()
+        view = entity_cls(self, row)
+        view.initialise(x, y, direction, is_ghost=True)
+        # Force a 1x1 extent regardless of the class's FOOTPRINT.
+        self.entities[row, Entity.F_W] = 1.0
+        self.entities[row, Entity.F_H] = 1.0
+        self._live_count += 1
+        self.entities_dirty.add(row)
+        self.write_cell(
+            x, y,
+            cell.pack_cell(view.type_id, direction, row),
+            cell.pack_local(0, 0),
+            cell.pack_flags(cell.GHOST_PENDING),
+        )
+        return view
+
     # --- frustration overlay --------------------------------------------
     def set_frustrated(self, x, y):
         """Mark a cell as wanted-but-unavailable, leaving its occupant intact.

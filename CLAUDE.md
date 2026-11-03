@@ -198,6 +198,34 @@ Consequences worth knowing:
 - A frustrated cell is *not* a ghost. `cell.is_ghost()` is false for it;
   `cell.is_frustrated()` is the separate test.
 
+### Previewing is not the same as building
+
+Two distinctions in `BuildPlan` that are easy to collapse and shouldn't be:
+
+- `buildable` — what commit will create. Empty for a frustrated
+  all-or-nothing plan.
+- `previewable` — what to *show*. A blocked structure still previews the part
+  that would fit, because the shape tells the player how far to move to clear
+  the obstruction.
+
+So a half-blocked `Add` ghosts its free cell and tints its blocked one, and
+commits nothing. Those partial ghosts go in `Engine.preview_only_rows` rather
+than `ghost_rows`: on commit they are **despawned, not promoted** — half a
+structure is not a thing that can exist. They are stamped with
+`Gameboard.spawn_cell_ghost()`, which claims a row but writes exactly one cell
+with a 1×1 extent; a normal `spawn()` would stamp the whole footprint and
+overwrite the very cells doing the blocking.
+
+### Previews must not see themselves
+
+`Engine.preview(builder, start, end)` clears the old preview **before** asking
+the builder to plan. This ordering is load-bearing: ghosts are real entities in
+real cells, so a plan computed against a board that still holds last frame's
+preview collides with it — drag a structure one cell sideways and the overlap
+with its own previous position reads as blocked, flickering red as you move.
+`preview_plan(plan)` (taking an already-built plan) exists for tests and has
+the same hazard, which is why callers should prefer `preview()`.
+
 Because belts are 1×1 and not all-or-nothing, a belt run across an obstacle
 still commits — only the overlapping cells are frustrated. A structure with any
 cell blocked commits nothing but still tints every blocked cell. Same

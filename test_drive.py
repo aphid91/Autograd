@@ -298,6 +298,61 @@ assert int((cell.ghost_state_arr(board.grid[:, :, cell.CH_Z])
 assert cell.cell_id(board.cell_word(8, 8)) == want_id
 ok("commit cleared the tint, occupant still intact")
 
+print("=== a tool must not collide with its own preview ===")
+# Regression: plans were computed before the previous preview was cleared, so
+# dragging a structure one cell sideways frustrated against its own ghost.
+engine.clear_board(); step()
+fake["keys"].add(glfw.KEY_2); step(); fake["keys"].discard(glfw.KEY_2); step()
+orch.toolbelt.active.direction = cell.DIR_PX
+for x in range(8, 18):
+    put_cursor_at_cell(x, 24); step()
+    assert orch.last_plan is not None and orch.last_plan.ok, (
+        f"self-frustrated at x={x}: {orch.last_plan.frustrated_cells}")
+ok("dragging an Add across 10 cells never self-frustrates")
+
+engine.clear_board(); step()
+fake["keys"].add(glfw.KEY_1); step(); fake["keys"].discard(glfw.KEY_1); step()
+put_cursor_at_cell(5, 28); step()
+fake["left"] = True; step(); fake["left"] = False
+for end in range(6, 20):
+    put_cursor_at_cell(end, 28); step()
+    assert orch.last_plan.ok, (
+        f"belt self-frustrated at {end}: {orch.last_plan.frustrated_cells}")
+ok("growing a belt run never self-frustrates")
+fake["right"] = True; step(); fake["right"] = False; step()
+
+print("=== a blocked structure still previews the part that fits ===")
+engine.clear_board(); step()
+fake["keys"].add(glfw.KEY_2); step(); fake["keys"].discard(glfw.KEY_2); step()
+# An earlier section rotated this tool; put it back to horizontal so the
+# footprint is (20,30)+(21,30) and the blocker below actually clashes.
+orch.toolbelt.active.direction = cell.DIR_PX
+blocker = engine.place_belt(21, 30, cell.DIR_PX)
+blocker_id = blocker.row
+put_cursor_at_cell(20, 30); step()      # Add would cover (20,30) and (21,30)
+assert cell.is_ghost(int(board.grid[30, 20, cell.CH_Z])), "free half must ghost"
+assert cell.is_frustrated(int(board.grid[30, 21, cell.CH_Z])), "blocked half must tint"
+assert cell.cell_id(board.cell_word(21, 30)) == blocker_id, "blocker clobbered"
+assert cell.cell_type(board.cell_word(21, 30)) == cell.TYPE_BELT
+ok("half-blocked Add ghosts the half that fits, tints the other")
+
+# ...but committing it still builds nothing: half a structure cannot exist.
+live_before = board.live_count
+fake["left"] = True; step(); fake["left"] = False; step()
+assert board.live_count == live_before, "a fragment was committed!"
+# The half-ghost is still shown (the cursor has not moved), but it must still
+# be a *ghost* -- never promoted to a real entity.
+assert cell.is_ghost(int(board.grid[30, 20, cell.CH_Z])), "fragment went real!"
+assert not engine.ghost_rows, "nothing committable should remain"
+assert cell.cell_id(board.cell_word(21, 30)) == blocker_id
+ok("committing the blocked Add built nothing; fragment stayed a ghost")
+
+# Moving away must clean the fragment up entirely.
+put_cursor_at_cell(40, 36); step()
+assert board.is_empty(20, 30), "fragment leaked after moving away"
+ok("fragment cleared once the cursor moved on")
+fake["keys"].add(glfw.KEY_1); step(); fake["keys"].discard(glfw.KEY_1); step()
+
 print("=== switching tools drops an in-flight preview ===")
 engine.clear_board(); step()
 put_cursor_at_cell(12, 12); step()

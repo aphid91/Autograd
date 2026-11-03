@@ -58,9 +58,9 @@ class Orchestrator:
         target = self.input.target
         if anchor is None or target is None:
             return
-        plan = tool.plan(self.engine, anchor, target)
-        self.engine.preview_plan(plan)
-        self.last_plan = plan
+        # Engine.preview() clears the old preview before planning, so the tool
+        # never sees its own ghosts as obstacles.
+        self.last_plan = self.engine.preview(tool, anchor, target)
 
     # --- frame ----------------------------------------------------------
     def frame(self, dt):
