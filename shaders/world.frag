@@ -382,11 +382,14 @@ void main() {
             // other side. Drawn *under* the body so the body edge caps the
             // inner end cleanly.
             //
-            // An input face stubs when a belt points into it; an output face
-            // stubs when the neighbour is a belt that would accept what we
-            // emit -- which, since feeds_into() already counts our output
-            // faces as a source, is exactly the belt that is drawing an
-            // incoming arm back at us. The two halves meet at the shared edge.
+            // An input face stubs when the neighbour emits at it. An output
+            // face stubs when the neighbour would take what we emit -- a belt
+            // (which has already drawn an incoming arm back at us, since
+            // feeds_into() counts our output faces as a source) or another
+            // structure whose own input face points at us. Both halves of a
+            // structure-to-structure join must agree, which is what
+            // accepts_from() is for; checking only for belts here left the
+            // output side silent while the input side stubbed.
             int in_mask  = input_face_mask(type, facing);
             int out_mask = output_face_mask(type, facing);
             float stub = 0.0;
@@ -398,14 +401,16 @@ void main() {
                     // Something feeding us from that side.
                     want = feeds_into(nc, toward, c.z);
                 } else if (has_face(out_mask, d)) {
-                    // Any adjacent belt connects: either it is draining this
-                    // output (and has drawn an arm back at us), or it is
-                    // pointing into us on a face we emit from -- a topology
-                    // conflict the belt resolves in favour of its own facing.
-                    // Either way the two cells are physically joined, so the
-                    // stub is drawn and the belt renders its own direction.
                     ivec4 n = fetch(nc);
-                    want = cell_type(n.x) == TYPE_BELT && same_layer(c.z, n.z);
+                    // Any adjacent belt connects: either it is draining this
+                    // output, or it is pointing into us on a face we emit from
+                    // -- a topology conflict the belt resolves in favour of
+                    // its own facing. Either way the cells are joined.
+                    bool belt_there =
+                        cell_type(n.x) == TYPE_BELT && same_layer(c.z, n.z);
+                    // A structure takes our output only on a declared input
+                    // face pointing back at us.
+                    want = belt_there || accepts_from(nc, toward, c.z);
                 }
                 if (!want) continue;
                 float sd_stub = sd_segment(p, vec2(0.0),
@@ -452,8 +457,8 @@ void main() {
                 a_out = max(a_out, port_arrow(p, rot_face(DIR_PX, facing), false, px));
                 a_out = max(a_out, port_arrow(p, rot_face(DIR_NY, facing), false, px));
             }
-            col = mix(col, COL_IN,  a_in  * a_body * alpha_scale);
-            col = mix(col, COL_OUT, a_out * a_body * alpha_scale);
+            col = mix(col, COL_IN,  a_in  * alpha_scale);//can extend outside a_body
+            col = mix(col, COL_OUT, a_out * alpha_scale);//can extend outside a_body
         }
 
         // Frustration is an overlay, never a replacement: whatever occupies

@@ -344,9 +344,16 @@ if you want to change it.
 Both carry short port arrows — blue pointing inward at inputs, red pointing
 outward at outputs — plus **connection stubs**: a short belt-coloured bar from
 the body edge out to the cell boundary, drawn only on a port face that
-actually has something on the other side, so a structure and its belts read as
-physically joined. Stubs are drawn *under* the body so the body edge caps
-their inner end.
+actually has something on the other side, so a structure and its neighbours
+read as physically joined. Stubs are drawn *under* the body so the body edge
+caps their inner end.
+
+A face stubs when the neighbour is a genuine counterpart: an **input** face
+needs something emitting at it (`feeds_into`), an **output** face needs
+something that would take it — a belt, or another structure whose own input
+face points back (`accepts_from`). Both sides of a structure-to-structure join
+must agree, so both predicates exist; checking only for belts on the output
+side left one half of such a join silent.
 
 Ports are derived in GLSL by `input_face_mask()` / `output_face_mask()` in
 [shaders/common.glsl](shaders/common.glsl), mirroring `Entity.INPUTS` /
