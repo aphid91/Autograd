@@ -47,6 +47,49 @@ ivec2 cell_local(int w) {
 
 bool is_empty(int w) { return cell_type(w) == TYPE_EMPTY; }
 
+// --- structure ports ----------------------------------------------------
+//
+// MUST match Entity.INPUTS / OUTPUTS and faces_for() in core/entity.py.
+// Ports are per-cell: every cell of a multi-cell footprint carries its own
+// faces, so a shader can answer "is this face a port?" from the cell alone,
+// with no footprint-wide reasoning.
+//
+// Authored at DIR_PX and rotated into the entity's facing:
+//   Add  inputs +Y, outputs -Y   (on each of its two cells)
+//   Mul  inputs +Y and -X, outputs +X and -Y
+//
+// Faces are returned as a 4-bit mask indexed by direction.
+
+int rotate_face_mask(int mask, int facing) {
+    int out_mask = 0;
+    for (int d = 0; d < 4; ++d) {
+        if ((mask & (1 << d)) != 0) out_mask |= 1 << ((d + facing) % 4);
+    }
+    return out_mask;
+}
+
+int input_face_mask(int type, int facing) {
+    int m = 0;
+    if (type == TYPE_ADD) m = (1 << DIR_PY);
+    else if (type == TYPE_MUL) m = (1 << DIR_PY) | (1 << DIR_NX);
+    else return 0;
+    return rotate_face_mask(m, facing);
+}
+
+int output_face_mask(int type, int facing) {
+    int m = 0;
+    if (type == TYPE_ADD) m = (1 << DIR_NY);
+    else if (type == TYPE_MUL) m = (1 << DIR_PX) | (1 << DIR_NY);
+    else return 0;
+    return rotate_face_mask(m, facing);
+}
+
+bool has_face(int mask, int dir) { return (mask & (1 << dir)) != 0; }
+
+bool is_structure(int type) {
+    return type != TYPE_EMPTY && type != TYPE_BELT;
+}
+
 // Rotate a cell-local coordinate so that +X becomes `dir`.
 // Local space is centred on the cell, -0.5..0.5.
 vec2 rotate_to_dir(vec2 p, int dir) {

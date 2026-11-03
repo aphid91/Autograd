@@ -405,6 +405,50 @@ for _name, _want in [
         f"{_name}: shader says {_glsl_int(_name)}, cell.py says {_want}")
 ok("GLSL cell encoding matches core/cell.py")
 
+# The shader derives structure ports itself (input_face_mask /
+# output_face_mask in common.glsl) so it can decide belt topology and draw
+# connection stubs. Those masks must agree with Entity.faces_for(), which is
+# the Python-side authority. Reimplement the shader's rotation here and
+# compare against the real thing for every type and facing.
+def _glsl_mask(fn_name, type_name):
+    """The authored (unrotated) mask the shader uses for a type."""
+    body = _re.search(rf"int {fn_name}\(int type, int facing\)\s*\{{(.*?)\n\}}",
+                      _src, _re.S)
+    assert body, f"{fn_name} not found in shader"
+    m = _re.search(rf"type == {type_name}\)\s*m = ([^;]+);", body.group(1))
+    assert m, f"{type_name} not handled in {fn_name}"
+    expr = m.group(1)
+    mask = 0
+    for shift in _re.findall(r"1 << (DIR_\w+)", expr):
+        mask |= 1 << getattr(cell, shift)
+    return mask
+
+for _cls, _tname in [(Add, "TYPE_ADD"), (Mul, "TYPE_MUL")]:
+    for _facing in range(4):
+        _ins, _outs = _cls.faces_for(0, 0, _facing)
+        _want_in = 0
+        for _c, _f in _ins:
+            _want_in |= 1 << _f
+        _want_out = 0
+        for _c, _f in _outs:
+            _want_out |= 1 << _f
+        # Shader rotates the authored mask by `facing`.
+        _got_in = 0
+        for _d in range(4):
+            if _glsl_mask("input_face_mask", _tname) & (1 << _d):
+                _got_in |= 1 << ((_d + _facing) % 4)
+        _got_out = 0
+        for _d in range(4):
+            if _glsl_mask("output_face_mask", _tname) & (1 << _d):
+                _got_out |= 1 << ((_d + _facing) % 4)
+        assert _got_in == _want_in, (
+            f"{_cls.__name__} facing {cell.DIR_NAMES[_facing]}: shader inputs "
+            f"{_got_in:04b} != entity {_want_in:04b}")
+        assert _got_out == _want_out, (
+            f"{_cls.__name__} facing {cell.DIR_NAMES[_facing]}: shader outputs "
+            f"{_got_out:04b} != entity {_want_out:04b}")
+ok("GLSL structure port masks match Entity.faces_for()")
+
 print("=== device round trip after all that ===")
 assert board.verify_round_trip(), "grid round trip mismatch"
 ok("to_device/from_device match")

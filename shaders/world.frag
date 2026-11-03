@@ -41,7 +41,7 @@ uniform isampler2D grid;      // RGBA32I, one texel per cell
 #define CHEVRON_LEN       0.11   // reach along the travel axis
 #define CHEVRON_SPAN      0.11   // half-width across the belt
 #define CHEVRON_THICK     0.030  // stroke half-thickness
-#define CHEVRON_INSET     0.00   // nudge chevrons along the run
+#define CHEVRON_INSET     0.25   // nudge chevrons along the run
 // At a merge, tributary chevrons stop this far short of the centre so the
 // converging streams stay legible instead of piling up on each other.
 #define MERGE_GAP         0.18
@@ -54,6 +54,11 @@ uniform isampler2D grid;      // RGBA32I, one texel per cell
 #define PORT_ARROW_SPAN   0.10
 #define PORT_ARROW_THICK  0.034
 #define PORT_OFFSET       0.34   // distance from cell centre to the port
+// A short belt-coloured stub bridging a port to a connected neighbour, so a
+// structure and the belt it talks to read as physically joined. Only drawn
+// when there is actually something on the other side.
+#define STUB_WIDTH        0.34   // matches BELT_WIDTH by default
+#define STUB_REACH        0.50   // out to the cell edge
 
 // --- ghosts / overlays ---
 #define GHOST_ALPHA       0.45
@@ -92,15 +97,33 @@ bool same_layer(int a_z, int b_z) {
     return ghost_state(a_z) == ghost_state(b_z);
 }
 
-// Is the neighbour at `c` a belt that outputs *into* `from_dir`'s cell?
-// A belt only ever outputs along its own facing, so a neighbour feeds us iff
-// its direction points back at us. That is why merges are the only junction
-// to handle: nothing diverges.
+// Does the cell at `c` emit into the neighbour it faces along `toward`?
+//
+// Two kinds of source count. A belt emits along its own facing, so it feeds us
+// iff its direction points back at us -- which is why nothing diverges and
+// merges are the only junction to handle. A *structure* emits from each of its
+// output faces, so it feeds us iff it has an output face pointing at us. That
+// makes a belt downstream of an Add or Mul draw an incoming arm, exactly as if
+// a belt were there.
 bool feeds_into(ivec2 c, int toward, int my_z) {
     ivec4 n = fetch(c);
-    if (cell_type(n.x) != TYPE_BELT) return false;
+    int t = cell_type(n.x);
+    if (t == TYPE_EMPTY) return false;
     if (!same_layer(my_z, n.z)) return false;
-    return cell_dir(n.x) == toward;
+    if (t == TYPE_BELT) return cell_dir(n.x) == toward;
+    return has_face(output_face_mask(t, cell_dir(n.x)), toward);
+}
+
+// Does the cell at `c` accept input from the neighbour facing it along
+// `toward`? Only structures accept on a declared face; a belt's "input" is
+// implicit (anything facing it), and is handled by feeds_into from the other
+// side.
+bool accepts_from(ivec2 c, int toward, int my_z) {
+    ivec4 n = fetch(c);
+    int t = cell_type(n.x);
+    if (!is_structure(t)) return false;
+    if (!same_layer(my_z, n.z)) return false;
+    return has_face(input_face_mask(t, cell_dir(n.x)), toward);
 }
 
 // ======================================================================
@@ -167,6 +190,13 @@ BeltDraw draw_belt(vec2 p, ivec2 ci, ivec4 c, float px, vec2 world) {
     // isolated belt reads as a full tile rather than a half one.
     int in_count = 0;
     for (int d = 0; d < 4; ++d) {
+        // Never treat the cell we output into as a source. A structure can
+        // have an output face pointing back at a belt that feeds it (a Mul
+        // emits +Y while the belt above runs -Y into it), and taking that as
+        // an incoming arm would lay two opposed chevron streams on one arm.
+        // The belt's own facing wins: it is leaving, not arriving.
+        if (d == out_dir) continue;
+
         ivec2 nc = ci + DIR_VECS[d];
         // A neighbour in direction d feeds us if it faces the opposite way.
         int toward = (d + 2) % 4;
@@ -192,39 +222,46 @@ BeltDraw draw_belt(vec2 p, ivec2 ci, ivec4 c, float px, vec2 world) {
     // continuous march.
     float chev = 0.0;
 
-    // Outgoing: centre -> edge, phase locked to world position.
+    // Outgoing: along the travel axis, phase locked to world position so
+    // adjacent cells continue the same lattice.
     {
-        // Distance along the travel axis in world space, so adjacent cells
-        // continue the same lattice.
         float wphase = dot(world, out_vec);
-        // Local t runs 0..0.5 from centre to the output edge.
-        chev = max(chev, chevrons_along(p, out_vec, 0.0, 0.5,
+        // Normally centre -> output edge. When something feeds us from
+        // directly behind, that incoming stream is collinear with this one,
+        // so this single pass covers the whole cell instead -- one lattice,
+        // no seam and no doubling at the midpoint.
+        bool fed_from_behind =
+            feeds_into(ci + DIR_VECS[(out_dir + 2) % 4], out_dir, c.z);
+        float t0 = (fed_from_behind || !any_in) ? -0.5 : 0.0;
+        chev = max(chev, chevrons_along(p, out_vec, t0, 0.5,
                                         wphase - dot(p, out_vec), px));
     }
 
     for (int d = 0; d < 4; ++d) {
+        // Same rule as the spine: the cell we output into is never a source.
+        if (d == out_dir) continue;
+
         ivec2 nc = ci + DIR_VECS[d];
         int toward = (d + 2) % 4;
         if (!feeds_into(nc, toward, c.z)) continue;
         // Incoming from direction d: material travels from that edge toward
         // the centre, i.e. along -dir_vec(d). The arm spans t in 0..0.5
         // measured along the travel direction.
+        // A stream arriving from directly behind us travels the same axis as
+        // our outgoing stream. The outgoing pass below already marches the
+        // whole cell on that axis with the correct world phase, so drawing
+        // this one too would lay a second lattice over the first at a
+        // different offset -- visible as doubled chevrons. Skip it.
+        bool straight_through = (d == (out_dir + 2) % 4);
+        if (straight_through) continue;
+
         vec2 axis = -dir_vec(d);
         float wphase = dot(world, axis);
-        // Tributaries stop short of the centre at a true merge; the straight
-        // -through stream does not, so a plain run stays seamless.
-        bool tributary = is_merge && (d != (out_dir + 2) % 4);
-        float t_end = tributary ? -MERGE_GAP : 0.0;
+        // Tributaries stop short of the centre at a true merge so converging
+        // streams stay legible.
+        float t_end = is_merge ? -MERGE_GAP : 0.0;
         chev = max(chev, chevrons_along(p, axis, -0.5, t_end,
                                         wphase - dot(p, axis), px));
-    }
-
-    if (!any_in) {
-        // The incoming half of a lone belt still marches, so a run's first
-        // cell is not visually empty behind the centre.
-        float wphase = dot(world, out_vec);
-        chev = max(chev, chevrons_along(p, out_vec, -0.5, 0.0,
-                                        wphase - dot(p, out_vec), px));
     }
 
     o.chevron = chev * o.body;   // never draw chevrons off the spine
@@ -282,6 +319,18 @@ void main() {
     bool inside = in_board(ci);
     vec3 col = inside ? COL_BG : COL_VOID;
 
+    // --- grid lines, drawn FIRST ---------------------------------------
+    // Under the entities, not over them, so belts visibly join across cell
+    // boundaries and a multi-cell structure is not sliced up by the grid.
+    {
+        vec2 to_edge = min(cf, 1.0 - cf) / px;
+        float line = 1.0 - smoothstep(0.0, 1.0, min(to_edge.x, to_edge.y));
+        float grid_fade = smoothstep(GRID_FADE_LO, GRID_FADE_HI, cam_zoom);
+        bool major = (ci.x % MAJOR_EVERY == 0) || (ci.y % MAJOR_EVERY == 0);
+        col = mix(col, major ? COL_GRID_MAJOR : COL_GRID,
+                  line * grid_fade * GRID_ALPHA);
+    }
+
     if (inside) {
         ivec4 c = texelFetch(grid, ci, 0);
         int type = cell_type(c.x);
@@ -326,6 +375,46 @@ void main() {
             float sd_body = max(max(-p.x - edge.x, p.x - edge.y),
                                 max(-p.y - edge.z, p.y - edge.w));
             float a_body = fill(sd_body, px);
+
+            // --- connection stubs ---
+            // A short belt-coloured bar from the body edge out to the cell
+            // boundary, on any port face that actually has something on the
+            // other side. Drawn *under* the body so the body edge caps the
+            // inner end cleanly.
+            //
+            // An input face stubs when a belt points into it; an output face
+            // stubs when the neighbour is a belt that would accept what we
+            // emit -- which, since feeds_into() already counts our output
+            // faces as a source, is exactly the belt that is drawing an
+            // incoming arm back at us. The two halves meet at the shared edge.
+            int in_mask  = input_face_mask(type, facing);
+            int out_mask = output_face_mask(type, facing);
+            float stub = 0.0;
+            for (int d = 0; d < 4; ++d) {
+                ivec2 nc = ci + DIR_VECS[d];
+                int toward = (d + 2) % 4;
+                bool want = false;
+                if (has_face(in_mask, d)) {
+                    // Something feeding us from that side.
+                    want = feeds_into(nc, toward, c.z);
+                } else if (has_face(out_mask, d)) {
+                    // Any adjacent belt connects: either it is draining this
+                    // output (and has drawn an arm back at us), or it is
+                    // pointing into us on a face we emit from -- a topology
+                    // conflict the belt resolves in favour of its own facing.
+                    // Either way the two cells are physically joined, so the
+                    // stub is drawn and the belt renders its own direction.
+                    ivec4 n = fetch(nc);
+                    want = cell_type(n.x) == TYPE_BELT && same_layer(c.z, n.z);
+                }
+                if (!want) continue;
+                float sd_stub = sd_segment(p, vec2(0.0),
+                                           dir_vec(d) * STUB_REACH)
+                                - STUB_WIDTH * 0.5;
+                stub = max(stub, fill(sd_stub, px));
+            }
+            col = mix(col, COL_BELT, stub * alpha_scale);
+
             col = mix(col, body_colour(type), a_body * alpha_scale);
 
             // Footprint-space coords, so the glyph is centred on the whole
@@ -376,15 +465,7 @@ void main() {
         }
     }
 
-    // --- grid lines -----------------------------------------------------
-    vec2 to_edge = min(cf, 1.0 - cf) / px;
-    float line = 1.0 - smoothstep(0.0, 1.0, min(to_edge.x, to_edge.y));
-    float grid_fade = smoothstep(GRID_FADE_LO, GRID_FADE_HI, cam_zoom);
-    bool major = (ci.x % MAJOR_EVERY == 0) || (ci.y % MAJOR_EVERY == 0);
-    col = mix(col, major ? COL_GRID_MAJOR : COL_GRID,
-              line * grid_fade * GRID_ALPHA);
-
-    // Board border.
+    // Board border, over everything so the playfield edge stays readable.
     vec2 b0 = abs(world) / px;
     vec2 b1 = abs(world - vec2(board_size)) / px;
     float border = 1.0 - smoothstep(0.0, 1.5,

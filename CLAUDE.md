@@ -292,6 +292,11 @@ live in one `TUNABLES` block at the top of
 change often; nothing below that block hardcodes a number you would want to
 tweak. `F5` hot-reloads.
 
+**Draw order is grid → entities → border.** Grid lines go down first, *under*
+the entities, so belts visibly join across cell boundaries and a multi-cell
+structure is not sliced up by them. Only the board border draws over
+everything, so the playfield edge stays readable.
+
 GLSL has no `#include`, so [render/shader_loader.py](render/shader_loader.py)
 implements a minimal one by textual substitution, with an implicit include
 guard (a file already pulled in is skipped). That exists so the cell encoding
@@ -304,11 +309,16 @@ direction. Topology comes from the cell and its 4 orthogonal neighbours — no
 lookup table, no precomputed tile index:
 
 - The **outgoing** arm always runs centre → the facing edge.
-- A neighbour contributes an **incoming** arm iff it is a belt whose direction
-  points at us. Since a belt only ever outputs along its own facing, nothing
-  diverges, so merges (T and PLUS) are the only junctions that exist.
+- A neighbour contributes an **incoming** arm iff it *emits at us*: a belt
+  whose direction points back at us, **or a structure with an output face
+  pointing at us**. Since neither ever diverges, merges (T and PLUS) are the
+  only junctions that exist.
 - With no incoming neighbour the spine extends backwards too, so an isolated
   belt fills its cell rather than looking like a half tile.
+- **The cell we output into is never a source**, even if it emits back at us.
+  A `Mul` can have an output face pointing at the very belt that feeds it;
+  without this rule that belt would draw two opposed chevron streams on one
+  arm. The belt's own facing wins — it is leaving, not arriving.
 
 **Chevron phase comes from world position**, not from the cell: the lattice is
 a function of distance along the travel axis, so the pattern is continuous
@@ -332,8 +342,18 @@ if you want to change it.
 
 `Add` draws one Plus centred on its whole 2×1 footprint; `Mul` draws an X.
 Both carry short port arrows — blue pointing inward at inputs, red pointing
-outward at outputs — derived from type and facing to match
-`Entity.faces_for()`.
+outward at outputs — plus **connection stubs**: a short belt-coloured bar from
+the body edge out to the cell boundary, drawn only on a port face that
+actually has something on the other side, so a structure and its belts read as
+physically joined. Stubs are drawn *under* the body so the body edge caps
+their inner end.
+
+Ports are derived in GLSL by `input_face_mask()` / `output_face_mask()` in
+[shaders/common.glsl](shaders/common.glsl), mirroring `Entity.INPUTS` /
+`OUTPUTS`. They are **per-cell** — every cell of a multi-cell footprint carries
+its own faces — so the shader answers "is this face a port?" from one cell with
+no footprint-wide reasoning. `test_drive.py` pins these masks against
+`Entity.faces_for()` for every type and facing.
 
 Multi-cell entities recover their extent by probing neighbours for a matching
 entity id, then draw in *footprint space* so the glyph is centred on the entity
