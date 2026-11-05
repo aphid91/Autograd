@@ -64,7 +64,8 @@ class Engine:
         self.preview_only_rows.clear()
         self.board.clear_frustrated()
 
-    def preview(self, builder, start, end):
+    def preview(self, builder, start, end, start_frac=(0.5, 0.5),
+                end_frac=(0.5, 0.5)):
         """Replace the current preview with what `builder` plans for a gesture.
 
         The old preview is cleared *before* the new plan is computed. This
@@ -75,7 +76,7 @@ class Engine:
         blocked. Clearing first means a plan only ever sees committed entities.
         """
         self.clear_ghosts()
-        plan = builder.plan(self, start, end)
+        plan = builder.plan(self, start, end, start_frac, end_frac)
         self._apply_preview(plan)
         return plan
 

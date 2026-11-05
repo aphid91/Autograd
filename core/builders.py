@@ -24,6 +24,23 @@ from core.engine_paths import plan_path, path_directions, intent_dir
 from core.entity import Add, Belt, Mul
 
 
+def quadrant_dir(frac):
+    """Which way a sub-cell cursor position points, as a direction constant.
+
+    The cell is split by its diagonals into four triangles; the one the point
+    falls in names the direction. Used to aim a belt placed with a single
+    click, where there is no drag to take a heading from -- clicking the right
+    part of a square gives an east-facing belt, the top part north, and so on.
+    Dead centre is +X, matching the old fixed default.
+    """
+    ox, oy = frac[0] - 0.5, frac[1] - 0.5
+    if ox == 0.0 and oy == 0.0:
+        return cell.DIR_PX
+    if abs(ox) >= abs(oy):
+        return cell.DIR_PX if ox > 0 else cell.DIR_NX
+    return cell.DIR_PY if oy > 0 else cell.DIR_NY
+
+
 class Placement:
     """One entity a plan would create, and whether it can actually happen."""
 
@@ -116,8 +133,15 @@ class EntityBuilder:
     #: acting on a single click.
     drag_based = True
 
-    def plan(self, engine, start, end):
-        """Build a BuildPlan for a gesture from `start` to `end` cells."""
+    def plan(self, engine, start, end, start_frac=(0.5, 0.5),
+             end_frac=(0.5, 0.5)):
+        """Build a BuildPlan for a gesture from `start` to `end` cells.
+
+        `start_frac` / `end_frac` give the cursor's position *within* those
+        cells, 0..1 on each axis with y up. Tools that care where in a square
+        the player pointed -- a belt aiming its first and last segment -- use
+        them; others ignore them.
+        """
         raise NotImplementedError
 
     def cycle(self, backward=False):
@@ -162,17 +186,58 @@ class BeltBuilder(EntityBuilder):
     def status(self):
         return self.MODE_NAMES[self.mode]
 
-    def plan(self, engine, start, end):
+    #: How far across a cell the pointer must be, measured from the centre
+    #: toward an edge, before the final belt turns to exit that way. 0.6 means
+    #: the outer 40% of the cell on that side.
+    TURN_THRESHOLD = 0.6
+
+    def plan(self, engine, start, end, start_frac=(0.5, 0.5),
+             end_frac=(0.5, 0.5)):
         # Directions come from the unfiltered path so a belt's facing never
-        # depends on what is in the way -- see Engine.plan_oriented's history.
+        # depends on what is in the way -- see the note in CLAUDE.md.
         path = plan_path(start, end, self.mode)
-        dirs = path_directions(path, fallback=intent_dir(start, end))
+        dirs = path_directions(path, fallback=quadrant_dir(start_frac))
+
+        if dirs:
+            # The last belt exits the run, and the pointer's position in that
+            # final cell says which way. Straight on by default; past the
+            # threshold toward a side edge, it turns and forms a corner.
+            turn = self._exit_turn(dirs[-1], end_frac)
+            if turn is not None:
+                dirs[-1] = turn
 
         placements = []
         for (x, y), d in zip(path, dirs):
             blocked = [] if engine.buildable(x, y) else [(x, y)]
             placements.append(Placement(Belt, x, y, d, blocked))
         return BuildPlan(placements, all_or_nothing=False)
+
+    def _exit_turn(self, travel_dir, frac):
+        """A turned exit direction for the final belt, or None to go straight.
+
+        Only sideways deflection counts: pushing the pointer *along* the
+        direction of travel means "keep going", which is already the default,
+        and pulling it backwards would reverse the belt into the run it just
+        came from.
+        """
+        fx, fy = frac
+        # Offsets from the cell centre, -0.5..0.5, positive toward +X / +Y.
+        ox, oy = fx - 0.5, fy - 0.5
+        margin = self.TURN_THRESHOLD - 0.5
+
+        if travel_dir in (cell.DIR_PX, cell.DIR_NX):
+            # Travelling horizontally: a vertical push turns the belt.
+            if oy > margin:
+                return cell.DIR_PY
+            if oy < -margin:
+                return cell.DIR_NY
+        else:
+            # Travelling vertically: a horizontal push turns the belt.
+            if ox > margin:
+                return cell.DIR_PX
+            if ox < -margin:
+                return cell.DIR_NX
+        return None
 
 
 class StructureBuilder(EntityBuilder):
@@ -200,9 +265,10 @@ class StructureBuilder(EntityBuilder):
         w, h = self.entity_cls.footprint_for(self.direction)
         return f"{w}x{h} facing {cell.DIR_NAMES[self.direction]}"
 
-    def plan(self, engine, start, end):
-        # A structure ignores the drag: it places at the cursor, which is
-        # `end` so that press-and-drag still previews under the cursor.
+    def plan(self, engine, start, end, start_frac=(0.5, 0.5),
+             end_frac=(0.5, 0.5)):
+        # A structure ignores both the drag and the sub-cell position: it
+        # places at the cursor's cell, rotated by R.
         x, y = end
         blocked = [
             c for c in self.entity_cls.cells_for(x, y, self.direction)

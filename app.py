@@ -6,13 +6,15 @@ Orchestrator, which owns the engine, camera, input manager, and UI.
 Controls:
   WASD          pan
   Q / E         zoom out / in
+  Scroll        zoom, anchored at the cursor
+  Left-drag     pan the camera
   F             frame the whole board
-  1-9, 0        select a toolbelt slot (scroll wheel also works)
-  Left-click    build with the active tool
+  1-9, 0        select a toolbelt slot
+  Left-click    build with the active tool (on release, not press)
   R / shift+R   per-tool: belt path shape, or structure rotation
   Right-click   cancel a plan, or drag to erase
   Esc           cancel a plan
-  F5            reload world.frag
+  F5            reload the world shaders
   Delete        clear the board
 """
 

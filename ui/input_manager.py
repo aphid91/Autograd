@@ -5,21 +5,31 @@ want_capture_* flags, so there is exactly one answer to "is the UI eating this
 input?". It owns the belt-planning state machine but no board state: it tells
 the orchestrator what the player wants and the engine decides what happens.
 
+A left-press does not act immediately. It *arms* a gesture, and what happens
+depends on what the mouse does next: moving past DRAG_THRESHOLD_PX turns it
+into a camera pan, while releasing without moving that far is a click. This is
+why building happens on release rather than press -- the press alone is
+ambiguous.
+
 State machine, for a drag-based tool (a belt run):
 
-  IDLE      left-press on world   -> PLANNING (anchor = cell under cursor)
-            right-press on world  -> ERASING
-  PLANNING  mouse move            -> re-preview the path
-            R / shift+R           -> the active tool's cycle, re-preview
-            left-press            -> commit, -> IDLE
-            right-press / Esc     -> cancel, -> IDLE
-  ERASING   drag                  -> erase under cursor
-            right-release         -> IDLE
+  IDLE      left-press on world    -> ARMED (remember where, act later)
+            right-press on world   -> ERASING
+  ARMED     moved past threshold   -> PANNING
+            left-release           -> PLANNING (anchor = the pressed cell)
+  PANNING   mouse move             -> drag the camera
+            left-release           -> IDLE (no build)
+  PLANNING  mouse move             -> re-preview the path
+            R / shift+R            -> the active tool's cycle, re-preview
+            left-press             -> ARMED again; the release commits
+            right-press / Esc      -> cancel, -> IDLE
+  ERASING   drag                   -> erase under cursor
+            right-release          -> IDLE
 
 A click-based tool (a structure) never enters PLANNING: it previews under the
-cursor while IDLE and commits on a single left-press. Both styles hand the
-builder the same (anchor, target) pair, so builders need not care which
-gesture produced them.
+cursor while IDLE and commits on a left *release* that was not a drag. Both
+styles hand the builder the same (anchor, target) pair, so builders need not
+care which gesture produced them.
 
 Right-press is consumed by the cancel when PLANNING, so a cancel never also
 starts an erase -- the erase gesture needs a fresh press.
@@ -38,8 +48,22 @@ from core.toolbelt import SLOT_COUNT
 STATE_IDLE = 0
 STATE_PLANNING = 1
 STATE_ERASING = 2
+STATE_ARMED = 3      # left button down, not yet known to be click or drag
+STATE_PANNING = 4
 
-STATE_NAMES = {STATE_IDLE: "Idle", STATE_PLANNING: "Planning", STATE_ERASING: "Erasing"}
+STATE_NAMES = {
+    STATE_IDLE: "Idle",
+    STATE_PLANNING: "Planning",
+    STATE_ERASING: "Erasing",
+    STATE_ARMED: "Armed",
+    STATE_PANNING: "Panning",
+}
+
+# How far the cursor must move, in framebuffer pixels, before a held left
+# button counts as a camera drag rather than a click. Small enough that a
+# deliberate drag registers immediately, large enough that hand tremor during
+# a click does not steal the build.
+DRAG_THRESHOLD_PX = 6.0
 
 # Keys that are edge-triggered (act once per press) rather than held.
 _SLOT_KEYS = {
@@ -58,8 +82,9 @@ class Intents:
         "pan_x", "pan_y", "zoom", "cycle_tool", "cycle_backward", "frame_board",
         "reload_shader", "clear_board",
         "begin_plan", "update_plan", "commit_plan", "cancel_plan",
-        "erase_at", "cursor_cell", "cursor_in_world",
-        "select_slot", "scroll",
+        "erase_at", "cursor_cell", "cursor_in_world", "cursor_frac",
+        "select_slot", "scroll_steps", "scroll_at",
+        "drag_pan_px",
     )
 
     def __init__(self):
@@ -78,9 +103,14 @@ class Intents:
         self.cancel_plan = False
         self.erase_at = []         # [(x, y), ...] cells to erase this frame
         self.cursor_cell = None    # (x, y) or None if off-world
+        # Where the cursor sits *within* its cell, each component 0..1. Tools
+        # use this to aim a belt from which part of the square was clicked.
+        self.cursor_frac = (0.5, 0.5)
         self.cursor_in_world = False
         self.select_slot = None    # slot index requested this frame
-        self.scroll = 0.0
+        self.scroll_steps = 0.0    # scroll notches this frame
+        self.scroll_at = None      # cursor position to anchor the zoom on
+        self.drag_pan_px = (0.0, 0.0)   # camera drag delta, framebuffer px
 
 
 class InputManager:
@@ -91,7 +121,18 @@ class InputManager:
         self.state = STATE_IDLE
         self.anchor = None          # planning start cell
         self.target = None          # planning end cell (cursor)
+        # Sub-cell cursor position at each end, 0..1 each axis. Tools use these
+        # to aim the first and last belt of a run.
+        self.anchor_frac = (0.5, 0.5)
+        self.target_frac = (0.5, 0.5)
         self._last_hover = None     # for click-based tools' idle preview
+        self._last_frac = None
+        # Armed-press bookkeeping.
+        self._press_px = (0.0, 0.0)
+        self._press_cell = None
+        self._press_frac = (0.5, 0.5)
+        self._pending_commit = False
+        self._pan_last_px = None
 
         self._prev_keys = {k: False for k in _EDGE_KEYS}
         self._prev_left = False
@@ -110,8 +151,8 @@ class InputManager:
     def _viewport(self):
         return glfw.get_framebuffer_size(self.window)
 
-    def _cursor_cell(self):
-        """Cell under the cursor, in framebuffer pixels.
+    def _cursor_px(self):
+        """Cursor position in framebuffer pixels.
 
         glfw reports the cursor in window coordinates; on a HiDPI display the
         framebuffer is larger, so scale before converting or picking drifts
@@ -123,7 +164,19 @@ class InputManager:
         if win_w > 0 and win_h > 0:
             mx *= fb_w / win_w
             my *= fb_h / win_h
-        return self.camera.screen_to_cell(mx, my, (fb_w, fb_h))
+        return mx, my
+
+    def _cursor_cell_frac(self):
+        """((cell_x, cell_y), (fx, fy)) for the cursor.
+
+        `fx`/`fy` are the position within the cell, 0..1, with y up to match
+        world orientation -- so (0.5, 0.9) is near the cell's north edge.
+        """
+        import math
+        mx, my = self._cursor_px()
+        wx, wy = self.camera.screen_to_world(mx, my, self._viewport())
+        cx, cy = math.floor(wx), math.floor(wy)
+        return (cx, cy), (wx - cx, wy - cy)
 
     def _on_scroll(self, window, xoff, yoff):
         self._scroll_accum += yoff
@@ -186,21 +239,29 @@ class InputManager:
         it.cycle_backward = shift
 
         # --- toolbelt selection ---
+        # Number keys only: scroll is zoom now, Factorio-style.
         for key, digit in _SLOT_KEYS.items():
             if self._edge(key, not want_kb):
                 it.select_slot = (SLOT_COUNT - 1) if digit == 0 else digit - 1
                 break
 
-        it.scroll = 0.0 if want_mouse else self._take_scroll()
+        # --- scroll zoom, anchored at the cursor ---
+        scroll = 0.0 if want_mouse else self._take_scroll()
+        if scroll:
+            it.scroll_steps = scroll
+            it.scroll_at = self._cursor_px()
 
         # --- cursor ---
-        cx, cy = self._cursor_cell()
+        (cx, cy), frac = self._cursor_cell_frac()
+        mx, my = self._cursor_px()
         it.cursor_cell = (cx, cy)
+        it.cursor_frac = frac
         it.cursor_in_world = not want_mouse and board.in_bounds(cx, cy)
 
         left = glfw.get_mouse_button(self.window, glfw.MOUSE_BUTTON_LEFT) == glfw.PRESS
         right = glfw.get_mouse_button(self.window, glfw.MOUSE_BUTTON_RIGHT) == glfw.PRESS
         left_press = left and not self._prev_left
+        left_release = (not left) and self._prev_left
         right_press = right and not self._prev_right
         right_release = (not right) and self._prev_right
         self._prev_left = left
@@ -214,30 +275,79 @@ class InputManager:
 
         # --- state machine ---
         if self.state == STATE_IDLE:
-            # A click-based tool (a structure) has no drag phase: it shows a
-            # preview under the cursor whenever idle, and a click commits it.
-            # Anchor and target are the same cell so builders see one gesture
-            # shape regardless of which style produced it.
+            # A click-based tool (a structure) has no drag phase, but it still
+            # must not build on press -- the press might become a pan. It
+            # previews under the cursor and waits for the release.
             if not drag_based and not want_mouse and board.in_bounds(cx, cy):
                 self.anchor = self.target = (cx, cy)
-                if left_press:
-                    it.commit_plan = True
-                    it.update_plan = True
-                elif (cx, cy) != self._last_hover or cycle:
+                if (cx, cy) != self._last_hover or frac != self._last_frac \
+                        or cycle:
                     it.update_plan = True
                 self._last_hover = (cx, cy)
+                self._last_frac = frac
 
-            if drag_based and left_press and board.in_bounds(cx, cy):
-                self.state = STATE_PLANNING
-                self.anchor = (cx, cy)
-                self.target = (cx, cy)
-                it.begin_plan = (cx, cy)
-                it.update_plan = True
+            if left_press and board.in_bounds(cx, cy):
+                self.state = STATE_ARMED
+                self._press_px = (mx, my)
+                self._press_cell = (cx, cy)
+                self._press_frac = frac
             elif right_press and board.in_bounds(cx, cy):
                 self.state = STATE_ERASING
                 self._last_erase_cell = None
                 it.erase_at.append((cx, cy))
                 self._last_erase_cell = (cx, cy)
+
+        elif self.state == STATE_ARMED:
+            moved = ((mx - self._press_px[0]) ** 2
+                     + (my - self._press_px[1]) ** 2) ** 0.5
+            if moved > DRAG_THRESHOLD_PX:
+                # This is a drag, not a click: take over as a camera pan and
+                # never build from this press.
+                self.state = STATE_PANNING
+                self._pan_last_px = (mx, my)
+                it.drag_pan_px = (mx - self._press_px[0], my - self._press_px[1])
+            elif left_release:
+                # A click. What it means depends on what we were doing.
+                if self._pending_commit:
+                    # Second click of a drag-based gesture: commit.
+                    self.state = STATE_IDLE
+                    self._pending_commit = False
+                    self.anchor = self.target = None
+                    it.commit_plan = True
+                elif drag_based:
+                    # First click: start planning from the pressed cell.
+                    self.state = STATE_PLANNING
+                    self.anchor = self._press_cell
+                    self.target = (cx, cy)
+                    self.anchor_frac = self._press_frac
+                    self.target_frac = frac
+                    it.begin_plan = self.anchor
+                    it.update_plan = True
+                else:
+                    # Click-based tool: build where the press landed.
+                    self.state = STATE_IDLE
+                    self.anchor = self.target = self._press_cell
+                    self.anchor_frac = self.target_frac = self._press_frac
+                    it.commit_plan = True
+
+        elif self.state == STATE_PANNING:
+            if left_release:
+                # If the press that became this pan was going to commit a
+                # plan, that plan is still live -- return to it rather than
+                # dropping the player's half-drawn run because they panned.
+                if self._pending_commit:
+                    self.state = STATE_PLANNING
+                    self._pending_commit = False
+                    self.target = (cx, cy)
+                    self.target_frac = frac
+                    it.update_plan = True
+                else:
+                    self.state = STATE_IDLE
+                self._pan_last_px = None
+            else:
+                last = self._pan_last_px or (mx, my)
+                it.drag_pan_px = (mx - last[0], my - last[1])
+                self._pan_last_px = (mx, my)
 
         elif self.state == STATE_PLANNING:
             if right_press or escape:
@@ -245,18 +355,24 @@ class InputManager:
                 # through to starting an erase.
                 self.state = STATE_IDLE
                 self.anchor = self.target = None
+                self._pending_commit = False
                 it.cancel_plan = True
             elif left_press:
-                self.state = STATE_IDLE
-                self.anchor = self.target = None
-                it.commit_plan = True
+                # Arm the commit: it fires on release, unless this turns into
+                # a drag, in which case the plan survives and we keep planning.
+                self.state = STATE_ARMED
+                self._press_px = (mx, my)
+                self._press_cell = (cx, cy)
+                self._press_frac = frac
+                self._pending_commit = True
             else:
                 if cycle:
                     # The orchestrator applies this to the active tool; we
                     # only need to know the preview must be rebuilt.
                     it.update_plan = True
-                if (cx, cy) != self.target:
+                if (cx, cy) != self.target or frac != self.target_frac:
                     self.target = (cx, cy)
+                    self.target_frac = frac
                     it.update_plan = True
 
         elif self.state == STATE_ERASING:
@@ -283,6 +399,9 @@ class InputManager:
         self.anchor = self.target = None
         self._last_erase_cell = None
         self._last_hover = None
+        self._last_frac = None
+        self._pending_commit = False
+        self._pan_last_px = None
 
 
 def _trace(a, b):

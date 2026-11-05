@@ -40,18 +40,36 @@ the GLSL cell encoding still agrees with `core/cell.py`.
 |---|---|
 | `WASD` | pan |
 | `Q` / `E` | zoom out / in |
+| Scroll | zoom, anchored at the cursor |
+| Left-drag | pan the camera |
 | `F` | frame the whole board |
-| `1`-`9`, `0` | select a toolbelt slot (scroll wheel also works) |
-| Left-click | build with the active tool |
+| `1`-`9`, `0` | select a toolbelt slot |
+| Left-click | build with the active tool (fires on **release**) |
 | `R` / `shift+R` | **per-tool**: belt path shape, or structure rotation |
 | Right-click | cancel a plan, or drag to erase |
 | `Esc` | cancel a plan |
-| `F5` | reload `world.frag` |
+| `F5` | reload the world shaders |
 | `Delete` | clear the board |
 
 `R` deliberately means different things in different tools — the input manager
 reports only that it was pressed and the active builder decides. Adding a tool
 with its own notion of "cycle" needs no input-layer change.
+
+### A left-press is ambiguous, so building happens on release
+
+Left-drag pans and left-click builds, which means a press alone cannot be
+acted on: it might become either. A press therefore *arms* a gesture
+(`STATE_ARMED`) and the next thing the mouse does decides — moving past
+`DRAG_THRESHOLD_PX` (6px) turns it into `STATE_PANNING`, releasing without
+moving that far is a click.
+
+Two consequences worth knowing:
+
+- A press that arrives mid-plan sets `_pending_commit`. If it becomes a drag
+  instead, `STATE_PANNING` returns to `PLANNING` rather than `IDLE` — panning
+  must not throw away a half-drawn belt run.
+- The threshold is in framebuffer pixels, not cells, so it means the same
+  thing at every zoom level.
 
 ## Architecture
 
@@ -256,9 +274,23 @@ nothing; this is correct, and the UI names the active mode to make it legible.
 what happens to be in the way. Deriving directions after filtering means a cell
 whose successor was blocked has no step to read and falls back to `+X`, which is
 how "complete the last cell of a 2×2 loop" used to produce an east-facing belt
-instead of one that closes the loop. For a genuine single-cell path (a click
-with no drag) there is no step at all, so the drag's dominant axis is the
-fallback.
+instead of one that closes the loop.
+
+**Where in a cell you point steers the ends of a run.** `InputManager` reports
+the cursor's fractional position within its cell (`cursor_frac`, 0..1 each
+axis, y up) alongside the cell index, and the builder uses it at both ends:
+
+- **First belt of a single-cell run** — there is no step to read a heading
+  from, so `quadrant_dir()` splits the cell by its diagonals and names the
+  direction. Clicking the right of a square gives an east belt, the top a
+  north one. Dead centre is `+X`.
+- **Last belt of any run** — goes straight on by default, but if the pointer
+  is more than `TURN_THRESHOLD` (0.6) of the way toward a side edge, it turns
+  that way and forms a corner. Only *sideways* deflection counts: pushing
+  along the travel axis already means "keep going", and pulling backwards
+  would reverse the belt into the run it came from.
+
+Tools that do not care (`StructureBuilder`) simply ignore the fractions.
 
 ### Structures
 
@@ -391,6 +423,10 @@ bugs:
 - Scroll is event-based, so `InputManager` installs a glfw scroll callback and
   **chains to imgui's**; dropping the previous callback would break scrolling
   in the UI panels.
+- Scroll zoom is **cursor-anchored** (`Camera.zoom_at`): sample the world
+  point under the cursor, change the zoom, then shift the centre by however
+  much that point moved. The drive test asserts the anchor holds to within
+  0.05 cells.
 - Mouse *presses* are suppressed over imgui windows but *releases* are always
   honoured, so a gesture cannot get stuck on.
 - `dt` is clamped to 0.1s in the main loop so a hitch does not fling the camera.

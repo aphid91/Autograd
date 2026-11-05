@@ -63,6 +63,24 @@ def step(n=1):
     for _ in range(n):
         orch.frame(1.0 / 60.0)
 
+def click():
+    """A full press+release without moving: the build gesture.
+
+    Building happens on release now, because a press alone is ambiguous --
+    it might become a camera drag.
+    """
+    fake["left"] = True; step()
+    fake["left"] = False; step()
+
+def drag_px(dx, dy, steps=4):
+    """Hold left and move the cursor by a pixel delta, to pan the camera."""
+    sx, sy = fake["cursor"]
+    fake["left"] = True; step()
+    for i in range(1, steps + 1):
+        fake["cursor"] = (sx + dx * i / steps, sy + dy * i / steps)
+        step()
+    fake["left"] = False; step()
+
 def cells_of_type(t):
     return int((cell.cell_type_arr(board.grid[:, :, 0]) == t).sum())
 
@@ -80,8 +98,7 @@ step()
 assert board.live_count == 0
 put_cursor_at_cell(10, 10); step()
 
-fake["left"] = True; step()           # press -> PLANNING
-fake["left"] = False
+click()                               # press+release -> PLANNING
 assert orch.input.state == STATE_PLANNING, orch.input.state
 assert orch.input.anchor == (10, 10), orch.input.anchor
 ok(f"planning from {orch.input.anchor}")
@@ -104,8 +121,7 @@ g_after = len(engine.ghost_rows)
 assert g_after == nghost, (nghost, g_after)
 ok("re-previewed after mode cycle")
 
-fake["left"] = True; step()           # second click -> commit
-fake["left"] = False; step()
+click()                               # second click -> commit
 assert orch.input.state == STATE_IDLE
 assert not engine.ghost_rows, "ghosts should be consumed"
 remaining_ghost_cells = int((cell.ghost_state_arr(board.grid[:, :, cell.CH_Z]) == cell.GHOST_PENDING).sum())
@@ -118,7 +134,7 @@ print("=== cancel with right click ===")
 # live_count, so the invariant is "cancel returns to the pre-plan count".
 live_before = board.live_count
 put_cursor_at_cell(40, 40); step()
-fake["left"] = True; step(); fake["left"] = False
+click()
 assert orch.input.state == STATE_PLANNING
 put_cursor_at_cell(46, 44); step()
 assert len(engine.ghost_rows) > 0
@@ -142,13 +158,13 @@ engine.place_belt_path((5, 20), (25, 20), MODE_HORIZONTAL_FIRST)
 step()
 before = board.live_count
 put_cursor_at_cell(15, 14); step()
-fake["left"] = True; step(); fake["left"] = False
+click()
 put_cursor_at_cell(15, 26); step()
 gc = [(x, y) for x, y in
       zip(*np.nonzero(cell.ghost_state_arr(board.grid[:, :, cell.CH_Z]) == cell.GHOST_PENDING)[::-1])]
 assert (15, 20) not in gc, "ghosted on top of an existing belt!"
 ok(f"{len(gc)} ghost cells, crossing cell (15,20) skipped")
-fake["left"] = True; step(); fake["left"] = False; step()
+click()
 assert not board.is_empty(15, 20)
 crossing_id = cell.cell_id(board.cell_word(15, 20))
 assert crossing_id != 0
@@ -184,9 +200,9 @@ ok("drags through a blocker keep their heading")
 engine.clear_board(); step()
 engine.place_belt(2, 3, cell.DIR_PX)
 put_cursor_at_cell(2, 2); step()
-fake["left"] = True; step(); fake["left"] = False
+click()
 put_cursor_at_cell(2, 6); step()
-fake["left"] = True; step(); fake["left"] = False; step()
+click()
 built = [(x, y) for y in range(2, 7) for x in [2] if not board.is_empty(x, y)]
 dirs_built = {cell.cell_dir(board.cell_word(x, y)) for x, y in built if (x, y) != (2, 3)}
 assert dirs_built == {cell.DIR_PY}, dirs_built
@@ -250,7 +266,7 @@ assert orch.input.state == STATE_IDLE, "structures never enter PLANNING"
 ok("Add ghosts on hover without a click")
 
 # One click places it; it covers two cells.
-fake["left"] = True; step(); fake["left"] = False; step()
+click()
 assert not board.is_empty(20, 20) and not board.is_empty(21, 20)
 placed_id = cell.cell_id(board.cell_word(20, 20))
 assert cell.cell_id(board.cell_word(21, 20)) == placed_id, "both cells, one entity"
@@ -262,7 +278,7 @@ before = add_tool.direction
 fake["keys"].add(glfw.KEY_R); step(); fake["keys"].discard(glfw.KEY_R); step()
 assert add_tool.direction != before
 put_cursor_at_cell(30, 30); step()
-fake["left"] = True; step(); fake["left"] = False; step()
+click()
 assert not board.is_empty(30, 30) and not board.is_empty(30, 31), "rotated = vertical"
 assert board.is_empty(31, 30)
 ok("R rotated the Add to 1x2")
@@ -276,7 +292,7 @@ assert frustrated > 0, "overlap should tint"
 assert len(engine.ghost_rows) == 0, "all-or-nothing must ghost nothing"
 # The occupant survives underneath the tint.
 assert cell.cell_type(board.cell_word(30, 30)) == cell.TYPE_ADD
-fake["left"] = True; step(); fake["left"] = False; step()
+click()
 assert board.live_count == live_before, "blocked placement must build nothing"
 ok(f"overlap tinted {frustrated} cells, built nothing, occupant intact")
 
@@ -286,13 +302,13 @@ fake["keys"].add(glfw.KEY_1); step(); fake["keys"].discard(glfw.KEY_1); step()
 engine.place_belt(8, 8, cell.DIR_PY)
 want_id = cell.cell_id(board.cell_word(8, 8))
 put_cursor_at_cell(6, 8); step()
-fake["left"] = True; step(); fake["left"] = False
+click()
 put_cursor_at_cell(11, 8); step()
 assert cell.is_frustrated(int(board.grid[8, 8, cell.CH_Z])), "crossing cell tinted"
 assert cell.cell_id(board.cell_word(8, 8)) == want_id, "occupant id clobbered!"
 assert cell.cell_dir(board.cell_word(8, 8)) == cell.DIR_PY, "occupant dir clobbered!"
 ok("belt crossing tints the blocker without touching its entity")
-fake["left"] = True; step(); fake["left"] = False; step()
+click()
 assert int((cell.ghost_state_arr(board.grid[:, :, cell.CH_Z])
             == cell.GHOST_FRUSTRATED).sum()) == 0, "commit must clear tints"
 assert cell.cell_id(board.cell_word(8, 8)) == want_id
@@ -313,7 +329,7 @@ ok("dragging an Add across 10 cells never self-frustrates")
 engine.clear_board(); step()
 fake["keys"].add(glfw.KEY_1); step(); fake["keys"].discard(glfw.KEY_1); step()
 put_cursor_at_cell(5, 28); step()
-fake["left"] = True; step(); fake["left"] = False
+click()
 for end in range(6, 20):
     put_cursor_at_cell(end, 28); step()
     assert orch.last_plan.ok, (
@@ -338,7 +354,7 @@ ok("half-blocked Add ghosts the half that fits, tints the other")
 
 # ...but committing it still builds nothing: half a structure cannot exist.
 live_before = board.live_count
-fake["left"] = True; step(); fake["left"] = False; step()
+click()
 assert board.live_count == live_before, "a fragment was committed!"
 # The half-ghost is still shown (the cursor has not moved), but it must still
 # be a *ghost* -- never promoted to a real entity.
@@ -356,7 +372,7 @@ fake["keys"].add(glfw.KEY_1); step(); fake["keys"].discard(glfw.KEY_1); step()
 print("=== switching tools drops an in-flight preview ===")
 engine.clear_board(); step()
 put_cursor_at_cell(12, 12); step()
-fake["left"] = True; step(); fake["left"] = False
+click()
 put_cursor_at_cell(18, 12); step()
 assert len(engine.ghost_rows) > 0
 fake["keys"].add(glfw.KEY_3); step(); fake["keys"].discard(glfw.KEY_3); step()
@@ -459,13 +475,110 @@ ok("entity SSBO matches CPU array")
 print("=== partial upload really is partial ===")
 board.to_device(force=True)
 put_cursor_at_cell(50, 50); step()
-fake["left"] = True; step(); fake["left"] = False
+click()
 put_cursor_at_cell(52, 50); step()
 cells_up, rows_up = orch.ui.last_upload
 print(f"  3-cell ghost preview uploaded {cells_up} cells (board is {board.width*board.height})")
 assert 0 < cells_up < 500, cells_up
 ok("dirty-rect upload stayed small")
 fake["right"] = True; step(); fake["right"] = False; step()
+
+print("=== left-drag pans instead of building ===")
+engine.clear_board(); step()
+fake["keys"].add(glfw.KEY_1); step(); fake["keys"].discard(glfw.KEY_1); step()
+put_cursor_at_cell(30, 30); step()
+c_before = cam.center.copy()
+live_before = board.live_count
+drag_px(120.0, 0.0)
+assert orch.input.state == STATE_IDLE, orch.input.state
+assert board.live_count == live_before, "a drag must not build"
+assert not engine.ghost_rows, "a drag must leave no preview"
+assert abs(cam.center[0] - c_before[0]) > 1.0, (c_before, cam.center)
+ok(f"left-drag panned {c_before[0]:.1f} -> {cam.center[0]:.1f}, built nothing")
+
+# Dragging right moves the view left: the world follows the cursor.
+c2 = cam.center.copy()
+drag_px(-120.0, 0.0)
+assert cam.center[0] > c2[0], "drag direction inverted"
+ok("drag direction follows the cursor")
+
+# A press that does NOT move past the threshold is still a click.
+put_cursor_at_cell(34, 30); step()
+sx, sy = fake["cursor"]
+fake["left"] = True; step()
+fake["cursor"] = (sx + 2.0, sy + 1.0)   # inside DRAG_THRESHOLD_PX
+step()
+fake["left"] = False; step()
+assert orch.input.state == STATE_PLANNING, (
+    f"a small wobble should still click, got {orch.input.state}")
+ok("sub-threshold wobble still counts as a click")
+fake["keys"].add(glfw.KEY_ESCAPE); step(); fake["keys"].discard(glfw.KEY_ESCAPE); step()
+
+print("=== scroll zooms at the cursor ===")
+engine.clear_board(); step()
+cam.center[:] = (32.0, 32.0); cam.zoom = 20.0
+# Point at a cell well off-centre and remember what is under the cursor.
+put_cursor_at_cell(44, 40); step()
+mx, my = fake["cursor"]
+before_world = cam.screen_to_world(mx, my, (W, H))
+z0 = cam.zoom
+input_manager_obj = orch.input
+input_manager_obj._scroll_accum = 3.0      # three notches in
+step()
+assert cam.zoom > z0, (z0, cam.zoom)
+after_world = cam.screen_to_world(mx, my, (W, H))
+drift = max(abs(after_world[0] - before_world[0]),
+            abs(after_world[1] - before_world[1]))
+assert drift < 0.05, f"world point under cursor moved {drift:.3f} cells"
+ok(f"zoomed {z0:.1f} -> {cam.zoom:.1f}, cursor anchor held (drift {drift:.4f})")
+
+input_manager_obj._scroll_accum = -3.0     # and back out
+step()
+assert cam.zoom < z0 * 1.01
+after2 = cam.screen_to_world(mx, my, (W, H))
+drift2 = max(abs(after2[0] - before_world[0]), abs(after2[1] - before_world[1]))
+assert drift2 < 0.05, drift2
+ok(f"zoomed back out to {cam.zoom:.1f}, anchor still held")
+
+# Scroll no longer touches the toolbelt.
+slot_before = orch.toolbelt.selected
+input_manager_obj._scroll_accum = 2.0
+step()
+assert orch.toolbelt.selected == slot_before, "scroll must not change tools"
+ok("scroll leaves the toolbelt alone")
+
+print("=== sub-cell aiming through the full stack ===")
+engine.clear_board(); step()
+
+def click_at_frac(cx, cy, fx, fy):
+    """Click at a specific sub-cell position."""
+    sx, sy = cam.world_to_screen(cx + fx, cy + fy, (W, H))
+    fake["cursor"] = (float(sx), float(sy))
+    step()
+    click()
+
+for (fx, fy), want in [((0.85, 0.5), cell.DIR_PX), ((0.15, 0.5), cell.DIR_NX),
+                       ((0.5, 0.85), cell.DIR_PY), ((0.5, 0.15), cell.DIR_NY)]:
+    engine.clear_board(); step()
+    click_at_frac(12, 12, fx, fy)     # press+release -> PLANNING at (12,12)
+    click_at_frac(12, 12, fx, fy)     # click again -> commit the single cell
+    assert not board.is_empty(12, 12), f"nothing built at frac {(fx, fy)}"
+    got = cell.cell_dir(board.cell_word(12, 12))
+    assert got == want, (
+        f"frac {(fx, fy)}: want {cell.DIR_NAMES[want]}, got {cell.DIR_NAMES[got]}")
+ok("a single-cell click aims by quadrant, not always east")
+
+# The last belt of a run turns when the pointer is past the threshold.
+engine.clear_board(); step()
+click_at_frac(5, 15, 0.5, 0.5)                    # start planning
+sx, sy = cam.world_to_screen(11 + 0.5, 15 + 0.8, (W, H))
+fake["cursor"] = (float(sx), float(sy)); step()   # high in the final cell
+click()
+dirs = [cell.cell_dir(board.cell_word(x, 15)) for x in range(5, 12)]
+assert dirs[:-1] == [cell.DIR_PX] * 6, [cell.DIR_NAMES[d] for d in dirs]
+assert dirs[-1] == cell.DIR_PY, (
+    f"last belt should turn north, got {cell.DIR_NAMES[dirs[-1]]}")
+ok("final belt turns north when the pointer is high in its cell")
 
 print("=== camera pan/zoom ===")
 c0 = cam.center.copy(); z0 = cam.zoom
@@ -484,7 +597,7 @@ print("=== imgui capture gating ===")
 io.want_capture_mouse = True
 engine.clear_board(); step()
 put_cursor_at_cell(8, 8)
-fake["left"] = True; step(); fake["left"] = False
+click()
 assert orch.input.state == STATE_IDLE, "click over UI should not start a plan"
 assert board.live_count == 0
 io.want_capture_mouse = False

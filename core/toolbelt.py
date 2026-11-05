@@ -1,8 +1,8 @@
 """Toolbelt: the Factorio-style slot bar. Exactly one tool is active.
 
-Ten slots, selected with 1..9,0 or the scroll wheel. Slots beyond the
-available tools stay visible but empty, so the bar's shape is stable as tools
-are added. The UI splits it visually between slots 5 and 6.
+Ten slots, selected with 1..9,0. Slots beyond the available tools stay visible
+but empty, so the bar's shape is stable as tools are added. The UI splits it
+visually between slots 5 and 6.
 """
 
 SLOT_COUNT = 10
@@ -44,6 +44,10 @@ class Toolbelt:
 
         Wraps rather than clamping so a long scroll cannot strand you on an
         end slot, matching how a hotbar normally behaves.
+
+        Currently unbound: the scroll wheel zooms the camera, Factorio-style,
+        and slots are selected with the number keys. Kept for whenever slot
+        cycling wants a binding (shift+scroll, say).
         """
         if not delta:
             return False

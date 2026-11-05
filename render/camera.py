@@ -20,7 +20,8 @@ MAX_ZOOM = 160.0
 DEFAULT_ZOOM = 32.0
 
 PAN_CELLS_PER_SEC = 18.0
-ZOOM_PER_SEC = 2.2  # multiplicative: zoom *= ZOOM_PER_SEC ** dt
+ZOOM_PER_SEC = 2.2     # held Q/E: zoom *= ZOOM_PER_SEC ** dt
+ZOOM_PER_SCROLL = 1.15  # one scroll notch
 
 GRID_TEXTURE_UNIT = 0
 ENTITY_SSBO_BINDING = 0
@@ -86,7 +87,40 @@ class Camera:
         if direction == 0:
             return
         factor = ZOOM_PER_SEC ** (dt * direction)
+        self._apply_zoom(factor)
+
+    def zoom_at(self, steps, screen_pos, viewport):
+        """Zoom by discrete scroll steps, anchored at a screen position.
+
+        The world point under the cursor stays put, so scrolling feels like
+        pulling the map toward the pointer rather than toward the screen
+        centre. Compute what the cursor is over, change the zoom, then shift
+        the centre by however much that point moved.
+        """
+        if not steps:
+            return
+        before = self.screen_to_world(screen_pos[0], screen_pos[1], viewport)
+        self._apply_zoom(ZOOM_PER_SCROLL ** steps)
+        after = self.screen_to_world(screen_pos[0], screen_pos[1], viewport)
+        self.center[0] += before[0] - after[0]
+        self.center[1] += before[1] - after[1]
+        self._clamp_center()
+
+    def _apply_zoom(self, factor):
         self.zoom = float(np.clip(self.zoom * factor, MIN_ZOOM, MAX_ZOOM))
+
+    def pan_pixels(self, dx_px, dy_px):
+        """Drag the world by a screen-space delta, in framebuffer pixels.
+
+        Used by click-drag panning: the world point under the cursor tracks
+        the cursor exactly, so the map feels grabbed rather than nudged.
+        Screen y is top-down and world y is up, hence the sign flip.
+        """
+        if dx_px == 0.0 and dy_px == 0.0:
+            return
+        self.center[0] -= dx_px / self.zoom
+        self.center[1] += dy_px / self.zoom
+        self._clamp_center()
 
     def _clamp_center(self):
         """Keep the view centre within a margin of the board."""

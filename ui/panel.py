@@ -188,8 +188,9 @@ class UI:
 
         imgui.separator()
         imgui.text_unformatted("Controls")
-        imgui.text("WASD pan    Q/E zoom    F frame")
-        imgui.text("1-9,0 or scroll: select tool")
+        imgui.text("WASD pan    Q/E or scroll: zoom    F frame")
+        imgui.text("Left-drag: pan the camera")
+        imgui.text("1-9,0: select tool")
         imgui.text("Left-click: build with the active tool")
         imgui.text("R / shift+R: per-tool (belt shape, structure rotation)")
         imgui.text("Right-click: cancel plan / drag to erase")

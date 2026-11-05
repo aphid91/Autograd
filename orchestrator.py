@@ -59,8 +59,12 @@ class Orchestrator:
         if anchor is None or target is None:
             return
         # Engine.preview() clears the old preview before planning, so the tool
-        # never sees its own ghosts as obstacles.
-        self.last_plan = self.engine.preview(tool, anchor, target)
+        # never sees its own ghosts as obstacles. The sub-cell positions let a
+        # belt aim its first and last segment from where the player pointed.
+        self.last_plan = self.engine.preview(
+            tool, anchor, target,
+            self.input.anchor_frac, self.input.target_frac,
+        )
 
     # --- frame ----------------------------------------------------------
     def frame(self, dt):
@@ -79,6 +83,13 @@ class Orchestrator:
         # 2. camera
         self.camera.pan(intents.pan_x, intents.pan_y, dt)
         self.camera.zoom_by(intents.zoom, dt)
+        if intents.scroll_steps and intents.scroll_at is not None:
+            self.camera.zoom_at(
+                intents.scroll_steps, intents.scroll_at, viewport
+            )
+        dpx, dpy = intents.drag_pan_px
+        if dpx or dpy:
+            self.camera.pan_pixels(dpx, dpy)
         if intents.frame_board:
             self.camera.frame_board(viewport)
         if intents.reload_shader:
@@ -90,9 +101,6 @@ class Orchestrator:
         # a half-drawn belt run means nothing to the structure tool.
         if intents.select_slot is not None:
             if self.toolbelt.select(intents.select_slot):
-                self._on_tool_changed()
-        if intents.scroll:
-            if self.toolbelt.scroll(intents.scroll):
                 self._on_tool_changed()
 
         tool = self.toolbelt.active
