@@ -497,8 +497,13 @@ void main() {
             // the top cell and leaves the bottom, so neither end sees both
             // halves, but every cell of that column is on the channel).
             {
-                int pass_mask = rotate_face_mask(pass_through_mask(type),
-                                                 facing);
+                // Flip then rotate, exactly as the port masks do -- a
+                // mirrored machine's control axis mirrors with it, so
+                // rotating alone leaves the overlay pointing the wrong way
+                // and disagreeing with the ports it is meant to describe.
+                int pm = pass_through_mask(type);
+                if (flipped) pm = flip_face_mask(pm);
+                int pass_mask = rotate_face_mask(pm, facing);
                 float pass = 0.0, pass_chev = 0.0;
                 for (int d = 0; d < 4; ++d) {
                     if (!has_face(pass_mask, d)) continue;

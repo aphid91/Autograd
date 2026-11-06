@@ -745,13 +745,39 @@ for _cls in STRUCTURES:
         f"{_cls.__name__}: shader pass-through {_got:04b} != "
         f"Entity.PASS_THROUGH {_want:04b}")
     # A declared pass-through axis must actually have ports on it, or the
-    # overlay would draw a channel the machine has no way to carry.
-    for _f in _cls.PASS_THROUGH:
-        _faces = {f for _c, f in _cls.faces_for(0, 0, cell.DIR_PX)[1]}
-        assert _f in _faces, (
-            f"{_cls.__name__}: PASS_THROUGH names {cell.DIR_NAMES[_f]} but "
-            f"no output face points that way")
+    # overlay would draw a channel the machine has no way to carry. This
+    # must hold at every orientation, and the shader must transform the
+    # pass-through mask the same way it transforms the ports -- flip *then*
+    # rotate. Rotating alone left a mirrored machine's overlay pointing the
+    # wrong way, disagreeing with the very ports it describes.
+    for _facing in range(4):
+        for _flip in (False, True):
+            _out_faces = {f for _c, f in
+                          _cls.faces_for(0, 0, _facing, _flip)[1]}
+            # What the shader computes for this orientation.
+            _pm = _want
+            if _flip:
+                _pm = sum(1 << cell.flip_dir_y(_d)
+                          for _d in range(4) if _pm >> _d & 1)
+            _pm = sum(1 << ((_d + _facing) % 4)
+                      for _d in range(4) if _pm >> _d & 1)
+            for _d in range(4):
+                if not _pm >> _d & 1:
+                    continue
+                assert _d in _out_faces, (
+                    f"{_cls.__name__} facing {cell.DIR_NAMES[_facing]} "
+                    f"flip={_flip}: control axis {cell.DIR_NAMES[_d]} has no "
+                    f"output face -- overlay disagrees with the ports")
 ok("GLSL pass_through_mask() matches Entity.PASS_THROUGH")
+ok("control axes line up with real output faces at every orientation")
+
+# The shader must flip the pass-through mask, not just rotate it.
+_pb = _re.search(r"int pm = pass_through_mask\(type\);(.*?)int pass_mask",
+                 _src, _re.S)
+assert _pb and "flip_face_mask(pm)" in _pb.group(1), (
+    "the control-signal overlay must mirror its axes when the machine is "
+    "flipped, exactly as the port masks do")
+ok("GLSL control overlay flips with the machine")
 
 # The shader's authored footprint table must match Entity.FOOTPRINT, since
 # unplace_local() uses it to invert the placement transform.
