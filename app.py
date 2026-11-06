@@ -58,7 +58,13 @@ def main():
     renderer = GlfwRenderer(window)
 
     orch = Orchestrator(window, ctx, BOARD_W, BOARD_H)
-    orch.seed_demo()
+    # Pick up the quicksave if there is one; otherwise start from the demo
+    # layout, so a first run still has something on the board.
+    loaded = orch.autoload()
+    if loaded is not None:
+        print(loaded[1])
+    else:
+        orch.seed_demo()
 
     last_wall = glfw.get_time()
 

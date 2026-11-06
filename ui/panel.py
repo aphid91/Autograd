@@ -12,7 +12,7 @@ class UIRequests:
 
     __slots__ = ("reload_shader", "frame_board", "clear_board",
                  "verify_round_trip", "select_slot", "cycle_tool",
-                 "cycle_backward", "flip_tool")
+                 "cycle_backward", "flip_tool", "quicksave", "quickload")
 
     def __init__(self):
         self.reload_shader = False
@@ -23,12 +23,16 @@ class UIRequests:
         self.cycle_tool = False
         self.cycle_backward = False
         self.flip_tool = False
+        self.quicksave = False
+        self.quickload = False
 
 
 class UI:
     def __init__(self):
         self.last_verify = None     # None | True | False
         self.last_upload = (0, 0)
+        #: None, or (ok, message) from the last save/load attempt.
+        self.last_save = None
 
     # --- toolbelt -------------------------------------------------------
     def draw_toolbelt(self, orch, req):
@@ -158,8 +162,24 @@ class UI:
                 gstate = cell.ghost_state(int(board.grid[cy, cx, cell.CH_Z]))
                 imgui.text(f"  {name} dir={cell.DIR_NAMES[d]} id={i}"
                            f"  [{cell.GHOST_NAMES[gstate]}]")
-        if imgui.button("Frame board (F)"):
+        if imgui.button("Frame board (shift+F)"):
             req.frame_board = True
+
+        imgui.separator()
+        imgui.text_unformatted("Save")
+        if imgui.button("Quicksave"):
+            req.quicksave = True
+        imgui.same_line()
+        if imgui.button("Quickload"):
+            req.quickload = True
+        if self.last_save is not None:
+            okay, msg = self.last_save
+            imgui.push_style_color(
+                imgui.Col_.text,
+                imgui.ImVec4(0.4, 1, 0.4, 1) if okay
+                else imgui.ImVec4(1, 0.3, 0.3, 1))
+            imgui.text_wrapped(msg)
+            imgui.pop_style_color()
 
         imgui.separator()
         imgui.text_unformatted("Device")

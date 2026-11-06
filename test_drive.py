@@ -944,6 +944,91 @@ assert _reach >= _longest - 1, (
     f"PROBE_REACH {_reach} too small for a {_longest}-cell footprint")
 ok(f"PROBE_REACH {_reach} spans the longest footprint ({_longest})")
 
+print("=== save / load ===")
+import os as _os
+import tempfile as _tempfile
+from core import persistence
+
+_savepath = _os.path.join(_tempfile.gettempdir(), "gates_test_save.npz")
+engine.clear_board(); step()
+engine.place_belt_path((2, 2), (20, 2), MODE_HORIZONTAL_FIRST)
+engine.place_structure(Shear, 10, 10, cell.DIR_PY)
+engine.place_structure(Sink, 30, 30, cell.DIR_PX)
+_ua = engine.place_under(5, 20, cell.DIR_PX, is_exit=False)
+_ub = engine.place_under(9, 20, cell.DIR_PX, is_exit=True)
+# Churn the free list so the allocator state is non-trivial.
+engine.erase(3, 2); engine.erase(5, 2); step()
+
+_want_grid = board.grid.copy()
+_want_ent = board.entities.copy()
+_want_alloc = (board.live_count, board._next_row, list(board._free_rows))
+_ua_row, _ub_row = _ua.row, _ub.row
+
+engine.save_board(_savepath)
+engine.clear_board(); step()
+assert board.live_count == 0
+_n = engine.load_board(_savepath)
+
+assert _n == _want_alloc[0], (_n, _want_alloc[0])
+assert np.array_equal(board.grid, _want_grid), "grid differs after reload"
+assert np.array_equal(board.entities, _want_ent), "entity table differs"
+# The allocator is part of the state: entity ids are baked into grid cells,
+# so a wrong free list would hand out a row that is still in use.
+assert (board.live_count, board._next_row,
+        list(board._free_rows)) == _want_alloc
+ok(f"save/load round trip is exact ({_n} entities, "
+   f"free list {_want_alloc[2]})")
+
+# Entity-level state has to survive, not just the bytes.
+_a, _b = board.view(_ua_row), board.view(_ub_row)
+assert _a.partner == _ub_row and _b.partner == _ua_row, "pairing lost"
+assert _b.is_exit and not _a.is_exit, "underground roles lost"
+ok("underground pairing and roles survive a reload")
+
+board.to_device()
+assert board.verify_round_trip(), "reloaded board does not reach the device"
+ok("reloaded board uploads cleanly")
+
+# A preview must never reach the file: ghosts belong to a gesture, not the
+# board, and would reload as entities nobody placed.
+put_cursor_at_cell(40, 40); step()
+click()
+put_cursor_at_cell(46, 44); step()
+assert len(engine.ghost_rows) > 0
+engine.save_board(_savepath)
+assert not engine.ghost_rows, "save should clear the preview first"
+_saved = np.load(_savepath)
+_gs = cell.ghost_state_arr(_saved["grid"][:, :, cell.CH_Z])
+assert int((_gs != cell.GHOST_NONE).sum()) == 0, "ghosts leaked into the file"
+_saved.close()
+ok("saving clears the preview; no ghost cells in the file")
+
+# And persistence.save() refuses outright if ghosts are somehow still set.
+_bb2 = BeltBuilder()
+engine.preview(_bb2, (5, 50), (12, 50))
+try:
+    persistence.save(board, _savepath)
+    raise AssertionError("save should refuse while ghosts are set")
+except persistence.SaveError:
+    pass
+engine.clear_ghosts()
+ok("persistence.save refuses to write a board with ghosts")
+
+# A file for a different board size is rejected rather than half-applied.
+from core.gameboard import Gameboard
+_other = Gameboard(32, 32)
+try:
+    persistence.load(_other, _savepath)
+    raise AssertionError("size mismatch should be rejected")
+except persistence.SaveError:
+    pass
+ok("a save for a different board size is rejected")
+
+_os.remove(_savepath)
+engine.clear_board(); step()
+# Leave the Belt tool active: later sections assume a drag-based tool.
+select_tool("Belt")
+
 print("=== device round trip after all that ===")
 assert board.verify_round_trip(), "grid round trip mismatch"
 ok("to_device/from_device match")

@@ -373,19 +373,18 @@ float sd_glyph(int glyph, vec2 p, float r, float t) {
 // Underground belts
 // ======================================================================
 //
-// An end is a funnel. The *surface* side is a wide mouth that tapers to a
-// narrow throat on the *buried* side, so material visibly necks down as it
-// dives and widens as it surfaces. Entrance and exit are the same shape
-// facing opposite ways along the travel direction:
+// An end is a funnel that **narrows along the travel direction**: wide where
+// material arrives, tapering to a point ahead of it. Both ends read as
+// arrowheads aimed downstream, so a run's direction is legible from the
+// shape alone, independent of the chevrons.
 //
-//     entrance, facing +X:   mouth at -X (surface), throat at +X (buried)
-//     exit,     facing +X:   throat at -X (buried), mouth at +X (surface)
+//     entrance, facing +X:   wide at -X, narrow at +X
+//     exit,     facing +X:   wide at -X, narrow at +X
 //
-// So the mouth always opens toward the *surface* belt this end talks to:
-// an entrance opens backwards at the run feeding it, an exit opens forwards
-// at the run it feeds. A trapezoid in cell-local space, rotated into the
-// facing, tapering from mouth (-UNDER_LEN) to throat (+UNDER_LEN); the
-// entrance is the one that needs mirroring to put its throat downstream.
+// Both therefore taper the same way; only the dotted span and the chevron
+// placement distinguish an entrance from an exit. A trapezoid in cell-local
+// space, rotated into the facing, tapering from the wide end (-UNDER_LEN)
+// to the point (+UNDER_LEN).
 float sd_funnel(vec2 p, int dir, bool mirror) {
     vec2 q = rotate_to_dir(p, dir);
     if (mirror) q.x = -q.x;
@@ -508,9 +507,10 @@ void main() {
             // back the way material came; an exit's faces the way it goes.
             int facing = cell_dir(c.x);
             bool exit_end = is_under_exit(c.z);
-            // An exit's mouth already opens along the facing; an entrance's
-            // must be mirrored so its mouth opens back at the run feeding it.
-            float a = fill(sd_funnel(p, facing, !exit_end), px);
+            // Both ends narrow along the travel direction, so neither is
+            // mirrored -- the taper reads as an arrowhead pointing the way
+            // material is going.
+            float a = fill(sd_funnel(p, facing, false), px);
             col = mix(col, COL_UNDER, a * alpha_scale);
             // A chevron on the mouth half, so travel direction is readable.
             vec2 fv = dir_vec(facing);

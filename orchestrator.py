@@ -15,8 +15,11 @@ believes -- including the ghost preview, which changes every frame the cursor
 moves and therefore exercises the partial-upload path continuously.
 """
 
+import os
+
 import glfw
 
+from core import persistence
 from core.builders import default_builders
 from render.camera import Camera
 from engine import Engine
@@ -63,6 +66,40 @@ class Orchestrator:
         for slot in self.toolbelt.slots:
             if slot is not None and hasattr(slot, "reset"):
                 slot.reset()
+
+    # --- quicksave -------------------------------------------------------
+    def _quicksave(self):
+        """Save, returning (ok, message) for the panel to show."""
+        try:
+            path = self.engine.save_board()
+        except (persistence.SaveError, OSError) as exc:
+            return (False, f"Save failed: {exc}")
+        self.last_plan = None
+        return (True, f"Saved {self.engine.board.live_count} entities "
+                      f"to {path}")
+
+    def _quickload(self, quiet=False):
+        """Load, returning (ok, message). `quiet` suppresses "no save yet",
+        which is the normal case on a first run rather than an error."""
+        path = persistence.DEFAULT_SAVE
+        if not os.path.exists(path):
+            return None if quiet else (False, f"No save at {path}")
+        try:
+            n = self.engine.load_board(path)
+        except (persistence.SaveError, OSError) as exc:
+            return (False, f"Load failed: {exc}")
+        # The loaded board has nothing to do with the in-flight gesture.
+        self.input.cancel()
+        self.last_plan = None
+        self._reset_tool_state()
+        return (True, f"Loaded {n} entities from {path}")
+
+    def autoload(self):
+        """Quickload at startup if a save exists. Returns (ok, msg) or None."""
+        result = self._quickload(quiet=True)
+        if result is not None:
+            self.ui.last_save = result
+        return result
 
     def _preview(self, tool):
         """Rebuild the preview for the active tool's current gesture."""
@@ -184,6 +221,10 @@ class Orchestrator:
                 self._preview(self.toolbelt.active)
         if requests.verify_round_trip:
             self.ui.last_verify = board.verify_round_trip()
+        if requests.quicksave:
+            self.ui.last_save = self._quicksave()
+        if requests.quickload:
+            self.ui.last_save = self._quickload()
 
         # 7. device sync, then render
         self.ui.last_upload = engine.sync_to_device()

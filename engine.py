@@ -14,6 +14,7 @@ from core.builders import BeltBuilder
 from core.engine_paths import bresenham, intent_dir, path_directions, plan_path
 from core.entity import Belt, Underground
 from core.gameboard import Gameboard
+from core import persistence
 
 # Re-exported so existing callers and tests keep working after the path
 # functions moved into engine_paths.
@@ -217,6 +218,27 @@ class Engine:
         view = self.board.spawn(entity_cls, x, y, direction, flipped=flipped)
         self.stats["placed"] += 1
         return view
+
+    # --- persistence -----------------------------------------------------
+    def save_board(self, path=None):
+        """Quicksave. Clears the preview first, since ghosts are not board
+        state -- they belong to a gesture in flight."""
+        path = path or persistence.DEFAULT_SAVE
+        self.clear_ghosts()
+        return persistence.save(self.board, path)
+
+    def load_board(self, path=None):
+        """Quickload, replacing everything. Returns the entity count.
+
+        Any in-flight preview is dropped: its ghost rows index the *old*
+        entity table and would dangle into the new one.
+        """
+        path = path or persistence.DEFAULT_SAVE
+        self.clear_ghosts()
+        n = persistence.load(self.board, path)
+        self.ghost_rows.clear()
+        self.preview_only_rows.clear()
+        return n
 
     # --- underground belts ----------------------------------------------
     def find_under_partner(self, x, y, direction, want_exit):
