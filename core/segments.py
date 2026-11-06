@@ -404,11 +404,37 @@ class SegmentIndex:
     def _is_tail(self, x, y):
         """Is (x, y) the upstream end of a run?
 
-        True when nothing feeds it, or when what feeds it is an underground
-        exit whose entrance is elsewhere (the run already accounts for the
-        jump from the entrance side).
+        Not just "no orthogonal neighbour feeds me". A paired underground
+        *exit* is fed across the buried span by an entrance several cells
+        away, which `_incoming()` cannot see -- it only probes the four
+        adjacent cells. Treating such an exit as a tail starts a second trace
+        over cells the entrance's run already covers, and the two segments
+        double-claim them.
         """
+        if self._fed_by_under(x, y) is not None:
+            return False
         return self._taken_from(x, y) is None
+
+    def _fed_by_under(self, x, y):
+        """The paired entrance diving into this underground exit, or None."""
+        row = self.board.entity_id_at(x, y)
+        if not row or not self.board.is_row_alive(row):
+            return None
+        view = self.board.view(row)
+        if view.type_id != cell.TYPE_UNDER or not view.is_exit:
+            return None
+        if not view.paired:
+            return None
+        mate = self.board.view(view.partner)
+        if mate.type_id != cell.TYPE_UNDER or mate.is_exit:
+            return None
+        # The entrance must still be a live, real cell that actually jumps
+        # here -- _under_jump() is the single authority for that.
+        ex, ey = mate.origin
+        jump = self._under_jump(ex, ey, mate.direction)
+        if jump is None or jump[0] != (x, y):
+            return None
+        return ex, ey
 
     def _trace(self, x, y):
         """Walk a whole run downstream from its tail. Returns (cells, length).

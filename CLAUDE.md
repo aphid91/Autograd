@@ -330,6 +330,13 @@ truth — delete every segment and they recompute from it. Membership is still
   which costs the O(1) trick nothing. This is why a segment's `length`
   (positions) is separate from its cell list, and why each cell stores its own
   offset rather than using its index in that list.
+
+  **A paired exit is therefore not a tail**, even though nothing adjacent
+  feeds it — its entrance is several cells away across the span, and
+  `_incoming()` only probes the four neighbours. Missing this started a
+  second trace from the exit over cells the entrance's run already claimed;
+  the duplicate only *appeared* when the exit came first in the row-major
+  scan, so westward and southward runs broke while eastward ones looked fine.
 - **Rebuilds are deferred to one per frame.** `Engine.invalidate_segments()`
   only marks stale; `sync_segments()` rebuilds once, before the tick. An erase
   drag over fifty cells rebuilds once.

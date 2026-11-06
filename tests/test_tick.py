@@ -10,6 +10,9 @@ the design says it does.
 scenario sees depends on the tick rate. Scenarios that count ticks set the
 rate explicitly rather than relying on the default.
 """
+import os
+import tempfile
+
 import glfw
 
 from core.tick import MAX_CATCHUP_TICKS, PHASE_BELT, PHASE_STRUCTURE
@@ -18,6 +21,11 @@ from tests import harness
 from tests.harness import (
     board, engine, fake, ok, orch, press_key, put_cursor_at_cell, step,
 )
+
+#: Never the default path. `save_board()` with no argument writes
+#: persistence.DEFAULT_SAVE relative to the cwd -- which, run from the repo
+#: root, is the player's own quicksave. A test must not be able to destroy it.
+_SCRATCH_SAVE = os.path.join(tempfile.gettempdir(), "gates_test_save.npz")
 
 
 def test_clock_advances_with_frames():
@@ -180,9 +188,13 @@ def test_board_edits_restart_the_timeline():
     engine.place_belt(10, 10)
     step(5)
     assert clock.tick > 0
-    engine.save_board()
-    engine.load_board()
-    assert clock.tick == 0, "load_board should restart the clock"
+    try:
+        engine.save_board(_SCRATCH_SAVE)
+        engine.load_board(_SCRATCH_SAVE)
+        assert clock.tick == 0, "load_board should restart the clock"
+    finally:
+        if os.path.exists(_SCRATCH_SAVE):
+            os.remove(_SCRATCH_SAVE)
     ok("load_board reset the tick counter")
 
 

@@ -150,6 +150,44 @@ def test_two_underground_pairs_chain():
     ok(f"two spans in one run: 1 segment, {seg.buried} buried positions")
 
 
+def test_underground_run_survives_scan_order():
+    """A paired exit is not a tail, whichever cell the scan reaches first.
+
+    An exit is fed across the buried span, which `_incoming()` cannot see --
+    it only probes the four adjacent cells. Treating the exit as a tail
+    starts a second trace over cells the entrance's run already covers, and
+    the two segments double-claim them.
+
+    The bug only *shows* when the exit is scanned before its entrance, so
+    every direction has to be checked: a run laid westward or southward puts
+    the exit earlier in row-major order, and that is the case the other
+    underground tests (all +X) never reach.
+    """
+    for direction, (sx, sy), step in (
+            (cell.DIR_PX, (5, 5), (1, 0)),
+            (cell.DIR_NX, (20, 8), (-1, 0)),
+            (cell.DIR_PY, (30, 5), (0, 1)),
+            (cell.DIR_NY, (35, 20), (0, -1))):
+        def at(i):
+            return (sx + step[0] * i, sy + step[1] * i)
+
+        engine.place_belt_path(at(0), at(2))
+        engine.place_under(*at(3), direction, is_exit=False)
+        engine.place_under(*at(7), direction, is_exit=True)
+        engine.place_belt_path(at(8), at(10))
+
+        index = _segs()
+        name = cell.DIR_NAMES[direction]
+        assert index.count == 1, (name, [str(s) for s in index.segments.values()])
+        seg = next(iter(index.segments.values()))
+        assert seg.cells[0] == at(0), (name, seg.cells[0])
+        assert seg.cells[-1] == at(10), (name, seg.cells[-1])
+        assert seg.buried == 3, (name, seg.buried)
+        _clean()
+        harness.reset()
+    ok("a paired exit is never a tail, in all four directions")
+
+
 def test_unpaired_entrance_ends_a_run():
     """An unpaired entrance leads nowhere, so the run stops there."""
     engine.place_belt_path((5, 5), (8, 5))

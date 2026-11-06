@@ -2,5 +2,4 @@ __pycache__/
 *.pyc
 .venv/
 imgui.ini
-quicksave.npz
 *.npz
