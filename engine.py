@@ -14,6 +14,7 @@ from core.builders import BeltBuilder
 from core.engine_paths import bresenham, intent_dir, path_directions, plan_path
 from core.entity import Belt, Underground
 from core.gameboard import Gameboard
+from core.segments import SegmentIndex
 from core.tick import Clock
 from core import persistence
 
@@ -39,6 +40,18 @@ class Engine:
         # accumulator and the phase order; see core/tick.py. Subsystems
         # register their phase callbacks on it as they are built.
         self.clock = Clock()
+        # Belt segments: derived from the grid, rebuilt whenever belts change.
+        # The simulation ticks segments, not cells -- see core/segments.py.
+        self.segments = SegmentIndex(self.board)
+        #: Set when something has changed that segments depend on. Rebuilding
+        #: is deferred to one point per frame rather than done per edit: an
+        #: erase drag touches many cells, and a rebuild per cell would be
+        #: wasted work on state nothing has read yet.
+        self._segments_stale = True
+        # Any grid write marks segments stale. Hooked at the board rather
+        # than at each call site here, so a new edit path cannot forget to
+        # invalidate -- see Gameboard._grid_changed().
+        self.board.on_grid_change = self.invalidate_segments
         # Ghost rows that will become real on commit.
         self.ghost_rows = []
         # Ghost rows that exist only to show the player what *would* fit, from
@@ -351,6 +364,28 @@ class Engine:
         self.clock.reset()
 
     # --- simulation ------------------------------------------------------
+    def invalidate_segments(self):
+        """Mark the segment index as needing a rebuild.
+
+        Called by every path that changes what a run looks like. Cheap and
+        idempotent: the rebuild itself happens once per frame in
+        sync_segments(), so an erase drag over fifty cells still rebuilds
+        once rather than fifty times.
+        """
+        self._segments_stale = True
+
+    def sync_segments(self):
+        """Rebuild the segment index if anything invalidated it.
+
+        Returns the number of segments if a rebuild happened, else None.
+        Called once per frame before the tick, so the simulation always runs
+        against segments matching the board the player just edited.
+        """
+        if not self._segments_stale:
+            return None
+        self._segments_stale = False
+        return self.segments.rebuild()
+
     def tick(self, dt):
         """Advance the simulation clock, running whatever ticks are due.
 

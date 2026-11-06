@@ -30,6 +30,9 @@ SHADER_DIR = os.path.join(
 )
 
 _INCLUDE_RE = re.compile(r'^[ \t]*#include[ \t]+"([^"]+)"[ \t]*$', re.MULTILINE)
+#: The `#version` line, which must stay first in the file -- injected defines
+#: go immediately after it.
+_VERSION_RE = re.compile(r'^[ \t]*#version[^\n]*$', re.MULTILINE)
 
 
 class ShaderError(Exception):
@@ -40,8 +43,16 @@ def shader_path(name):
     return os.path.join(SHADER_DIR, name)
 
 
-def load(name, _seen=None):
-    """Read a shader and splice in its includes. Returns the source text."""
+def load(name, defines=None, _seen=None):
+    """Read a shader and splice in its includes. Returns the source text.
+
+    `defines` is an optional iterable of preprocessor symbols to define at the
+    top of the *outermost* file, used for genuinely optional features like the
+    segment debug overlay. They go in via `#define` rather than a uniform
+    deliberately: an `#ifdef`-guarded block is not compiled at all when the
+    symbol is absent, so a debug overlay costs exactly nothing when off --
+    whereas a uniform branch would still be evaluated per pixel.
+    """
     if _seen is None:
         _seen = set()
 
@@ -61,10 +72,20 @@ def load(name, _seen=None):
             return f"// #include \"{inc}\" (already included)"
         # Mark the boundary so a compile error's line numbers are at least
         # traceable to a file, even though GLSL will renumber them.
-        body = load(inc, _seen)
+        # Defines are injected once, at the outermost file, so an included
+        # file does not re-emit them.
+        body = load(inc, None, _seen)
         return f"// ---- begin {inc} ----\n{body}\n// ---- end {inc} ----"
 
     src = _INCLUDE_RE.sub(substitute, src)
+
+    # Inject the requested defines. They must land *after* the #version
+    # directive, which GLSL requires to be the first non-comment line, so
+    # this splices after that line rather than prepending.
+    if defines:
+        block = "\n".join(f"#define {d} 1" for d in defines)
+        src = _VERSION_RE.sub(
+            lambda m: f"{m.group(0)}\n{block}", src, count=1)
 
     # Splice in the per-type tables generated from core/entity.py. Done here
     # rather than written to a file so there is no generated artefact to get

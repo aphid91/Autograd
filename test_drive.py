@@ -23,7 +23,9 @@ importing anything here exercises the cell encoding and the entity geometry.
 
 import sys
 
-from tests import harness, test_glsl, test_scenarios, test_tick
+from tests import (
+    harness, test_glsl, test_scenarios, test_segments, test_tick,
+)
 
 
 def _scenarios(module):
@@ -42,6 +44,7 @@ def main(argv):
     ran = harness.run_all(_scenarios(test_glsl), only=only, reset_each=False)
     ran += harness.run_all(_scenarios(test_scenarios), only=only)
     ran += harness.run_all(_scenarios(test_tick), only=only)
+    ran += harness.run_all(_scenarios(test_segments), only=only)
     if not ran:
         print(f"no tests matched {only!r}")
         return 1

@@ -49,6 +49,9 @@ class Orchestrator:
         self.last_plan = None
 
         self.cursor_cell = None
+        #: Segments rebuilt this frame, or None if the index was already
+        #: current. Shown in the inspection panel.
+        self.last_rebuild = None
         # Headless test harnesses set this to skip the imgui panel, which needs
         # a real backend (font atlas, texture upload) to build a frame.
         self.draw_ui = True
@@ -241,10 +244,23 @@ class Orchestrator:
             engine.clock.request_step()
         if requests.tick_rate is not None:
             engine.clock.set_rate(requests.tick_rate)
+        if requests.segment_debug is not None:
+            self.camera.set_define("SEGMENT_DEBUG", requests.segment_debug)
+        if requests.rebuild_segments:
+            engine.invalidate_segments()
+        if requests.audit_segments:
+            problems = engine.segments.audit()
+            self.ui.last_audit = (len(problems), problems[:6])
 
         # 7. simulation. After every player mutation, so a tick acts on the
         # board as just edited; before the device sync, so its effects are
         # drawn this frame rather than next.
+        #
+        # Segments are re-derived first: the tick runs on segments, so they
+        # must match the board the player just edited. Once per frame rather
+        # than once per edit -- an erase drag touches many cells and only the
+        # final shape matters.
+        self.last_rebuild = engine.sync_segments()
         engine.tick(dt)
 
         # 8. device sync, then render

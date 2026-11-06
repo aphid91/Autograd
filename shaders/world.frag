@@ -91,6 +91,17 @@ uniform float sim_alpha;      // fraction into the next tick, 0..1
 // Entity.Underground.MAX_SPAN -- test_drive.py pins the two together.
 #define UNDER_MAX_SPAN    5
 
+// --- segment debug overlay ---
+// Tints each belt cell by a hash of its segment id, so a run's extent and
+// where it is cut are visible at a glance. Compiled out entirely unless
+// SEGMENT_DEBUG is defined -- the loader injects that define when the
+// inspection panel asks for it, so this costs nothing when off.
+#define SEG_DEBUG_ALPHA   0.55
+#define SEG_DEBUG_INSET   0.34   // half-extent of the tinted patch, in cells
+// Marks the tail (upstream) end of each segment with a brighter dot, so the
+// direction a run is indexed from is readable.
+#define SEG_DEBUG_TAIL_R  0.12
+
 // --- ghosts / overlays ---
 #define GHOST_ALPHA       0.45
 #define FRUSTRATED_ALPHA  0.55
@@ -225,10 +236,12 @@ BeltDraw draw_belt(vec2 p, ivec2 ci, ivec4 c, float px, vec2 world) {
     float half_w = BELT_WIDTH * 0.5;
     float sd = sd_segment(p, vec2(0.0), out_vec * 0.5) - half_w;
 
-    // Every incoming neighbour adds an arm from its edge to the centre. With
-    // no incoming belts at all the spine still covers the whole cell, so an
-    // isolated belt reads as a full tile rather than a half one.
-    int in_count = 0;
+    // Gather every neighbour emitting at us, then let take_dir() pick the one
+    // the *simulation* will actually take from. Belts never merge here, so
+    // drawing an arm per candidate would show material arriving down a path
+    // nothing travels -- the phantom merge. Exactly one incoming arm is drawn,
+    // chosen by the same rule core/segments.py uses.
+    int in_mask_belt = 0;
     for (int d = 0; d < 4; ++d) {
         // Never treat the cell we output into as a source. A structure can
         // have an output face pointing back at a belt that feeds it (a
@@ -241,14 +254,15 @@ BeltDraw draw_belt(vec2 p, ivec2 ci, ivec4 c, float px, vec2 world) {
         // A neighbour in direction d feeds us if it faces the opposite way.
         int toward = (d + 2) % 4;
         if (!feeds_into(nc, toward, c.z)) continue;
-        in_count++;
-        sd = min(sd, sd_segment(p, vec2(0.0), dir_vec(d) * 0.5) - half_w);
+        in_mask_belt |= 1 << d;
     }
-    bool any_in = in_count > 0;
-    // A junction is anywhere more than one stream arrives, or where the one
-    // arriving stream is not the one leaving (a corner is not a junction --
-    // its single stream simply bends, and should stay continuous).
-    bool is_merge = in_count > 1;
+    int in_dir = take_dir(out_dir, in_mask_belt);
+    if (in_dir >= 0) {
+        sd = min(sd, sd_segment(p, vec2(0.0), dir_vec(in_dir) * 0.5) - half_w);
+    }
+    bool any_in = in_dir >= 0;
+    // With one source at most there is no merge left to draw: a corner has
+    // one stream in and one out, and stays continuous.
     if (!any_in) {
         // Extend backwards so a lone belt or a run start fills its cell.
         sd = min(sd, sd_segment(p, -out_vec * 0.5, out_vec * 0.5) - half_w);
@@ -277,30 +291,17 @@ BeltDraw draw_belt(vec2 p, ivec2 ci, ivec4 c, float px, vec2 world) {
                                         wphase - dot(p, out_vec), px));
     }
 
-    for (int d = 0; d < 4; ++d) {
-        // Same rule as the spine: the cell we output into is never a source.
-        if (d == out_dir) continue;
-
-        ivec2 nc = ci + DIR_VECS[d];
-        int toward = (d + 2) % 4;
-        if (!feeds_into(nc, toward, c.z)) continue;
-        // Incoming from direction d: material travels from that edge toward
-        // the centre, i.e. along -dir_vec(d). The arm spans t in 0..0.5
-        // measured along the travel direction.
-        // A stream arriving from directly behind us travels the same axis as
-        // our outgoing stream. The outgoing pass below already marches the
-        // whole cell on that axis with the correct world phase, so drawing
-        // this one too would lay a second lattice over the first at a
-        // different offset -- visible as doubled chevrons. Skip it.
-        bool straight_through = (d == (out_dir + 2) % 4);
-        if (straight_through) continue;
-
-        vec2 axis = -dir_vec(d);
+    // The single incoming arm, if it is not collinear with the outgoing one.
+    // A stream arriving from directly behind travels our own axis, and the
+    // outgoing pass above already marched the whole cell on that axis with
+    // the correct world phase -- drawing it again would lay a second lattice
+    // at a different offset, visible as doubled chevrons.
+    if (in_dir >= 0 && in_dir != (out_dir + 2) % 4) {
+        // Material travels from that edge toward the centre, i.e. along
+        // -dir_vec(in_dir).
+        vec2 axis = -dir_vec(in_dir);
         float wphase = dot(world, axis);
-        // Tributaries stop short of the centre at a true merge so converging
-        // streams stay legible.
-        float t_end = is_merge ? -MERGE_GAP : 0.0;
-        chev = max(chev, chevrons_along(p, axis, -0.5, t_end,
+        chev = max(chev, chevrons_along(p, axis, -0.5, 0.0,
                                         wphase - dot(p, axis), px));
     }
 
@@ -395,6 +396,37 @@ float span_dots(vec2 p, vec2 axis, vec2 world, float px) {
     }
     return fill(best, px);
 }
+
+#ifdef SEGMENT_DEBUG
+// ======================================================================
+// Segment debug overlay
+// ======================================================================
+//
+// Belt segments are *derived* state -- core/segments.py rebuilds them from
+// the grid -- and the failure mode of derived state is being quietly wrong
+// while looking internally consistent. This makes the derivation visible:
+// every cell of a run gets the same hashed colour, so a run that is cut
+// where it should not be, or fused with its neighbour, shows up immediately.
+//
+// Pairs with the inspection panel's audit(), which checks the same thing
+// numerically. The overlay localises a problem; the audit names it.
+
+// A segment id -> a distinct, reasonably bright colour. Any cheap integer
+// hash does; this is the usual xorshift-and-multiply with the result spread
+// across the three channels.
+vec3 segment_colour(int sid) {
+    uint h = uint(sid) * 2654435761u;
+    h ^= h >> 15;
+    h *= 2246822519u;
+    h ^= h >> 13;
+    // Keep saturation and value high so adjacent segments stay separable
+    // against the dark background, varying only the hue.
+    float hue = float(h & 1023u) / 1024.0;
+    vec3 k = fract(vec3(hue) + vec3(0.0, 0.6667, 0.3333));
+    vec3 rgb = clamp(abs(k * 6.0 - 3.0) - 1.0, 0.0, 1.0);
+    return mix(vec3(1.0), rgb, 0.85);
+}
+#endif
 
 // A port arrow: a chevron at `offset` from the cell centre, pointing along
 // `face` (outward) or against it (inward).
@@ -678,6 +710,27 @@ void main() {
             col = mix(col, COL_IN,  a_in  * alpha_scale);//can extend outside a_body
             col = mix(col, COL_OUT, a_out * alpha_scale);//can extend outside a_body
         }
+
+#ifdef SEGMENT_DEBUG
+        // Tint belt cells by segment, over the entity so the run's shape
+        // reads through whatever is drawn beneath.
+        {
+            int sid = segment_id(c.w);
+            if (sid != 0) {
+                // Not named `patch` -- that is a GLSL reserved word.
+                float tint = fill(sd_box(p, vec2(SEG_DEBUG_INSET)), px);
+                col = mix(col, segment_colour(sid), tint * SEG_DEBUG_ALPHA);
+                // Offset 0 is the tail: where items enter and where the
+                // closed form measures from. Marking it makes the run's
+                // direction of indexing visible, which is what tells you a
+                // segment was traced the wrong way round.
+                if (segment_offset(c.w) == 0) {
+                    float dot_a = fill(length(p) - SEG_DEBUG_TAIL_R, px);
+                    col = mix(col, vec3(1.0), dot_a * 0.9);
+                }
+            }
+        }
+#endif
 
         // Frustration is an overlay, never a replacement: whatever occupies
         // the cell is drawn above, and this tints on top so you can see

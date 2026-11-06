@@ -111,6 +111,12 @@ class Gameboard:
 
         self.grid_dirty = DirtyRect()
         self.entities_dirty = DirtyRange()
+        #: Called with no arguments whenever a grid cell changes. Set by the
+        #: engine so derived state (belt segments) can mark itself stale.
+        #: A callback here rather than annotations at each mutation site:
+        #: every grid write already funnels through mark_dirty(), so this is
+        #: the one place that cannot be forgotten as new edit paths are added.
+        self.on_grid_change = None
         self.mark_all_dirty()
 
         # Device resources, created by create_device_resources().
@@ -146,6 +152,10 @@ class Gameboard:
     def mark_all_dirty(self):
         self.grid_dirty.add_rect(0, 0, self.width, self.height)
         self.entities_dirty.add_range(0, self.capacity)
+        # A wholesale replacement (persistence.load) goes through here rather
+        # than through write_cell(), so this has to notify too -- otherwise a
+        # loaded board would keep the previous board's segments.
+        self._grid_changed()
 
     # --- grid access ----------------------------------------------------
     def cell_word(self, x, y):
@@ -160,17 +170,56 @@ class Gameboard:
             return False
         return cell.is_empty(self.grid[y, x, cell.CH_X])
 
+    def _real_content(self, x, y):
+        """What derived state sees at a cell: its .x word, or 0 if a ghost.
+
+        Segment derivation ignores GHOST_PENDING cells, so for its purposes a
+        ghosted cell is indistinguishable from an empty one. Collapsing that
+        to a single comparable value is what lets write_cell() tell a
+        meaningful edit from preview churn.
+
+        Frustrated cells are *not* collapsed: the overlay leaves the
+        occupant's .x intact and the derivation counts it, so a frustrated
+        belt cell is still fully part of its run.
+        """
+        if cell.ghost_state(self.grid[y, x, cell.CH_Z]) == cell.GHOST_PENDING:
+            return 0
+        return int(self.grid[y, x, cell.CH_X])
+
     def write_cell(self, x, y, word_x, word_y=0, word_z=0, word_w=0):
         if not self.in_bounds(x, y):
             raise IndexError(f"({x}, {y}) out of bounds")
+        # Notify iff the cell's *real* content changes. A moving ghost
+        # preview rewrites a handful of cells every frame, and since the
+        # derivation skips ghosts those writes cannot change its answer --
+        # notifying anyway would rebuild the whole index once per frame for
+        # an identical result, which on a 512x512 board is a real cost.
+        before = self._real_content(x, y)
         self.grid[y, x] = (word_x, word_y, word_z, word_w)
         self.mark_dirty(x, y)
+        if self._real_content(x, y) != before:
+            self._grid_changed()
 
     def clear_cell(self, x, y):
         if not self.in_bounds(x, y):
             return
+        before = self._real_content(x, y)
         self.grid[y, x] = 0
         self.mark_dirty(x, y)
+        if before != 0:
+            self._grid_changed()
+
+    def _grid_changed(self):
+        """Tell whoever is listening that the grid's contents changed.
+
+        Deliberately *not* called by mark_dirty(): that only says a region
+        must be re-uploaded, which is also true when nothing about the
+        topology moved (a segment stamp, say). Only writes that can change
+        what a belt run looks like notify -- see write_cell() for why ghost
+        churn is excluded.
+        """
+        if self.on_grid_change is not None:
+            self.on_grid_change()
 
     def entity_id_at(self, x, y):
         """Row index of the entity occupying (x, y), or 0 if none."""
@@ -341,9 +390,19 @@ class Gameboard:
         )
         self._frustrated.append((x, y))
         self.mark_dirty(x, y)
+        # Deliberately does NOT notify derived state. The overlay leaves .x
+        # alone, and segment derivation counts frustrated cells as real, so
+        # nothing it sees has moved. Notifying here would rebuild the index
+        # every frame a blocked structure is waved over a belt -- and, before
+        # the derivation counted them, briefly cut the run in two and
+        # destroyed the items on it.
 
     def clear_frustrated(self):
-        """Drop every frustration overlay. Does not touch entities."""
+        """Drop every frustration overlay. Does not touch entities.
+
+        Like set_frustrated(), does not notify derived state: the overlay was
+        never visible to it.
+        """
         for (x, y) in self._frustrated:
             if not self.in_bounds(x, y):
                 continue

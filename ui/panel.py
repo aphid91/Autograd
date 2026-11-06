@@ -13,7 +13,8 @@ class UIRequests:
     __slots__ = ("reload_shader", "frame_board", "clear_board",
                  "verify_round_trip", "select_slot", "cycle_tool",
                  "cycle_backward", "flip_tool", "quicksave", "quickload",
-                 "toggle_pause", "step_tick", "tick_rate")
+                 "toggle_pause", "step_tick", "tick_rate",
+                 "segment_debug", "rebuild_segments", "audit_segments")
 
     def __init__(self):
         self.reload_shader = False
@@ -30,6 +31,10 @@ class UIRequests:
         self.step_tick = False
         #: New ticks/sec, or None to leave the rate alone.
         self.tick_rate = None
+        #: New state for the shader's segment overlay, or None for no change.
+        self.segment_debug = None
+        self.rebuild_segments = False
+        self.audit_segments = False
 
 
 class UI:
@@ -38,6 +43,128 @@ class UI:
         self.last_upload = (0, 0)
         #: None, or (ok, message) from the last save/load attempt.
         self.last_save = None
+        #: Whether the segment inspector window is open. Everything expensive
+        #: it does is inside this guard, so a closed inspector costs one bool
+        #: test per frame.
+        self.show_segments = False
+        #: Result of the last audit: None, or (problem_count, first_few).
+        self.last_audit = None
+
+    # --- segment inspector ----------------------------------------------
+    def draw_segment_inspector(self, orch, req):
+        """Observability for the segment index. Only drawn when open.
+
+        Segments are derived state rebuilt from the grid, and the thing that
+        goes wrong with derived state is disagreeing with its source while
+        staying internally consistent. This window exists to make that
+        visible: counts and pool state for the whole index, the full ring
+        state of whatever the cursor is over, and an audit that checks the
+        index against the grid cell by cell.
+
+        Pairs with the shader's SEGMENT_DEBUG overlay -- the overlay shows
+        *where* a run is wrong, this says *what* is wrong with it.
+        """
+        expanded, self.show_segments = imgui.begin(
+            "Segments", self.show_segments)
+        if not expanded:
+            imgui.end()
+            return
+
+        engine = orch.engine
+        index = engine.segments
+        board = engine.board
+
+        # --- overview ---
+        imgui.text(f"Segments: {index.count}")
+        imgui.text(f"Items:    {index.total_items()}")
+        st = index.stats
+        imgui.text(f"Rebuilds: {st['rebuilds']}   "
+                   f"built {st['segments_built']}")
+        imgui.text(f"Items dropped to edits: {st['items_dropped']}")
+        if orch.last_rebuild is not None:
+            imgui.text_disabled(
+                f"rebuilt this frame: {orch.last_rebuild} segments")
+        else:
+            imgui.text_disabled("index current (no rebuild this frame)")
+
+        # --- id pool ---
+        imgui.separator()
+        imgui.text_unformatted("Id pool")
+        imgui.text(f"Next id: {index._next_sid}   "
+                   f"free: {len(index._free_sids)}")
+        # A free list longer than the live set means ids are churning, which
+        # is expected while editing and suspicious while idle.
+        total = index.count + len(index._free_sids)
+        imgui.text(f"Allocated ever: {total}")
+
+        # --- cells ---
+        imgui.separator()
+        imgui.text_unformatted("Capacity")
+        cells = sum(len(s.cells) for s in index.segments.values())
+        positions = sum(s.length for s in index.segments.values())
+        ring = sum(s.cap for s in index.segments.values())
+        imgui.text(f"Belt cells:     {cells}")
+        imgui.text(f"Item positions: {positions}"
+                   f"   (+{positions - cells} buried)")
+        imgui.text(f"Ring slots:     {ring}")
+
+        # --- the hovered segment ---
+        imgui.separator()
+        imgui.text_unformatted("Under cursor")
+        seg = None
+        if orch.cursor_cell is not None:
+            cx, cy = orch.cursor_cell
+            if board.in_bounds(cx, cy):
+                seg = index.at(cx, cy)
+        if seg is None:
+            imgui.text_disabled("no segment under the cursor")
+        else:
+            cx, cy = orch.cursor_cell
+            imgui.text(f"Segment {seg.sid}")
+            imgui.text(f"  tail {seg.cells[0]} -> head {seg.cells[-1]}")
+            imgui.text(f"  length {seg.length} positions, "
+                       f"{len(seg.cells)} cells")
+            if seg.buried:
+                imgui.text(f"  buried (underground): {seg.buried}")
+            imgui.text(f"  this cell's offset: {index.offset_at(cx, cy)}")
+            imgui.separator()
+            imgui.text_unformatted("  Ring")
+            imgui.text(f"    head {seg.head}  tail {seg.tail}  "
+                       f"count {seg.count}")
+            imgui.text(f"    base {seg.base}  cap {seg.cap}")
+            imgui.text(f"    anchor (packed head pos) {seg.anchor}")
+            imgui.text_unformatted("  Ends")
+            imgui.text(f"    src {seg.src if seg.src else '(dangling)'}")
+            imgui.text(f"    dst {seg.dst if seg.dst else '(dangling)'}")
+
+        # --- controls ---
+        imgui.separator()
+        changed, on = imgui.checkbox(
+            "Segment colour overlay", "SEGMENT_DEBUG" in orch.camera.defines)
+        if changed:
+            req.segment_debug = on
+        imgui.text_disabled("recompiles the shader; zero cost when off")
+        if imgui.button("Force rebuild"):
+            req.rebuild_segments = True
+        imgui.same_line()
+        if imgui.button("Audit"):
+            req.audit_segments = True
+        if self.last_audit is not None:
+            count, sample = self.last_audit
+            if count == 0:
+                imgui.push_style_color(
+                    imgui.Col_.text, imgui.ImVec4(0.4, 1, 0.4, 1))
+                imgui.text("audit clean")
+                imgui.pop_style_color()
+            else:
+                imgui.push_style_color(
+                    imgui.Col_.text, imgui.ImVec4(1, 0.3, 0.3, 1))
+                imgui.text(f"{count} PROBLEM(S)")
+                for line in sample:
+                    imgui.text_wrapped(f"  {line}")
+                imgui.pop_style_color()
+
+        imgui.end()
 
     # --- toolbelt -------------------------------------------------------
     def draw_toolbelt(self, orch, req):
@@ -126,6 +253,8 @@ class UI:
         io = imgui.get_io()
 
         self.draw_toolbelt(orch, req)
+        if self.show_segments:
+            self.draw_segment_inspector(orch, req)
 
         imgui.begin("Gates")
 
@@ -156,6 +285,9 @@ class UI:
         # wall-clock and is deliberately running late -- see MAX_CATCHUP_TICKS.
         if clock.dropped_ticks:
             imgui.text_disabled(f"dropped {clock.dropped_ticks} ticks")
+        imgui.text(f"Segments: {engine.segments.count}")
+        _changed, self.show_segments = imgui.checkbox(
+            "Inspect segments", self.show_segments)
 
         imgui.separator()
         imgui.text_unformatted("Build")

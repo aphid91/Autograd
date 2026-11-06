@@ -13,7 +13,9 @@ duplicated in GLSL at the top of world.frag -- KEEP THE TWO IN SYNC.
         bit  3       underground end is an exit (not an entrance)
         bit  4       underground end is paired with a partner
         bits 5-31   reserved
-    .w              reserved
+    .w  bits 0-15    offset along the belt segment, from its tail
+        bits 16-30   segment id (0 = not on a segment)
+        bit  31      unused -- deliberately clear, as in .x
 
 GHOST_FRUSTRATED is an overlay, not an entity. A frustrated cell is one a
 pending build wants but cannot have, which means something is already there --
@@ -33,6 +35,18 @@ bit 31 -- the int32 sign bit -- is never set. The grid texture is signed
 break Python-side comparisons and need sign-aware unpacking in GLSL. Keeping
 every word non-negative is worth one bit of a field that already addresses
 4.2M entities.
+
+`.w` carries belt-segment membership: which segment a belt cell belongs to,
+and how far along that segment it sits. Both live in the cell rather than
+being looked up because the fragment shader needs them for a cell it has
+*already* fetched -- deciding whether an item disc covers this pixel costs no
+extra texture reads. The same 31-bit discipline applies: the segment id is 15
+bits, so bit 31 stays clear.
+
+Segment membership is **derived state**, not authored: core/segments.py
+rebuilds it from the grid whenever belts change. It is still stored in the
+grid (rather than recomputed per frame) because the renderer cannot afford to
+walk a run per pixel.
 """
 
 import numpy as np
@@ -241,6 +255,55 @@ def unpack_local(word):
     return (word >> LOCAL_SHIFT) & LOCAL_MASK, word & LOCAL_MASK
 
 
+# --- .w: belt segment membership ---------------------------------------
+# Which segment a belt cell belongs to, and its distance from that segment's
+# tail (the upstream end, where items enter). Derived state, rebuilt by
+# core/segments.py; stored in the cell so the fragment shader gets it from a
+# texel it has already fetched.
+SEG_OFF_SHIFT, SEG_OFF_BITS = 0, 16
+SEG_ID_SHIFT, SEG_ID_BITS = 16, 15   # 15 not 16: keeps bit 31 (sign) clear
+
+SEG_OFF_MASK = (1 << SEG_OFF_BITS) - 1
+SEG_ID_MASK = (1 << SEG_ID_BITS) - 1
+
+#: Highest segment id a cell can name. Segment 0 is "no segment", mirroring
+#: entity row 0 being the null entity.
+MAX_SEGMENT_ID = SEG_ID_MASK
+#: Longest run a single segment may cover, since every cell must be able to
+#: record its own offset.
+MAX_SEGMENT_LEN = SEG_OFF_MASK + 1
+
+
+def pack_segment(segment_id=0, offset=0):
+    """Pack channel .w. Segment 0 packs to exactly 0 -- "not on a segment"."""
+    if segment_id == 0:
+        return 0
+    if not 0 <= segment_id <= MAX_SEGMENT_ID:
+        raise ValueError(f"segment id {segment_id} exceeds {MAX_SEGMENT_ID}")
+    if not 0 <= offset <= SEG_OFF_MASK:
+        raise ValueError(f"segment offset {offset} exceeds {SEG_OFF_MASK}")
+    return (segment_id << SEG_ID_SHIFT) | (offset << SEG_OFF_SHIFT)
+
+
+def unpack_segment(word):
+    """(segment_id, offset) from a channel .w word."""
+    word = int(word)
+    return ((word >> SEG_ID_SHIFT) & SEG_ID_MASK,
+            (word >> SEG_OFF_SHIFT) & SEG_OFF_MASK)
+
+
+def segment_id(word):
+    return (int(word) >> SEG_ID_SHIFT) & SEG_ID_MASK
+
+
+def segment_offset(word):
+    return (int(word) >> SEG_OFF_SHIFT) & SEG_OFF_MASK
+
+
+def segment_id_arr(words):
+    return np.right_shift(words, SEG_ID_SHIFT) & SEG_ID_MASK
+
+
 # --- .z: ghost state ----------------------------------------------------
 def pack_flags(ghost_state=GHOST_NONE, flipped=False, under_exit=False,
                under_paired=False):
@@ -357,6 +420,25 @@ def _self_check():
 
     words = np.array([EMPTY_WORD, pack_cell(TYPE_BELT, DIR_PX, 5)], dtype=np.int32)
     assert list(is_empty_arr(words)) == [True, False]
+
+    # --- .w: segment membership ---
+    assert pack_segment(0, 0) == 0
+    assert pack_segment(0, 7) == 0, "no segment means no offset either"
+    assert unpack_segment(0) == (0, 0)
+    for sid in (1, 2, 999, MAX_SEGMENT_ID):
+        for off in (0, 1, 5, SEG_OFF_MASK):
+            w = pack_segment(sid, off)
+            assert unpack_segment(w) == (sid, off), (sid, off, w)
+            assert segment_id(w) == sid
+            assert segment_offset(w) == off
+            # Same int32-sign discipline as .x: never let bit 31 be set.
+            assert w > 0 and w <= 0x7FFFFFFF, (sid, off, w)
+            assert int(np.array([w], dtype=np.int32)[0]) == w, (sid, off)
+    # The id and offset fields must not bleed into one another.
+    assert segment_offset(pack_segment(MAX_SEGMENT_ID, 0)) == 0
+    assert segment_id(pack_segment(1, SEG_OFF_MASK)) == 1
+    segs = np.array([0, pack_segment(3, 2), pack_segment(1, 0)], dtype=np.int32)
+    assert list(segment_id_arr(segs)) == [0, 3, 1]
 
 
 _self_check()

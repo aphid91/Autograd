@@ -665,14 +665,29 @@ def test_save_load():
     _want_ent = board.entities.copy()
     _want_alloc = (board.live_count, board._next_row, list(board._free_rows))
     _ua_row, _ub_row = _ua.row, _ub.row
+    # Segment *shape*, keyed on endpoints rather than ids -- see the note on
+    # the grid comparison below.
+    _want_segs = {(s.cells[0], s.cells[-1], s.length)
+                  for s in engine.segments.segments.values()}
 
     engine.save_board(_savepath)
     engine.clear_board(); step()
     assert board.live_count == 0
     _n = engine.load_board(_savepath)
+    # A step so belt segments are re-derived before comparing.
+    step()
 
     assert _n == _want_alloc[0], (_n, _want_alloc[0])
-    assert np.array_equal(board.grid, _want_grid), "grid differs after reload"
+    # Channels .x/.y/.z are the persistent ones and must come back verbatim.
+    # .w is excluded on purpose: it holds belt-segment membership, which is
+    # derived state rebuilt from the grid, and its *ids* are arbitrary labels
+    # handed out in scan order. A reload re-derives the same segmentation
+    # with different ids, so comparing .w would assert on the allocator's
+    # bookkeeping rather than on anything about the board. The segmentation
+    # itself is checked structurally just below.
+    assert np.array_equal(board.grid[:, :, :cell.CH_W],
+                          _want_grid[:, :, :cell.CH_W]), \
+        "grid differs after reload"
     assert np.array_equal(board.entities, _want_ent), "entity table differs"
     # The allocator is part of the state: entity ids are baked into grid cells,
     # so a wrong free list would hand out a row that is still in use.
@@ -680,6 +695,17 @@ def test_save_load():
             list(board._free_rows)) == _want_alloc
     ok(f"save/load round trip is exact ({_n} entities, "
        f"free list {_want_alloc[2]})")
+
+    # The segmentation itself must come back, even though its ids need not.
+    # Compare the *shape* of the index: which cell runs exist, keyed by their
+    # endpoints rather than by id.
+    _shape = {(s.cells[0], s.cells[-1], s.length)
+              for s in engine.segments.segments.values()}
+    assert _shape == _want_segs, (
+        f"segmentation differs after reload:\n"
+        f"  before {sorted(_want_segs)}\n  after  {sorted(_shape)}")
+    assert not engine.segments.audit(), engine.segments.audit()
+    ok(f"belt segmentation re-derived identically ({len(_shape)} segments)")
 
     # Entity-level state has to survive, not just the bytes.
     _a, _b = board.view(_ua_row), board.view(_ub_row)

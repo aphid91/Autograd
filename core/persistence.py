@@ -48,11 +48,19 @@ def save(board, path):
             f"refusing to save with {ghosts} ghost/frustrated cells still "
             f"set -- clear the preview first")
 
+    # .w carries belt-segment membership, which is derived from the rest of
+    # the grid and whose ids mean nothing without the live SegmentIndex.
+    # Saved as zero so a reloaded board is byte-identical to a freshly
+    # derived one: the engine rebuilds segments on the next frame either way,
+    # and persisting ids that will be reallocated differently is a trap.
+    saved_grid = board.grid.copy()
+    saved_grid[:, :, cell.CH_W] = 0
+
     np.savez_compressed(
         path,
         version=np.array([FORMAT_VERSION], dtype=np.int32),
         size=np.array([board.width, board.height], dtype=np.int32),
-        grid=board.grid,
+        grid=saved_grid,
         entities=board.entities,
         # The allocator is part of the state: entity ids are embedded in grid
         # cells, so the free list and the high-water mark have to come back
@@ -106,6 +114,13 @@ def load(board, path):
             f"{ENTITY_STRIDE}")
 
     board.grid[:] = grid.astype(np.int32, copy=False)
+    # .w holds belt-segment membership, which is *derived* from the rest of
+    # the grid and whose ids are only meaningful alongside the live
+    # SegmentIndex. Clear it rather than trusting the file: the engine
+    # re-derives segments on the next frame, and a stale id here would have
+    # cells pointing at segments that do not exist. Saving it is harmless;
+    # believing it is not.
+    board.grid[:, :, cell.CH_W] = 0
     # The table may have grown since the save; keep the larger of the two so
     # capacity never shrinks under live rows.
     rows = entities.shape[0]

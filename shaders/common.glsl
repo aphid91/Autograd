@@ -16,6 +16,9 @@ const int FLIP_SHIFT = 2;   // .z bit 2: mirrored about the authored X axis
 const int UNDER_EXIT_SHIFT   = 3;   // .z bit 3: this end surfaces
 const int UNDER_PAIRED_SHIFT = 4;   // .z bit 4: this end has a partner
 const int LOCAL_SHIFT = 16, LOCAL_MASK = 0xFFFF;
+// .w: belt segment membership. Derived state, stamped by core/segments.py.
+const int SEG_OFF_SHIFT = 0,  SEG_OFF_MASK = 0xFFFF;
+const int SEG_ID_SHIFT  = 16, SEG_ID_MASK  = 0x7FFF;  // 15 bits: sign stays clear
 
 const int GHOST_NONE       = 0;
 const int GHOST_PENDING    = 1;
@@ -51,6 +54,13 @@ bool is_under_paired(int w) { return ((w >> UNDER_PAIRED_SHIFT) & 1) != 0; }
 ivec2 cell_local(int w) {
     return ivec2((w >> LOCAL_SHIFT) & LOCAL_MASK, w & LOCAL_MASK);
 }
+
+// Segment id from .w, or 0 for a cell on no segment.
+int segment_id(int w) { return (w >> SEG_ID_SHIFT) & SEG_ID_MASK; }
+// Distance from the segment's tail, in item positions. Not the same as the
+// cell's index along the run: an underground span advances this without
+// contributing a drawn cell, which is why it is stored rather than counted.
+int segment_offset(int w) { return (w >> SEG_OFF_SHIFT) & SEG_OFF_MASK; }
 
 bool is_empty(int w) { return cell_type(w) == TYPE_EMPTY; }
 
@@ -170,6 +180,29 @@ bool is_structure(int type) {
 // Types that move material along a single facing, belt-style.
 bool is_beltlike(int type) {
     return type == TYPE_BELT || type == TYPE_UNDER;
+}
+
+// Which of several incoming directions a cell actually takes material from.
+// `mask` is a 4-bit set of directions (as seen from the receiving cell) that
+// hold something emitting at us. Returns -1 for none.
+//
+// MUST match take_dir() in core/segments.py. Belts never merge in this game,
+// but a player can still point two at one cell; one source wins
+// deterministically and the rest are left unconnected. The simulation and the
+// renderer have to agree on which, or the picture would show an arm that
+// carries nothing -- that disagreement is the old "phantom merge" goof.
+//
+// Prefer straight-through (the cell directly behind us), then counter-
+// clockwise from our own facing.
+int take_dir(int facing, int mask) {
+    if (mask == 0) return -1;
+    int behind = (facing + 2) % 4;
+    if ((mask & (1 << behind)) != 0) return behind;
+    for (int i = 0; i < 4; ++i) {
+        int d = (facing + i) % 4;
+        if ((mask & (1 << d)) != 0) return d;
+    }
+    return -1;
 }
 
 // Rotate a cell-local coordinate so that +X becomes `dir`.

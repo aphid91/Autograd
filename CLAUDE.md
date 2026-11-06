@@ -42,6 +42,7 @@ There is no pytest/linter configured.
 | [tests/test_scenarios.py](tests/test_scenarios.py) | drive the orchestrator and assert board state |
 | [tests/test_glsl.py](tests/test_glsl.py) | static checks on the generated GLSL — no context, no board |
 | [tests/test_tick.py](tests/test_tick.py) | the clock as wired into the frame loop: rate, `alpha`, keys, phase order |
+| [tests/test_segments.py](tests/test_segments.py) | belt-run derivation: tracing, cuts, undergrounds, merges, audit under churn |
 
 **Scenarios are independent.** `harness.reset()` clears the board, camera,
 input state and toolbelt before each one, so a failure names the scenario
@@ -129,9 +130,10 @@ everything else is grouped by layer.
 | [core/engine_paths.py](core/engine_paths.py) | pure path geometry (elbows, Bresenham) |
 | [core/builders.py](core/builders.py) | `EntityBuilder`/`BuildPlan`; `BeltBuilder`, `StructureBuilder`, `UndergroundBuilder` |
 | [core/glsl_types.py](core/glsl_types.py) | emits the per-type GLSL tables from the entity classes |
-| [core/persistence.py](core/persistence.py) | save/load the board to a single `.npz` |
+| [core/persistence.py](core/persistence.py) | save/load the board to a single `.npz` (`.w` zeroed — derived) |
 | [core/toolbelt.py](core/toolbelt.py) | ten slots, one active tool |
 | [core/tick.py](core/tick.py) | the simulation clock: tick counter, fixed timestep, phase order |
+| [core/segments.py](core/segments.py) | belt runs coalesced into the O(1) simulation unit; derived from the grid |
 | [engine.py](engine.py) | preview/commit a plan, erase, ghost lifecycle |
 | [render/camera.py](render/camera.py) | pan/zoom, world↔screen, the world render pass |
 | [render/shader_loader.py](render/shader_loader.py) | reads `shaders/`, resolves `#include` |
@@ -161,7 +163,15 @@ bit  31     unused — deliberately clear
 offset from the origin — the **placed** offset, after flip and rotation, not
 the authored one (see "Orientation" under Structures). `.z` bits 0-1 hold the
 ghost state (`0` real / `1` ghost / `2` frustrated — see "Frustrated cells"
-below) and bit 2 the flip flag. `.w` is reserved.
+below) and bit 2 the flip flag.
+
+`.w` carries belt-segment membership: bits 0-15 the offset along the segment
+from its tail, bits 16-30 the segment id (`0` = not on a segment), bit 31
+clear as in `.x`. Both live in the cell because the fragment shader needs
+them for a texel it has **already fetched** — deciding whether an item disc
+covers this pixel costs no extra texture reads. This is derived state (see
+"Belt segments"), stored rather than recomputed because the renderer cannot
+walk a run per pixel.
 
 Three things to know before touching this:
 
@@ -291,6 +301,91 @@ A board replacement — `clear_board()`, `load_board()` — calls `clock.reset()
 Item positions are a closed-form function of the tick counter, so a new board
 must start a new timeline or every item on it is dated to a tick that never
 happened for it.
+
+### Belt segments
+
+[docs/belt_report.md](docs/belt_report.md) gives a closed form for every
+item's position on a "pure" belt — one line, no branching, no mid-line
+insertion, uniform speed. Nothing per-item is updated after the item enters,
+so a whole run ticks in O(1) however many items are on it.
+
+That is only valid for a **maximal run between two nodes**, so the unit of
+simulation is the *segment*, not the cell. The player draws cells;
+[core/segments.py](core/segments.py) coalesces them.
+
+**Segments are a cache over the grid.** The grid stays the single source of
+truth — delete every segment and they recompute from it. Membership is still
+*stored*, in `.w`, because the renderer needs it per-pixel.
+
+- **An edit drops the items on the segments it touches.** Splitting a run
+  means dividing a ring's live contents between two new rings, and every
+  position is relative to its segment's anchor, so it is not expressible in
+  the closed form. Dropping them is the price of O(1); edits are human-paced.
+- **Ring capacity is a power of two.** Required, not tidy: slots are indexed
+  `k % cap` on a monotonically growing counter, which only survives unsigned
+  wraparound when `cap` is a power of two.
+- **Undergrounds add capacity without cells.** A paired entrance/exit
+  contributes `span + 1` positions — the two ends plus buried tiles that hold
+  items nobody draws. The run continues through as though the gap were belt,
+  which costs the O(1) trick nothing. This is why a segment's `length`
+  (positions) is separate from its cell list, and why each cell stores its own
+  offset rather than using its index in that list.
+- **Rebuilds are deferred to one per frame.** `Engine.invalidate_segments()`
+  only marks stale; `sync_segments()` rebuilds once, before the tick. An erase
+  drag over fifty cells rebuilds once.
+
+**Invalidation is hooked at the board, not at each call site.** Every grid
+write funnels through `Gameboard.write_cell()` / `clear_cell()`, which notify
+`on_grid_change` — so a new edit path cannot forget to invalidate.
+
+**The hook compares *real* cell content, not raw writes** (`_real_content()`).
+A moving ghost preview rewrites cells every frame, and since derivation skips
+ghosts those writes cannot change its answer; notifying anyway rebuilt the
+whole index once per frame for an identical result. Preview churn now causes
+**zero** rebuilds.
+
+**Frustrated cells count as real.** This is the subtle one, and it was a live
+bug: frustration is an overlay that leaves `.x` untouched precisely so the
+occupant survives, so skipping those cells cut a run in two for as long as the
+player held a blocked structure over it — which, once items exist, would
+silently destroy them. Only `GHOST_PENDING` is fictional.
+
+#### Merges are resolved, not supported
+
+Belts never merge here, but nothing stops a player pointing two at one cell.
+`take_dir()` picks exactly one source: **straight-through first, then
+CCW-most** from the receiving cell's own facing. Losers are simply not
+connected.
+
+It is mirrored in `common.glsl` and **both sides must agree** — the renderer
+previously drew an incoming arm per candidate, showing material arriving down
+a path nothing travels (the "phantom merge"). `draw_belt()` now calls
+`take_dir()` and draws the one arm the simulation actually uses.
+
+A related rule: **the cell we output into is never a source**, even when it
+faces back at us. Without it two nose-to-nose belts each name the other as
+upstream, neither is a tail, and the pair falls through the closed-loop path
+as one bogus segment.
+
+#### Observability
+
+Segments are derived state, whose failure mode is disagreeing with its source
+while staying internally consistent. Two tools, both free when off:
+
+- **`SegmentIndex.audit()`** checks the index against the grid cell by cell —
+  stamps, offsets, ring invariants, double-claims, orphaned belt cells.
+  Asserted clean throughout [tests/test_segments.py](tests/test_segments.py),
+  including after 40 random edits.
+- **The `SEGMENT_DEBUG` shader overlay** tints each run by a hash of its
+  segment id, with a dot on the tail. Behind `#ifdef`, so toggling it
+  recompiles and the disabled build does not contain the code at all —
+  `shader_loader.load()` takes a `defines` set, injected after `#version`.
+  `Camera.set_define()` drives it.
+
+The **Segments** inspector window (checkbox in the main panel) shows counts,
+id-pool state, capacity totals, the hovered segment's full ring state, and a
+button for each of the above. Everything expensive is inside the
+window-open guard.
 
 ### Builders: one mechanism for every placement tool
 
@@ -589,6 +684,12 @@ implements a minimal one by textual substitution, with an implicit include
 guard (a file already pulled in is skipped). That exists so the cell encoding
 has exactly one GLSL copy.
 
+`load()` also takes a set of `defines`, injected as `#define` lines
+immediately after `#version` (which GLSL requires to stay first). Optional
+features live behind `#ifdef` rather than a uniform branch so a disabled
+overlay is **not compiled at all** — toggling one is a recompile, which is
+the point. `Camera.set_define()` drives it; `SEGMENT_DEBUG` is the first user.
+
 ### Generated GLSL tables
 
 Everything the shaders know about a *specific* machine is generated from the
@@ -636,10 +737,12 @@ direction. Topology comes from the cell and its 4 orthogonal neighbours — no
 lookup table, no precomputed tile index:
 
 - The **outgoing** arm always runs centre → the facing edge.
-- A neighbour contributes an **incoming** arm iff it *emits at us*: a belt
-  whose direction points back at us, **or a structure with an output face
-  pointing at us**. Since neither ever diverges, merges (T and PLUS) are the
-  only junctions that exist.
+- A neighbour is a *candidate* source iff it emits at us: a belt whose
+  direction points back at us, **or a structure with an output face pointing
+  at us**. Candidates are then passed to `take_dir()`, which picks **exactly
+  one** — so at most one incoming arm is ever drawn. See "Merges are resolved,
+  not supported": drawing an arm per candidate was the phantom-merge goof, and
+  the renderer must agree with the simulation about which source wins.
 - With no incoming neighbour the spine extends backwards too, so an isolated
   belt fills its cell rather than looking like a half tile.
 - **The cell we output into is never a source**, even if it emits back at us.
@@ -654,11 +757,11 @@ a corner, where the axis changes — which looks natural, since the belt visibly
 turns there. `CHEVRON_PERIOD` sets the spacing in cells; `1.0` gives one per
 cell, `0.5` two.
 
-At a **merge** (more than one incoming arm) tributary chevrons stop
-`MERGE_GAP` short of the centre so converging streams stay legible. The
-straight-through stream does not, so a plain run never breaks. A corner is
-deliberately *not* a merge: one stream arrives and one leaves, so it stays
-continuous.
+There is no merge case left to draw: `take_dir()` admits one source, so a
+cell has at most one incoming and one outgoing arm. A corner therefore stays
+continuous — one stream arrives, one leaves. `MERGE_GAP` survives as a
+tunable for the control-signal overlay, where channels can still legitimately
+converge.
 
 `same_layer()` decides what counts as a neighbour: currently ghosts chain only
 with ghosts and real belts only with real belts, so a preview reads as its own
@@ -760,10 +863,13 @@ bugs:
 ## Deferred
 
 Noted so they are not mistaken for oversights: belt and structure *simulation*
-(the clock and its phase order exist and tick, but no subsystem registers a
-phase yet — nothing moves, and none of the signatures in the table above are
-evaluated: no arithmetic happens, and `Source`/`Sink` neither produce nor
-consume);
+(the clock and its phase order exist and tick, and belt runs are coalesced
+into segments with ring buffers allocated — but no subsystem registers a
+phase yet, so nothing moves: `Segment.head`/`tail` stay at zero, no
+arithmetic happens, and `Source`/`Sink` neither produce nor consume);
+**incremental segment rebuild** (currently whole-board on any real edit;
+the inspector reports rebuild counts so there is a number to point at before
+anyone optimises it);
 compute shader passes (the context is 4.3 and the SSBO is bound, but nothing
 dispatches); curved corner geometry (corners are currently a right-angle join
 of two straight arms, which reads fine but is not a true curve); entity-row

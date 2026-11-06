@@ -42,14 +42,35 @@ class Camera:
         self.program = None
         self.vao = None
         self.compile_error = None
+        #: Optional shader features, as preprocessor symbols. Debug overlays
+        #: live behind #ifdef rather than a uniform so they are not compiled
+        #: at all when off -- see shader_loader.load().
+        self.defines = set()
         self.reload_shader()
 
     # --- shader ---------------------------------------------------------
+    def set_define(self, name, enabled):
+        """Turn an optional shader feature on or off, recompiling if it moved.
+
+        Returns True if a recompile happened. Toggling a define means a new
+        program: that is the point -- the disabled build does not contain the
+        feature's code at all.
+        """
+        had = name in self.defines
+        if had == bool(enabled):
+            return False
+        if enabled:
+            self.defines.add(name)
+        else:
+            self.defines.discard(name)
+        self.reload_shader()
+        return True
+
     def reload_shader(self):
         """Recompile the world shaders. Keeps the old program on failure."""
         try:
-            vert_src = shader_loader.load(VERT_NAME)
-            frag_src = shader_loader.load(FRAG_NAME)
+            vert_src = shader_loader.load(VERT_NAME, self.defines)
+            frag_src = shader_loader.load(FRAG_NAME, self.defines)
         except shader_loader.ShaderError as e:
             self.compile_error = str(e)
             return False
