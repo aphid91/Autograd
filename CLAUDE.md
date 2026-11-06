@@ -43,6 +43,7 @@ There is no pytest/linter configured.
 | [tests/test_glsl.py](tests/test_glsl.py) | static checks on the generated GLSL — no context, no board |
 | [tests/test_tick.py](tests/test_tick.py) | the clock as wired into the frame loop: rate, `alpha`, keys, phase order |
 | [tests/test_segments.py](tests/test_segments.py) | belt-run derivation: tracing, cuts, undergrounds, merges, audit under churn |
+| [tests/test_belts.py](tests/test_belts.py) | the closed form against the naive oracle, on fixed and randomised configs |
 
 **Scenarios are independent.** `harness.reset()` clears the board, camera,
 input state and toolbelt before each one, so a failure names the scenario
@@ -61,9 +62,13 @@ import, so the cell encoding, the entity geometry and the clock's timing
 contract are exercised by importing anything.
 
 A scenario that registers a phase callback on the shared clock must remove it
-in a `finally` — the clock is global state like the board, and a stray
-callback would run for every later scenario. Same reasoning as restoring
-imgui's `want_capture_mouse`.
+in a `finally`, **with `clock.off_phase(phase, fn)` and not by clearing the
+phase** — the engine's belt transport lives on `PHASE_BELT`, so a blanket
+clear stops the simulation for every later scenario. `harness.reset()`
+asserts the callback survived, because when this happened the symptom
+appeared three files away as "the belt phase ran but nothing moved". Same
+reasoning as restoring imgui's `want_capture_mouse`, with a sharper failure
+mode.
 
 **Beware exact float multiples when asserting tick counts.** `0.3 // 0.1` is
 2, not 3, so a single `advance()` spanning several periods runs an unreliable
@@ -134,6 +139,7 @@ everything else is grouped by layer.
 | [core/toolbelt.py](core/toolbelt.py) | ten slots, one active tool |
 | [core/tick.py](core/tick.py) | the simulation clock: tick counter, fixed timestep, phase order |
 | [core/segments.py](core/segments.py) | belt runs coalesced into the O(1) simulation unit; derived from the grid |
+| [core/belts.py](core/belts.py) | closed-form item transport, and the naive oracle it is tested against |
 | [engine.py](engine.py) | preview/commit a plan, erase, ghost lifecycle |
 | [render/camera.py](render/camera.py) | pan/zoom, world↔screen, the world render pass |
 | [render/shader_loader.py](render/shader_loader.py) | reads `shaders/`, resolves `#include` |
@@ -374,6 +380,84 @@ faces back at us. Without it two nose-to-nose belts each name the other as
 upstream, neither is a tail, and the pair falls through the closed-loop path
 as one bogus segment.
 
+### Belt transport: the closed form
+
+[core/belts.py](core/belts.py) implements docs/belt_report.md. Every item's
+position is an expression, never a stored value:
+
+```
+pos(k, t) = min( (t - enter_tick[k]) * v,  anchor - (k - head) * d )
+```
+
+The first term is where the item would be if never blocked, the second where
+it would be if packed tight behind the head. The `min` decides which without
+anything tracking the clump boundary, and since both grow at rate `v`, **once
+an item is packed it stays packed** — Factorio's permanent compression, for
+free. `enter_tick` is written once; `head`, `tail` and `anchor` are the only
+mutable state, which is what makes a run O(1) however many items are on it.
+
+**Tick order is advance-anchor → pop → push**, straight from the report.
+
+**Fixed point, not floats.** `L`, `v`, `d` are integers in `UNIT`-ths of a
+cell because the pop test is `pos == L` *exactly*; float drift would
+eventually miss it and stall a belt permanently with an item a hair short of
+the end. At the default `v == d == UNIT` positions are whole cells.
+
+**`alpha` interpolation is exact, not approximate.** Both terms are linear in
+time, so evaluating at `tick + alpha` is the same expression — clumps form
+smoothly with no snapping.
+
+Two bugs here, both found by the randomised oracle comparison and neither
+visible at whole ticks:
+
+- **The pop's `anchor = L - d` assumes `L >= d`** — a requirement the report
+  states and a short run can violate. A 1-cell belt with 3-cell spacing put
+  the anchor at -2 cells, and the next item to enter took that as its packed
+  position and rendered *behind* the belt's start. Now clamped at 0, which
+  changes nothing where the precondition holds.
+- **The fractional anchor needs the same clamp as the whole-tick one.**
+  `tick_segment()` does `min(anchor + v, L)`; the render path omitted it, so a
+  fully blocked clump slid forward as `alpha` rose and snapped back on the
+  tick, with the head drifting clean off the end. The report's render formula
+  has it: `A_render = min(A + α*v, L)`.
+
+#### The oracle is the point
+
+`naive_tick()` is the report's reference implementation — store every
+position, move them one at a time. Obviously correct, far too slow to ship,
+and its only job is to disagree with the closed form.
+[tests/test_belts.py](tests/test_belts.py) runs both on identical
+producer/consumer decisions and compares **positions and pop/push events**
+every tick, across 600 randomised configurations plus fixed edge cases
+(`v > d`, `d > v`, `d > L`, 1-cell runs, ring wraparound).
+
+This matters because the closed form is the part most likely to be subtly
+wrong and least likely to *look* wrong: an item a fraction of a cell out of
+place reads as plausible motion. Keep the oracle when this moves to compute
+shaders — the report recommends exactly that, and it is how the GPU port will
+be validated.
+
+The randomised sweep also checks **fractional-time invariants** at every
+tick, which is what caught the second bug above; whole-tick sampling alone
+missed it entirely.
+
+#### Driving it before gates exist
+
+`BeltSim.tick()` takes `offer(seg)` / `accept(seg, payload)` callbacks per
+segment, mirroring the report's `producerOffers` / `consumerAccepts`. Belt
+transport knows nothing about gates. Until the gate layer lands,
+`Engine.debug_feed` stands in: set it and every run with a **dangling**
+upstream end is offered that value each tick, and every dangling downstream
+end accepts. It deliberately skips runs a real gate already feeds, so it
+cannot conjure items into the middle of a chain.
+
+Registered on `PHASE_BELT` at `Engine` construction. **Remove a phase
+callback with `Clock.off_phase()`, never by clearing the phase** — the
+engine's transport is on that list, and a blanket clear silently stops the
+whole simulation. A test cleanup did exactly that, and the symptom surfaced
+three files later as "the belt phase ran but nothing moved"; `harness.reset()`
+now asserts the callback is still there.
+
 #### Observability
 
 Segments are derived state, whose failure mode is disagreeing with its source
@@ -383,6 +467,10 @@ while staying internally consistent. Two tools, both free when off:
   stamps, offsets, ring invariants, double-claims, orphaned belt cells.
   Asserted clean throughout [tests/test_segments.py](tests/test_segments.py),
   including after 40 random edits.
+- **`BeltSim.audit()`** checks the *items* rather than the segmentation:
+  positions within bounds, ordering, no pair closer than the spacing, the
+  anchor not past the end. The two fail for quite different reasons, so the
+  inspector's Audit button runs both.
 - **The `SEGMENT_DEBUG` shader overlay** tints each run by a hash of its
   segment id, with a dot on the tail. Behind `#ifdef`, so toggling it
   recompiles and the disabled build does not contain the code at all —
@@ -393,6 +481,12 @@ The **Segments** inspector window (checkbox in the main panel) shows counts,
 id-pool state, capacity totals, the hovered segment's full ring state, and a
 button for each of the above. Everything expensive is inside the
 window-open guard.
+
+It also lists the hovered run's **items** — position, payload, entry tick,
+and whether each is `packed` or `free`, i.e. which term of the `min` is
+binding. That distinction is the heart of the closed form and otherwise
+completely invisible. The positions shown are computed live, not read back
+from storage, because there is nowhere to read them from.
 
 ### Builders: one mechanism for every placement tool
 
@@ -869,11 +963,14 @@ bugs:
 
 ## Deferred
 
-Noted so they are not mistaken for oversights: belt and structure *simulation*
-(the clock and its phase order exist and tick, and belt runs are coalesced
-into segments with ring buffers allocated — but no subsystem registers a
-phase yet, so nothing moves: `Segment.head`/`tail` stay at zero, no
-arithmetic happens, and `Source`/`Sink` neither produce nor consume);
+Noted so they are not mistaken for oversights: **structure** simulation
+(belts now carry items — the closed form runs on the belt phase and is
+oracle-verified — but no gate fires: none of the signatures in the machine
+table are evaluated, no arithmetic happens, and `Source`/`Sink` neither
+produce nor consume. `Engine.debug_feed` stands in for them);
+**item rendering** (positions are computed and inspectable but nothing is
+drawn — `sim_tick`/`sim_alpha` reach the shader and are still unused, so
+GLSL strips them);
 **incremental segment rebuild** (currently whole-board on any real edit;
 the inspector reports rebuild counts so there is a number to point at before
 anyone optimises it);

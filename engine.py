@@ -13,9 +13,10 @@ from core import cell
 from core.builders import BeltBuilder
 from core.engine_paths import bresenham, intent_dir, path_directions, plan_path
 from core.entity import Belt, Underground
+from core.belts import BeltSim
 from core.gameboard import Gameboard
 from core.segments import SegmentIndex
-from core.tick import Clock
+from core.tick import Clock, PHASE_BELT
 from core import persistence
 
 # Re-exported so existing callers and tests keep working after the path
@@ -52,6 +53,18 @@ class Engine:
         # than at each call site here, so a new edit path cannot forget to
         # invalidate -- see Gameboard._grid_changed().
         self.board.on_grid_change = self.invalidate_segments
+        # Belt transport: the closed form from docs/belt_report.md. Registered
+        # on the belt phase, so it runs after the structure phase every tick --
+        # see core/tick.py for why that order is what lets a gate fire every
+        # tick without a bubble.
+        self.belts = BeltSim(self.segments)
+        self.clock.on_phase(PHASE_BELT, self._belt_phase)
+        #: Debug feed, until gates drive the belts for real. When set, every
+        #: segment with a dangling upstream end is offered this value each
+        #: tick, and every dangling downstream end accepts. Exists so the
+        #: transport can be watched on a real board before the gate layer
+        #: lands; None disables it entirely.
+        self.debug_feed = None
         # Ghost rows that will become real on commit.
         self.ghost_rows = []
         # Ghost rows that exist only to show the player what *would* fit, from
@@ -385,6 +398,42 @@ class Engine:
             return None
         self._segments_stale = False
         return self.segments.rebuild()
+
+    def clear_items(self):
+        """Take every item off every belt, leaving the segmentation alone.
+
+        Resets each ring to empty and the anchor to the far end, which is the
+        initial state from docs/belt_report.md. Distinct from a rebuild: the
+        runs survive, only what is on them is discarded.
+        """
+        for seg in self.segments.segments.values():
+            seg.head = seg.tail = 0
+            seg.anchor = self.belts.length_of(seg)
+
+    def _belt_phase(self):
+        """The belt half of a tick. Registered on PHASE_BELT.
+
+        Gates do not exist yet, so the only producers and consumers available
+        are the debug feed's: a dangling upstream end offers, a dangling
+        downstream end accepts. Once the gate layer lands these callbacks come
+        from waiting zones and input ports instead, and nothing else here
+        changes.
+        """
+        if self.debug_feed is None:
+            self.belts.tick(self.clock.tick)
+            return
+
+        value = float(self.debug_feed)
+
+        def offer(seg):
+            # Only feed a run nothing else is feeding, so the debug source
+            # cannot inject items into the middle of a real chain.
+            return value if seg.src is None else None
+
+        def accept(seg, _payload):
+            return seg.dst is None
+
+        self.belts.tick(self.clock.tick, offer=offer, accept=accept)
 
     def tick(self, dt):
         """Advance the simulation clock, running whatever ticks are due.

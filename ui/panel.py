@@ -3,6 +3,7 @@
 from imgui_bundle import imgui
 
 from core import cell
+from core.belts import UNIT
 from ui.input_manager import STATE_NAMES
 from core.toolbelt import SLOT_COUNT, SPLIT_AFTER
 
@@ -14,7 +15,8 @@ class UIRequests:
                  "verify_round_trip", "select_slot", "cycle_tool",
                  "cycle_backward", "flip_tool", "quicksave", "quickload",
                  "toggle_pause", "step_tick", "tick_rate",
-                 "segment_debug", "rebuild_segments", "audit_segments")
+                 "segment_debug", "rebuild_segments", "audit_segments",
+                 "debug_feed", "clear_items")
 
     def __init__(self):
         self.reload_shader = False
@@ -35,6 +37,10 @@ class UIRequests:
         self.segment_debug = None
         self.rebuild_segments = False
         self.audit_segments = False
+        #: New debug-feed value, `False` to disable it, or None for no change.
+        #: Not just a float: None and "off" are different requests.
+        self.debug_feed = None
+        self.clear_items = False
 
 
 class UI:
@@ -74,13 +80,19 @@ class UI:
         index = engine.segments
         board = engine.board
 
+        sim = engine.belts
+        clock = engine.clock
+
         # --- overview ---
         imgui.text(f"Segments: {index.count}")
         imgui.text(f"Items:    {index.total_items()}")
         st = index.stats
+        bst = sim.stats
         imgui.text(f"Rebuilds: {st['rebuilds']}   "
                    f"built {st['segments_built']}")
         imgui.text(f"Items dropped to edits: {st['items_dropped']}")
+        imgui.text(f"Pushed {bst['pushed']}  popped {bst['popped']}  "
+                   f"over {bst['ticks']} ticks")
         if orch.last_rebuild is not None:
             imgui.text_disabled(
                 f"rebuilt this frame: {orch.last_rebuild} segments")
@@ -132,10 +144,59 @@ class UI:
             imgui.text(f"    head {seg.head}  tail {seg.tail}  "
                        f"count {seg.count}")
             imgui.text(f"    base {seg.base}  cap {seg.cap}")
-            imgui.text(f"    anchor (packed head pos) {seg.anchor}")
+            imgui.text(f"    anchor {seg.anchor} / {sim.length_of(seg)}"
+                       f"   (packed head position)")
+            imgui.text(f"    physical capacity {sim.capacity_of(seg)} items")
             imgui.text_unformatted("  Ends")
             imgui.text(f"    src {seg.src if seg.src else '(dangling)'}")
             imgui.text(f"    dst {seg.dst if seg.dst else '(dangling)'}")
+
+            # --- the items themselves ---
+            # Positions are computed, never stored, so this is the closed form
+            # being evaluated live rather than a readout of saved state.
+            imgui.separator()
+            imgui.text_unformatted("  Items (cell offset from tail)")
+            if seg.count == 0:
+                imgui.text_disabled("    empty")
+            else:
+                for k in range(seg.head, seg.tail):
+                    pos = sim.position_of(seg, k, clock.tick, clock.alpha)
+                    payload = sim.payload_of(seg, k)
+                    enter = int(seg.enter_tick[k % seg.cap])
+                    # Mark whichever term of the min is binding: "packed"
+                    # means this item is in a clump, "free" that it is still
+                    # running at full speed. That distinction is the heart of
+                    # the closed form and is otherwise invisible.
+                    unblocked = (clock.tick - enter + clock.alpha) * sim.speed
+                    packed = pos < unblocked - 1e-6
+                    imgui.text(
+                        f"    k={k:<4} {pos / UNIT:6.2f}  "
+                        f"val {payload:+.3g}  entered t={enter}  "
+                        f"{'packed' if packed else 'free'}")
+                    if k - seg.head > 12:
+                        imgui.text_disabled(
+                            f"    ... {seg.tail - k - 1} more")
+                        break
+
+        # --- debug feed ---
+        # Gates do not drive the belts yet, so this is how transport gets
+        # exercised on a real board: every run with a dangling upstream end
+        # is offered an item each tick, and every dangling downstream end
+        # takes one. Goes away once the gate layer lands.
+        imgui.separator()
+        imgui.text_unformatted("Debug feed")
+        feeding = engine.debug_feed is not None
+        changed, on = imgui.checkbox("Feed dangling runs", feeding)
+        if changed:
+            req.debug_feed = (-1.0 if on else False)
+        if feeding:
+            moved, value = imgui.slider_float(
+                "value", float(engine.debug_feed), -4.0, 4.0, "%.2f")
+            if moved:
+                req.debug_feed = value
+        imgui.text_disabled("stands in for Source/Sink until gates exist")
+        if imgui.button("Clear items"):
+            req.clear_items = True
 
         # --- controls ---
         imgui.separator()

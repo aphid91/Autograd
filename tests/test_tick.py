@@ -132,17 +132,21 @@ def test_phases_run_in_order_every_tick():
     log = []
     # Registered in reverse to prove the *phase* decides the order, not the
     # registration sequence.
-    clock.on_phase(PHASE_BELT, lambda: log.append("belt"))
-    clock.on_phase(PHASE_STRUCTURE, lambda: log.append("structure"))
+    belt_cb = clock.on_phase(PHASE_BELT, lambda: log.append("belt"))
+    struct_cb = clock.on_phase(PHASE_STRUCTURE,
+                               lambda: log.append("structure"))
     try:
         step(3)
-        assert log == ["structure", "belt"] * 3, log
+        # The engine registers belt transport at construction, so the belt
+        # phase already has a callback; only ours is asserted on here.
+        assert [e for e in log] == ["structure", "belt"] * 3, log
         ok("three ticks ran structure,belt three times in order")
     finally:
-        # Phase callbacks live on the shared clock, so a scenario that adds
-        # them must take them away again or every later one inherits them.
-        clock._phases[PHASE_BELT].clear()
-        clock._phases[PHASE_STRUCTURE].clear()
+        # Remove exactly our own, never clear the phase: the engine's belt
+        # transport lives on the belt phase, and clearing it silently stops
+        # the simulation for every later scenario.
+        clock.off_phase(PHASE_BELT, belt_cb)
+        clock.off_phase(PHASE_STRUCTURE, struct_cb)
 
 
 def test_catchup_cap_bounds_work_per_frame():
@@ -222,7 +226,8 @@ def test_tick_happens_before_device_sync():
             "a cell dirtied during the tick should upload in the same frame")
         ok(f"a tick-dirtied cell uploaded the same frame ({cells} cells)")
     finally:
-        clock._phases[PHASE_BELT].clear()
+        # Ours only -- the engine's belt transport is on this phase too.
+        clock.off_phase(PHASE_BELT, dirty_a_cell)
 
 
 def test_clock_does_not_disturb_building():

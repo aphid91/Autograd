@@ -165,10 +165,37 @@ class Clock:
         self._accum = frac * self.seconds_per_tick
 
     def on_phase(self, phase, fn):
-        """Register `fn()` to run during `phase` of every tick."""
+        """Register `fn()` to run during `phase` of every tick.
+
+        Returns `fn`, so it can be used as a decorator or captured for a
+        later off_phase().
+        """
         if not 0 <= phase < PHASE_COUNT:
             raise ValueError(f"no such phase: {phase}")
         self._phases[phase].append(fn)
+        return fn
+
+    def off_phase(self, phase, fn):
+        """Unregister a single phase callback. Returns True if it was there.
+
+        Exists so a caller that adds a callback can remove exactly its own,
+        rather than clearing the phase. Clearing is the tempting shortcut and
+        is wrong: the engine registers belt transport at construction, when it
+        is the only callback, so a blanket clear silently stops the whole
+        simulation -- which is precisely what a test cleanup did, with the
+        symptom appearing in an unrelated scenario several files later.
+        """
+        if not 0 <= phase < PHASE_COUNT:
+            raise ValueError(f"no such phase: {phase}")
+        try:
+            self._phases[phase].remove(fn)
+            return True
+        except ValueError:
+            return False
+
+    def phase_count(self, phase):
+        """How many callbacks are registered on a phase. For tests and the UI."""
+        return len(self._phases[phase])
 
     # --- render-time interpolation ---------------------------------------
     @property
@@ -348,6 +375,21 @@ def _self_check():
     c.on_phase(PHASE_STRUCTURE, lambda: log.append("b"))
     c.advance(0.1)
     assert log == ["a", "b"], log
+
+    # off_phase() removes exactly one callback and leaves its neighbours.
+    log = []
+    c = Clock(ticks_per_sec=10.0)
+    keep = c.on_phase(PHASE_BELT, lambda: log.append("keep"))
+    drop = c.on_phase(PHASE_BELT, lambda: log.append("drop"))
+    assert c.phase_count(PHASE_BELT) == 2
+    assert c.off_phase(PHASE_BELT, drop) is True
+    assert c.phase_count(PHASE_BELT) == 1
+    assert c.off_phase(PHASE_BELT, drop) is False, "removing twice is a no-op"
+    c.request_step()
+    c.advance(0.0)
+    assert log == ["keep"], log
+    assert c.off_phase(PHASE_BELT, keep) is True
+    assert c.phase_count(PHASE_BELT) == 0
 
     # A phase callback sees the tick it is computing, not the one after.
     # Stepped explicitly rather than via one large advance(): float residue in

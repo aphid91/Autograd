@@ -24,6 +24,7 @@ import moderngl
 from imgui_bundle import imgui
 
 from core import cell
+from core.tick import PHASE_BELT
 
 W, H = 1024, 768
 BOARD = 64
@@ -123,6 +124,19 @@ def reset():
     # counter, but not the pause flag.
     engine.clock.resume()
     engine.clock.reset()
+    # The debug item feed is global state too: a scenario that leaves it on
+    # would quietly fill every later scenario's belts.
+    engine.debug_feed = None
+    for k in engine.belts.stats:
+        engine.belts.stats[k] = 0
+    # The engine registers belt transport on the belt phase at construction.
+    # A scenario that clears the phase instead of removing its own callback
+    # silently stops the simulation for everything after it -- which happened,
+    # and surfaced three files later as "the belt phase ran but nothing
+    # moved". Catch it here, where the cause is still obvious.
+    assert engine.clock.phase_count(PHASE_BELT) >= 1, (
+        "the engine's belt phase callback has been lost -- a scenario "
+        "cleared the phase rather than calling clock.off_phase()")
     step()
 
 

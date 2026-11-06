@@ -249,8 +249,18 @@ class Orchestrator:
         if requests.rebuild_segments:
             engine.invalidate_segments()
         if requests.audit_segments:
-            problems = engine.segments.audit()
+            # Both halves: the segmentation against the grid, and the items
+            # on it against the transport's invariants. They fail for quite
+            # different reasons, so running one without the other hides half
+            # the possible trouble.
+            problems = (engine.segments.audit()
+                        + engine.belts.audit(engine.clock.tick))
             self.ui.last_audit = (len(problems), problems[:6])
+        if requests.debug_feed is not None:
+            engine.debug_feed = (None if requests.debug_feed is False
+                                 else float(requests.debug_feed))
+        if requests.clear_items:
+            engine.clear_items()
 
         # 7. simulation. After every player mutation, so a tick acts on the
         # board as just edited; before the device sync, so its effects are
