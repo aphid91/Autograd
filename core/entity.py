@@ -619,23 +619,28 @@ class Source(Structure):
 
 
 class Sink(Structure):
-    """3x3 consumer with an input at the middle of each side.
+    """2x2 consumer that accepts on every perimeter face.
 
-    Square, so rotation does not change the footprint and all four faces are
-    symmetric -- R is a no-op in practice, but it stays ROTATABLE rather than
-    special-casing the toolbelt.
+    Eight inputs: each of the four cells carries the two outward faces of its
+    corner, so material can be fed in from anywhere without aiming at a
+    particular tile.
+
+    Square and fully symmetric, so rotation changes nothing -- R is a no-op
+    in practice, but it stays ROTATABLE rather than special-casing the
+    toolbelt. Being achiral, F does nothing either (is_chiral() derives that
+    from this port layout).
     """
 
     TYPE_ID = cell.TYPE_SINK
-    FOOTPRINT = (3, 3)
+    FOOTPRINT = (2, 2)
     COLOUR = (0.34, 0.34, 0.40)
     GLYPH = "dot"
 
     INPUTS = (
-        (1, 2, cell.DIR_PY),   # north
-        (1, 0, cell.DIR_NY),   # south
-        (0, 1, cell.DIR_NX),   # west
-        (2, 1, cell.DIR_PX),   # east
+        (0, 1, cell.DIR_NX), (0, 1, cell.DIR_PY),   # top-left corner
+        (1, 1, cell.DIR_PY), (1, 1, cell.DIR_PX),   # top-right
+        (1, 0, cell.DIR_PX), (1, 0, cell.DIR_NY),   # bottom-right
+        (0, 0, cell.DIR_NY), (0, 0, cell.DIR_NX),   # bottom-left
     )
     OUTPUTS = ()
 
@@ -730,15 +735,23 @@ def _self_check():
     for lx in range(3):
         assert Source.face_masks_at(lx, 0) == (0, 0), lx
 
-    # Sink: an input at the middle of each side of a 3x3, and no outputs. The
-    # four corners and the centre carry no ports at all.
-    assert Sink.FOOTPRINT == (3, 3)
-    assert not Sink.OUTPUTS and len(Sink.INPUTS) == 4
-    for (lx, ly) in ((0, 0), (2, 0), (0, 2), (2, 2), (1, 1)):
-        assert Sink.face_masks_at(lx, ly) == (0, 0), (lx, ly)
+    # Sink: a 2x2 accepting on every perimeter face, and no outputs. Each
+    # cell carries exactly the two faces that point out of the footprint.
+    assert Sink.FOOTPRINT == (2, 2)
+    assert not Sink.OUTPUTS and len(Sink.INPUTS) == 8
+    for (lx, ly) in ((0, 0), (1, 0), (0, 1), (1, 1)):
+        in_mask, out_mask = Sink.face_masks_at(lx, ly)
+        assert out_mask == 0, (lx, ly)
+        # Two ports per cell, and both must face away from the other cells.
+        outward = {cell.DIR_NX if lx == 0 else cell.DIR_PX,
+                   cell.DIR_NY if ly == 0 else cell.DIR_PY}
+        assert in_mask == sum(1 << d for d in outward), (lx, ly)
     # Square, so its extent survives rotation.
     for d in range(4):
-        assert Sink.footprint_for(d) == (3, 3), d
+        assert Sink.footprint_for(d) == (2, 2), d
+    # Every perimeter face of the 2x2 is covered exactly once.
+    ins, _ = Sink.faces_for(0, 0, cell.DIR_PX)
+    assert len(set(ins)) == 8, ins
 
     # --- orientation: cells and faces must transform together -------------
     # place_local() is a bijection onto the placed bounding box and

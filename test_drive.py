@@ -423,15 +423,20 @@ assert _built == _ghosted, f"built {_built}, ghosted {_ghosted}"
 assert board.is_empty(31, 20), "built on the wrong side of the cursor"
 ok(f"commit lands exactly where the ghost was: {_built}")
 
-# An odd axis has a middle cell, so the fraction must change nothing.
-select_tool("Sink")
-assert orch.toolbelt.active.name == "Sink"
-put_cursor_at(30.1, 20.1); step()
-_a = sorted(orch.last_plan.placements[0].cells())
-put_cursor_at(30.9, 20.9); step()
-_b = sorted(orch.last_plan.placements[0].cells())
-assert _a == _b, f"3x3 should ignore the sub-cell position: {_a} vs {_b}"
-ok("3x3 Sink ignores the sub-cell position, as an odd extent should")
+# An odd axis has a middle cell, so the fraction must change nothing there.
+# Source is 4x1 -- even on x, odd on y -- so it exercises both rules at once:
+# moving across the cell shifts it, moving up the cell does not.
+_src = select_tool("Source")
+_src.direction = cell.DIR_PX
+put_cursor_at(30.2, 20.2); step()
+_lo = sorted(orch.last_plan.placements[0].cells())
+put_cursor_at(30.2, 20.8); step()
+_hi = sorted(orch.last_plan.placements[0].cells())
+assert _lo == _hi, f"odd axis must ignore the fraction: {_lo} vs {_hi}"
+put_cursor_at(30.8, 20.2); step()
+_right2 = sorted(orch.last_plan.placements[0].cells())
+assert _right2 != _lo, f"even axis must track the fraction: {_lo} vs {_right2}"
+ok("4x1 Source tracks the pointer across x, ignores it up y")
 
 select_tool("Belt")
 
@@ -607,32 +612,33 @@ for x in range(8, 18):
         f"self-frustrated at x={x}: {orch.last_plan.frustrated_cells}")
 ok("dragging a Shear across 10 cells never self-frustrates")
 
-# The same, for the largest footprint -- a 3x3 overlaps its own previous
-# position far more heavily, so it is the real test of the clear-then-plan
-# ordering.
+# The same for a 2D footprint, which overlaps its own previous position far
+# more heavily than a 1D one and so is the real test of clear-then-plan.
+# Everything here derives from FOOTPRINT, so changing a machine's shape does
+# not invalidate the test.
 engine.clear_board(); step()
 select_tool("Sink")
-assert orch.toolbelt.active.name == "Sink"
+_sw, _sh2 = Sink.FOOTPRINT
+assert _sw > 1 and _sh2 > 1, "this section wants a 2D footprint"
 for x in range(8, 18):
     put_cursor_at_cell(x, 24); step()
     assert orch.last_plan is not None and orch.last_plan.ok, (
         f"Sink self-frustrated at x={x}: {orch.last_plan.frustrated_cells}")
 click()
-assert board.live_count == 1, "3x3 Sink is one entity"
-# Structures are centred on the cursor, so a 3x3 clicked at (17,24) has its
-# origin one cell down and left.
+assert board.live_count == 1, "a Sink is one entity"
 _ox, _oy = Sink.origin_for_cursor(17, 24, cell.DIR_PX)
-assert (_ox, _oy) == (16, 23), (_ox, _oy)
 _sink_id = cell.cell_id(board.cell_word(_ox, _oy))
-for _dx in range(3):
-    for _dy in range(3):
+for _dx in range(_sw):
+    for _dy in range(_sh2):
         assert cell.cell_id(
             board.cell_word(_ox + _dx, _oy + _dy)) == _sink_id, (_dx, _dy)
         assert cell.unpack_local(
             int(board.grid[_oy + _dy, _ox + _dx, cell.CH_Y])) == (_dx, _dy)
-# The cursor cell really is the middle one.
-assert cell.unpack_local(int(board.grid[24, 17, cell.CH_Y])) == (1, 1)
-ok("3x3 Sink centres on the cursor, one entity, correct local offsets")
+# The cursor cell is covered, and sits at the footprint's centre offset.
+assert (17, 24) in Sink.cells_for(_ox, _oy, cell.DIR_PX)
+assert cell.unpack_local(int(board.grid[24, 17, cell.CH_Y])) == \
+    Sink.centre_offset(cell.DIR_PX)
+ok(f"{_sw}x{_sh2} Sink centres on the cursor, one entity, correct offsets")
 
 engine.clear_board(); step()
 select_tool("Belt")
