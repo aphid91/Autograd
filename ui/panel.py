@@ -12,7 +12,8 @@ class UIRequests:
 
     __slots__ = ("reload_shader", "frame_board", "clear_board",
                  "verify_round_trip", "select_slot", "cycle_tool",
-                 "cycle_backward", "flip_tool", "quicksave", "quickload")
+                 "cycle_backward", "flip_tool", "quicksave", "quickload",
+                 "toggle_pause", "step_tick", "tick_rate")
 
     def __init__(self):
         self.reload_shader = False
@@ -25,6 +26,10 @@ class UIRequests:
         self.flip_tool = False
         self.quicksave = False
         self.quickload = False
+        self.toggle_pause = False
+        self.step_tick = False
+        #: New ticks/sec, or None to leave the rate alone.
+        self.tick_rate = None
 
 
 class UI:
@@ -129,6 +134,30 @@ class UI:
         imgui.text(f"Placed {engine.stats['placed']}  Erased {engine.stats['erased']}")
 
         imgui.separator()
+        imgui.text_unformatted("Simulation")
+        clock = engine.clock
+        if clock.paused:
+            imgui.push_style_color(imgui.Col_.text, imgui.ImVec4(1, 0.8, 0.3, 1))
+            imgui.text(f"Tick {clock.tick}   PAUSED")
+            imgui.pop_style_color()
+        else:
+            imgui.text(f"Tick {clock.tick}   alpha {clock.alpha:.2f}")
+        if imgui.button("Pause (Space)" if not clock.paused
+                        else "Resume (Space)"):
+            req.toggle_pause = True
+        imgui.same_line()
+        if imgui.button("Step (.)"):
+            req.step_tick = True
+        changed, rate = imgui.slider_float(
+            "ticks/sec", clock.ticks_per_sec, 0.5, 60.0, "%.1f")
+        if changed:
+            req.tick_rate = rate
+        # A non-zero drop count means the sim is not keeping up with
+        # wall-clock and is deliberately running late -- see MAX_CATCHUP_TICKS.
+        if clock.dropped_ticks:
+            imgui.text_disabled(f"dropped {clock.dropped_ticks} ticks")
+
+        imgui.separator()
         imgui.text_unformatted("Build")
         active = orch.toolbelt.active
         imgui.text(f"Tool:  {active.name if active else '(none)'}")
@@ -218,6 +247,7 @@ class UI:
         imgui.text("Left-click: build with the active tool")
         imgui.text("R / shift+R: per-tool (belt shape, structure rotation)")
         imgui.text("Right-click: cancel plan / drag to erase")
+        imgui.text("Space: pause sim    .: step one tick")
 
         imgui.end()
         return req

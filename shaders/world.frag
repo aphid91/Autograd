@@ -14,6 +14,13 @@ uniform float cam_zoom;       // pixels per cell
 uniform ivec2 board_size;     // grid dimensions, cells
 uniform isampler2D grid;      // RGBA32I, one texel per cell
 
+// Simulation time, split so the whole-tick part keeps full integer precision:
+// item positions are a closed-form function of (tick - enter_tick), and a
+// float32 carrying a large absolute tick count would lose the sub-tick
+// resolution the interpolation depends on. Render time is sim_tick + sim_alpha.
+uniform int   sim_tick;       // whole ticks elapsed
+uniform float sim_alpha;      // fraction into the next tick, 0..1
+
 // ======================================================================
 // TUNABLES -- everything here is safe to fiddle with.
 // ======================================================================

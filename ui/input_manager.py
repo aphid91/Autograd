@@ -41,6 +41,10 @@ they were pressed and the active builder decides what they mean (cycle a
 belt's path shape, rotate a structure, mirror a chiral one). `F` takes the
 bare key and the camera's frame-the-board moves to `shift+F`, since framing
 is much the rarer action.
+
+`Space` and `.` drive the simulation clock -- pause and single-step. They are
+global rather than per-tool: the clock is not something a builder has an
+opinion about.
 """
 
 import glfw
@@ -76,6 +80,7 @@ _SLOT_KEYS = {
 }
 _EDGE_KEYS = (
     glfw.KEY_R, glfw.KEY_ESCAPE, glfw.KEY_F, glfw.KEY_F5, glfw.KEY_DELETE,
+    glfw.KEY_SPACE, glfw.KEY_PERIOD,
 ) + tuple(_SLOT_KEYS)
 
 
@@ -88,7 +93,7 @@ class Intents:
         "begin_plan", "update_plan", "commit_plan", "cancel_plan",
         "erase_at", "cursor_cell", "cursor_in_world", "cursor_frac",
         "select_slot", "scroll_steps", "scroll_at",
-        "drag_pan_px",
+        "drag_pan_px", "toggle_pause", "step_tick",
     )
 
     def __init__(self):
@@ -117,6 +122,10 @@ class Intents:
         self.scroll_steps = 0.0    # scroll notches this frame
         self.scroll_at = None      # cursor position to anchor the zoom on
         self.drag_pan_px = (0.0, 0.0)   # camera drag delta, framebuffer px
+        # Simulation clock controls. Space pauses, '.' single-steps -- which
+        # is the primary way to watch one tick's worth of state change.
+        self.toggle_pause = False
+        self.step_tick = False
 
 
 class InputManager:
@@ -236,6 +245,13 @@ class InputManager:
         it.clear_board = self._edge(glfw.KEY_DELETE, not want_kb)
         cycle = self._edge(glfw.KEY_R, not want_kb)
         escape = self._edge(glfw.KEY_ESCAPE, not want_kb)
+
+        # --- simulation clock ---
+        # Space pauses; '.' runs exactly one tick, which works whether or not
+        # the sim is paused. Both are edge-triggered: holding them must not
+        # run a tick per frame.
+        it.toggle_pause = self._edge(glfw.KEY_SPACE, not want_kb)
+        it.step_tick = self._edge(glfw.KEY_PERIOD, not want_kb)
 
         # R is per-tool; shift reverses whatever it means.
         shift = (self._key(glfw.KEY_LEFT_SHIFT)

@@ -41,6 +41,7 @@ There is no pytest/linter configured.
 | [tests/harness.py](tests/harness.py) | the fake mouse/keyboard, the shared GL context, and `reset()` |
 | [tests/test_scenarios.py](tests/test_scenarios.py) | drive the orchestrator and assert board state |
 | [tests/test_glsl.py](tests/test_glsl.py) | static checks on the generated GLSL — no context, no board |
+| [tests/test_tick.py](tests/test_tick.py) | the clock as wired into the frame loop: rate, `alpha`, keys, phase order |
 
 **Scenarios are independent.** `harness.reset()` clears the board, camera,
 input state and toolbelt before each one, so a failure names the scenario
@@ -54,8 +55,19 @@ than inheriting a previous one's board, and anything that mutates global state
 (imgui's `want_capture_mouse`, say) restores it in a `finally` so a failing
 assertion cannot poison everything after.
 
-`core/cell.py` and `core/entity.py` also run self-checks at import, so the
-cell encoding and the entity geometry are exercised by importing anything.
+`core/cell.py`, `core/entity.py` and `core/tick.py` also run self-checks at
+import, so the cell encoding, the entity geometry and the clock's timing
+contract are exercised by importing anything.
+
+A scenario that registers a phase callback on the shared clock must remove it
+in a `finally` — the clock is global state like the board, and a stray
+callback would run for every later scenario. Same reasoning as restoring
+imgui's `want_capture_mouse`.
+
+**Beware exact float multiples when asserting tick counts.** `0.3 // 0.1` is
+2, not 3, so a single `advance()` spanning several periods runs an unreliable
+number of ticks. Tests that care about the count use `request_step(n)` or
+one `advance()` per tick rather than pinning the division.
 
 ## Controls
 
@@ -74,6 +86,8 @@ cell encoding and the entity geometry are exercised by importing anything.
 | `Esc` | cancel a plan, or a tool's multi-step state |
 | `F5` | reload the world shaders |
 | `Delete` | clear the board |
+| `Space` | pause / resume the simulation |
+| `.` | run exactly one tick (works while paused) |
 
 `R` and `F` deliberately mean different things in different tools — the input
 manager reports only that they were pressed and the active builder decides.
@@ -117,6 +131,7 @@ everything else is grouped by layer.
 | [core/glsl_types.py](core/glsl_types.py) | emits the per-type GLSL tables from the entity classes |
 | [core/persistence.py](core/persistence.py) | save/load the board to a single `.npz` |
 | [core/toolbelt.py](core/toolbelt.py) | ten slots, one active tool |
+| [core/tick.py](core/tick.py) | the simulation clock: tick counter, fixed timestep, phase order |
 | [engine.py](engine.py) | preview/commit a plan, erase, ghost lifecycle |
 | [render/camera.py](render/camera.py) | pan/zoom, world↔screen, the world render pass |
 | [render/shader_loader.py](render/shader_loader.py) | reads `shaders/`, resolves `#include` |
@@ -203,10 +218,79 @@ future compute passes, not for per-frame use.
 ### Frame order
 
 `Orchestrator.frame()` runs: poll input → apply to camera/engine → build UI and
-apply its requests → `to_device()` → render world → (caller renders imgui). The
-device sync sits after all mutation and before rendering, so what is drawn is
-always what the CPU believes. Input is polled before the UI is built so the
-panel shows current state rather than lagging a frame.
+apply its requests → **advance the clock** → `to_device()` → render world →
+(caller renders imgui). The device sync sits after all mutation and before
+rendering, so what is drawn is always what the CPU believes. Input is polled
+before the UI is built so the panel shows current state rather than lagging a
+frame.
+
+The clock advances after player mutation and before the device sync — the one
+window where both hold: a tick acts on the board as just edited, and its
+effects reach the GPU the same frame rather than a frame late.
+
+### The simulation clock and the two-phase tick
+
+[core/tick.py](core/tick.py) owns *time*. Nothing else decides when a tick
+happens or in what order its phases run. It is separate from `engine.py`
+because everything tick-dependent is one concern and `engine.py` already
+carries the placement API.
+
+**Fixed timestep.** The sim runs at `TICKS_PER_SEC` regardless of framerate;
+`advance(dt)` banks real time and fires whole ticks out of it, so the same
+tick sequence produces the same board at any framerate. `alpha` is the
+leftover, 0..1 — how far into the next tick we are — and reaches the shader
+as `sim_tick` + `sim_alpha` so items interpolate smoothly instead of snapping
+between slots. The split keeps integer precision: the tick counter grows
+without bound and a float32 loses sub-tick resolution past ~16.7M ticks.
+
+**The backlog is capped** (`MAX_CATCHUP_TICKS`) and, when it trips, the
+accumulator is *zeroed* rather than charged per tick. Charging only for the
+ticks that ran would leave the dropped time banked for the next call to fire —
+the backlog the cap exists to prevent — and subtracting all of it can leave a
+near-full period from float residue, parking `alpha` at ~1.0 and having the
+renderer interpolate a whole tick past the last one that ran.
+
+**A tick is two phases, and the order is load-bearing:**
+
+1. **structure** — gates that can fire, fire. Reads input ports and waiting
+   zones; writes waiting zones and clears inputs. Touches no belt state.
+2. **belt** — waiting zones drain onto belts (or straight into a
+   directly-connected gate's input port), belts advance, belt heads load into
+   gate input ports.
+
+Two phases rather than one because a gate's fire decision depends on whether
+its output is backed up. Updating together would make that answer depend on
+whether the downstream belt had already advanced this tick — execution-order
+dependent, and so nondeterministic the moment it becomes a compute dispatch.
+Split, each phase reads state frozen for the whole phase and writes state the
+other reads.
+
+Structure *before* belt specifically, because that is what lets a well-fed
+gate fire every tick with no bubble: the structure phase gets first look at a
+zone the belt phase emptied one phase earlier. Reverse them and a gate sees a
+full zone every other tick and runs at half rate. Consequences:
+
+- **Bubble-free output needs `d == v`** — spacing equals speed, items
+  nose-to-tail. A belt accepts a new item only once the previous moved a full
+  `d`, i.e. every `d/v` ticks, so a sustained one-item-per-tick is specifically
+  the maximum-density configuration.
+- **A stall costs exactly one tick to recover**, and that tick is unavoidable
+  without letting the structure phase read belt state.
+- **One tick of latency per hop**, so a chain of `k` gates has `k` ticks of
+  pipeline latency. It applies equally to a belt hop and a direct gate-to-gate
+  connection, which is what keeps the two consistent.
+
+**Phases are registered, not hardcoded.** Subsystems register a callable per
+phase; the clock knows nothing about gates or belts. That keeps it testable
+with no board, and means the GPU port replaces the *bodies* of those callbacks
+with compute dispatches while the sequencing stays as it is. The barrier
+between phases is implicit now (one returns before the next is called) and
+becomes a real `glMemoryBarrier` later.
+
+A board replacement — `clear_board()`, `load_board()` — calls `clock.reset()`.
+Item positions are a closed-form function of the tick counter, so a new board
+must start a new timeline or every item on it is dated to a tick that never
+happened for it.
 
 ### Builders: one mechanism for every placement tool
 
@@ -676,13 +760,21 @@ bugs:
 ## Deferred
 
 Noted so they are not mistaken for oversights: belt and structure *simulation*
-(nothing moves — the machines have ports and are drawn, but none of the
-signatures in the table above are evaluated: no arithmetic happens, and
-`Source`/`Sink` neither produce nor consume);
+(the clock and its phase order exist and tick, but no subsystem registers a
+phase yet — nothing moves, and none of the signatures in the table above are
+evaluated: no arithmetic happens, and `Source`/`Sink` neither produce nor
+consume);
 compute shader passes (the context is 4.3 and the SSBO is bound, but nothing
 dispatches); curved corner geometry (corners are currently a right-angle join
 of two straight arms, which reads fine but is not a true curve); entity-row
-compaction; a growable or chunked board (fixed 512×512); save/load.
+compaction; a growable or chunked board (fixed 512×512).
+
+**Simulation is being built CPU-first, then ported.** The tick phases, the
+belt segment representation and the gate logic are all designed so the port to
+compute shaders replaces phase-callback *bodies* with dispatches and leaves
+the sequencing alone — see "The simulation clock and the two-phase tick". The
+CPU implementation is kept afterwards as the test oracle, per
+[docs/belt_report.md](docs/belt_report.md).
 
 Tools the builder abstraction is shaped for but which do not exist yet:
 blueprint capture/paste, and undo (which would record the rows a committed

@@ -178,7 +178,14 @@ class Camera:
         )
 
     # --- render ---------------------------------------------------------
-    def render(self, viewport):
+    def render(self, viewport, clock=None):
+        """Draw the world.
+
+        `clock` supplies the simulation time the shader interpolates item
+        motion against -- `tick + alpha`, so items move smoothly between
+        ticks instead of snapping between slots. Optional so the camera can
+        still be driven with no simulation at all.
+        """
         if self.program is None or self.vao is None:
             return
 
@@ -195,6 +202,16 @@ class Camera:
         self._set("cam_zoom", float(self.zoom))
         self._set("board_size", (int(board.width), int(board.height)))
         self._set("grid", GRID_TEXTURE_UNIT)
+        # Fractional tick time. Split into whole and fraction rather than sent
+        # as one float: the tick counter grows without bound and a float32
+        # loses sub-tick precision past ~16.7M ticks, which at 10/s is under
+        # three weeks of runtime. The shader adds them where it needs to.
+        if clock is not None:
+            self._set("sim_tick", int(clock.tick))
+            self._set("sim_alpha", float(clock.alpha))
+        else:
+            self._set("sim_tick", 0)
+            self._set("sim_alpha", 0.0)
 
         self.vao.render(moderngl.TRIANGLE_STRIP)
 

@@ -13,6 +13,9 @@ Two kinds of test live under tests/:
   tests/test_glsl.py       static checks on the generated GLSL and the
                            hand-written code that consumes it. No GL context,
                            no board.
+  tests/test_tick.py       the simulation clock as wired into the frame loop.
+                           core/tick.py self-checks the Clock in isolation;
+                           these cover the orchestrator wiring and the keys.
 
 core/cell.py and core/entity.py also run self-checks at import, so simply
 importing anything here exercises the cell encoding and the entity geometry.
@@ -20,7 +23,7 @@ importing anything here exercises the cell encoding and the entity geometry.
 
 import sys
 
-from tests import harness, test_glsl, test_scenarios
+from tests import harness, test_glsl, test_scenarios, test_tick
 
 
 def _scenarios(module):
@@ -38,6 +41,7 @@ def main(argv):
     # scenarios fail too, and the cause is much clearer here.
     ran = harness.run_all(_scenarios(test_glsl), only=only, reset_each=False)
     ran += harness.run_all(_scenarios(test_scenarios), only=only)
+    ran += harness.run_all(_scenarios(test_tick), only=only)
     if not ran:
         print(f"no tests matched {only!r}")
         return 1

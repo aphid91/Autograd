@@ -5,14 +5,20 @@ Per-frame order matters:
   1. poll input  -> intents
   2. apply intents to the camera and engine (the only mutation point)
   3. build the UI frame, apply its requests
-  4. sync dirty state to the device
-  5. render the world, then the UI on top
+  4. advance the simulation clock
+  5. sync dirty state to the device
+  6. render the world, then the UI on top
 
 Input is polled before the UI is built, so the UI shows the state the player
 just produced rather than lagging a frame behind. The device sync happens after
 all mutation and before rendering, so what is drawn is always what the CPU
 believes -- including the ghost preview, which changes every frame the cursor
 moves and therefore exercises the partial-upload path continuously.
+
+The clock advances *after* player mutation and *before* the device sync, which
+puts it in the one window where both hold: a tick sees the board the player
+just edited, and its effects reach the GPU in the same frame rather than being
+displayed a frame late.
 """
 
 import os
@@ -145,6 +151,10 @@ class Orchestrator:
             self.camera.reload_shader()
         if intents.clear_board:
             engine.clear_board()
+        if intents.toggle_pause:
+            engine.clock.toggle_pause()
+        if intents.step_tick:
+            engine.clock.request_step()
 
         # 3. toolbelt selection. Changing tools drops any in-flight preview --
         # a half-drawn belt run means nothing to the structure tool.
@@ -225,10 +235,21 @@ class Orchestrator:
             self.ui.last_save = self._quicksave()
         if requests.quickload:
             self.ui.last_save = self._quickload()
+        if requests.toggle_pause:
+            engine.clock.toggle_pause()
+        if requests.step_tick:
+            engine.clock.request_step()
+        if requests.tick_rate is not None:
+            engine.clock.set_rate(requests.tick_rate)
 
-        # 7. device sync, then render
+        # 7. simulation. After every player mutation, so a tick acts on the
+        # board as just edited; before the device sync, so its effects are
+        # drawn this frame rather than next.
+        engine.tick(dt)
+
+        # 8. device sync, then render
         self.ui.last_upload = engine.sync_to_device()
-        self.camera.render(viewport)
+        self.camera.render(viewport, engine.clock)
 
     def seed_demo(self):
         """A few belts so the board is not empty on first run."""

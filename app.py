@@ -8,14 +8,17 @@ Controls:
   Q / E         zoom out / in
   Scroll        zoom, anchored at the cursor
   Left-drag     pan the camera
-  F             frame the whole board
+  F             per-tool: flip (mirror) the held structure
+  shift+F       frame the whole board
   1-9, 0        select a toolbelt slot
   Left-click    build with the active tool (on release, not press)
   R / shift+R   per-tool: belt path shape, or structure rotation
   Right-click   cancel a plan, or drag to erase
-  Esc           cancel a plan
+  Esc           cancel a plan, or a tool's multi-step state
   F5            reload the world shaders
   Delete        clear the board
+  Space         pause / resume the simulation
+  .             run exactly one tick (works while paused)
 """
 
 import glfw

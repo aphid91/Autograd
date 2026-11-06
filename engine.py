@@ -14,6 +14,7 @@ from core.builders import BeltBuilder
 from core.engine_paths import bresenham, intent_dir, path_directions, plan_path
 from core.entity import Belt, Underground
 from core.gameboard import Gameboard
+from core.tick import Clock
 from core import persistence
 
 # Re-exported so existing callers and tests keep working after the path
@@ -34,6 +35,10 @@ __all__ = [
 class Engine:
     def __init__(self, width=512, height=512):
         self.board = Gameboard(width, height)
+        # The simulation clock. Owns the tick counter, the fixed-step
+        # accumulator and the phase order; see core/tick.py. Subsystems
+        # register their phase callbacks on it as they are built.
+        self.clock = Clock()
         # Ghost rows that will become real on commit.
         self.ghost_rows = []
         # Ghost rows that exist only to show the player what *would* fit, from
@@ -238,6 +243,10 @@ class Engine:
         n = persistence.load(self.board, path)
         self.ghost_rows.clear()
         self.preview_only_rows.clear()
+        # A new board is a new timeline. Item positions are a closed-form
+        # function of the tick counter, so carrying the old count over would
+        # date every item on the loaded board to a tick that never happened.
+        self.clock.reset()
         return n
 
     # --- underground belts ----------------------------------------------
@@ -337,6 +346,19 @@ class Engine:
                 if self.board.is_row_alive(r)]
         for r in rows:
             self.board.despawn(r)
+        # Nothing is left to carry a history, so restart the clock too --
+        # same reasoning as load_board().
+        self.clock.reset()
+
+    # --- simulation ------------------------------------------------------
+    def tick(self, dt):
+        """Advance the simulation clock, running whatever ticks are due.
+
+        Called once per frame by the orchestrator, after all player mutation
+        and before the device sync -- so a tick's effects reach the GPU in the
+        same frame they happen.
+        """
+        return self.clock.advance(dt)
 
     # --- device ---------------------------------------------------------
     def create_device_resources(self, ctx):

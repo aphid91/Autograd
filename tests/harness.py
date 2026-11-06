@@ -117,6 +117,12 @@ def reset():
     orch.toolbelt.select(0)
     cam.center[:] = (BOARD / 2, BOARD / 2)
     cam.zoom = 16.0
+    # The clock is global state like everything else here: a scenario that
+    # paused the sim or ran it far forward must not leave the next one
+    # starting mid-timeline. clear_board() above already resets the tick
+    # counter, but not the pause flag.
+    engine.clock.resume()
+    engine.clock.reset()
     step()
 
 
