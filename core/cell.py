@@ -9,7 +9,8 @@ duplicated in GLSL at the top of world.frag -- KEEP THE TWO IN SYNC.
         bit  31     unused -- deliberately left clear, see below
     .y              packed (local_x, local_y) for multi-cell entities
     .z  bits 0-1    ghost state  0=real, 1=ghost, 2=frustrated
-        bits 2-31   reserved
+        bit  2       flipped: entity mirrored about its authored X axis
+        bits 3-31   reserved
     .w              reserved
 
 GHOST_FRUSTRATED is an overlay, not an entity. A frustrated cell is one a
@@ -69,6 +70,20 @@ def rotate_dir_ccw_n(direction, turns):
     return (direction + turns) % 4
 
 
+def flip_dir_y(direction):
+    """Mirror a direction about the X axis: +Y <-> -Y, +X and -X unchanged.
+
+    This is the face half of a structure flip. Entities are authored at DIR_PX
+    and flipped about the authored X axis *before* being rotated, so a chiral
+    machine has a mirrored twin at every facing.
+    """
+    if direction == DIR_PY:
+        return DIR_NY
+    if direction == DIR_NY:
+        return DIR_PY
+    return direction
+
+
 def rotate_offset(lx, ly, direction):
     """Rotate an entity-local offset into a facing.
 
@@ -84,15 +99,21 @@ def rotate_offset(lx, ly, direction):
 # --- entity types -------------------------------------------------------
 TYPE_EMPTY = 0
 TYPE_BELT = 1
-TYPE_ADD = 2
-TYPE_MUL = 3
-# 4..127 reserved for future structures.
+TYPE_SWAP = 2    # conditional swap: x,y,z -> x, (y,z if x>0 else z,y)
+TYPE_SHEAR = 3   # x,y -> x, x+y
+TYPE_MAC = 4     # x,y,z -> x, y, z + x*y
+TYPE_SOURCE = 5  # emits from one tip
+TYPE_SINK = 6    # consumes on all four sides
+# 7..127 reserved for future structures.
 
 TYPE_NAMES = {
     TYPE_EMPTY: "empty",
     TYPE_BELT: "belt",
-    TYPE_ADD: "add",
-    TYPE_MUL: "mul",
+    TYPE_SWAP: "swap",
+    TYPE_SHEAR: "shear",
+    TYPE_MAC: "mac",
+    TYPE_SOURCE: "source",
+    TYPE_SINK: "sink",
 }
 
 # --- bit field layout ---------------------------------------------------
@@ -111,6 +132,13 @@ MAX_ENTITY_ID = ID_MASK
 # never clears the occupant's id in .x -- see the module docstring.
 GHOST_SHIFT, GHOST_BITS = 0, 2
 GHOST_MASK = (1 << GHOST_BITS) - 1
+
+# .z bit 2: the entity is mirrored about its authored X axis. This lives in
+# the cell rather than only in the entity row because the renderer resolves
+# ports per-cell straight from the grid texture, and must transform the cell's
+# local offset the same way the placement did.
+FLIP_SHIFT = 2
+FLIP_BIT = 1 << FLIP_SHIFT
 
 GHOST_NONE = 0
 GHOST_PENDING = 1      # a ghost entity of our own, in a free cell
@@ -198,10 +226,14 @@ def unpack_local(word):
 
 
 # --- .z: ghost state ----------------------------------------------------
-def pack_flags(ghost_state=GHOST_NONE):
+def pack_flags(ghost_state=GHOST_NONE, flipped=False):
     if not 0 <= ghost_state <= GHOST_MASK:
         raise ValueError(f"bad ghost state {ghost_state}")
-    return ghost_state << GHOST_SHIFT
+    return (ghost_state << GHOST_SHIFT) | (FLIP_BIT if flipped else 0)
+
+
+def is_flipped(word):
+    return bool(int(word) & FLIP_BIT)
 
 
 def ghost_state(word):
@@ -255,9 +287,18 @@ def _self_check():
     assert not is_ghost(pack_flags(GHOST_FRUSTRATED)), "frustrated is not a ghost"
     for s in (GHOST_NONE, GHOST_PENDING, GHOST_FRUSTRATED):
         assert ghost_state(pack_flags(s)) == s
-        # Replacing the field must leave the reserved bits alone.
+        # Replacing the ghost field must leave every other bit alone --
+        # including the flip bit, which shares .z.
         assert ghost_state(with_ghost_state(0xFF00 | 0x3, s)) == s
-        assert (with_ghost_state(0xFF00, s) >> 2) == (0xFF00 >> 2)
+        assert (with_ghost_state(0xFF00, s) >> 3) == (0xFF00 >> 3)
+        assert is_flipped(with_ghost_state(pack_flags(s, True), s))
+        assert not is_flipped(with_ghost_state(pack_flags(s, False), s))
+
+    # The flip bit and the ghost field are independent.
+    for s in (GHOST_NONE, GHOST_PENDING, GHOST_FRUSTRATED):
+        for fl in (False, True):
+            w = pack_flags(s, fl)
+            assert ghost_state(w) == s and is_flipped(w) == fl, (s, fl)
 
     assert step_to_dir(1, 0) == DIR_PX and step_to_dir(0, -1) == DIR_NY
 

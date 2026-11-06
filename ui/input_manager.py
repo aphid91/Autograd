@@ -21,6 +21,8 @@ State machine, for a drag-based tool (a belt run):
             left-release           -> IDLE (no build)
   PLANNING  mouse move             -> re-preview the path
             R / shift+R            -> the active tool's cycle, re-preview
+            F                      -> the active tool's flip, re-preview
+            shift+F                -> frame the whole board
             left-press             -> ARMED again; the release commits
             right-press / Esc      -> cancel, -> IDLE
   ERASING   drag                   -> erase under cursor
@@ -34,9 +36,11 @@ care which gesture produced them.
 Right-press is consumed by the cancel when PLANNING, so a cancel never also
 starts an erase -- the erase gesture needs a fresh press.
 
-`R` and `shift+R` are deliberately *per-tool*: this class reports that they
-were pressed and the active builder decides what they mean (cycle a belt's
-path shape, rotate a structure).
+`R`, `shift+R` and `F` are deliberately *per-tool*: this class reports that
+they were pressed and the active builder decides what they mean (cycle a
+belt's path shape, rotate a structure, mirror a chiral one). `F` takes the
+bare key and the camera's frame-the-board moves to `shift+F`, since framing
+is much the rarer action.
 """
 
 import glfw
@@ -79,8 +83,8 @@ class Intents:
     """What the player asked for this frame. Plain data, consumed once."""
 
     __slots__ = (
-        "pan_x", "pan_y", "zoom", "cycle_tool", "cycle_backward", "frame_board",
-        "reload_shader", "clear_board",
+        "pan_x", "pan_y", "zoom", "cycle_tool", "cycle_backward", "flip_tool",
+        "frame_board", "reload_shader", "clear_board",
         "begin_plan", "update_plan", "commit_plan", "cancel_plan",
         "erase_at", "cursor_cell", "cursor_in_world", "cursor_frac",
         "select_slot", "scroll_steps", "scroll_at",
@@ -94,6 +98,8 @@ class Intents:
         # R (or shift+R) -- meaning is the active tool's to decide.
         self.cycle_tool = False
         self.cycle_backward = False
+        # F -- also the active tool's to interpret.
+        self.flip_tool = False
         self.frame_board = False
         self.reload_shader = False
         self.clear_board = False
@@ -226,7 +232,6 @@ class InputManager:
             if self._key(glfw.KEY_Q):
                 it.zoom -= 1.0
 
-        it.frame_board = self._edge(glfw.KEY_F, not want_kb)
         it.reload_shader = self._edge(glfw.KEY_F5, not want_kb)
         it.clear_board = self._edge(glfw.KEY_DELETE, not want_kb)
         cycle = self._edge(glfw.KEY_R, not want_kb)
@@ -237,6 +242,13 @@ class InputManager:
                  or self._key(glfw.KEY_RIGHT_SHIFT))
         it.cycle_tool = cycle
         it.cycle_backward = shift
+
+        # F is per-tool like R (the active builder decides what a flip means);
+        # shift+F is the camera's frame-the-board, which is the rarer action
+        # and so gives up the bare key.
+        f_key = self._edge(glfw.KEY_F, not want_kb)
+        it.flip_tool = f_key and not shift
+        it.frame_board = f_key and shift
 
         # --- toolbelt selection ---
         # Number keys only: scroll is zoom now, Factorio-style.
@@ -281,7 +293,7 @@ class InputManager:
             if not drag_based and not want_mouse and board.in_bounds(cx, cy):
                 self.anchor = self.target = (cx, cy)
                 if (cx, cy) != self._last_hover or frac != self._last_frac \
-                        or cycle:
+                        or cycle or it.flip_tool:
                     it.update_plan = True
                 self._last_hover = (cx, cy)
                 self._last_frac = frac
@@ -366,8 +378,8 @@ class InputManager:
                 self._press_frac = frac
                 self._pending_commit = True
             else:
-                if cycle:
-                    # The orchestrator applies this to the active tool; we
+                if cycle or it.flip_tool:
+                    # The orchestrator applies these to the active tool; we
                     # only need to know the preview must be rebuilt.
                     it.update_plan = True
                 if (cx, cy) != self.target or frac != self.target_frac:

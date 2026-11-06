@@ -21,7 +21,7 @@ them -- that is what makes a frustrated cell different from an absent one.
 
 from core import cell
 from core.engine_paths import plan_path, path_directions, intent_dir
-from core.entity import Add, Belt, Mul
+from core.entity import STRUCTURES, Belt
 
 
 def quadrant_dir(frac):
@@ -44,26 +44,31 @@ def quadrant_dir(frac):
 class Placement:
     """One entity a plan would create, and whether it can actually happen."""
 
-    __slots__ = ("entity_cls", "x", "y", "direction", "blocked_cells")
+    __slots__ = ("entity_cls", "x", "y", "direction", "blocked_cells",
+                 "flipped")
 
-    def __init__(self, entity_cls, x, y, direction, blocked_cells=()):
+    def __init__(self, entity_cls, x, y, direction, blocked_cells=(),
+                 flipped=False):
         self.entity_cls = entity_cls
         self.x = x
         self.y = y
         self.direction = direction
         self.blocked_cells = list(blocked_cells)
+        self.flipped = flipped
 
     @property
     def frustrated(self):
         return bool(self.blocked_cells)
 
     def cells(self):
-        return self.entity_cls.cells_for(self.x, self.y, self.direction)
+        return self.entity_cls.cells_for(self.x, self.y, self.direction,
+                                         self.flipped)
 
     def __repr__(self):
         state = "frustrated" if self.frustrated else "ok"
+        mirror = " flipped" if self.flipped else ""
         return (f"<Placement {self.entity_cls.__name__} ({self.x},{self.y}) "
-                f"{cell.DIR_NAMES[self.direction]} {state}>")
+                f"{cell.DIR_NAMES[self.direction]}{mirror} {state}>")
 
 
 class BuildPlan:
@@ -146,6 +151,15 @@ class EntityBuilder:
 
     def cycle(self, backward=False):
         """Handle the tool's R / shift+R key. Return True if state changed."""
+        return False
+
+    def flip(self):
+        """Handle the tool's F key. Return True if state changed.
+
+        Like R, F is per-tool: the input manager reports only that it was
+        pressed. A tool with no mirrored form (a belt, an achiral structure)
+        returns False and nothing happens.
+        """
         return False
 
     def status(self):
@@ -254,6 +268,7 @@ class StructureBuilder(EntityBuilder):
         self.entity_cls = entity_cls
         self.name = name or entity_cls.__name__
         self.direction = cell.DIR_PX
+        self.flipped = False
 
     def cycle(self, backward=False):
         if not self.entity_cls.ROTATABLE:
@@ -261,27 +276,45 @@ class StructureBuilder(EntityBuilder):
         self.direction = cell.rotate_dir(self.direction, cw=not backward)
         return True
 
+    def flip(self):
+        """Mirror the held structure, if mirroring means anything for it.
+
+        Chirality is derived from the port layout rather than declared, so an
+        achiral type (Source, Sink) reports no change and F is a silent no-op
+        -- there is no second version of it to reach.
+        """
+        if not self.entity_cls.is_chiral():
+            return False
+        self.flipped = not self.flipped
+        return True
+
     def status(self):
         w, h = self.entity_cls.footprint_for(self.direction)
-        return f"{w}x{h} facing {cell.DIR_NAMES[self.direction]}"
+        s = f"{w}x{h} facing {cell.DIR_NAMES[self.direction]}"
+        if self.entity_cls.is_chiral():
+            s += " (flipped)" if self.flipped else ""
+        return s
 
     def plan(self, engine, start, end, start_frac=(0.5, 0.5),
              end_frac=(0.5, 0.5)):
         # A structure ignores both the drag and the sub-cell position: it
-        # places at the cursor's cell, rotated by R.
+        # places at the cursor's cell, rotated by R and mirrored by F.
         x, y = end
         blocked = [
-            c for c in self.entity_cls.cells_for(x, y, self.direction)
+            c for c in self.entity_cls.cells_for(
+                x, y, self.direction, self.flipped)
             if not engine.buildable(*c)
         ]
-        placement = Placement(self.entity_cls, x, y, self.direction, blocked)
+        placement = Placement(self.entity_cls, x, y, self.direction, blocked,
+                              flipped=self.flipped)
         return BuildPlan([placement], all_or_nothing=True)
 
 
 def default_builders():
-    """The toolbelt's starting tools, in slot order."""
-    return [
-        BeltBuilder(),
-        StructureBuilder(Add, "Add"),
-        StructureBuilder(Mul, "Mul"),
-    ]
+    """The toolbelt's starting tools, in slot order.
+
+    Belt first, then one StructureBuilder per registered structure. Adding a
+    machine is a new Entity subclass in core/entity.py plus its entry in
+    STRUCTURES -- nothing here needs to change.
+    """
+    return [BeltBuilder()] + [StructureBuilder(c) for c in STRUCTURES]

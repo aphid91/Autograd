@@ -13,7 +13,7 @@ from orchestrator import Orchestrator
 from ui.input_manager import STATE_IDLE, STATE_PLANNING, STATE_ERASING
 from engine import MODE_HORIZONTAL_FIRST, MODE_VERTICAL_FIRST, MODE_LINE
 from core.builders import BeltBuilder, StructureBuilder
-from core.entity import Add, Mul
+from core.entity import STRUCTURES, Mac, Shear, Sink, Source, Swap
 
 W, H = 1024, 768
 
@@ -241,11 +241,14 @@ print("=== toolbelt selection ===")
 engine.clear_board(); step()
 assert orch.toolbelt.active.name == "Belt", orch.toolbelt.active.name
 fake["keys"].add(glfw.KEY_2); step(); fake["keys"].discard(glfw.KEY_2); step()
-assert orch.toolbelt.active.name == "Add", orch.toolbelt.active.name
-ok("key 2 selected Add")
+assert orch.toolbelt.active.name == "Swap", orch.toolbelt.active.name
+ok("key 2 selected Swap")
 fake["keys"].add(glfw.KEY_3); step(); fake["keys"].discard(glfw.KEY_3); step()
-assert orch.toolbelt.active.name == "Mul"
-ok("key 3 selected Mul")
+assert orch.toolbelt.active.name == "Shear"
+ok("key 3 selected Shear")
+fake["keys"].add(glfw.KEY_6); step(); fake["keys"].discard(glfw.KEY_6); step()
+assert orch.toolbelt.active.name == "Sink"
+ok("key 6 selected Sink")
 fake["keys"].add(glfw.KEY_0); step(); fake["keys"].discard(glfw.KEY_0); step()
 assert orch.toolbelt.selected == 9 and orch.toolbelt.active is None
 ok("key 0 selected empty slot 10")
@@ -255,33 +258,39 @@ ok("key 1 back to Belt")
 
 print("=== structure placement is click-based and all-or-nothing ===")
 engine.clear_board(); step()
-fake["keys"].add(glfw.KEY_2); step(); fake["keys"].discard(glfw.KEY_2); step()
-add_tool = orch.toolbelt.active
-assert not add_tool.drag_based
+fake["keys"].add(glfw.KEY_3); step(); fake["keys"].discard(glfw.KEY_3); step()
+shear_tool = orch.toolbelt.active
+assert shear_tool.name == "Shear"
+assert not shear_tool.drag_based
+shear_tool.direction = cell.DIR_PX
 
 # Hovering alone must ghost, with no click at all.
 put_cursor_at_cell(20, 20); step()
 assert len(engine.ghost_rows) == 1, len(engine.ghost_rows)
 assert orch.input.state == STATE_IDLE, "structures never enter PLANNING"
-ok("Add ghosts on hover without a click")
+ok("Shear ghosts on hover without a click")
 
 # One click places it; it covers two cells.
 click()
 assert not board.is_empty(20, 20) and not board.is_empty(21, 20)
 placed_id = cell.cell_id(board.cell_word(20, 20))
 assert cell.cell_id(board.cell_word(21, 20)) == placed_id, "both cells, one entity"
-assert cell.cell_type(board.cell_word(20, 20)) == cell.TYPE_ADD
-ok("single click placed a 2x1 Add sharing one entity id")
+assert cell.cell_type(board.cell_word(20, 20)) == cell.TYPE_SHEAR
+# Each cell of the footprint carries its own local offset, which is what the
+# per-cell port lookup keys on.
+assert cell.unpack_local(int(board.grid[20, 20, cell.CH_Y])) == (0, 0)
+assert cell.unpack_local(int(board.grid[20, 21, cell.CH_Y])) == (1, 0)
+ok("single click placed a 2x1 Shear sharing one entity id")
 
 # Rotation changes the footprint orientation.
-before = add_tool.direction
+before = shear_tool.direction
 fake["keys"].add(glfw.KEY_R); step(); fake["keys"].discard(glfw.KEY_R); step()
-assert add_tool.direction != before
+assert shear_tool.direction != before
 put_cursor_at_cell(30, 30); step()
 click()
 assert not board.is_empty(30, 30) and not board.is_empty(30, 31), "rotated = vertical"
 assert board.is_empty(31, 30)
-ok("R rotated the Add to 1x2")
+ok("R rotated the Shear to 1x2")
 
 # Overlapping placement frustrates and builds nothing.
 live_before = board.live_count
@@ -291,10 +300,79 @@ frustrated = int((cell.ghost_state_arr(board.grid[:, :, cell.CH_Z])
 assert frustrated > 0, "overlap should tint"
 assert len(engine.ghost_rows) == 0, "all-or-nothing must ghost nothing"
 # The occupant survives underneath the tint.
-assert cell.cell_type(board.cell_word(30, 30)) == cell.TYPE_ADD
+assert cell.cell_type(board.cell_word(30, 30)) == cell.TYPE_SHEAR
 click()
 assert board.live_count == live_before, "blocked placement must build nothing"
 ok(f"overlap tinted {frustrated} cells, built nothing, occupant intact")
+
+print("=== F flips a chiral structure, shift+F frames the board ===")
+engine.clear_board(); step()
+fake["keys"].add(glfw.KEY_3); step(); fake["keys"].discard(glfw.KEY_3); step()
+_tool = orch.toolbelt.active
+_tool.direction = cell.DIR_PX
+_tool.flipped = False
+assert _tool.entity_cls.is_chiral(), "Shear should be chiral"
+put_cursor_at_cell(12, 40); step()
+fake["keys"].add(glfw.KEY_F); step(); fake["keys"].discard(glfw.KEY_F); step()
+assert _tool.flipped, "F should flip a chiral structure"
+ok("F flipped the held Shear")
+
+# The flip must reach the board, and land in .z where the renderer reads it.
+click()
+_fl = [c for c in _tool.entity_cls.cells_for(12, 40, cell.DIR_PX, True)]
+assert all(cell.is_flipped(int(board.grid[y, x, cell.CH_Z])) for x, y in _fl), \
+    "flip bit missing from the placed cells"
+# ...and the ports must match the flipped layout, not the plain one.
+_ins, _outs = _tool.entity_cls.faces_for(12, 40, cell.DIR_PX, True)
+_plain_in, _ = _tool.entity_cls.faces_for(12, 40, cell.DIR_PX, False)
+assert sorted(_ins) != sorted(_plain_in), "flip should change the port layout"
+ok("flipped Shear placed with the flip bit set in .z")
+
+# F is an involution.
+fake["keys"].add(glfw.KEY_F); step(); fake["keys"].discard(glfw.KEY_F); step()
+assert not _tool.flipped, "F twice should return to the original"
+ok("F is an involution")
+
+# An achiral structure ignores F entirely.
+fake["keys"].add(glfw.KEY_6); step(); fake["keys"].discard(glfw.KEY_6); step()
+_sink_tool = orch.toolbelt.active
+assert _sink_tool.name == "Sink" and not _sink_tool.entity_cls.is_chiral()
+fake["keys"].add(glfw.KEY_F); step(); fake["keys"].discard(glfw.KEY_F); step()
+assert not _sink_tool.flipped, "F must be a no-op for an achiral type"
+ok("F does nothing to an achiral Sink")
+
+# shift+F still frames the board, and plain F does not.
+_before = tuple(orch.camera.center)
+fake["keys"].add(glfw.KEY_F)
+fake["keys"].add(glfw.KEY_LEFT_SHIFT); step()
+fake["keys"].discard(glfw.KEY_F); fake["keys"].discard(glfw.KEY_LEFT_SHIFT)
+step()
+assert tuple(orch.camera.center) != _before or orch.camera.center[0] == board.width * 0.5
+ok("shift+F framed the board")
+fake["keys"].add(glfw.KEY_1); step(); fake["keys"].discard(glfw.KEY_1); step()
+
+print("=== rotating a structure keeps its ports on the outside ===")
+# Regression: the shader looked its port tables up with the placed .y offset
+# instead of inverting it, so a rotated structure's ports moved to interior
+# edges. Sink is the sharpest case -- 3x3, rotation-invariant extent.
+engine.clear_board(); step()
+for _cls in (Sink, Source, Swap, Shear, Mac):
+    for _d in range(4):
+        for _fl in (False, True):
+            _ins, _outs = _cls.faces_for(20, 20, _d, _fl)
+            _occ = set(_cls.cells_for(20, 20, _d, _fl))
+            _w, _h = _cls.footprint_for(_d)
+            for (_xy, _f) in _ins + _outs:
+                assert _xy in _occ, (_cls.__name__, _d, _fl, _xy)
+                # A port must face *out* of the footprint: the cell one step
+                # along the face direction must be outside it.
+                _nx = _xy[0] + cell.DIR_STEPS[_f][0]
+                _ny = _xy[1] + cell.DIR_STEPS[_f][1]
+                assert (_nx, _ny) not in _occ, (
+                    f"{_cls.__name__} facing {cell.DIR_NAMES[_d]} flip={_fl}: "
+                    f"port at {_xy} faces {cell.DIR_NAMES[_f]} into the "
+                    f"footprint's interior")
+ok("every port faces outward at every rotation and flip")
 
 print("=== frustration never destroys the occupant ===")
 engine.clear_board(); step()
@@ -318,13 +396,33 @@ print("=== a tool must not collide with its own preview ===")
 # Regression: plans were computed before the previous preview was cleared, so
 # dragging a structure one cell sideways frustrated against its own ghost.
 engine.clear_board(); step()
-fake["keys"].add(glfw.KEY_2); step(); fake["keys"].discard(glfw.KEY_2); step()
+fake["keys"].add(glfw.KEY_3); step(); fake["keys"].discard(glfw.KEY_3); step()
 orch.toolbelt.active.direction = cell.DIR_PX
 for x in range(8, 18):
     put_cursor_at_cell(x, 24); step()
     assert orch.last_plan is not None and orch.last_plan.ok, (
         f"self-frustrated at x={x}: {orch.last_plan.frustrated_cells}")
-ok("dragging an Add across 10 cells never self-frustrates")
+ok("dragging a Shear across 10 cells never self-frustrates")
+
+# The same, for the largest footprint -- a 3x3 overlaps its own previous
+# position far more heavily, so it is the real test of the clear-then-plan
+# ordering.
+engine.clear_board(); step()
+fake["keys"].add(glfw.KEY_6); step(); fake["keys"].discard(glfw.KEY_6); step()
+assert orch.toolbelt.active.name == "Sink"
+for x in range(8, 18):
+    put_cursor_at_cell(x, 24); step()
+    assert orch.last_plan is not None and orch.last_plan.ok, (
+        f"Sink self-frustrated at x={x}: {orch.last_plan.frustrated_cells}")
+click()
+assert board.live_count == 1, "3x3 Sink is one entity"
+_sink_id = cell.cell_id(board.cell_word(17, 24))
+for _dx in range(3):
+    for _dy in range(3):
+        assert cell.cell_id(board.cell_word(17 + _dx, 24 + _dy)) == _sink_id, (_dx, _dy)
+        assert cell.unpack_local(
+            int(board.grid[24 + _dy, 17 + _dx, cell.CH_Y])) == (_dx, _dy)
+ok("3x3 Sink places as one entity with correct per-cell local offsets")
 
 engine.clear_board(); step()
 fake["keys"].add(glfw.KEY_1); step(); fake["keys"].discard(glfw.KEY_1); step()
@@ -339,18 +437,18 @@ fake["right"] = True; step(); fake["right"] = False; step()
 
 print("=== a blocked structure still previews the part that fits ===")
 engine.clear_board(); step()
-fake["keys"].add(glfw.KEY_2); step(); fake["keys"].discard(glfw.KEY_2); step()
+fake["keys"].add(glfw.KEY_3); step(); fake["keys"].discard(glfw.KEY_3); step()
 # An earlier section rotated this tool; put it back to horizontal so the
 # footprint is (20,30)+(21,30) and the blocker below actually clashes.
 orch.toolbelt.active.direction = cell.DIR_PX
 blocker = engine.place_belt(21, 30, cell.DIR_PX)
 blocker_id = blocker.row
-put_cursor_at_cell(20, 30); step()      # Add would cover (20,30) and (21,30)
+put_cursor_at_cell(20, 30); step()      # Shear would cover (20,30) and (21,30)
 assert cell.is_ghost(int(board.grid[30, 20, cell.CH_Z])), "free half must ghost"
 assert cell.is_frustrated(int(board.grid[30, 21, cell.CH_Z])), "blocked half must tint"
 assert cell.cell_id(board.cell_word(21, 30)) == blocker_id, "blocker clobbered"
 assert cell.cell_type(board.cell_word(21, 30)) == cell.TYPE_BELT
-ok("half-blocked Add ghosts the half that fits, tints the other")
+ok("half-blocked Shear ghosts the half that fits, tints the other")
 
 # ...but committing it still builds nothing: half a structure cannot exist.
 live_before = board.live_count
@@ -361,7 +459,7 @@ assert board.live_count == live_before, "a fragment was committed!"
 assert cell.is_ghost(int(board.grid[30, 20, cell.CH_Z])), "fragment went real!"
 assert not engine.ghost_rows, "nothing committable should remain"
 assert cell.cell_id(board.cell_word(21, 30)) == blocker_id
-ok("committing the blocked Add built nothing; fragment stayed a ghost")
+ok("committing the blocked Shear built nothing; fragment stayed a ghost")
 
 # Moving away must clean the fragment up entirely.
 put_cursor_at_cell(40, 36); step()
@@ -376,7 +474,7 @@ click()
 put_cursor_at_cell(18, 12); step()
 assert len(engine.ghost_rows) > 0
 fake["keys"].add(glfw.KEY_3); step(); fake["keys"].discard(glfw.KEY_3); step()
-assert orch.toolbelt.active.name == "Mul"
+assert orch.toolbelt.active.name == "Shear"
 assert orch.input.state == STATE_IDLE, "tool switch should cancel the gesture"
 belt_ghosts = [r for r in engine.ghost_rows
                if board.is_row_alive(r)
@@ -412,8 +510,10 @@ for _name, _want in [
     ("TYPE_SHIFT", cell.TYPE_SHIFT), ("TYPE_MASK", cell.TYPE_MASK),
     ("ID_SHIFT", cell.ID_SHIFT), ("ID_MASK", cell.ID_MASK),
     ("GHOST_MASK", cell.GHOST_MASK), ("LOCAL_SHIFT", cell.LOCAL_SHIFT),
-    ("TYPE_BELT", cell.TYPE_BELT), ("TYPE_ADD", cell.TYPE_ADD),
-    ("TYPE_MUL", cell.TYPE_MUL),
+    ("FLIP_SHIFT", cell.FLIP_SHIFT),
+    ("TYPE_BELT", cell.TYPE_BELT), ("TYPE_SWAP", cell.TYPE_SWAP),
+    ("TYPE_SHEAR", cell.TYPE_SHEAR), ("TYPE_MAC", cell.TYPE_MAC),
+    ("TYPE_SOURCE", cell.TYPE_SOURCE), ("TYPE_SINK", cell.TYPE_SINK),
     ("GHOST_PENDING", cell.GHOST_PENDING),
     ("GHOST_FRUSTRATED", cell.GHOST_FRUSTRATED),
 ]:
@@ -426,44 +526,149 @@ ok("GLSL cell encoding matches core/cell.py")
 # connection stubs. Those masks must agree with Entity.faces_for(), which is
 # the Python-side authority. Reimplement the shader's rotation here and
 # compare against the real thing for every type and facing.
-def _glsl_mask(fn_name, type_name):
-    """The authored (unrotated) mask the shader uses for a type."""
-    body = _re.search(rf"int {fn_name}\(int type, int facing\)\s*\{{(.*?)\n\}}",
-                      _src, _re.S)
+#
+# Ports are *per-cell*, so this has to agree cell by cell, not merely type by
+# type: a port belongs to one cell of a footprint, and a shader that spread it
+# across all of them would draw arrows on the wrong cells and stub to the
+# wrong neighbours. Parse the authored per-cell masks out of the GLSL and
+# compare every (type, local cell) pair against Entity.face_masks_at().
+def _glsl_cell_masks(fn_name, type_name):
+    """{(lx, ly): mask} the shader uses for a type, authored (unrotated)."""
+    body = _re.search(
+        rf"int {fn_name}\(int type, ivec2 lcl\)\s*\{{(.*?)\n\}}", _src, _re.S)
     assert body, f"{fn_name} not found in shader"
-    m = _re.search(rf"type == {type_name}\)\s*m = ([^;]+);", body.group(1))
-    assert m, f"{type_name} not handled in {fn_name}"
-    expr = m.group(1)
-    mask = 0
-    for shift in _re.findall(r"1 << (DIR_\w+)", expr):
-        mask |= 1 << getattr(cell, shift)
-    return mask
+    # The branch for this type runs until the next `else if (type ==` or the
+    # closing of the chain.
+    branch = _re.search(
+        rf"type == {type_name}\)\s*\{{(.*?)\}}", body.group(1), _re.S)
+    if not branch:
+        return {}
+    out = {}
+    for lx, ly, expr in _re.findall(
+            r"lcl == ivec2\((\d+),\s*(\d+)\)\)\s*return ([^;]+);",
+            branch.group(1)):
+        mask = 0
+        for face in _re.findall(r"FACE\((DIR_\w+)\)", expr):
+            mask |= 1 << getattr(cell, face)
+        out[(int(lx), int(ly))] = mask
+    return out
 
-for _cls, _tname in [(Add, "TYPE_ADD"), (Mul, "TYPE_MUL")]:
+_checked = 0
+for _cls in STRUCTURES:
+    _tname = "TYPE_" + cell.TYPE_NAMES[_cls.TYPE_ID].upper()
+    _glsl_in = _glsl_cell_masks("input_face_mask_local", _tname)
+    _glsl_out = _glsl_cell_masks("output_face_mask_local", _tname)
+    _w, _h = _cls.FOOTPRINT
+    for _lx in range(_w):
+        for _ly in range(_h):
+            _want_in, _want_out = _cls.face_masks_at(_lx, _ly)
+            _got_in = _glsl_in.get((_lx, _ly), 0)
+            _got_out = _glsl_out.get((_lx, _ly), 0)
+            assert _got_in == _want_in, (
+                f"{_cls.__name__} cell {(_lx, _ly)}: shader inputs "
+                f"{_got_in:04b} != entity {_want_in:04b}")
+            assert _got_out == _want_out, (
+                f"{_cls.__name__} cell {(_lx, _ly)}: shader outputs "
+                f"{_got_out:04b} != entity {_want_out:04b}")
+            _checked += 1
+    # The shader must not carry ports for cells outside the footprint.
+    _authored = {(x, y) for x in range(_w) for y in range(_h)}
+    _stray = (set(_glsl_in) | set(_glsl_out)) - _authored
+    assert not _stray, f"{_cls.__name__}: shader ports off the footprint: {_stray}"
+
+    # And the full shader pipeline must put each port on the SAME CELL as
+    # faces_for() does, at every orientation.
+    #
+    # Regression: the shader used to look its tables up with the *placed*
+    # offset straight out of .y while the tables are authored at DIR_PX. That
+    # un-rotated a port's face while leaving its cell put, so a rotated
+    # structure's ports moved to interior edges. A 3x3 Sink hid it best --
+    # its extent is rotation-invariant, so nothing else looked wrong.
+    #
+    # Checking an aggregate mask over the whole footprint cannot catch that:
+    # the set of faces is right, it is the cell-to-face pairing that breaks.
+    # So compare the (cell, face) pairs.
     for _facing in range(4):
-        _ins, _outs = _cls.faces_for(0, 0, _facing)
-        _want_in = 0
-        for _c, _f in _ins:
-            _want_in |= 1 << _f
-        _want_out = 0
-        for _c, _f in _outs:
-            _want_out |= 1 << _f
-        # Shader rotates the authored mask by `facing`.
-        _got_in = 0
-        for _d in range(4):
-            if _glsl_mask("input_face_mask", _tname) & (1 << _d):
-                _got_in |= 1 << ((_d + _facing) % 4)
-        _got_out = 0
-        for _d in range(4):
-            if _glsl_mask("output_face_mask", _tname) & (1 << _d):
-                _got_out |= 1 << ((_d + _facing) % 4)
-        assert _got_in == _want_in, (
-            f"{_cls.__name__} facing {cell.DIR_NAMES[_facing]}: shader inputs "
-            f"{_got_in:04b} != entity {_want_in:04b}")
-        assert _got_out == _want_out, (
-            f"{_cls.__name__} facing {cell.DIR_NAMES[_facing]}: shader outputs "
-            f"{_got_out:04b} != entity {_want_out:04b}")
-ok("GLSL structure port masks match Entity.faces_for()")
+        for _flip in (False, True):
+            for _which, _tbl in (("inputs", _glsl_in), ("outputs", _glsl_out)):
+                _want = {
+                    (xy, f) for xy, f in
+                    _cls.faces_for(0, 0, _facing, _flip)[0 if _which == "inputs" else 1]
+                }
+                # Reproduce what the shader does, cell by cell: for each cell
+                # of the PLACED footprint, invert to authored space, read the
+                # table, then flip and rotate the faces.
+                _got = set()
+                _ew, _eh = _cls.footprint_for(_facing)
+                for _px in range(_ew):
+                    for _py in range(_eh):
+                        _a = _cls.unplace_local(_px, _py, _facing, _flip)
+                        _m = _tbl.get(_a, 0)
+                        for _d in range(4):
+                            if not _m & (1 << _d):
+                                continue
+                            _f = cell.flip_dir_y(_d) if _flip else _d
+                            _got.add(((_px, _py),
+                                      cell.rotate_dir_ccw_n(_f, _facing)))
+                assert _got == _want, (
+                    f"{_cls.__name__} {_which} facing "
+                    f"{cell.DIR_NAMES[_facing]} flip={_flip}:\n"
+                    f"  shader {sorted(_got)}\n  entity {sorted(_want)}")
+ok(f"GLSL per-cell port masks match Entity.face_masks_at() ({_checked} cells)")
+ok("GLSL ports land on the right cell at every rotation and flip")
+
+# The simulation above reproduces the shader's *tables*, but a table can be
+# perfect while the lookup is wrong -- which is exactly how the rotation bug
+# happened. So pin the lookup itself: the public mask functions must invert
+# the placed offset before indexing, and must apply the flip to the faces.
+for _fn in ("input_face_mask", "output_face_mask"):
+    _body = _re.search(
+        rf"int {_fn}\(int type, ivec2 lcl, int facing, bool flipped\)"
+        rf"\s*\{{(.*?)\n\}}", _src, _re.S)
+    assert _body, f"{_fn} not found with the expected signature"
+    _b = _body.group(1)
+    assert "unplace_local(type, lcl, facing, flipped)" in _b, (
+        f"{_fn} must invert the placed offset before the table lookup -- "
+        f"indexing with the raw .y offset puts ports on interior edges")
+    assert "flip_face_mask" in _b, f"{_fn} must mirror faces when flipped"
+    assert "rotate_face_mask" in _b, f"{_fn} must rotate faces into the facing"
+ok("GLSL mask functions invert the placed offset before lookup")
+
+# The two neighbour probes are the call sites where the flip flag is easy to
+# get wrong: each must read the *neighbour's* own flip bit out of its .z
+# rather than reusing the calling cell's, exactly as it already does for the
+# neighbour's local offset and facing.
+for _probe in ("feeds_into", "accepts_from"):
+    _pb = _re.search(rf"bool {_probe}\([^)]*\)\s*\{{(.*?)\n\}}", _src, _re.S)
+    assert _pb, f"{_probe} not found"
+    assert "is_flipped(n.z)" in _pb.group(1), (
+        f"{_probe} must read the neighbour's own flip bit (is_flipped(n.z))")
+# The structure-drawing path must pass its own cell's flip bit too.
+assert _re.search(r"input_face_mask\(type, lcl, facing, flipped\)", _src), \
+    "the structure draw path must pass its cell's flip flag"
+assert _re.search(r"output_face_mask\(type, lcl, facing, flipped\)", _src), \
+    "the structure draw path must pass its cell's flip flag"
+ok("GLSL port mask callers pass the flip flag")
+
+# The shader's authored footprint table must match Entity.FOOTPRINT, since
+# unplace_local() uses it to invert the placement transform.
+for _cls in STRUCTURES:
+    _tname = "TYPE_" + cell.TYPE_NAMES[_cls.TYPE_ID].upper()
+    _m = _re.search(rf"type == {_tname}\)\s*return ivec2\((\d+),\s*(\d+)\);",
+                    _src)
+    assert _m, f"{_tname} missing from type_footprint() in the shader"
+    _got_fp = (int(_m.group(1)), int(_m.group(2)))
+    assert _got_fp == _cls.FOOTPRINT, (
+        f"{_cls.__name__}: shader footprint {_got_fp} != {_cls.FOOTPRINT}")
+ok("GLSL type_footprint() matches Entity.FOOTPRINT")
+
+# The shader's footprint probe must reach far enough to span the largest
+# machine, or a multi-cell body would draw as two separate shapes.
+_reach = int(_re.search(r"#define PROBE_REACH\s+(\d+)", _src).group(1))
+_longest = max(max(c.FOOTPRINT) for c in STRUCTURES)
+assert _reach >= _longest - 1, (
+    f"PROBE_REACH {_reach} too small for a {_longest}-cell footprint")
+ok(f"PROBE_REACH {_reach} spans the longest footprint ({_longest})")
 
 print("=== device round trip after all that ===")
 assert board.verify_round_trip(), "grid round trip mismatch"

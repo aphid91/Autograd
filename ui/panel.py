@@ -12,7 +12,7 @@ class UIRequests:
 
     __slots__ = ("reload_shader", "frame_board", "clear_board",
                  "verify_round_trip", "select_slot", "cycle_tool",
-                 "cycle_backward")
+                 "cycle_backward", "flip_tool")
 
     def __init__(self):
         self.reload_shader = False
@@ -22,6 +22,7 @@ class UIRequests:
         self.select_slot = None
         self.cycle_tool = False
         self.cycle_backward = False
+        self.flip_tool = False
 
 
 class UI:
@@ -99,6 +100,9 @@ class UI:
                 if imgui.small_button("shift+R"):
                     req.cycle_tool = True
                     req.cycle_backward = True
+                imgui.same_line()
+                if imgui.small_button("F"):
+                    req.flip_tool = True
             else:
                 imgui.text_disabled("empty slot")
         imgui.end()

@@ -24,7 +24,8 @@ _F_ORIGIN_Y = 3
 _F_DIR = 4
 _F_W = 5
 _F_H = 6
-_COMMON_FIELDS = 7
+_F_FLIPPED = 7   # 0 or 1: mirrored about the authored X axis, before rotation
+_COMMON_FIELDS = 8
 
 # Room for subclass fields after the common prefix. Keep this a multiple of 4
 # so each row lands on a vec4 boundary in the SSBO -- GLSL std430 arrays of
@@ -55,6 +56,25 @@ class Entity:
     F_TYPE = _F_TYPE
     F_W = _F_W
     F_H = _F_H
+    F_FLIPPED = _F_FLIPPED
+
+    #: True if mirroring this type produces a genuinely different machine.
+    #: A type whose port layout is symmetric about the authored X axis is
+    #: achiral, and F is a no-op for it -- see is_chiral().
+    @classmethod
+    def is_chiral(cls):
+        """Does flipping this type change its port layout at all?
+
+        Derived rather than declared, so it cannot drift from the ports: flip
+        every face and cell, and see whether the resulting layout differs.
+        """
+        if not cls.INPUTS and not cls.OUTPUTS:
+            return False
+        plain = (frozenset(cls.faces_for(0, 0, cell.DIR_PX, False)[0]),
+                 frozenset(cls.faces_for(0, 0, cell.DIR_PX, False)[1]))
+        mirrored = (frozenset(cls.faces_for(0, 0, cell.DIR_PX, True)[0]),
+                    frozenset(cls.faces_for(0, 0, cell.DIR_PX, True)[1]))
+        return plain != mirrored
 
     @classmethod
     def footprint_for(cls, direction):
@@ -63,8 +83,12 @@ class Entity:
         return (h, w) if direction % 2 else (w, h)
 
     @classmethod
-    def cells_for(cls, x, y, direction):
+    def cells_for(cls, x, y, direction, flipped=False):
         """Every (cx, cy) a placement at (x, y) facing `direction` would cover.
+
+        `flipped` is accepted for signature parity with faces_for() but cannot
+        change the answer: mirroring permutes cells within the footprint's
+        bounding box, it does not move the box.
 
         The origin stays at (x, y) and the footprint extends in +X/+Y from it,
         so a rotated 2x1 occupies (x,y) and (x,y+1) rather than pivoting about
@@ -76,41 +100,98 @@ class Entity:
         return [(x + lx, y + ly) for lx in range(w) for ly in range(h)]
 
     @classmethod
-    def faces_for(cls, x, y, direction):
+    def faces_for(cls, x, y, direction, flipped=False):
         """(inputs, outputs) in world space for a placement.
 
         Each entry is ((cell_x, cell_y), face_direction). Faces are derived
-        from the type and its facing rather than stored per-instance -- every
-        instance of a type has the same port layout, so storage would be pure
-        duplication. If ports ever become per-instance configurable this is
-        where that changes.
+        from the type and its orientation rather than stored per-instance --
+        every instance of a type has the same port layout, so storage would be
+        pure duplication. If ports ever become per-instance configurable this
+        is where that changes.
+
+        A cell and its faces must transform *together*: this applies the flip
+        then the rotation to both, which is what keeps a port on the outside
+        of the footprint at every orientation.
         """
         def place(spec):
             out = []
             for (lx, ly, face) in spec:
-                rx, ry = cls._rotate_local(lx, ly, direction)
+                rx, ry = cls.place_local(lx, ly, direction, flipped)
+                if flipped:
+                    face = cell.flip_dir_y(face)
                 out.append(((x + rx, y + ry), cell.rotate_dir_ccw_n(face, direction)))
             return out
 
         return place(cls.INPUTS), place(cls.OUTPUTS)
 
     @classmethod
-    def _rotate_local(cls, lx, ly, direction):
-        """Rotate a local offset, then shift it back into the +X/+Y quadrant.
+    def face_masks_at(cls, lx, ly):
+        """(input_mask, output_mask) for one authored local cell, as bitmasks.
 
-        Rotating (1,0) by a quarter turn gives (0,1) but rotating (0,0)..(1,0)
-        as a *block* gives offsets that can go negative; normalising against
-        the rotated footprint keeps every offset non-negative so it still packs
-        into .y's unsigned local field.
+        Indexed by direction, authored at DIR_PX. This is the per-cell view of
+        INPUTS/OUTPUTS and is the Python side of the GLSL
+        input_face_mask()/output_face_mask() pair -- the shader answers "is
+        this face a port?" from a single cell, so the two must agree cell by
+        cell, not merely type by type. test_drive.py pins that.
         """
-        rx, ry = cell.rotate_offset(lx, ly, direction)
+        in_mask = out_mask = 0
+        for (ax, ay, face) in cls.INPUTS:
+            if (ax, ay) == (lx, ly):
+                in_mask |= 1 << face
+        for (ax, ay, face) in cls.OUTPUTS:
+            if (ax, ay) == (lx, ly):
+                out_mask |= 1 << face
+        return in_mask, out_mask
+
+    @classmethod
+    def place_local(cls, lx, ly, direction, flipped=False):
+        """An authored local offset -> its offset within the placed footprint.
+
+        Flip first (mirror about the authored X axis), then rotate, then shift
+        back into the +X/+Y quadrant. Rotating (1,0) by a quarter turn gives
+        (0,1), but rotating (0,0)..(1,0) as a *block* gives offsets that can go
+        negative; normalising against the rotated footprint keeps every offset
+        non-negative so it still packs into .y's unsigned local field.
+
+        This is the mapping Gameboard._stamp_footprint() writes into .y, so
+        `.y` holds *placed* offsets, not authored ones. Anything reading .y
+        back to ask about ports must invert it -- see unplace_local().
+        """
         w, h = cls.FOOTPRINT
+        if flipped:
+            ly = (h - 1) - ly
+        rx, ry = cell.rotate_offset(lx, ly, direction)
         # The bounding box corners, rotated, give the shift needed.
         corners = [cell.rotate_offset(cx, cy, direction)
                    for cx in (0, w - 1) for cy in (0, h - 1)]
         min_x = min(c[0] for c in corners)
         min_y = min(c[1] for c in corners)
         return rx - min_x, ry - min_y
+
+    @classmethod
+    def unplace_local(cls, px, py, direction, flipped=False):
+        """The inverse of place_local(): placed offset -> authored offset.
+
+        The renderer reads a *placed* offset out of .y but the port tables are
+        authored at DIR_PX, so it must come back here before any lookup. Doing
+        the lookup on the placed offset directly is what put Sink's ports on
+        interior edges: the face was being un-rotated while the cell was not.
+        """
+        w, h = cls.FOOTPRINT
+        corners = [cell.rotate_offset(cx, cy, direction)
+                   for cx in (0, w - 1) for cy in (0, h - 1)]
+        min_x = min(c[0] for c in corners)
+        min_y = min(c[1] for c in corners)
+        # Undo the quadrant shift, then the rotation.
+        rx, ry = cell.rotate_offset(px + min_x, py + min_y, (4 - direction) % 4)
+        if flipped:
+            ry = (h - 1) - ry
+        return rx, ry
+
+    @classmethod
+    def _rotate_local(cls, lx, ly, direction):
+        """Deprecated alias kept for callers predating the flip support."""
+        return cls.place_local(lx, ly, direction, False)
 
     _registry = {}
 
@@ -144,10 +225,11 @@ class Entity:
         self.board.entities[self.row, offset] = value
         self.board.entities_dirty.add(self.row)
 
-    def initialise(self, x, y, direction, is_ghost=False):
+    def initialise(self, x, y, direction, is_ghost=False, flipped=False):
         """Populate a freshly claimed row. Subclasses extend, calling super()."""
         # Store the *rotated* extent, so footprint_w/h describe the entity as
-        # it actually sits on the board.
+        # it actually sits on the board. A flip mirrors within that extent and
+        # so never changes it.
         w, h = self.footprint_for(direction)
         row = self.board.entities[self.row]
         row[:] = 0
@@ -158,6 +240,7 @@ class Entity:
         row[_F_DIR] = float(direction)
         row[_F_W] = float(w)
         row[_F_H] = float(h)
+        row[_F_FLIPPED] = 1.0 if flipped else 0.0
         self._ghost = is_ghost
         self.board.entities_dirty.add(self.row)
 
@@ -181,6 +264,14 @@ class Entity:
     @direction.setter
     def direction(self, value):
         self._set(_F_DIR, float(value))
+
+    @property
+    def flipped(self):
+        return bool(self._get(_F_FLIPPED))
+
+    @flipped.setter
+    def flipped(self, value):
+        self._set(_F_FLIPPED, 1.0 if value else 0.0)
 
     @property
     def footprint_w(self):
@@ -232,8 +323,12 @@ class Belt(Entity):
     F_THROUGHPUT = _COMMON_FIELDS + 0
     F_ITEM_COUNT = _COMMON_FIELDS + 1
 
-    def initialise(self, x, y, direction, is_ghost=False, throughput=1.0):
-        super().initialise(x, y, direction, is_ghost=is_ghost)
+    def initialise(self, x, y, direction, is_ghost=False, flipped=False,
+                   throughput=1.0):
+        # A belt is 1x1 with no ports, so `flipped` is meaningless for it --
+        # accepted and passed through only so every entity type takes the
+        # same orientation arguments and callers need no special case.
+        super().initialise(x, y, direction, is_ghost=is_ghost, flipped=flipped)
         self._set(self.F_THROUGHPUT, float(throughput))
 
     @property
@@ -252,34 +347,122 @@ class Structure(Entity):
     ROTATABLE = True
 
 
-class Add(Structure):
-    """2x1 splitter-like structure: two inputs on one long edge, two outputs
-    on the other.
+# The machine set. Every one is a continuous rectangle, authored at DIR_PX.
+#
+# The shared idiom: a *pass-through* channel crosses the body on one axis and
+# leaves its value unchanged, while the channel taking the long way across the
+# footprint is the one that gets mutated. Which cell carries which port is the
+# whole specification -- see face_masks_at(), and note that a port lives on one
+# cell of the footprint, not on all of them.
 
-    Authored at DIR_PX as two cells side by side in X, inputs facing +Y (top)
-    and outputs facing -Y (bottom). Rotating makes it 1x2 with the faces
-    carried around accordingly.
+
+class Swap(Structure):
+    """Conditional swap: x,y,z -> x, (y,z if x>0 else z,y).
+
+    Authored at DIR_PX as a 1x2 (tall) body. The x channel runs vertically
+    through the *whole* body -- in at the north face of the top cell, out at
+    the south face of the bottom cell -- so the two cells carry one half each
+    of that pass-through. y and z each cross their own cell horizontally,
+    west to east, and are the pair that may be exchanged.
     """
 
-    TYPE_ID = cell.TYPE_ADD
+    TYPE_ID = cell.TYPE_SWAP
+    FOOTPRINT = (1, 2)
+
+    INPUTS = (
+        (0, 1, cell.DIR_PY),   # x in, top of the body
+        (0, 1, cell.DIR_NX),   # y in
+        (0, 0, cell.DIR_NX),   # z in
+    )
+    OUTPUTS = (
+        (0, 0, cell.DIR_NY),   # x out, bottom of the body
+        (0, 1, cell.DIR_PX),   # y' out
+        (0, 0, cell.DIR_PX),   # z' out
+    )
+
+
+class Shear(Structure):
+    """Shear: x,y -> x, x+y.
+
+    Authored at DIR_PX as a 2x1 (wide) body. x passes straight down through
+    the first cell only -- one cell in, one cell out, unchanged. y enters the
+    west face of that same first cell, travels the long way across both cells,
+    and leaves the east face of the second as x+y.
+    """
+
+    TYPE_ID = cell.TYPE_SHEAR
     FOOTPRINT = (2, 1)
 
-    INPUTS = ((0, 0, cell.DIR_PY), (1, 0, cell.DIR_PY))
-    OUTPUTS = ((0, 0, cell.DIR_NY), (1, 0, cell.DIR_NY))
+    INPUTS = (
+        (0, 0, cell.DIR_PY),   # x in
+        (0, 0, cell.DIR_NX),   # y in
+    )
+    OUTPUTS = (
+        (0, 0, cell.DIR_NY),   # x out, same cell: a pass-through
+        (1, 0, cell.DIR_PX),   # x+y out, at the far end
+    )
 
 
-class Mul(Structure):
-    """1x1 structure with two adjacent inputs and two adjacent outputs.
+class Mac(Structure):
+    """Multiply-accumulate: x,y,z -> x, y, z + x*y.
 
-    Authored at DIR_PX with inputs on the north and west faces and outputs on
-    the east and south -- so material turns a corner through it.
+    Authored at DIR_PX as a 2x1 (wide) body, like Shear but with a second
+    vertical control channel: x passes down through the first cell and y down
+    through the second, both unchanged. z crosses the long way and picks up
+    the product.
     """
 
-    TYPE_ID = cell.TYPE_MUL
-    FOOTPRINT = (1, 1)
+    TYPE_ID = cell.TYPE_MAC
+    FOOTPRINT = (2, 1)
 
-    INPUTS = ((0, 0, cell.DIR_PY), (0, 0, cell.DIR_NX))
-    OUTPUTS = ((0, 0, cell.DIR_PX), (0, 0, cell.DIR_NY))
+    INPUTS = (
+        (0, 0, cell.DIR_PY),   # x in
+        (1, 0, cell.DIR_PY),   # y in
+        (0, 0, cell.DIR_NX),   # z in
+    )
+    OUTPUTS = (
+        (0, 0, cell.DIR_NY),   # x out
+        (1, 0, cell.DIR_NY),   # y out
+        (1, 0, cell.DIR_PX),   # z + x*y out
+    )
+
+
+class Source(Structure):
+    """4x1 emitter with a single output at one short end.
+
+    Authored at DIR_PX lying along X with the port on the +X tip, so the
+    default placement emits east and R walks it around.
+    """
+
+    TYPE_ID = cell.TYPE_SOURCE
+    FOOTPRINT = (4, 1)
+
+    INPUTS = ()
+    OUTPUTS = ((3, 0, cell.DIR_PX),)
+
+
+class Sink(Structure):
+    """3x3 consumer with an input at the middle of each side.
+
+    Square, so rotation does not change the footprint and all four faces are
+    symmetric -- R is a no-op in practice, but it stays ROTATABLE rather than
+    special-casing the toolbelt.
+    """
+
+    TYPE_ID = cell.TYPE_SINK
+    FOOTPRINT = (3, 3)
+
+    INPUTS = (
+        (1, 2, cell.DIR_PY),   # north
+        (1, 0, cell.DIR_NY),   # south
+        (0, 1, cell.DIR_NX),   # west
+        (2, 1, cell.DIR_PX),   # east
+    )
+    OUTPUTS = ()
+
+
+#: Every placeable structure, in the order the toolbelt offers them.
+STRUCTURES = (Swap, Shear, Mac, Source, Sink)
 
 
 def _self_check():
@@ -287,46 +470,148 @@ def _self_check():
     assert _COMMON_FIELDS <= ENTITY_STRIDE
     assert Belt.F_ITEM_COUNT < ENTITY_STRIDE, "belt fields overflow the stride"
     assert Entity.view_for(cell.TYPE_BELT) is Belt
-    assert Entity.view_for(cell.TYPE_ADD) is Add
-    assert Entity.view_for(cell.TYPE_MUL) is Mul
     assert Entity.view_for(999) is Entity
-    for c in (Belt, Add, Mul):
+    for c in (Belt,) + STRUCTURES:
         assert c.TYPE_ID <= cell.MAX_TYPE
+        assert Entity.view_for(c.TYPE_ID) is c, c.__name__
+        assert c.TYPE_ID in cell.TYPE_NAMES, c.__name__
 
-    # Rotation swaps the extent of a non-square footprint and leaves a square
-    # one alone.
-    assert Add.footprint_for(cell.DIR_PX) == (2, 1)
-    assert Add.footprint_for(cell.DIR_PY) == (1, 2)
-    assert Add.footprint_for(cell.DIR_NX) == (2, 1)
-    assert Mul.footprint_for(cell.DIR_PY) == (1, 1)
+    # --- properties every structure must have, whatever its shape ---------
+    for c in STRUCTURES:
+        w, h = c.FOOTPRINT
+        authored = {(lx, ly) for lx in range(w) for ly in range(h)}
+        assert c.ROTATABLE, c.__name__
 
-    # The origin is always the cell under the cursor, at every rotation.
+        # Rotation swaps the extent of a non-square footprint, leaves a
+        # square one alone, and never changes the cell count.
+        assert c.footprint_for(cell.DIR_PX) == (w, h), c.__name__
+        assert c.footprint_for(cell.DIR_PY) == (h, w), c.__name__
+        assert c.footprint_for(cell.DIR_NX) == (w, h), c.__name__
+
+        for d in range(4):
+            cells = c.cells_for(5, 5, d)
+            # The origin is always the cell under the cursor, at every
+            # rotation, and the footprint never doubles up on a cell.
+            assert (5, 5) in cells, (c.__name__, d)
+            assert len(cells) == w * h, (c.__name__, d)
+            assert len(set(cells)) == w * h, (c.__name__, d)
+
+            # Faces land on cells the entity actually occupies, and rotate
+            # with it. A face is never both an input and an output of the
+            # same cell.
+            occupied = set(cells)
+            ins, outs = c.faces_for(5, 5, d)
+            assert len(ins) == len(c.INPUTS), (c.__name__, d)
+            assert len(outs) == len(c.OUTPUTS), (c.__name__, d)
+            for (xy, _f) in ins + outs:
+                assert xy in occupied, (c.__name__, d, xy)
+            assert not (set(ins) & set(outs)), (c.__name__, d)
+
+        # Ports are authored on real cells of the footprint, and the per-cell
+        # masks must account for every one of them -- this is the invariant
+        # the GLSL side mirrors.
+        total_in = total_out = 0
+        for (lx, ly) in authored:
+            im, om = c.face_masks_at(lx, ly)
+            assert not (im & om), (c.__name__, (lx, ly), "face is in and out")
+            total_in += bin(im).count("1")
+            total_out += bin(om).count("1")
+        assert total_in == len(c.INPUTS), c.__name__
+        assert total_out == len(c.OUTPUTS), c.__name__
+        for (lx, ly, _f) in c.INPUTS + c.OUTPUTS:
+            assert (lx, ly) in authored, (c.__name__, (lx, ly))
+
+    # --- the specifics each machine is defined by -------------------------
+    # Swap: x passes through the whole 1x2 body, in at the top, out at the
+    # bottom; y and z cross their own cell west to east.
+    assert Swap.FOOTPRINT == (1, 2)
+    assert Swap.face_masks_at(0, 1) == ((1 << cell.DIR_PY) | (1 << cell.DIR_NX),
+                                        1 << cell.DIR_PX)
+    assert Swap.face_masks_at(0, 0) == (1 << cell.DIR_NX,
+                                        (1 << cell.DIR_NY) | (1 << cell.DIR_PX))
+
+    # Shear: x in and out of the first cell (a pass-through on one cell), the
+    # mutated channel entering the first cell and leaving the second.
+    assert Shear.FOOTPRINT == (2, 1)
+    assert Shear.face_masks_at(0, 0) == ((1 << cell.DIR_PY) | (1 << cell.DIR_NX),
+                                         1 << cell.DIR_NY)
+    assert Shear.face_masks_at(1, 0) == (0, 1 << cell.DIR_PX)
+
+    # Mac: Shear plus a second vertical control channel on the far cell.
+    assert Mac.FOOTPRINT == (2, 1)
+    assert Mac.face_masks_at(0, 0) == ((1 << cell.DIR_PY) | (1 << cell.DIR_NX),
+                                       1 << cell.DIR_NY)
+    assert Mac.face_masks_at(1, 0) == (1 << cell.DIR_PY,
+                                       (1 << cell.DIR_NY) | (1 << cell.DIR_PX))
+
+    # Source: one output, on the +X tip of a 4x1 and nowhere else.
+    assert Source.FOOTPRINT == (4, 1)
+    assert not Source.INPUTS and len(Source.OUTPUTS) == 1
+    assert Source.face_masks_at(3, 0) == (0, 1 << cell.DIR_PX)
+    for lx in range(3):
+        assert Source.face_masks_at(lx, 0) == (0, 0), lx
+
+    # Sink: an input at the middle of each side of a 3x3, and no outputs. The
+    # four corners and the centre carry no ports at all.
+    assert Sink.FOOTPRINT == (3, 3)
+    assert not Sink.OUTPUTS and len(Sink.INPUTS) == 4
+    for (lx, ly) in ((0, 0), (2, 0), (0, 2), (2, 2), (1, 1)):
+        assert Sink.face_masks_at(lx, ly) == (0, 0), (lx, ly)
+    # Square, so its extent survives rotation.
     for d in range(4):
-        assert (5, 5) in Add.cells_for(5, 5, d), d
-        assert len(Add.cells_for(5, 5, d)) == 2, d
-        assert len(set(Add.cells_for(5, 5, d))) == 2, "footprint cells must differ"
-        assert Mul.cells_for(5, 5, d) == [(5, 5)], d
+        assert Sink.footprint_for(d) == (3, 3), d
 
-    # Faces land on cells the entity actually occupies, and rotate with it.
-    for d in range(4):
-        occupied = set(Add.cells_for(7, 7, d))
-        ins, outs = Add.faces_for(7, 7, d)
-        assert len(ins) == 2 and len(outs) == 2, d
-        for (c, _f) in ins + outs:
-            assert c in occupied, (d, c, occupied)
-        # Inputs and outputs always point in opposite directions for an Add.
-        assert {f for _c, f in ins} == {cell.rotate_dir_ccw_n(cell.DIR_PY, d)}
-        assert {f for _c, f in outs} == {cell.rotate_dir_ccw_n(cell.DIR_NY, d)}
+    # --- orientation: cells and faces must transform together -------------
+    # place_local() is a bijection onto the placed bounding box and
+    # unplace_local() inverts it, at every orientation. This is what the
+    # renderer relies on to turn a .y offset back into an authored one; when
+    # it was missing, a rotated Sink put its ports on interior edges.
+    for c in STRUCTURES:
+        w, h = c.FOOTPRINT
+        for d in range(4):
+            for fl in (False, True):
+                placed = {}
+                for lx in range(w):
+                    for ly in range(h):
+                        p = c.place_local(lx, ly, d, fl)
+                        placed[p] = (lx, ly)
+                        assert c.unplace_local(*p, d, fl) == (lx, ly), (
+                            c.__name__, d, fl, (lx, ly), p)
+                ew, eh = c.footprint_for(d)
+                assert set(placed) == {(a, b) for a in range(ew)
+                                       for b in range(eh)}, (c.__name__, d, fl)
 
-    # Mul's ports are adjacent (perpendicular), not opposed.
-    ins, outs = Mul.faces_for(0, 0, cell.DIR_PX)
-    in_dirs = {f for _c, f in ins}
-    out_dirs = {f for _c, f in outs}
-    assert in_dirs == {cell.DIR_PY, cell.DIR_NX}, in_dirs
-    assert out_dirs == {cell.DIR_PX, cell.DIR_NY}, out_dirs
-    assert not (in_dirs & out_dirs), "a face cannot be both input and output"
+                # Every port lands on a cell the entity actually occupies --
+                # never off the footprint, never on an interior edge.
+                occupied = set(c.cells_for(5, 5, d, fl))
+                ins, outs = c.faces_for(5, 5, d, fl)
+                for (xy, _f) in ins + outs:
+                    assert xy in occupied, (c.__name__, d, fl, xy)
+                assert len(ins) == len(c.INPUTS)
+                assert len(outs) == len(c.OUTPUTS)
 
-    assert Belt.ROTATABLE is False and Add.ROTATABLE and Mul.ROTATABLE
+    # A flip is an involution, and never changes which cells are covered.
+    for c in STRUCTURES:
+        for d in range(4):
+            for lx in range(c.FOOTPRINT[0]):
+                for ly in range(c.FOOTPRINT[1]):
+                    once = c.place_local(lx, ly, d, True)
+                    assert c.unplace_local(*once, d, True) == (lx, ly)
+            assert (sorted(c.cells_for(3, 3, d, False))
+                    == sorted(c.cells_for(3, 3, d, True))), c.__name__
+
+    # Chirality is derived from the ports, so it cannot drift from them.
+    # The arithmetic machines are chiral; Source and Sink are symmetric
+    # about the authored X axis and so have no second version.
+    assert Swap.is_chiral() and Shear.is_chiral() and Mac.is_chiral()
+    assert not Source.is_chiral() and not Sink.is_chiral()
+    # An achiral type's flipped placement is identical to its plain one.
+    for c in (Source, Sink):
+        for d in range(4):
+            assert (sorted(c.faces_for(0, 0, d, False)[0])
+                    == sorted(c.faces_for(0, 0, d, True)[0])), c.__name__
+
+    assert Belt.ROTATABLE is False
 
 
 _self_check()

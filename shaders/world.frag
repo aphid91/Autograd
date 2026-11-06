@@ -27,9 +27,12 @@ uniform isampler2D grid;      // RGBA32I, one texel per cell
 
 #define COL_BELT        vec3(0.46, 0.47, 0.52)   // the spine
 #define COL_CHEVRON     vec3(0.74, 0.76, 0.82)   // direction fringes
-#define COL_ADD         vec3(0.40, 0.56, 0.44)
-#define COL_MUL         vec3(0.54, 0.44, 0.62)
-#define COL_STRUCT_MARK vec3(0.88, 0.90, 0.94)   // the Plus / X glyph
+#define COL_SWAP        vec3(0.60, 0.40, 0.42)   // reddish
+#define COL_SHEAR       vec3(0.40, 0.56, 0.44)   // green
+#define COL_MAC         vec3(0.54, 0.44, 0.62)   // purple
+#define COL_SOURCE      vec3(0.42, 0.52, 0.60)
+#define COL_SINK        vec3(0.34, 0.34, 0.40)
+#define COL_STRUCT_MARK vec3(0.88, 0.90, 0.94)   // the glyph
 #define COL_IN          vec3(0.35, 0.60, 0.95)   // input ports  (blue)
 #define COL_OUT         vec3(0.95, 0.35, 0.30)   // output ports (red)
 #define COL_FRUSTRATED  vec3(0.90, 0.25, 0.22)
@@ -59,6 +62,9 @@ uniform isampler2D grid;      // RGBA32I, one texel per cell
 // when there is actually something on the other side.
 #define STUB_WIDTH        0.34   // matches BELT_WIDTH by default
 #define STUB_REACH        0.50   // out to the cell edge
+// How far a cell probes for siblings when recovering its footprint extent.
+// Must be >= (longest footprint axis - 1); Source is 4x1, so 3.
+#define PROBE_REACH       3
 
 // --- ghosts / overlays ---
 #define GHOST_ALPHA       0.45
@@ -73,10 +79,26 @@ uniform isampler2D grid;      // RGBA32I, one texel per cell
 
 // ======================================================================
 
+// --- per-type visuals ---------------------------------------------------
+// One place to say what a machine looks like. Adding a structure is a row
+// here plus its ports in common.glsl -- nothing below needs to know the type.
+
 vec3 body_colour(int type) {
-    if (type == TYPE_ADD) return COL_ADD;
-    if (type == TYPE_MUL) return COL_MUL;
+    if (type == TYPE_SWAP)   return COL_SWAP;
+    if (type == TYPE_SHEAR)  return COL_SHEAR;
+    if (type == TYPE_MAC)    return COL_MAC;
+    if (type == TYPE_SOURCE) return COL_SOURCE;
+    if (type == TYPE_SINK)   return COL_SINK;
     return COL_BELT;
+}
+
+int body_glyph(int type) {
+    if (type == TYPE_SWAP)   return GLYPH_ZED;
+    if (type == TYPE_SHEAR)  return GLYPH_PLUS;
+    if (type == TYPE_MAC)    return GLYPH_CROSS;
+    if (type == TYPE_SOURCE) return GLYPH_DOT;
+    if (type == TYPE_SINK)   return GLYPH_DOT;
+    return GLYPH_NONE;
 }
 
 // --- grid access --------------------------------------------------------
@@ -103,15 +125,19 @@ bool same_layer(int a_z, int b_z) {
 // iff its direction points back at us -- which is why nothing diverges and
 // merges are the only junction to handle. A *structure* emits from each of its
 // output faces, so it feeds us iff it has an output face pointing at us. That
-// makes a belt downstream of an Add or Mul draw an incoming arm, exactly as if
-// a belt were there.
+// makes a belt downstream of a machine draw an incoming arm, exactly as if a
+// belt were there.
 bool feeds_into(ivec2 c, int toward, int my_z) {
     ivec4 n = fetch(c);
     int t = cell_type(n.x);
     if (t == TYPE_EMPTY) return false;
     if (!same_layer(my_z, n.z)) return false;
     if (t == TYPE_BELT) return cell_dir(n.x) == toward;
-    return has_face(output_face_mask(t, cell_dir(n.x)), toward);
+    // Per-cell ports: ask the neighbour cell about its *own* local offset,
+    // not ours -- only the cell of the footprint that actually carries the
+    // output face emits.
+    return has_face(output_face_mask(t, cell_local(n.y), cell_dir(n.x),
+                                     is_flipped(n.z)), toward);
 }
 
 // Does the cell at `c` accept input from the neighbour facing it along
@@ -123,7 +149,8 @@ bool accepts_from(ivec2 c, int toward, int my_z) {
     int t = cell_type(n.x);
     if (!is_structure(t)) return false;
     if (!same_layer(my_z, n.z)) return false;
-    return has_face(input_face_mask(t, cell_dir(n.x)), toward);
+    return has_face(input_face_mask(t, cell_local(n.y), cell_dir(n.x),
+                                    is_flipped(n.z)), toward);
 }
 
 // ======================================================================
@@ -191,8 +218,8 @@ BeltDraw draw_belt(vec2 p, ivec2 ci, ivec4 c, float px, vec2 world) {
     int in_count = 0;
     for (int d = 0; d < 4; ++d) {
         // Never treat the cell we output into as a source. A structure can
-        // have an output face pointing back at a belt that feeds it (a Mul
-        // emits +Y while the belt above runs -Y into it), and taking that as
+        // have an output face pointing back at a belt that feeds it (a
+        // machine emits +Y while the belt above runs -Y into it), and taking that as
         // an incoming arm would lay two opposed chevron streams on one arm.
         // The belt's own facing wins: it is leaving, not arriving.
         if (d == out_dir) continue;
@@ -272,11 +299,11 @@ BeltDraw draw_belt(vec2 p, ivec2 ci, ivec4 c, float px, vec2 world) {
 // Structures
 // ======================================================================
 //
-// Add: a Plus centred on the whole 2x1 footprint.
-// Mul: an X in its single cell.
-// Both carry short arrows at their ports -- blue inward for inputs, red
-// outward for outputs. Ports are derived from type + facing, matching
-// Entity.faces_for() in core/entity.py.
+// Every machine draws the same way: a body merged across its footprint, one
+// glyph centred on that footprint, and short arrows at its ports -- blue
+// inward for inputs, red outward for outputs. Which colour and glyph comes
+// from the table above; which ports from input_face_mask()/output_face_mask()
+// in common.glsl, matching Entity.face_masks_at() in core/entity.py.
 
 float sd_plus(vec2 p, float r, float t) {
     return min(sd_box(p, vec2(r, t)), sd_box(p, vec2(t, r)));
@@ -286,6 +313,31 @@ float sd_cross(vec2 p, float r, float t) {
     // The X is a Plus rotated 45 degrees.
     vec2 q = vec2(p.x + p.y, p.x - p.y) * 0.70710678;
     return sd_plus(q, r, t);
+}
+
+// A "Z": top bar, diagonal, bottom bar. Drawn from segments so the stroke
+// weight matches the other glyphs.
+float sd_zed(vec2 p, float r, float t) {
+    vec2 tl = vec2(-r,  r), tr = vec2( r,  r);
+    vec2 bl = vec2(-r, -r), br = vec2( r, -r);
+    float d = sd_segment(p, tl, tr);
+    d = min(d, sd_segment(p, tr, bl));   // the diagonal
+    d = min(d, sd_segment(p, bl, br));
+    return d - t;
+}
+
+float sd_dot(vec2 p, float r, float t) {
+    return length(p) - max(t * 2.0, r * 0.35);
+}
+
+// Dispatch on the glyph id from body_glyph(). `r` is the arm reach and `t`
+// the stroke half-thickness, both already scaled to the footprint.
+float sd_glyph(int glyph, vec2 p, float r, float t) {
+    if (glyph == GLYPH_PLUS)  return sd_plus(p, r, t);
+    if (glyph == GLYPH_CROSS) return sd_cross(p, r, t);
+    if (glyph == GLYPH_ZED)   return sd_zed(p, r, t);
+    if (glyph == GLYPH_DOT)   return sd_dot(p, r, t);
+    return 1e9;
 }
 
 // A port arrow: a chevron at `offset` from the cell centre, pointing along
@@ -299,9 +351,6 @@ float port_arrow(vec2 p, int face, bool inward, float px) {
     return fill(sd_chevron(local, PORT_ARROW_LEN, PORT_ARROW_SPAN,
                            PORT_ARROW_THICK), px);
 }
-
-// Rotate a face authored at DIR_PX into the entity's facing.
-int rot_face(int face, int facing) { return (face + facing) % 4; }
 
 void main() {
     // Pixel -> world. y is flipped so world +Y points up the screen.
@@ -349,17 +398,19 @@ void main() {
 
             // Recover the footprint extent by probing neighbours for the same
             // entity id, so a multi-cell entity draws as one merged shape.
+            // PROBE_REACH must be at least (longest footprint axis - 1):
+            // Source is 4x1, so 3. Raise it if a bigger machine is added.
             ivec2 lo = ivec2(0), hi = ivec2(0);
-            for (int k = 1; k <= 3; ++k) {
+            for (int k = 1; k <= PROBE_REACH; ++k) {
                 if (cell_id(fetch(ci + ivec2(k, 0)).x) != id) break; hi.x = k;
             }
-            for (int k = 1; k <= 3; ++k) {
+            for (int k = 1; k <= PROBE_REACH; ++k) {
                 if (cell_id(fetch(ci - ivec2(k, 0)).x) != id) break; lo.x = k;
             }
-            for (int k = 1; k <= 3; ++k) {
+            for (int k = 1; k <= PROBE_REACH; ++k) {
                 if (cell_id(fetch(ci + ivec2(0, k)).x) != id) break; hi.y = k;
             }
-            for (int k = 1; k <= 3; ++k) {
+            for (int k = 1; k <= PROBE_REACH; ++k) {
                 if (cell_id(fetch(ci - ivec2(0, k)).x) != id) break; lo.y = k;
             }
 
@@ -390,8 +441,9 @@ void main() {
             // structure-to-structure join must agree, which is what
             // accepts_from() is for; checking only for belts here left the
             // output side silent while the input side stubbed.
-            int in_mask  = input_face_mask(type, facing);
-            int out_mask = output_face_mask(type, facing);
+            bool flipped = is_flipped(c.z);
+            int in_mask  = input_face_mask(type, lcl, facing, flipped);
+            int out_mask = output_face_mask(type, lcl, facing, flipped);
             float stub = 0.0;
             for (int d = 0; d < 4; ++d) {
                 ivec2 nc = ci + DIR_VECS[d];
@@ -434,28 +486,21 @@ void main() {
             // inside a 2x1 rather than spilling past the short edges.
             float s = min(extent.x, extent.y);
 
-            float mark = 0.0;
-            if (type == TYPE_ADD) {
-                mark = fill(sd_plus(pf, MARK_RADIUS * s, MARK_THICK * s), px);
-            } else if (type == TYPE_MUL) {
-                mark = fill(sd_cross(pf, MARK_RADIUS * s, MARK_THICK * s), px);
-            }
+            float mark = fill(sd_glyph(body_glyph(type), pf,
+                                       MARK_RADIUS * s, MARK_THICK * s), px);
             col = mix(col, COL_STRUCT_MARK, mark * a_body * alpha_scale);
 
             // --- ports ---
-            // Authored at DIR_PX, rotated into `facing`, and matched to the
-            // cell that owns them. Add's ports sit on both cells of its 2x1;
-            // Mul's four all sit on its single cell.
+            // Already rotated into `facing` by input_face_mask() /
+            // output_face_mask(), and per-cell: this cell draws exactly the
+            // ports it owns, so a port on one cell of a footprint does not
+            // appear on its neighbours.
             float a_in = 0.0, a_out = 0.0;
-            if (type == TYPE_ADD) {
-                // Inputs face +Y, outputs -Y, one pair per footprint cell.
-                a_in  = max(a_in,  port_arrow(p, rot_face(DIR_PY, facing), true,  px));
-                a_out = max(a_out, port_arrow(p, rot_face(DIR_NY, facing), false, px));
-            } else if (type == TYPE_MUL) {
-                a_in  = max(a_in,  port_arrow(p, rot_face(DIR_PY, facing), true,  px));
-                a_in  = max(a_in,  port_arrow(p, rot_face(DIR_NX, facing), true,  px));
-                a_out = max(a_out, port_arrow(p, rot_face(DIR_PX, facing), false, px));
-                a_out = max(a_out, port_arrow(p, rot_face(DIR_NY, facing), false, px));
+            for (int d = 0; d < 4; ++d) {
+                if (has_face(in_mask, d))
+                    a_in = max(a_in, port_arrow(p, d, true, px));
+                if (has_face(out_mask, d))
+                    a_out = max(a_out, port_arrow(p, d, false, px));
             }
             col = mix(col, COL_IN,  a_in  * alpha_scale);//can extend outside a_body
             col = mix(col, COL_OUT, a_out * alpha_scale);//can extend outside a_body

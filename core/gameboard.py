@@ -229,7 +229,8 @@ class Gameboard:
 
     def _stamp_footprint(self, view):
         word_z = cell.pack_flags(
-            cell.GHOST_PENDING if view.is_ghost else cell.GHOST_NONE
+            cell.GHOST_PENDING if view.is_ghost else cell.GHOST_NONE,
+            flipped=view.flipped,
         )
         word_x = cell.pack_cell(view.type_id, view.direction, view.row)
         ox, oy = view.origin
@@ -275,7 +276,7 @@ class Gameboard:
         self.entities_dirty.add(row)
         self._stamp_footprint(view)
 
-    def spawn_cell_ghost(self, entity_cls, x, y, direction):
+    def spawn_cell_ghost(self, entity_cls, x, y, direction, flipped=False):
         """Ghost a *single cell* of a multi-cell entity's footprint.
 
         Used to preview the part of a blocked placement that would still fit.
@@ -291,7 +292,7 @@ class Gameboard:
             return None
         row = self._claim_row()
         view = entity_cls(self, row)
-        view.initialise(x, y, direction, is_ghost=True)
+        view.initialise(x, y, direction, is_ghost=True, flipped=flipped)
         # Force a 1x1 extent regardless of the class's FOOTPRINT.
         self.entities[row, Entity.F_W] = 1.0
         self.entities[row, Entity.F_H] = 1.0
@@ -301,7 +302,7 @@ class Gameboard:
             x, y,
             cell.pack_cell(view.type_id, direction, row),
             cell.pack_local(0, 0),
-            cell.pack_flags(cell.GHOST_PENDING),
+            cell.pack_flags(cell.GHOST_PENDING, flipped=flipped),
         )
         return view
 

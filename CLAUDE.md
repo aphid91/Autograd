@@ -42,7 +42,8 @@ the GLSL cell encoding still agrees with `core/cell.py`.
 | `Q` / `E` | zoom out / in |
 | Scroll | zoom, anchored at the cursor |
 | Left-drag | pan the camera |
-| `F` | frame the whole board |
+| `F` | **per-tool**: flip (mirror) the held structure |
+| `shift+F` | frame the whole board |
 | `1`-`9`, `0` | select a toolbelt slot |
 | Left-click | build with the active tool (fires on **release**) |
 | `R` / `shift+R` | **per-tool**: belt path shape, or structure rotation |
@@ -51,9 +52,11 @@ the GLSL cell encoding still agrees with `core/cell.py`.
 | `F5` | reload the world shaders |
 | `Delete` | clear the board |
 
-`R` deliberately means different things in different tools — the input manager
-reports only that it was pressed and the active builder decides. Adding a tool
-with its own notion of "cycle" needs no input-layer change.
+`R` and `F` deliberately mean different things in different tools — the input
+manager reports only that they were pressed and the active builder decides.
+Adding a tool with its own notion of "cycle" or "flip" needs no input-layer
+change. `F` took the bare key from frame-the-board (now `shift+F`) because
+flipping is the far more frequent action.
 
 ### A left-press is ambiguous, so building happens on release
 
@@ -84,7 +87,7 @@ everything else is grouped by layer.
 | file | role |
 |---|---|
 | [core/cell.py](core/cell.py) | grid cell bit packing; type, direction, and ghost-state constants |
-| [core/entity.py](core/entity.py) | `Entity` view base, `Belt`, `Structure`/`Add`/`Mul`, type registry |
+| [core/entity.py](core/entity.py) | `Entity` view base, `Belt`, `Structure` and the machine set, type registry |
 | [core/gameboard.py](core/gameboard.py) | grid array, entity table, free list, dirty tracking, device transfer |
 | [core/engine_paths.py](core/engine_paths.py) | pure path geometry (elbows, Bresenham) |
 | [core/builders.py](core/builders.py) | `EntityBuilder`/`BuildPlan`; `BeltBuilder`, `StructureBuilder` |
@@ -115,9 +118,10 @@ bit  31     unused — deliberately clear
 ```
 
 `.y` packs `(local_x, local_y)` so a multi-cell entity's cells each know their
-offset from the origin. `.z` bits 0-1 hold the ghost state
-(`0` real / `1` ghost / `2` frustrated — see "Frustrated cells" below). `.w` is
-reserved.
+offset from the origin — the **placed** offset, after flip and rotation, not
+the authored one (see "Orientation" under Structures). `.z` bits 0-1 hold the
+ghost state (`0` real / `1` ghost / `2` frustrated — see "Frustrated cells"
+below) and bit 2 the flip flag. `.w` is reserved.
 
 Three things to know before touching this:
 
@@ -202,6 +206,7 @@ The two builders differ in exactly two ways:
 | `all_or_nothing` | `False` — build around obstacles | `True` — any clash blocks it |
 | `drag_based` | `True` (press, move, click) | `False` (hover, click) |
 | `R` means | cycle path shape | rotate 90° (`shift+R` reverses) |
+| `F` means | nothing | mirror, if the type is chiral |
 
 `drag_based` is the one place the gesture style leaks out: a click-based tool
 never enters `PLANNING`, it previews under the cursor while `IDLE` and commits
@@ -238,7 +243,7 @@ Two distinctions in `BuildPlan` that are easy to collapse and shouldn't be:
   that would fit, because the shape tells the player how far to move to clear
   the obstruction.
 
-So a half-blocked `Add` ghosts its free cell and tints its blocked one, and
+So a half-blocked `Shear` ghosts its free cell and tints its blocked one, and
 commits nothing. Those partial ghosts go in `Engine.preview_only_rows` rather
 than `ghost_rows`: on commit they are **despawned, not promoted** — half a
 structure is not a thing that can exist. They are stamped with
@@ -294,11 +299,73 @@ Tools that do not care (`StructureBuilder`) simply ignore the fractions.
 
 ### Structures
 
-`Add` is 2×1 with two inputs on one long edge and two outputs on the other;
-`Mul` is 1×1 with two *adjacent* inputs (north, west) and two adjacent outputs
-(east, south), so material turns a corner through it. Both are authored at
-`DIR_PX` and rotated.
+The machine set lives in `core/entity.py` and is listed in `STRUCTURES`, which
+is what the toolbelt builds its tools from. All are authored at `DIR_PX` and
+rotated; all are continuous rectangles.
 
+| type | footprint | signature |
+|---|---|---|
+| `Swap` | 1×2 | x,y,z → x, (y,z if x>0 else z,y) |
+| `Shear` | 2×1 | x,y → x, x+y |
+| `Mac` | 2×1 | x,y,z → x, y, z + x·y |
+| `Source` | 4×1 | one output on the +X tip |
+| `Sink` | 3×3 | one input at the middle of each side |
+
+The three arithmetic machines share an idiom: a **pass-through channel**
+crosses the body on one axis unchanged, while the channel taking the *long
+way* across the footprint is the one that gets mutated. `Swap`'s x runs
+vertically through the whole 1×2 body (in at the top cell's north face, out at
+the bottom cell's south) while y and z cross their own cell horizontally.
+`Shear` passes x down through cell 0 only; `Mac` is `Shear` plus a second
+vertical control channel down cell 1.
+
+**Adding a machine is two rows.** An `Entity` subclass with `FOOTPRINT`,
+`INPUTS`, `OUTPUTS` plus an entry in `STRUCTURES` and `cell.TYPE_NAMES`; then
+its ports in `input_face_mask_local`/`output_face_mask_local` and its colour
+and glyph in `body_colour`/`body_glyph`. Nothing else needs to know the type —
+the builders, the toolbelt, the stub logic and the port arrows are all generic.
+`test_drive.py` then checks the two sides agree automatically.
+
+- **Ports are per-cell, not per-type.** A port belongs to one cell of a
+  footprint — `Shear`'s y-input is on cell 0 only, `Source` has one port on a
+  4-cell body. `Entity.face_masks_at(lx, ly)` is the Python authority and the
+  GLSL `*_face_mask(type, lcl, facing, flipped)` pair mirrors it. Spreading a
+  port across every cell of a footprint would draw arrows on the wrong cells
+  and stub to the wrong neighbours, so `test_drive.py` pins the two **cell by
+  cell**, at every orientation, and rejects shader ports outside the
+  footprint.
+
+#### Orientation: authored space vs placed space
+
+This is the subtle part, and it has already caused one visible bug.
+
+A type is authored at `DIR_PX` and placed by **flipping first, then rotating**
+(`Entity.place_local`). `.y` therefore holds the **placed** offset, not the
+authored one — `Gameboard._stamp_footprint()` writes offsets within the
+*rotated* bounding box.
+
+So anything that reads `.y` back and wants to ask about ports **must invert it
+first**, via `Entity.unplace_local()` / the GLSL `unplace_local()`. The
+renderer skipping that inversion is what put a rotated `Sink`'s ports on
+interior edges: the port's *face* was being un-rotated while its *cell* stayed
+put, so the two no longer agreed.
+
+**A cell and its faces must always transform together.** The invariant worth
+remembering is that a port always faces *out* of the footprint — the cell one
+step along a port's direction is never part of the same entity. `test_drive.py`
+asserts exactly that for every type, rotation and flip, which is a far
+stronger check than comparing face masks: an aggregate mask over the footprint
+stays correct even when the cell-to-face pairing is scrambled.
+
+- **Flip is `.z` bit 2**, alongside the ghost state, because the renderer
+  resolves ports per-cell straight from the grid texture and so needs the flag
+  without a round trip through the entity row (where it also lives, as
+  `F_FLIPPED`). A neighbour probe must read the *neighbour's* flip bit
+  (`is_flipped(n.z)`), not the calling cell's.
+- **Chirality is derived, not declared** (`Entity.is_chiral()`): it mirrors the
+  port layout and compares. `Swap`, `Shear` and `Mac` are chiral; `Source` and
+  `Sink` are symmetric about the authored X axis, so `F` is a deliberate no-op
+  for them rather than a special case in the toolbelt.
 - **Faces are derived, not stored** (`Entity.faces_for`). Every instance of a
   type has the same port layout, so storing it per-row would be duplication.
   If ports ever become per-instance configurable, that is where it changes.
@@ -348,7 +415,7 @@ lookup table, no precomputed tile index:
 - With no incoming neighbour the spine extends backwards too, so an isolated
   belt fills its cell rather than looking like a half tile.
 - **The cell we output into is never a source**, even if it emits back at us.
-  A `Mul` can have an output face pointing at the very belt that feeds it;
+  A machine can have an output face pointing at the very belt that feeds it;
   without this rule that belt would draw two opposed chevron streams on one
   arm. The belt's own facing wins — it is leaving, not arriving.
 
@@ -372,7 +439,9 @@ if you want to change it.
 
 ### Structures
 
-`Add` draws one Plus centred on its whole 2×1 footprint; `Mul` draws an X.
+Each machine draws a glyph centred on its whole footprint — `Shear` a Plus,
+`Mac` an X, `Swap` a Z, `Source`/`Sink` a dot — chosen by `body_glyph()` and
+drawn by `sd_glyph()`, with the colour from `body_colour()`.
 Both carry short port arrows — blue pointing inward at inputs, red pointing
 outward at outputs — plus **connection stubs**: a short belt-coloured bar from
 the body edge out to the cell boundary, drawn only on a port face that
@@ -389,10 +458,12 @@ side left one half of such a join silent.
 
 Ports are derived in GLSL by `input_face_mask()` / `output_face_mask()` in
 [shaders/common.glsl](shaders/common.glsl), mirroring `Entity.INPUTS` /
-`OUTPUTS`. They are **per-cell** — every cell of a multi-cell footprint carries
-its own faces — so the shader answers "is this face a port?" from one cell with
-no footprint-wide reasoning. `test_drive.py` pins these masks against
-`Entity.faces_for()` for every type and facing.
+`OUTPUTS`. They are **per-cell** — a port belongs to one cell of a footprint,
+and the mask functions take that cell's local offset — so the shader answers
+"is this face a port?" from one cell with no footprint-wide reasoning. When
+probing a *neighbour*, pass that neighbour's own `cell_local(n.y)`, not yours.
+`test_drive.py` pins these masks against `Entity.face_masks_at()` for every
+type, cell and facing.
 
 Multi-cell entities recover their extent by probing neighbours for a matching
 entity id, then draw in *footprint space* so the glyph is centred on the entity
@@ -435,7 +506,9 @@ bugs:
 ## Deferred
 
 Noted so they are not mistaken for oversights: belt and structure *simulation*
-(nothing moves — `Add`/`Mul` have ports and are drawn, but have no behaviour);
+(nothing moves — the machines have ports and are drawn, but none of the
+signatures in the table above are evaluated: no arithmetic happens, and
+`Source`/`Sink` neither produce nor consume);
 compute shader passes (the context is 4.3 and the SSBO is bound, but nothing
 dispatches); curved corner geometry (corners are currently a right-angle join
 of two straight arms, which reads fine but is not a true curve); entity-row

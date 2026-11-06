@@ -12,16 +12,20 @@ const int DIR_SHIFT  = 0,  DIR_MASK   = 0x3;
 const int TYPE_SHIFT = 2,  TYPE_MASK  = 0x7F;
 const int ID_SHIFT   = 9,  ID_MASK    = 0x3FFFFF;
 const int GHOST_SHIFT = 0, GHOST_MASK = 0x3;
+const int FLIP_SHIFT = 2;   // .z bit 2: mirrored about the authored X axis
 const int LOCAL_SHIFT = 16, LOCAL_MASK = 0xFFFF;
 
 const int GHOST_NONE       = 0;
 const int GHOST_PENDING    = 1;
 const int GHOST_FRUSTRATED = 2;
 
-const int TYPE_EMPTY = 0;
-const int TYPE_BELT  = 1;
-const int TYPE_ADD   = 2;
-const int TYPE_MUL   = 3;
+const int TYPE_EMPTY  = 0;
+const int TYPE_BELT   = 1;
+const int TYPE_SWAP   = 2;
+const int TYPE_SHEAR  = 3;
+const int TYPE_MAC    = 4;
+const int TYPE_SOURCE = 5;
+const int TYPE_SINK   = 6;
 
 // Directions. These index DIR_VECS below.
 const int DIR_PX = 0;   // +X east
@@ -40,6 +44,7 @@ int cell_type  (int w) { return (w >> TYPE_SHIFT)  & TYPE_MASK;  }
 int cell_dir   (int w) { return (w >> DIR_SHIFT)   & DIR_MASK;   }
 int cell_id    (int w) { return (w >> ID_SHIFT)    & ID_MASK;    }
 int ghost_state(int w) { return (w >> GHOST_SHIFT) & GHOST_MASK; }
+bool is_flipped (int w) { return ((w >> FLIP_SHIFT) & 1) != 0; }
 
 ivec2 cell_local(int w) {
     return ivec2((w >> LOCAL_SHIFT) & LOCAL_MASK, w & LOCAL_MASK);
@@ -49,16 +54,65 @@ bool is_empty(int w) { return cell_type(w) == TYPE_EMPTY; }
 
 // --- structure ports ----------------------------------------------------
 //
-// MUST match Entity.INPUTS / OUTPUTS and faces_for() in core/entity.py.
-// Ports are per-cell: every cell of a multi-cell footprint carries its own
-// faces, so a shader can answer "is this face a port?" from the cell alone,
-// with no footprint-wide reasoning.
+// MUST match Entity.INPUTS / OUTPUTS and Entity.face_masks_at() in
+// core/entity.py. Ports are per-cell: a port lives on *one* cell of a
+// footprint, not on all of them, so these take the cell's authored local
+// offset as well as its type. That is what lets a shader answer "is this
+// face a port?" from a single cell with no footprint-wide reasoning.
 //
-// Authored at DIR_PX and rotated into the entity's facing:
-//   Add  inputs +Y, outputs -Y   (on each of its two cells)
-//   Mul  inputs +Y and -X, outputs +X and -Y
+// Masks are 4-bit, indexed by direction, authored at DIR_PX.
 //
-// Faces are returned as a 4-bit mask indexed by direction.
+//   Swap   1x2  x down the whole body (in top, out bottom);
+//               y and z cross their own cell, west to east
+//   Shear  2x1  x down through cell 0 only; y in at cell 0's west face,
+//               out at cell 1's east face as x+y
+//   Mac    2x1  Shear plus a second vertical channel down cell 1
+//   Source 4x1  one output on the +X tip
+//   Sink   3x3  one input at the middle of each side
+//
+// .y holds the *placed* offset (flipped, then rotated, then shifted into the
+// +X/+Y quadrant -- see Entity.place_local()), NOT the authored one. The
+// tables below are authored at DIR_PX, so a placed offset must be inverted
+// back into authored space before any lookup: unplace_local() here mirrors
+// Entity.unplace_local(). Looking up the placed offset directly un-rotates a
+// port's *face* while leaving its *cell* put, which lands ports on interior
+// edges of a rotated footprint -- a 3x3 Sink is the clearest case, since its
+// extent is rotation-invariant and so hides the error everywhere else.
+
+#define FACE(d) (1 << (d))
+
+// The authored (DIR_PX) footprint of a type. MUST match Entity.FOOTPRINT.
+ivec2 type_footprint(int type) {
+    if (type == TYPE_SWAP)   return ivec2(1, 2);
+    if (type == TYPE_SHEAR)  return ivec2(2, 1);
+    if (type == TYPE_MAC)    return ivec2(2, 1);
+    if (type == TYPE_SOURCE) return ivec2(4, 1);
+    if (type == TYPE_SINK)   return ivec2(3, 3);
+    return ivec2(1, 1);
+}
+
+ivec2 rotate_offset(ivec2 p, int dir) {
+    for (int i = 0; i < (dir % 4); ++i) p = ivec2(-p.y, p.x);
+    return p;
+}
+
+// Placed offset (what .y holds) -> authored offset. Inverse of
+// Entity.place_local(); see Entity.unplace_local().
+ivec2 unplace_local(int type, ivec2 p, int facing, bool flipped) {
+    ivec2 fp = type_footprint(type);
+    // Undo the shift that kept the rotated block in the +X/+Y quadrant.
+    ivec2 lo = ivec2(0);
+    for (int cx = 0; cx < 2; ++cx) {
+        for (int cy = 0; cy < 2; ++cy) {
+            ivec2 corner = rotate_offset(
+                ivec2(cx == 0 ? 0 : fp.x - 1, cy == 0 ? 0 : fp.y - 1), facing);
+            lo = min(lo, corner);
+        }
+    }
+    ivec2 a = rotate_offset(p + lo, (4 - facing) % 4);
+    if (flipped) a.y = (fp.y - 1) - a.y;
+    return a;
+}
 
 int rotate_face_mask(int mask, int facing) {
     int out_mask = 0;
@@ -68,23 +122,77 @@ int rotate_face_mask(int mask, int facing) {
     return out_mask;
 }
 
-int input_face_mask(int type, int facing) {
-    int m = 0;
-    if (type == TYPE_ADD) m = (1 << DIR_PY);
-    else if (type == TYPE_MUL) m = (1 << DIR_PY) | (1 << DIR_NX);
-    else return 0;
+// Mirror a face mask about the X axis: +Y <-> -Y. Matches cell.flip_dir_y().
+int flip_face_mask(int mask) {
+    int out_mask = mask & (FACE(DIR_PX) | FACE(DIR_NX));
+    if ((mask & FACE(DIR_PY)) != 0) out_mask |= FACE(DIR_NY);
+    if ((mask & FACE(DIR_NY)) != 0) out_mask |= FACE(DIR_PY);
+    return out_mask;
+}
+
+// Authored input mask for one local cell of a type.
+int input_face_mask_local(int type, ivec2 lcl) {
+    if (type == TYPE_SWAP) {
+        if (lcl == ivec2(0, 1)) return FACE(DIR_PY) | FACE(DIR_NX);
+        if (lcl == ivec2(0, 0)) return FACE(DIR_NX);
+    } else if (type == TYPE_SHEAR) {
+        if (lcl == ivec2(0, 0)) return FACE(DIR_PY) | FACE(DIR_NX);
+    } else if (type == TYPE_MAC) {
+        if (lcl == ivec2(0, 0)) return FACE(DIR_PY) | FACE(DIR_NX);
+        if (lcl == ivec2(1, 0)) return FACE(DIR_PY);
+    } else if (type == TYPE_SINK) {
+        if (lcl == ivec2(1, 2)) return FACE(DIR_PY);
+        if (lcl == ivec2(1, 0)) return FACE(DIR_NY);
+        if (lcl == ivec2(0, 1)) return FACE(DIR_NX);
+        if (lcl == ivec2(2, 1)) return FACE(DIR_PX);
+    }
+    return 0;
+}
+
+// Authored output mask for one local cell of a type.
+int output_face_mask_local(int type, ivec2 lcl) {
+    if (type == TYPE_SWAP) {
+        if (lcl == ivec2(0, 1)) return FACE(DIR_PX);
+        if (lcl == ivec2(0, 0)) return FACE(DIR_NY) | FACE(DIR_PX);
+    } else if (type == TYPE_SHEAR) {
+        if (lcl == ivec2(0, 0)) return FACE(DIR_NY);
+        if (lcl == ivec2(1, 0)) return FACE(DIR_PX);
+    } else if (type == TYPE_MAC) {
+        if (lcl == ivec2(0, 0)) return FACE(DIR_NY);
+        if (lcl == ivec2(1, 0)) return FACE(DIR_NY) | FACE(DIR_PX);
+    } else if (type == TYPE_SOURCE) {
+        if (lcl == ivec2(3, 0)) return FACE(DIR_PX);
+    }
+    return 0;
+}
+
+// `lcl` is the PLACED offset straight out of .y. The pipeline mirrors
+// Entity.faces_for(): invert the cell back to authored space, read its
+// authored faces, then apply the same flip and rotation to those faces so
+// cell and face move together.
+int input_face_mask(int type, ivec2 lcl, int facing, bool flipped) {
+    int m = input_face_mask_local(
+        type, unplace_local(type, lcl, facing, flipped));
+    if (flipped) m = flip_face_mask(m);
     return rotate_face_mask(m, facing);
 }
 
-int output_face_mask(int type, int facing) {
-    int m = 0;
-    if (type == TYPE_ADD) m = (1 << DIR_NY);
-    else if (type == TYPE_MUL) m = (1 << DIR_PX) | (1 << DIR_NY);
-    else return 0;
+int output_face_mask(int type, ivec2 lcl, int facing, bool flipped) {
+    int m = output_face_mask_local(
+        type, unplace_local(type, lcl, facing, flipped));
+    if (flipped) m = flip_face_mask(m);
     return rotate_face_mask(m, facing);
 }
 
 bool has_face(int mask, int dir) { return (mask & (1 << dir)) != 0; }
+
+// Glyph ids, used by world.frag's per-type visual table. A type names a
+// glyph rather than drawing one inline, so several machines can share a mark.
+const int GLYPH_NONE  = 0;
+const int GLYPH_PLUS  = 1;
+const int GLYPH_CROSS = 2;   // X
+const int GLYPH_ZED   = 3;   // Z
+const int GLYPH_DOT   = 4;
 
 bool is_structure(int type) {
     return type != TYPE_EMPTY && type != TYPE_BELT;

@@ -106,7 +106,8 @@ class Engine:
         for p in plan.previewable:
             if not p.frustrated:
                 view = self.board.spawn(
-                    p.entity_cls, p.x, p.y, p.direction, is_ghost=True
+                    p.entity_cls, p.x, p.y, p.direction, is_ghost=True,
+                    flipped=p.flipped
                 )
                 self.ghost_rows.append(view.row)
                 continue
@@ -119,7 +120,7 @@ class Engine:
                 if (cx, cy) in blocked or not self.buildable(cx, cy):
                     continue
                 view = self.board.spawn_cell_ghost(
-                    p.entity_cls, cx, cy, p.direction
+                    p.entity_cls, cx, cy, p.direction, flipped=p.flipped
                 )
                 if view is not None:
                     self.preview_only_rows.append(view.row)
@@ -149,7 +150,8 @@ class Engine:
         """Commit a plan directly, with no preview step."""
         rows = []
         for p in plan.buildable:
-            view = self.board.spawn(p.entity_cls, p.x, p.y, p.direction)
+            view = self.board.spawn(p.entity_cls, p.x, p.y, p.direction,
+                                    flipped=p.flipped)
             rows.append(view.row)
         self.stats["placed"] += len(rows)
         return rows
@@ -170,13 +172,14 @@ class Engine:
         self.build_plan(plan)
         return [(p.x, p.y) for p in plan.buildable]
 
-    def place_structure(self, entity_cls, x, y, direction=cell.DIR_PX):
+    def place_structure(self, entity_cls, x, y, direction=cell.DIR_PX,
+                        flipped=False):
         """Place one structure if its whole footprint is free."""
-        blocked = [c for c in entity_cls.cells_for(x, y, direction)
+        blocked = [c for c in entity_cls.cells_for(x, y, direction, flipped)
                    if not self.buildable(*c)]
         if blocked:
             return None
-        view = self.board.spawn(entity_cls, x, y, direction)
+        view = self.board.spawn(entity_cls, x, y, direction, flipped=flipped)
         self.stats["placed"] += 1
         return view
 

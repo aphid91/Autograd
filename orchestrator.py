@@ -105,9 +105,11 @@ class Orchestrator:
 
         tool = self.toolbelt.active
 
-        # 4. per-tool R / shift+R
+        # 4. per-tool R / shift+R and F
         if intents.cycle_tool and tool is not None:
             tool.cycle(backward=intents.cycle_backward)
+        if intents.flip_tool and tool is not None:
+            tool.flip()
 
         # 5. build / erase
         if intents.cancel_plan:
@@ -155,6 +157,10 @@ class Orchestrator:
                 self._on_tool_changed()
         if requests.cycle_tool and self.toolbelt.active is not None:
             self.toolbelt.active.cycle(backward=requests.cycle_backward)
+            if self.input.anchor is not None:
+                self._preview(self.toolbelt.active)
+        if requests.flip_tool and self.toolbelt.active is not None:
+            self.toolbelt.active.flip()
             if self.input.anchor is not None:
                 self._preview(self.toolbelt.active)
         if requests.verify_round_trip:
