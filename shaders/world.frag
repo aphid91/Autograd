@@ -65,6 +65,13 @@ uniform isampler2D grid;      // RGBA32I, one texel per cell
 // How far a cell probes for siblings when recovering its footprint extent.
 // Must be >= (longest footprint axis - 1); Source is 4x1, so 3.
 #define PROBE_REACH       3
+// A faint belt drawn straight through a machine on any cell whose ports pass
+// a signal through unchanged -- the "control" channels, which enter one face
+// and leave the opposite one. Shows at a glance which way material survives
+// the operation. Drawn over the body, under the glyph.
+#define PASS_ALPHA        0.22   // overlay opacity -- tweak to taste
+#define PASS_WIDTH        0.22   // spine thickness, in cells
+#define PASS_CHEVRON      1.0    // chevron opacity, relative to PASS_ALPHA
 
 // --- ghosts / overlays ---
 #define GHOST_ALPHA       0.45
@@ -473,6 +480,60 @@ void main() {
             col = mix(col, COL_BELT, stub * alpha_scale);
 
             col = mix(col, body_colour(type), a_body * alpha_scale);
+
+            // --- control-signal overlay ---
+            // A faint belt straight through the cell on each axis the machine
+            // passes unchanged, so you can see at a glance which signals
+            // survive the operation. Over the body, under the glyph.
+            //
+            // The axes are declared (Entity.PASS_THROUGH), not inferred: a
+            // mutated channel enters and leaves on opposite faces exactly as
+            // a pass-through does, so geometry alone cannot tell them apart.
+            //
+            // Only cells that actually carry the channel draw it -- Shear
+            // passes x through its first cell only, so its second cell shows
+            // nothing. A cell carries it if it has a port on that axis, or if
+            // it sits mid-channel between two cells that do (Swap's x enters
+            // the top cell and leaves the bottom, so neither end sees both
+            // halves, but every cell of that column is on the channel).
+            {
+                int pass_mask = rotate_face_mask(pass_through_mask(type),
+                                                 facing);
+                float pass = 0.0, pass_chev = 0.0;
+                for (int d = 0; d < 4; ++d) {
+                    if (!has_face(pass_mask, d)) continue;
+                    int back = (d + 2) % 4;
+                    // This cell is on the channel if it terminates either end
+                    // of it here, or if the footprint continues both ways
+                    // (making it an interior link in the run).
+                    ivec2 step = DIR_VECS[d];
+                    bool more_fwd  = (step.x != 0)
+                                   ? ((step.x > 0) ? hi.x > 0 : lo.x > 0)
+                                   : ((step.y > 0) ? hi.y > 0 : lo.y > 0);
+                    bool more_back = (step.x != 0)
+                                   ? ((step.x > 0) ? lo.x > 0 : hi.x > 0)
+                                   : ((step.y > 0) ? lo.y > 0 : hi.y > 0);
+                    bool on_channel = has_face(out_mask, d)
+                                   || has_face(in_mask, back)
+                                   || (more_fwd && more_back);
+                    if (!on_channel) continue;
+
+                    vec2 axis = dir_vec(d);
+                    float sd_pass = sd_segment(p, -axis * 0.5, axis * 0.5)
+                                    - PASS_WIDTH * 0.5;
+                    pass = max(pass, fill(sd_pass, px));
+                    // Chevrons share the belt lattice, so a control channel
+                    // lines up with the belts feeding it.
+                    float wphase = dot(world, axis);
+                    pass_chev = max(pass_chev,
+                        chevrons_along(p, axis, -0.5, 0.5,
+                                       wphase - dot(p, axis), px));
+                }
+                col = mix(col, COL_BELT, pass * PASS_ALPHA * alpha_scale);
+                col = mix(col, COL_CHEVRON,
+                          pass_chev * pass * PASS_ALPHA * PASS_CHEVRON
+                          * alpha_scale);
+            }
 
             // Footprint-space coords, so the glyph is centred on the whole
             // entity rather than on one of its cells. `pf` is in *cell* units

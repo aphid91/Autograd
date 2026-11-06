@@ -186,6 +186,22 @@ int output_face_mask(int type, ivec2 lcl, int facing, bool flipped) {
 
 bool has_face(int mask, int dir) { return (mask & (1 << dir)) != 0; }
 
+// --- control channels ---------------------------------------------------
+//
+// The authored axes a type passes through *unchanged*. MUST match
+// Entity.PASS_THROUGH. This is declared, not derived: geometrically a
+// mutated channel is indistinguishable from a pass-through (Shear's y
+// enters -X and leaves +X exactly as its x enters +Y and leaves -Y), so
+// only the machine's semantics can tell them apart.
+//
+// Returned as a face mask in authored space; the caller rotates it.
+int pass_through_mask(int type) {
+    if (type == TYPE_SWAP)  return FACE(DIR_NY);
+    if (type == TYPE_SHEAR) return FACE(DIR_NY);
+    if (type == TYPE_MAC)   return FACE(DIR_NY);
+    return 0;
+}
+
 // Glyph ids, used by world.frag's per-type visual table. A type names a
 // glyph rather than drawing one inline, so several machines can share a mark.
 const int GLYPH_NONE  = 0;

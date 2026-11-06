@@ -47,6 +47,17 @@ class Entity:
     INPUTS = ()
     OUTPUTS = ()
 
+    # Authored axes along which this type passes a signal through *unchanged*
+    # -- its control channels. Each entry is a face direction; the channel is
+    # understood to run the whole way across the footprint on that axis.
+    #
+    # This has to be declared rather than derived. Geometrically a mutated
+    # channel looks exactly like a pass-through -- Shear's y enters -X and
+    # leaves +X just as its x enters +Y and leaves -Y -- so only the machine's
+    # semantics can tell them apart. The renderer draws a faint belt along
+    # these axes to show which signals survive the operation.
+    PASS_THROUGH = ()
+
     # Whether R rotates this type at all. Belts take their facing from the
     # path they are drawn along, so rotating one in isolation is meaningless.
     ROTATABLE = False
@@ -81,6 +92,29 @@ class Entity:
         """(w, h) of this type rotated into `direction`."""
         w, h = cls.FOOTPRINT
         return (h, w) if direction % 2 else (w, h)
+
+    @classmethod
+    def centre_offset(cls, direction):
+        """(dx, dy) from the footprint's origin to the cell under the cursor.
+
+        Structures are placed centred on the pointer rather than by their
+        origin corner, so a big machine straddles the cursor and a rotation
+        turns about its middle instead of swinging around a corner.
+
+        An even extent has no middle cell -- its true centre falls on a cell
+        boundary -- so this biases to the lower/left of the two with
+        (extent - 1) // 2. The bias is applied in *placed* space and so stays
+        consistent as the footprint rotates: a 4x1 Source always has one cell
+        behind the cursor and two ahead, whichever way it points.
+        """
+        w, h = cls.footprint_for(direction)
+        return (w - 1) // 2, (h - 1) // 2
+
+    @classmethod
+    def origin_for_cursor(cls, cx, cy, direction):
+        """Footprint origin for a placement centred on the cursor cell."""
+        dx, dy = cls.centre_offset(direction)
+        return cx - dx, cy - dy
 
     @classmethod
     def cells_for(cls, x, y, direction, flipped=False):
@@ -380,6 +414,9 @@ class Swap(Structure):
         (0, 0, cell.DIR_PX),   # z' out
     )
 
+    # x survives untouched; y and z are the pair that may be exchanged.
+    PASS_THROUGH = (cell.DIR_NY,)
+
 
 class Shear(Structure):
     """Shear: x,y -> x, x+y.
@@ -401,6 +438,9 @@ class Shear(Structure):
         (0, 0, cell.DIR_NY),   # x out, same cell: a pass-through
         (1, 0, cell.DIR_PX),   # x+y out, at the far end
     )
+
+    # x survives untouched; y is what the machine rewrites.
+    PASS_THROUGH = (cell.DIR_NY,)
 
 
 class Mac(Structure):
@@ -425,6 +465,9 @@ class Mac(Structure):
         (1, 0, cell.DIR_NY),   # y out
         (1, 0, cell.DIR_PX),   # z + x*y out
     )
+
+    # Both control channels survive untouched; z picks up the product.
+    PASS_THROUGH = (cell.DIR_NY,)
 
 
 class Source(Structure):
@@ -599,6 +642,35 @@ def _self_check():
                     assert c.unplace_local(*once, d, True) == (lx, ly)
             assert (sorted(c.cells_for(3, 3, d, False))
                     == sorted(c.cells_for(3, 3, d, True))), c.__name__
+
+    # Structures are placed centred on the cursor, so the cursor cell must
+    # always land inside the footprint and near its middle -- otherwise a
+    # rotation would swing the body around the pointer instead of turning
+    # about it.
+    for c in STRUCTURES:
+        for d in range(4):
+            ox, oy = c.origin_for_cursor(20, 20, d)
+            cells = c.cells_for(ox, oy, d)
+            assert (20, 20) in cells, (c.__name__, d)
+            w, h = c.footprint_for(d)
+            # Never more than half a cell from the true centre; an even
+            # extent has no middle cell, so half a cell is the best possible.
+            assert abs(20 - (ox + (w - 1) / 2)) <= 0.5, (c.__name__, d)
+            assert abs(20 - (oy + (h - 1) / 2)) <= 0.5, (c.__name__, d)
+        # An odd square sits exactly on the cursor at every rotation.
+        if c.FOOTPRINT[0] == c.FOOTPRINT[1] and c.FOOTPRINT[0] % 2 == 1:
+            for d in range(4):
+                off = c.centre_offset(d)
+                assert off == (c.FOOTPRINT[0] // 2,) * 2, (c.__name__, d)
+
+    # A declared pass-through axis must have an output face pointing that
+    # way, or the overlay would draw a channel the machine cannot carry.
+    for c in STRUCTURES:
+        out_faces = {f for _c, f in c.faces_for(0, 0, cell.DIR_PX)[1]}
+        for f in c.PASS_THROUGH:
+            assert f in out_faces, (c.__name__, cell.DIR_NAMES[f])
+    assert Swap.PASS_THROUGH and Shear.PASS_THROUGH and Mac.PASS_THROUGH
+    assert not Source.PASS_THROUGH and not Sink.PASS_THROUGH
 
     # Chirality is derived from the ports, so it cannot drift from them.
     # The arithmetic machines are chiral; Source and Sink are symmetric

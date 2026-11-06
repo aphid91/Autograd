@@ -351,6 +351,32 @@ assert tuple(orch.camera.center) != _before or orch.camera.center[0] == board.wi
 ok("shift+F framed the board")
 fake["keys"].add(glfw.KEY_1); step(); fake["keys"].discard(glfw.KEY_1); step()
 
+print("=== structures are centred on the cursor, not cornered on it ===")
+engine.clear_board(); step()
+fake["keys"].add(glfw.KEY_5); step(); fake["keys"].discard(glfw.KEY_5); step()
+_src_tool = orch.toolbelt.active
+assert _src_tool.name == "Source", _src_tool.name
+_src_tool.direction = cell.DIR_PX
+put_cursor_at_cell(30, 10); step()
+click()
+# A 4x1 placed at (30,10) must straddle the cursor, not start there.
+assert not board.is_empty(30, 10), "cursor cell must be covered"
+assert not board.is_empty(29, 10), "footprint should extend behind the cursor"
+assert not board.is_empty(32, 10) and board.is_empty(33, 10)
+ok("4x1 Source straddles the cursor (29..32, not 30..33)")
+
+# Rotating turns about the middle: the cursor cell stays covered.
+engine.clear_board(); step()
+for _d in range(4):
+    _src_tool.direction = _d
+    put_cursor_at_cell(30, 20); step()
+    assert orch.last_plan is not None and orch.last_plan.ok
+    _p = orch.last_plan.placements[0]
+    assert (30, 20) in _p.cells(), (
+        f"cursor left the footprint at {cell.DIR_NAMES[_d]}: {_p.cells()}")
+ok("the cursor stays inside the footprint through a full rotation")
+fake["keys"].add(glfw.KEY_1); step(); fake["keys"].discard(glfw.KEY_1); step()
+
 print("=== rotating a structure keeps its ports on the outside ===")
 # Regression: the shader looked its port tables up with the placed .y offset
 # instead of inverting it, so a rotated structure's ports moved to interior
@@ -416,13 +442,20 @@ for x in range(8, 18):
         f"Sink self-frustrated at x={x}: {orch.last_plan.frustrated_cells}")
 click()
 assert board.live_count == 1, "3x3 Sink is one entity"
-_sink_id = cell.cell_id(board.cell_word(17, 24))
+# Structures are centred on the cursor, so a 3x3 clicked at (17,24) has its
+# origin one cell down and left.
+_ox, _oy = Sink.origin_for_cursor(17, 24, cell.DIR_PX)
+assert (_ox, _oy) == (16, 23), (_ox, _oy)
+_sink_id = cell.cell_id(board.cell_word(_ox, _oy))
 for _dx in range(3):
     for _dy in range(3):
-        assert cell.cell_id(board.cell_word(17 + _dx, 24 + _dy)) == _sink_id, (_dx, _dy)
+        assert cell.cell_id(
+            board.cell_word(_ox + _dx, _oy + _dy)) == _sink_id, (_dx, _dy)
         assert cell.unpack_local(
-            int(board.grid[24 + _dy, 17 + _dx, cell.CH_Y])) == (_dx, _dy)
-ok("3x3 Sink places as one entity with correct per-cell local offsets")
+            int(board.grid[_oy + _dy, _ox + _dx, cell.CH_Y])) == (_dx, _dy)
+# The cursor cell really is the middle one.
+assert cell.unpack_local(int(board.grid[24, 17, cell.CH_Y])) == (1, 1)
+ok("3x3 Sink centres on the cursor, one entity, correct local offsets")
 
 engine.clear_board(); step()
 fake["keys"].add(glfw.KEY_1); step(); fake["keys"].discard(glfw.KEY_1); step()
@@ -649,6 +682,31 @@ assert _re.search(r"input_face_mask\(type, lcl, facing, flipped\)", _src), \
 assert _re.search(r"output_face_mask\(type, lcl, facing, flipped\)", _src), \
     "the structure draw path must pass its cell's flip flag"
 ok("GLSL port mask callers pass the flip flag")
+
+# The control-channel overlay is declared on both sides and must agree.
+for _cls in STRUCTURES:
+    _tname = "TYPE_" + cell.TYPE_NAMES[_cls.TYPE_ID].upper()
+    _m = _re.search(rf"type == {_tname}\)\s*return ([^;]+);",
+                    _re.search(r"int pass_through_mask\(int type\)\s*\{(.*?)\n\}",
+                               _src, _re.S).group(1))
+    _got = 0
+    if _m:
+        for _face in _re.findall(r"FACE\((DIR_\w+)\)", _m.group(1)):
+            _got |= 1 << getattr(cell, _face)
+    _want = 0
+    for _f in _cls.PASS_THROUGH:
+        _want |= 1 << _f
+    assert _got == _want, (
+        f"{_cls.__name__}: shader pass-through {_got:04b} != "
+        f"Entity.PASS_THROUGH {_want:04b}")
+    # A declared pass-through axis must actually have ports on it, or the
+    # overlay would draw a channel the machine has no way to carry.
+    for _f in _cls.PASS_THROUGH:
+        _faces = {f for _c, f in _cls.faces_for(0, 0, cell.DIR_PX)[1]}
+        assert _f in _faces, (
+            f"{_cls.__name__}: PASS_THROUGH names {cell.DIR_NAMES[_f]} but "
+            f"no output face points that way")
+ok("GLSL pass_through_mask() matches Entity.PASS_THROUGH")
 
 # The shader's authored footprint table must match Entity.FOOTPRINT, since
 # unplace_local() uses it to invert the placement transform.

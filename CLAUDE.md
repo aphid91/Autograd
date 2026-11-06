@@ -320,9 +320,11 @@ the bottom cell's south) while y and z cross their own cell horizontally.
 vertical control channel down cell 1.
 
 **Adding a machine is two rows.** An `Entity` subclass with `FOOTPRINT`,
-`INPUTS`, `OUTPUTS` plus an entry in `STRUCTURES` and `cell.TYPE_NAMES`; then
-its ports in `input_face_mask_local`/`output_face_mask_local` and its colour
-and glyph in `body_colour`/`body_glyph`. Nothing else needs to know the type —
+`INPUTS`, `OUTPUTS`, `PASS_THROUGH` plus an entry in `STRUCTURES` and
+`cell.TYPE_NAMES`; then its ports in
+`input_face_mask_local`/`output_face_mask_local`, its footprint in
+`type_footprint`, its control axes in `pass_through_mask`, and its colour and
+glyph in `body_colour`/`body_glyph`. Nothing else needs to know the type —
 the builders, the toolbelt, the stub logic and the port arrows are all generic.
 `test_drive.py` then checks the two sides agree automatically.
 
@@ -369,9 +371,17 @@ stays correct even when the cell-to-face pairing is scrambled.
 - **Faces are derived, not stored** (`Entity.faces_for`). Every instance of a
   type has the same port layout, so storing it per-row would be duplication.
   If ports ever become per-instance configurable, that is where it changes.
-- **The origin is always the cell under the cursor**, at every rotation —
-  `cells_for()` extends the footprint in +X/+Y from the origin rather than
-  pivoting about an interior point, which keeps placement predictable.
+- **The origin is the footprint's lower-left corner**, and `cells_for()`
+  extends in +X/+Y from it rather than pivoting about an interior point. That
+  is the storage model everywhere — rows, cells, `.y` offsets.
+- **Placement is centred on the cursor, not cornered on it.** A structure
+  straddles the pointer so a rotation turns about its middle instead of
+  swinging the body around a corner. `Entity.origin_for_cursor()` converts
+  cursor cell → origin, and `StructureBuilder.plan()` is the single place
+  that calls it: a gesture becomes a placement there, and nothing downstream
+  needs to know. An even extent has no middle cell, so `centre_offset()`
+  biases to the lower/left half with `(extent - 1) // 2` — a 4×1 Source sits
+  one cell behind the cursor and two ahead, at every facing.
 - **Erasing any cell of a multi-cell entity removes the whole entity.** There
   is no such thing as half a structure.
 - The renderer recovers a footprint's extent by probing neighbours for a
@@ -448,6 +458,32 @@ the body edge out to the cell boundary, drawn only on a port face that
 actually has something on the other side, so a structure and its neighbours
 read as physically joined. Stubs are drawn *under* the body so the body edge
 caps their inner end.
+
+### Control-signal overlay
+
+A machine draws a faint belt straight through itself on each axis it passes
+**unchanged** — the control channels, which in the standard layout run
+vertically while the mutated channel crosses horizontally. It makes "which
+signal survives this operation" readable at a glance. Drawn over the body and
+under the glyph; `PASS_ALPHA` in [world.frag](shaders/world.frag) sets the
+opacity, with `PASS_WIDTH` and `PASS_CHEVRON` alongside it.
+
+**The axes are declared, not derived** (`Entity.PASS_THROUGH`, mirrored by
+`pass_through_mask()` in GLSL and pinned by `test_drive.py`). This is the one
+piece of port information geometry cannot recover: a mutated channel enters
+one face and leaves the opposite one *exactly* as a pass-through does —
+`Shear`'s y enters `-X` and leaves `+X` just as its x enters `+Y` and leaves
+`-Y`. Only the machine's semantics distinguish them. An early version
+inferred the axes from the masks and drew the mutated channel as a control
+channel on every machine.
+
+Only cells that actually carry the channel draw it, so `Shear` marks its
+first cell and not its second. A cell qualifies if it has a port on that
+axis, or if it is an interior link between two that do — which is what
+carries `Swap`'s x channel across both cells of its 1×2 body, where the input
+is on one cell and the output on the other.
+
+### Stubs
 
 A face stubs when the neighbour is a genuine counterpart: an **input** face
 needs something emitting at it (`feeds_into`), an **output** face needs
