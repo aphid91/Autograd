@@ -11,6 +11,8 @@ subclass Entity, set TYPE_ID, append field offsets after the common prefix,
 bump ENTITY_STRIDE if needed, and the registry picks it up automatically.
 """
 
+import math
+
 from core import cell
 
 # Row layout, shared prefix for every entity type. Offsets are float32 slots.
@@ -101,20 +103,55 @@ class Entity:
         origin corner, so a big machine straddles the cursor and a rotation
         turns about its middle instead of swinging around a corner.
 
-        An even extent has no middle cell -- its true centre falls on a cell
-        boundary -- so this biases to the lower/left of the two with
-        (extent - 1) // 2. The bias is applied in *placed* space and so stays
-        consistent as the footprint rotates: a 4x1 Source always has one cell
-        behind the cursor and two ahead, whichever way it points.
+        For an even extent this is the lower/left of the two middle cells.
+        Which of the two the cursor actually picks is decided by
+        origin_for_cursor(), from the sub-cell position.
         """
         w, h = cls.footprint_for(direction)
         return (w - 1) // 2, (h - 1) // 2
 
     @classmethod
-    def origin_for_cursor(cls, cx, cy, direction):
-        """Footprint origin for a placement centred on the cursor cell."""
-        dx, dy = cls.centre_offset(direction)
-        return cx - dx, cy - dy
+    def origin_for_cursor(cls, cx, cy, direction, frac=(0.5, 0.5)):
+        """Footprint origin for a placement centred on the pointer.
+
+        `frac` is the cursor's position within its cell, 0..1 on each axis
+        with y up. It matters only on an axis of **even** extent, and there
+        it doubles the placement resolution.
+
+        An odd extent has a middle cell, so the footprint centres on the cell
+        under the cursor and the fraction is irrelevant. An even extent has
+        no middle cell -- its midline falls on a cell *boundary* -- so the
+        pointer picks which boundary: the nearest one. Pointing at the left
+        half of a cell puts the seam on that cell's left edge, the right half
+        on its right edge. A 2x1 therefore follows the pointer every half
+        cell rather than jumping a whole one, and a footprint even on both
+        axes snaps its centre to the nearest *corner*.
+
+        Working in continuous coordinates makes this fall out: the midline
+        wants to sit at the cursor, so round it to the lattice the extent
+        allows -- integers for even extents, half-integers for odd ones.
+        """
+        w, h = cls.footprint_for(direction)
+
+        def axis(c, f, extent):
+            # The caller's fraction is 0..1 within the cell. Clamp just below
+            # 1 so an exact 1.0 -- the far edge, which InputManager never
+            # produces but a direct caller might -- cannot round the midline
+            # into the next cell and step the footprint off the cursor.
+            f = min(max(f, 0.0), 1.0 - 1e-9)
+            # Where the footprint's midline should sit, in world units.
+            want = c + f
+            if extent % 2:
+                # Odd: the midline runs through a cell centre (half-integer).
+                mid = math.floor(want) + 0.5
+            else:
+                # Even: the midline is a cell boundary (integer). Round to
+                # the nearest, so the near edge of the pointer's cell wins.
+                mid = math.floor(want + 0.5)
+            # origin = midline - half the extent.
+            return int(round(mid - extent * 0.5))
+
+        return axis(cx, frac[0], w), axis(cy, frac[1], h)
 
     @classmethod
     def cells_for(cls, x, y, direction, flipped=False):
@@ -647,16 +684,34 @@ def _self_check():
     # always land inside the footprint and near its middle -- otherwise a
     # rotation would swing the body around the pointer instead of turning
     # about it.
+    _fracs = [i / 8 for i in range(9)]
     for c in STRUCTURES:
         for d in range(4):
-            ox, oy = c.origin_for_cursor(20, 20, d)
-            cells = c.cells_for(ox, oy, d)
-            assert (20, 20) in cells, (c.__name__, d)
             w, h = c.footprint_for(d)
-            # Never more than half a cell from the true centre; an even
-            # extent has no middle cell, so half a cell is the best possible.
-            assert abs(20 - (ox + (w - 1) / 2)) <= 0.5, (c.__name__, d)
-            assert abs(20 - (oy + (h - 1) / 2)) <= 0.5, (c.__name__, d)
+            for fx in _fracs:
+                for fy in _fracs:
+                    ox, oy = c.origin_for_cursor(20, 20, d, (fx, fy))
+                    # The pointer must never fall outside what it is placing.
+                    assert (20, 20) in c.cells_for(ox, oy, d), (
+                        c.__name__, d, (fx, fy))
+                    # ...and the footprint's midline must track the pointer to
+                    # within half a cell, which is the lattice's resolution.
+                    assert abs(ox + w / 2.0 - (20 + fx)) <= 0.5 + 1e-6, (
+                        c.__name__, d, (fx, fy))
+                    assert abs(oy + h / 2.0 - (20 + fy)) <= 0.5 + 1e-6, (
+                        c.__name__, d, (fx, fy))
+
+            # An EVEN axis has no middle cell, so the sub-cell position picks
+            # which boundary the midline lands on: the two halves of the cell
+            # must give different origins. An ODD axis has a middle cell and
+            # must ignore the fraction entirely.
+            lo_x = c.origin_for_cursor(20, 20, d, (0.25, 0.5))[0]
+            hi_x = c.origin_for_cursor(20, 20, d, (0.75, 0.5))[0]
+            assert (lo_x != hi_x) == (w % 2 == 0), (c.__name__, d, "x")
+            lo_y = c.origin_for_cursor(20, 20, d, (0.5, 0.25))[1]
+            hi_y = c.origin_for_cursor(20, 20, d, (0.5, 0.75))[1]
+            assert (lo_y != hi_y) == (h % 2 == 0), (c.__name__, d, "y")
+
         # An odd square sits exactly on the cursor at every rotation.
         if c.FOOTPRINT[0] == c.FOOTPRINT[1] and c.FOOTPRINT[0] % 2 == 1:
             for d in range(4):

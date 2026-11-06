@@ -375,6 +375,51 @@ for _d in range(4):
     assert (30, 20) in _p.cells(), (
         f"cursor left the footprint at {cell.DIR_NAMES[_d]}: {_p.cells()}")
 ok("the cursor stays inside the footprint through a full rotation")
+
+# On an EVEN axis the midline is a cell boundary, so the sub-cell position
+# picks *which* boundary -- the structure tracks the pointer every half cell
+# rather than jumping a whole one.
+def put_cursor_at(wx, wy):
+    """Place the fake cursor at an arbitrary world point, not a cell centre."""
+    sx, sy = cam.world_to_screen(wx, wy, (W, H))
+    fake["cursor"] = (float(sx), float(sy))
+
+engine.clear_board(); step()
+fake["keys"].add(glfw.KEY_3); step(); fake["keys"].discard(glfw.KEY_3); step()
+_sh = orch.toolbelt.active
+_sh.direction = cell.DIR_PX
+_sh.flipped = False
+put_cursor_at(30.2, 20.5); step()          # left half of cell 30
+_left = sorted(orch.last_plan.placements[0].cells())
+put_cursor_at(30.8, 20.5); step()          # right half of the same cell
+_right = sorted(orch.last_plan.placements[0].cells())
+assert _left != _right, (
+    f"a 2x1 must shift within one cell: {_left} vs {_right}")
+assert _left == [(29, 20), (30, 20)], _left
+assert _right == [(30, 20), (31, 20)], _right
+assert (30, 20) in _left and (30, 20) in _right, "cursor cell always covered"
+ok(f"2x1 seam follows the pointer within a cell: {_left} -> {_right}")
+
+# What you see is what you build: committing must land on the ghosted cells,
+# not on a different rounding of the same cursor cell.
+put_cursor_at(30.2, 20.5); step()
+_ghosted = sorted(orch.last_plan.placements[0].cells())
+click()
+_built = sorted(c for c in _ghosted if not board.is_empty(*c))
+assert _built == _ghosted, f"built {_built}, ghosted {_ghosted}"
+assert board.is_empty(31, 20), "built on the wrong side of the cursor"
+ok(f"commit lands exactly where the ghost was: {_built}")
+
+# An odd axis has a middle cell, so the fraction must change nothing.
+fake["keys"].add(glfw.KEY_6); step(); fake["keys"].discard(glfw.KEY_6); step()
+assert orch.toolbelt.active.name == "Sink"
+put_cursor_at(30.1, 20.1); step()
+_a = sorted(orch.last_plan.placements[0].cells())
+put_cursor_at(30.9, 20.9); step()
+_b = sorted(orch.last_plan.placements[0].cells())
+assert _a == _b, f"3x3 should ignore the sub-cell position: {_a} vs {_b}"
+ok("3x3 Sink ignores the sub-cell position, as an odd extent should")
+
 fake["keys"].add(glfw.KEY_1); step(); fake["keys"].discard(glfw.KEY_1); step()
 
 print("=== rotating a structure keeps its ports on the outside ===")

@@ -69,7 +69,7 @@ uniform isampler2D grid;      // RGBA32I, one texel per cell
 // a signal through unchanged -- the "control" channels, which enter one face
 // and leave the opposite one. Shows at a glance which way material survives
 // the operation. Drawn over the body, under the glyph.
-#define PASS_ALPHA        0.22   // overlay opacity -- tweak to taste
+#define PASS_ALPHA        0.82   // overlay opacity -- tweak to taste
 #define PASS_WIDTH        0.22   // spine thickness, in cells
 #define PASS_CHEVRON      1.0    // chevron opacity, relative to PASS_ALPHA
 

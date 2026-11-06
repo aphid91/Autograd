@@ -213,6 +213,13 @@ never enters `PLANNING`, it previews under the cursor while `IDLE` and commits
 on a press. Both styles hand the builder the same `(anchor, target)` pair, so
 builders do not care which produced them.
 
+Both styles must also keep `anchor_frac`/`target_frac` current — the `IDLE`
+hover branch updates them alongside `anchor`/`target`. They used to be
+maintained only on the drag path, which left a click-based tool planning from
+whatever fraction some earlier gesture happened to end on; harmless while
+structures ignored the sub-cell position, and a visible mis-placement as soon
+as they didn't.
+
 ### Frustrated cells are an overlay, not an entity
 
 This is the subtle part of the design. A frustrated cell is one a pending build
@@ -295,7 +302,9 @@ axis, y up) alongside the cell index, and the builder uses it at both ends:
   along the travel axis already means "keep going", and pulling backwards
   would reverse the belt into the run it came from.
 
-Tools that do not care (`StructureBuilder`) simply ignore the fractions.
+`StructureBuilder` uses `end_frac` too, but for a different purpose: picking
+which cell boundary an even-sized footprint centres on (see "Structures").
+A tool that cares about neither simply ignores both.
 
 ### Structures
 
@@ -377,11 +386,24 @@ stays correct even when the cell-to-face pairing is scrambled.
 - **Placement is centred on the cursor, not cornered on it.** A structure
   straddles the pointer so a rotation turns about its middle instead of
   swinging the body around a corner. `Entity.origin_for_cursor()` converts
-  cursor cell → origin, and `StructureBuilder.plan()` is the single place
-  that calls it: a gesture becomes a placement there, and nothing downstream
-  needs to know. An even extent has no middle cell, so `centre_offset()`
-  biases to the lower/left half with `(extent - 1) // 2` — a 4×1 Source sits
-  one cell behind the cursor and two ahead, at every facing.
+  cursor position → origin, and `StructureBuilder.plan()` is the single
+  place that calls it: a gesture becomes a placement there, and nothing
+  downstream needs to know.
+
+  **An even axis snaps to the nearest cell boundary, not the nearest cell.**
+  An odd extent has a middle cell, so the footprint centres on the cursor's
+  cell and the sub-cell position is irrelevant. An even extent has no middle
+  cell — its midline is a cell *boundary* — so the pointer picks which
+  boundary, giving twice the placement resolution: a 2×1 follows the cursor
+  every half cell, and a footprint even on both axes snaps its centre to the
+  nearest corner. Working in continuous coordinates makes this fall out:
+  round the desired midline onto the lattice the extent allows (integers for
+  even, half-integers for odd).
+
+  Two invariants hold for every type, rotation and sub-cell position, and
+  `core/entity.py` asserts both at import: the cursor is always inside what
+  it is placing, and the footprint's midline tracks the pointer to within
+  half a cell.
 - **Erasing any cell of a multi-cell entity removes the whole entity.** There
   is no such thing as half a structure.
 - The renderer recovers a footprint's extent by probing neighbours for a

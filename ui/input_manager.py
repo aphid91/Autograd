@@ -292,6 +292,12 @@ class InputManager:
             # previews under the cursor and waits for the release.
             if not drag_based and not want_mouse and board.in_bounds(cx, cy):
                 self.anchor = self.target = (cx, cy)
+                # Carry the sub-cell position too: a click-based tool plans
+                # from target_frac, and a structure whose footprint is even
+                # on an axis uses it to choose which cell boundary its
+                # midline lands on. Leaving it stale pinned every hover
+                # preview to whatever fraction a previous gesture ended on.
+                self.anchor_frac = self.target_frac = frac
                 if (cx, cy) != self._last_hover or frac != self._last_frac \
                         or cycle or it.flip_tool:
                     it.update_plan = True

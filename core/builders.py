@@ -297,15 +297,19 @@ class StructureBuilder(EntityBuilder):
 
     def plan(self, engine, start, end, start_frac=(0.5, 0.5),
              end_frac=(0.5, 0.5)):
-        # A structure ignores both the drag and the sub-cell position: it
-        # places under the cursor, rotated by R and mirrored by F.
+        # A structure ignores the drag -- it places under the cursor, rotated
+        # by R and mirrored by F -- but it does use the sub-cell position.
         #
         # The cursor marks the *centre* of the footprint, not its origin
         # corner, so a multi-cell machine straddles the pointer and rotating
-        # it turns about its middle. cells_for() still takes an origin --
-        # that is the storage model everywhere else -- so convert here, at
-        # the one place a gesture becomes a placement.
-        x, y = self.entity_cls.origin_for_cursor(*end, self.direction)
+        # it turns about its middle. On an axis of even extent the midline is
+        # a cell boundary rather than a cell, so `end_frac` picks which
+        # boundary: the structure then tracks the pointer every half cell.
+        # cells_for() still takes an origin -- that is the storage model
+        # everywhere else -- so convert here, at the one place a gesture
+        # becomes a placement.
+        x, y = self.entity_cls.origin_for_cursor(
+            *end, self.direction, end_frac)
         blocked = [
             c for c in self.entity_cls.cells_for(
                 x, y, self.direction, self.flipped)
