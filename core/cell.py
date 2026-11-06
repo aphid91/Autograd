@@ -117,7 +117,10 @@ TYPE_NAMES = {
     TYPE_MAC: "mac",
     TYPE_SOURCE: "source",
     TYPE_SINK: "sink",
-    TYPE_UNDER: "underground",
+    # Keep these short and identifier-safe: glsl_types.py upper-cases them
+    # into the GLSL type constants (TYPE_UNDER, TYPE_SHEAR, ...), so a name
+    # with a space or a hyphen would not compile.
+    TYPE_UNDER: "under",
 }
 
 # --- bit field layout ---------------------------------------------------

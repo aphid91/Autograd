@@ -64,6 +64,15 @@ class Entity:
     # path they are drawn along, so rotating one in isolation is meaningless.
     ROTATABLE = False
 
+    # --- appearance ------------------------------------------------------
+    # Declared here, beside the ports, so a machine is defined in exactly one
+    # place. core/glsl_types.py emits these into GLSL at shader-load time;
+    # nothing in the shaders names a type by hand.
+    #: Body colour as (r, g, b), 0..1. None means "not drawn as a body".
+    COLOUR = None
+    #: Glyph drawn centred on the footprint. One of the GLYPH_* names.
+    GLYPH = "none"
+
     # Exposed for Gameboard, which pokes these without building a view.
     F_ALIVE = _F_ALIVE
     F_TYPE = _F_TYPE
@@ -519,6 +528,8 @@ class Swap(Structure):
 
     TYPE_ID = cell.TYPE_SWAP
     FOOTPRINT = (1, 2)
+    COLOUR = (0.60, 0.40, 0.42)   # reddish
+    GLYPH = "zed"
 
     INPUTS = (
         (0, 1, cell.DIR_PY),   # x in, top of the body
@@ -546,6 +557,8 @@ class Shear(Structure):
 
     TYPE_ID = cell.TYPE_SHEAR
     FOOTPRINT = (2, 1)
+    COLOUR = (0.40, 0.56, 0.44)   # green
+    GLYPH = "plus"
 
     INPUTS = (
         (0, 0, cell.DIR_PY),   # x in
@@ -571,6 +584,8 @@ class Mac(Structure):
 
     TYPE_ID = cell.TYPE_MAC
     FOOTPRINT = (2, 1)
+    COLOUR = (0.54, 0.44, 0.62)   # purple
+    GLYPH = "cross"
 
     INPUTS = (
         (0, 0, cell.DIR_PY),   # x in
@@ -596,6 +611,8 @@ class Source(Structure):
 
     TYPE_ID = cell.TYPE_SOURCE
     FOOTPRINT = (4, 1)
+    COLOUR = (0.42, 0.52, 0.60)
+    GLYPH = "dot"
 
     INPUTS = ()
     OUTPUTS = ((3, 0, cell.DIR_PX),)
@@ -611,6 +628,8 @@ class Sink(Structure):
 
     TYPE_ID = cell.TYPE_SINK
     FOOTPRINT = (3, 3)
+    COLOUR = (0.34, 0.34, 0.40)
+    GLYPH = "dot"
 
     INPUTS = (
         (1, 2, cell.DIR_PY),   # north

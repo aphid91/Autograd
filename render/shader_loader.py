@@ -12,10 +12,18 @@ Includes are resolved relative to the shaders directory, are processed
 recursively, and a file already pulled in is skipped on later encounters (an
 implicit include guard), so two shaders can both include common.glsl without
 redefining anything.
+
+It also expands the `// @generated types` marker into the per-type tables
+built from the Python entity definitions -- see core/glsl_types.py. Doing
+that here keeps the whole "one definition of a machine" story inside the
+normal load path: there is no generated file on disk to go stale, and F5
+picks up a change to core/entity.py with no build step.
 """
 
 import os
 import re
+
+from core import glsl_types
 
 SHADER_DIR = os.path.join(
     os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "shaders"
@@ -56,7 +64,20 @@ def load(name, _seen=None):
         body = load(inc, _seen)
         return f"// ---- begin {inc} ----\n{body}\n// ---- end {inc} ----"
 
-    return _INCLUDE_RE.sub(substitute, src)
+    src = _INCLUDE_RE.sub(substitute, src)
+
+    # Splice in the per-type tables generated from core/entity.py. Done here
+    # rather than written to a file so there is no generated artefact to get
+    # stale, and F5 picks up a Python-side change without a rebuild step.
+    # Ids first: they must be defined before anything names a TYPE_* value.
+    # The tables come later in the file, after the FACE() macro and the
+    # GLYPH_* constants their bodies reference.
+    if glsl_types.MARKER_IDS in src:
+        src = src.replace(glsl_types.MARKER_IDS, glsl_types.type_constants())
+    if glsl_types.MARKER_TABLES in src:
+        src = src.replace(glsl_types.MARKER_TABLES, glsl_types.generate())
+
+    return src
 
 
 def dependencies(name):

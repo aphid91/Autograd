@@ -90,7 +90,9 @@ everything else is grouped by layer.
 | [core/entity.py](core/entity.py) | `Entity` view base, `Belt`, `Structure` and the machine set, type registry |
 | [core/gameboard.py](core/gameboard.py) | grid array, entity table, free list, dirty tracking, device transfer |
 | [core/engine_paths.py](core/engine_paths.py) | pure path geometry (elbows, Bresenham) |
-| [core/builders.py](core/builders.py) | `EntityBuilder`/`BuildPlan`; `BeltBuilder`, `StructureBuilder` |
+| [core/builders.py](core/builders.py) | `EntityBuilder`/`BuildPlan`; `BeltBuilder`, `StructureBuilder`, `UndergroundBuilder` |
+| [core/glsl_types.py](core/glsl_types.py) | emits the per-type GLSL tables from the entity classes |
+| [core/persistence.py](core/persistence.py) | save/load the board to a single `.npz` |
 | [core/toolbelt.py](core/toolbelt.py) | ten slots, one active tool |
 | [engine.py](engine.py) | preview/commit a plan, erase, ghost lifecycle |
 | [render/camera.py](render/camera.py) | pan/zoom, world↔screen, the world render pass |
@@ -378,14 +380,11 @@ the bottom cell's south) while y and z cross their own cell horizontally.
 `Shear` passes x down through cell 0 only; `Mac` is `Shear` plus a second
 vertical control channel down cell 1.
 
-**Adding a machine is two rows.** An `Entity` subclass with `FOOTPRINT`,
-`INPUTS`, `OUTPUTS`, `PASS_THROUGH` plus an entry in `STRUCTURES` and
-`cell.TYPE_NAMES`; then its ports in
-`input_face_mask_local`/`output_face_mask_local`, its footprint in
-`type_footprint`, its control axes in `pass_through_mask`, and its colour and
-glyph in `body_colour`/`body_glyph`. Nothing else needs to know the type —
-the builders, the toolbelt, the stub logic and the port arrows are all generic.
-`test_drive.py` then checks the two sides agree automatically.
+**Adding a machine is one Python class.** An `Entity` subclass declaring
+`FOOTPRINT`, `INPUTS`, `OUTPUTS`, `PASS_THROUGH`, `COLOUR` and `GLYPH`, plus
+an entry in `STRUCTURES` and `cell.TYPE_NAMES`. **No GLSL changes at all** —
+see "Generated GLSL tables" below. The builders, the toolbelt, the stub
+logic and the port arrows are all generic.
 
 - **Ports are per-cell, not per-type.** A port belongs to one cell of a
   footprint — `Shear`'s y-input is on cell 0 only, `Source` has one port on a
@@ -482,6 +481,46 @@ GLSL has no `#include`, so [render/shader_loader.py](render/shader_loader.py)
 implements a minimal one by textual substitution, with an implicit include
 guard (a file already pulled in is skipped). That exists so the cell encoding
 has exactly one GLSL copy.
+
+### Generated GLSL tables
+
+Everything the shaders know about a *specific* machine is generated from the
+Python class by [core/glsl_types.py](core/glsl_types.py) and spliced in by the
+loader at two markers in [shaders/common.glsl](shaders/common.glsl):
+
+| marker | emits |
+|---|---|
+| `// @generated type-ids` | `TYPE_*` constants, from `cell.TYPE_NAMES` |
+| `// @generated type-tables` | `type_footprint`, `input_face_mask_local`, `output_face_mask_local`, `pass_through_mask`, `type_colour`, `type_glyph` |
+
+**No shader names a machine by hand.** Adding a type in Python makes it
+appear in all six tables automatically.
+
+This replaced six hand-mirrored GLSL tables that had to be kept in step with
+Python by test assertions. The mechanism failed twice in practice — ports
+landing on interior edges of a rotated structure, and a flipped machine's
+control overlay pointing the wrong way — both of them "GLSL disagrees with
+Python about a type". Generation makes that class of bug structurally
+impossible rather than merely detectable, which matters more as simulation
+adds per-type data (throughput, transforms, buffer sizes) that would each
+need the same mirroring.
+
+Three consequences worth knowing:
+
+- **Order matters in `common.glsl`.** The ids marker must precede anything
+  naming a `TYPE_*`; the tables marker must follow `FACE()` and the `GLYPH_*`
+  constants, which the generated bodies reference. Hence two markers rather
+  than one.
+- **Nothing is written to disk.** The marker stays in the source, so there is
+  no generated file to go stale or to commit, and `F5` picks up a change to
+  `core/entity.py` with no build step.
+- **The tests changed shape.** They no longer pin two copies against each
+  other — they test the *generator* (does it emit what `face_masks_at()`
+  says?) and the hand-written GLSL that *consumes* the tables, which is where
+  the authored↔placed conversion still lives and is still worth pinning.
+
+Type names in `cell.TYPE_NAMES` are upper-cased into the GLSL constants, so
+they must be short and identifier-safe.
 
 ### Belts read their 5-cell neighbourhood
 

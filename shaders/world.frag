@@ -27,11 +27,6 @@ uniform isampler2D grid;      // RGBA32I, one texel per cell
 
 #define COL_BELT        vec3(0.46, 0.47, 0.52)   // the spine
 #define COL_CHEVRON     vec3(0.74, 0.76, 0.82)   // direction fringes
-#define COL_SWAP        vec3(0.60, 0.40, 0.42)   // reddish
-#define COL_SHEAR       vec3(0.40, 0.56, 0.44)   // green
-#define COL_MAC         vec3(0.54, 0.44, 0.62)   // purple
-#define COL_SOURCE      vec3(0.42, 0.52, 0.60)
-#define COL_SINK        vec3(0.34, 0.34, 0.40)
 #define COL_STRUCT_MARK vec3(0.88, 0.90, 0.94)   // the glyph
 #define COL_IN          vec3(0.35, 0.60, 0.95)   // input ports  (blue)
 #define COL_OUT         vec3(0.95, 0.35, 0.30)   // output ports (red)
@@ -102,27 +97,9 @@ uniform isampler2D grid;      // RGBA32I, one texel per cell
 
 // ======================================================================
 
-// --- per-type visuals ---------------------------------------------------
-// One place to say what a machine looks like. Adding a structure is a row
-// here plus its ports in common.glsl -- nothing below needs to know the type.
-
-vec3 body_colour(int type) {
-    if (type == TYPE_SWAP)   return COL_SWAP;
-    if (type == TYPE_SHEAR)  return COL_SHEAR;
-    if (type == TYPE_MAC)    return COL_MAC;
-    if (type == TYPE_SOURCE) return COL_SOURCE;
-    if (type == TYPE_SINK)   return COL_SINK;
-    return COL_BELT;
-}
-
-int body_glyph(int type) {
-    if (type == TYPE_SWAP)   return GLYPH_ZED;
-    if (type == TYPE_SHEAR)  return GLYPH_PLUS;
-    if (type == TYPE_MAC)    return GLYPH_CROSS;
-    if (type == TYPE_SOURCE) return GLYPH_DOT;
-    if (type == TYPE_SINK)   return GLYPH_DOT;
-    return GLYPH_NONE;
-}
+// Per-type colour and glyph come from type_colour() / type_glyph(), which
+// core/glsl_types.py generates from the Entity subclasses -- a machine's
+// appearance is declared beside its ports, in one place.
 
 // --- grid access --------------------------------------------------------
 bool in_board(ivec2 c) {
@@ -359,7 +336,7 @@ float sd_dot(vec2 p, float r, float t) {
     return length(p) - max(t * 2.0, r * 0.35);
 }
 
-// Dispatch on the glyph id from body_glyph(). `r` is the arm reach and `t`
+// Dispatch on the glyph id from type_glyph(). `r` is the arm reach and `t`
 // the stroke half-thickness, both already scaled to the footprint.
 float sd_glyph(int glyph, vec2 p, float r, float t) {
     if (glyph == GLYPH_PLUS)  return sd_plus(p, r, t);
@@ -373,18 +350,19 @@ float sd_glyph(int glyph, vec2 p, float r, float t) {
 // Underground belts
 // ======================================================================
 //
-// An end is a funnel that **narrows along the travel direction**: wide where
-// material arrives, tapering to a point ahead of it. Both ends read as
-// arrowheads aimed downstream, so a run's direction is legible from the
-// shape alone, independent of the chevrons.
+// An end is a funnel whose **narrow end faces the buried span**: wide on the
+// surface side where it meets ordinary belt, tapering to a point where it
+// goes under. A pair therefore reads as two arrowheads pointing at each
+// other across the gap, which is what makes the two ends of one run
+// recognisable as a unit.
 //
-//     entrance, facing +X:   wide at -X, narrow at +X
-//     exit,     facing +X:   wide at -X, narrow at +X
+//     entrance, facing +X:   wide at -X (surface), narrow at +X (buried)
+//     exit,     facing +X:   narrow at -X (buried), wide at +X (surface)
 //
-// Both therefore taper the same way; only the dotted span and the chevron
-// placement distinguish an entrance from an exit. A trapezoid in cell-local
-// space, rotated into the facing, tapering from the wide end (-UNDER_LEN)
-// to the point (+UNDER_LEN).
+// The span is downstream of an entrance but upstream of an exit, so the two
+// taper opposite ways: the exit is the mirrored one. A trapezoid in
+// cell-local space, rotated into the facing, tapering from the wide end
+// (-UNDER_LEN) to the point (+UNDER_LEN).
 float sd_funnel(vec2 p, int dir, bool mirror) {
     vec2 q = rotate_to_dir(p, dir);
     if (mirror) q.x = -q.x;
@@ -507,10 +485,10 @@ void main() {
             // back the way material came; an exit's faces the way it goes.
             int facing = cell_dir(c.x);
             bool exit_end = is_under_exit(c.z);
-            // Both ends narrow along the travel direction, so neither is
-            // mirrored -- the taper reads as an arrowhead pointing the way
-            // material is going.
-            float a = fill(sd_funnel(p, facing, false), px);
+            // The narrow end always faces the buried span: downstream of an
+            // entrance, upstream of an exit. So the exit is the mirrored
+            // one, and a pair points its two tips at each other.
+            float a = fill(sd_funnel(p, facing, exit_end), px);
             col = mix(col, COL_UNDER, a * alpha_scale);
             // A chevron on the mouth half, so travel direction is readable.
             vec2 fv = dir_vec(facing);
@@ -601,7 +579,7 @@ void main() {
             }
             col = mix(col, COL_BELT, stub * alpha_scale);
 
-            col = mix(col, body_colour(type), a_body * alpha_scale);
+            col = mix(col, type_colour(type), a_body * alpha_scale);
 
             // --- control-signal overlay ---
             // A faint belt straight through the cell on each axis the machine
@@ -674,7 +652,7 @@ void main() {
             // inside a 2x1 rather than spilling past the short edges.
             float s = min(extent.x, extent.y);
 
-            float mark = fill(sd_glyph(body_glyph(type), pf,
+            float mark = fill(sd_glyph(type_glyph(type), pf,
                                        MARK_RADIUS * s, MARK_THICK * s), px);
             col = mix(col, COL_STRUCT_MARK, mark * a_body * alpha_scale);
 

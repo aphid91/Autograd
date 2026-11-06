@@ -21,14 +21,11 @@ const int GHOST_NONE       = 0;
 const int GHOST_PENDING    = 1;
 const int GHOST_FRUSTRATED = 2;
 
-const int TYPE_EMPTY  = 0;
-const int TYPE_BELT   = 1;
-const int TYPE_SWAP   = 2;
-const int TYPE_SHEAR  = 3;
-const int TYPE_MAC    = 4;
-const int TYPE_SOURCE = 5;
-const int TYPE_SINK   = 6;
-const int TYPE_UNDER  = 7;   // underground belt end
+// Type ids are generated from cell.TYPE_NAMES, and the per-type tables
+// further down from the Entity subclasses -- see core/glsl_types.py, which
+// render/shader_loader.py expands at load time. Nothing here names a
+// machine by hand.
+// @generated type-ids
 
 // Directions. These index DIR_VECS below.
 const int DIR_PX = 0;   // +X east
@@ -86,15 +83,17 @@ bool is_empty(int w) { return cell_type(w) == TYPE_EMPTY; }
 
 #define FACE(d) (1 << (d))
 
-// The authored (DIR_PX) footprint of a type. MUST match Entity.FOOTPRINT.
-ivec2 type_footprint(int type) {
-    if (type == TYPE_SWAP)   return ivec2(1, 2);
-    if (type == TYPE_SHEAR)  return ivec2(2, 1);
-    if (type == TYPE_MAC)    return ivec2(2, 1);
-    if (type == TYPE_SOURCE) return ivec2(4, 1);
-    if (type == TYPE_SINK)   return ivec2(3, 3);
-    return ivec2(1, 1);
-}
+// Glyph ids, referenced by the generated type table below. A type names a
+// glyph rather than drawing one inline, so several machines can share a mark.
+const int GLYPH_NONE  = 0;
+const int GLYPH_PLUS  = 1;
+const int GLYPH_CROSS = 2;   // X
+const int GLYPH_ZED   = 3;   // Z
+const int GLYPH_DOT   = 4;
+
+// Footprints, per-cell port masks, control axes, colours and glyphs --
+// all emitted from the Entity subclasses. See core/glsl_types.py.
+// @generated type-tables
 
 ivec2 rotate_offset(ivec2 p, int dir) {
     for (int i = 0; i < (dir % 4); ++i) p = ivec2(-p.y, p.x);
@@ -135,42 +134,6 @@ int flip_face_mask(int mask) {
     return out_mask;
 }
 
-// Authored input mask for one local cell of a type.
-int input_face_mask_local(int type, ivec2 lcl) {
-    if (type == TYPE_SWAP) {
-        if (lcl == ivec2(0, 1)) return FACE(DIR_PY) | FACE(DIR_NX);
-        if (lcl == ivec2(0, 0)) return FACE(DIR_NX);
-    } else if (type == TYPE_SHEAR) {
-        if (lcl == ivec2(0, 0)) return FACE(DIR_PY) | FACE(DIR_NX);
-    } else if (type == TYPE_MAC) {
-        if (lcl == ivec2(0, 0)) return FACE(DIR_PY) | FACE(DIR_NX);
-        if (lcl == ivec2(1, 0)) return FACE(DIR_PY);
-    } else if (type == TYPE_SINK) {
-        if (lcl == ivec2(1, 2)) return FACE(DIR_PY);
-        if (lcl == ivec2(1, 0)) return FACE(DIR_NY);
-        if (lcl == ivec2(0, 1)) return FACE(DIR_NX);
-        if (lcl == ivec2(2, 1)) return FACE(DIR_PX);
-    }
-    return 0;
-}
-
-// Authored output mask for one local cell of a type.
-int output_face_mask_local(int type, ivec2 lcl) {
-    if (type == TYPE_SWAP) {
-        if (lcl == ivec2(0, 1)) return FACE(DIR_PX);
-        if (lcl == ivec2(0, 0)) return FACE(DIR_NY) | FACE(DIR_PX);
-    } else if (type == TYPE_SHEAR) {
-        if (lcl == ivec2(0, 0)) return FACE(DIR_NY);
-        if (lcl == ivec2(1, 0)) return FACE(DIR_PX);
-    } else if (type == TYPE_MAC) {
-        if (lcl == ivec2(0, 0)) return FACE(DIR_NY);
-        if (lcl == ivec2(1, 0)) return FACE(DIR_NY) | FACE(DIR_PX);
-    } else if (type == TYPE_SOURCE) {
-        if (lcl == ivec2(3, 0)) return FACE(DIR_PX);
-    }
-    return 0;
-}
-
 // `lcl` is the PLACED offset straight out of .y. The pipeline mirrors
 // Entity.faces_for(): invert the cell back to authored space, read its
 // authored faces, then apply the same flip and rotation to those faces so
@@ -191,29 +154,11 @@ int output_face_mask(int type, ivec2 lcl, int facing, bool flipped) {
 
 bool has_face(int mask, int dir) { return (mask & (1 << dir)) != 0; }
 
-// --- control channels ---------------------------------------------------
-//
-// The authored axes a type passes through *unchanged*. MUST match
-// Entity.PASS_THROUGH. This is declared, not derived: geometrically a
-// mutated channel is indistinguishable from a pass-through (Shear's y
-// enters -X and leaves +X exactly as its x enters +Y and leaves -Y), so
-// only the machine's semantics can tell them apart.
-//
-// Returned as a face mask in authored space; the caller rotates it.
-int pass_through_mask(int type) {
-    if (type == TYPE_SWAP)  return FACE(DIR_NY);
-    if (type == TYPE_SHEAR) return FACE(DIR_NY);
-    if (type == TYPE_MAC)   return FACE(DIR_NY);
-    return 0;
-}
-
-// Glyph ids, used by world.frag's per-type visual table. A type names a
-// glyph rather than drawing one inline, so several machines can share a mark.
-const int GLYPH_NONE  = 0;
-const int GLYPH_PLUS  = 1;
-const int GLYPH_CROSS = 2;   // X
-const int GLYPH_ZED   = 3;   // Z
-const int GLYPH_DOT   = 4;
+// pass_through_mask() -- the authored axes a type passes through unchanged
+// -- is generated above from Entity.PASS_THROUGH. It is declared data, not
+// derived: geometrically a mutated channel is indistinguishable from a
+// pass-through (Shear's y enters -X and leaves +X exactly as its x enters
+// +Y and leaves -Y), so only the machine's semantics tell them apart.
 
 // A machine with declared port faces. Undergrounds are excluded: they have
 // no port tables and behave like belts for connection purposes, taking input

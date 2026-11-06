@@ -731,106 +731,124 @@ for _name, _want in [
         f"{_name}: shader says {_glsl_int(_name)}, cell.py says {_want}")
 ok("GLSL cell encoding matches core/cell.py")
 
-# The shader derives structure ports itself (input_face_mask /
-# output_face_mask in common.glsl) so it can decide belt topology and draw
-# connection stubs. Those masks must agree with Entity.faces_for(), which is
-# the Python-side authority. Reimplement the shader's rotation here and
-# compare against the real thing for every type and facing.
-#
-# Ports are *per-cell*, so this has to agree cell by cell, not merely type by
-# type: a port belongs to one cell of a footprint, and a shader that spread it
-# across all of them would draw arrows on the wrong cells and stub to the
-# wrong neighbours. Parse the authored per-cell masks out of the GLSL and
-# compare every (type, local cell) pair against Entity.face_masks_at().
-def _glsl_cell_masks(fn_name, type_name):
-    """{(lx, ly): mask} the shader uses for a type, authored (unrotated)."""
-    body = _re.search(
-        rf"int {fn_name}\(int type, ivec2 lcl\)\s*\{{(.*?)\n\}}", _src, _re.S)
-    assert body, f"{fn_name} not found in shader"
-    # The branch for this type runs until the next `else if (type ==` or the
-    # closing of the chain.
-    branch = _re.search(
-        rf"type == {type_name}\)\s*\{{(.*?)\}}", body.group(1), _re.S)
-    if not branch:
-        return {}
-    out = {}
-    for lx, ly, expr in _re.findall(
-            r"lcl == ivec2\((\d+),\s*(\d+)\)\)\s*return ([^;]+);",
-            branch.group(1)):
-        mask = 0
-        for face in _re.findall(r"FACE\((DIR_\w+)\)", expr):
-            mask |= 1 << getattr(cell, face)
-        out[(int(lx), int(ly))] = mask
-    return out
+# The per-type tables are GENERATED from the Entity subclasses by
+# core/glsl_types.py, so they cannot disagree with Python by construction --
+# the assertions that used to pin them cell by cell are gone along with the
+# hand-written tables. What is worth testing now is the generator itself,
+# plus the hand-written GLSL that consumes what it emits.
+from core import glsl_types
 
+# Every registered type must appear in the emitted ids, and every name the
+# tables reference must be one that actually got defined.
+_ids = glsl_types.type_constants()
+for _tid, _tname in cell.TYPE_NAMES.items():
+    _const = "TYPE_" + _tname.upper()
+    assert f"const int {_const} = {_tid};" in _ids, _const
+_tables = glsl_types.generate()
+for _const in set(_re.findall(r"\bTYPE_[A-Z_]+\b", _tables)):
+    assert f"const int {_const} =" in _ids, (
+        f"generated tables reference {_const}, which is never defined")
+ok(f"generated type ids cover {len(cell.TYPE_NAMES)} types, no dangling refs")
+
+# The generated port tables must say exactly what face_masks_at() says.
+# This is a generator test, not a drift test: it catches an emitter bug -- a
+# transposed offset, a dropped cell -- which regenerating would not fix.
 _checked = 0
 for _cls in STRUCTURES:
     _tname = "TYPE_" + cell.TYPE_NAMES[_cls.TYPE_ID].upper()
-    _glsl_in = _glsl_cell_masks("input_face_mask_local", _tname)
-    _glsl_out = _glsl_cell_masks("output_face_mask_local", _tname)
-    _w, _h = _cls.FOOTPRINT
-    for _lx in range(_w):
-        for _ly in range(_h):
-            _want_in, _want_out = _cls.face_masks_at(_lx, _ly)
-            _got_in = _glsl_in.get((_lx, _ly), 0)
-            _got_out = _glsl_out.get((_lx, _ly), 0)
-            assert _got_in == _want_in, (
-                f"{_cls.__name__} cell {(_lx, _ly)}: shader inputs "
-                f"{_got_in:04b} != entity {_want_in:04b}")
-            assert _got_out == _want_out, (
-                f"{_cls.__name__} cell {(_lx, _ly)}: shader outputs "
-                f"{_got_out:04b} != entity {_want_out:04b}")
-            _checked += 1
-    # The shader must not carry ports for cells outside the footprint.
-    _authored = {(x, y) for x in range(_w) for y in range(_h)}
-    _stray = (set(_glsl_in) | set(_glsl_out)) - _authored
-    assert not _stray, f"{_cls.__name__}: shader ports off the footprint: {_stray}"
+    for _which, _idx in (("input", 0), ("output", 1)):
+        _body = _re.search(
+            rf"int {_which}_face_mask_local\(int type, ivec2 lcl\)"
+            rf"\s*\{{(.*?)\n\}}", _tables, _re.S).group(1)
+        _branch = _re.search(rf"type == {_tname}\) \{{(.*?)\n    \}}",
+                             _body, _re.S)
+        _emitted = {}
+        if _branch:
+            for _lx, _ly, _expr in _re.findall(
+                    r"lcl == ivec2\((\d+), (\d+)\)\) return ([^;]+);",
+                    _branch.group(1)):
+                _m = 0
+                for _f in _re.findall(r"FACE\((DIR_\w+)\)", _expr):
+                    _m |= 1 << getattr(cell, _f)
+                _emitted[(int(_lx), int(_ly))] = _m
+        _w, _h = _cls.FOOTPRINT
+        for _lx in range(_w):
+            for _ly in range(_h):
+                _want = _cls.face_masks_at(_lx, _ly)[_idx]
+                _got = _emitted.get((_lx, _ly), 0)
+                assert _got == _want, (
+                    f"{_cls.__name__} {_which} cell {(_lx, _ly)}: "
+                    f"emitted {_got:04b} != entity {_want:04b}")
+                _checked += 1
+        _inside = {(x, y) for x in range(_w) for y in range(_h)}
+        assert not (set(_emitted) - _inside), _cls.__name__
+ok(f"generated port tables match Entity.face_masks_at() ({_checked} cells)")
 
-    # And the full shader pipeline must put each port on the SAME CELL as
-    # faces_for() does, at every orientation.
-    #
-    # Regression: the shader used to look its tables up with the *placed*
-    # offset straight out of .y while the tables are authored at DIR_PX. That
-    # un-rotated a port's face while leaving its cell put, so a rotated
-    # structure's ports moved to interior edges. A 3x3 Sink hid it best --
-    # its extent is rotation-invariant, so nothing else looked wrong.
-    #
-    # Checking an aggregate mask over the whole footprint cannot catch that:
-    # the set of faces is right, it is the cell-to-face pairing that breaks.
-    # So compare the (cell, face) pairs.
+# Footprints, control axes, colours and glyphs likewise.
+for _cls in STRUCTURES:
+    _tname = "TYPE_" + cell.TYPE_NAMES[_cls.TYPE_ID].upper()
+    _fp = _re.search(
+        rf"ivec2 type_footprint.*?type == {_tname}\) "
+        rf"return ivec2\((\d+), (\d+)\)", _tables, _re.S)
+    _got_fp = (int(_fp.group(1)), int(_fp.group(2))) if _fp else (1, 1)
+    assert _got_fp == _cls.FOOTPRINT, (_cls.__name__, _got_fp)
+
+    _pt = _re.search(
+        rf"int pass_through_mask.*?type == {_tname}\) return ([^;]+);",
+        _tables, _re.S)
+    _got_pt = 0
+    if _pt:
+        for _f in _re.findall(r"FACE\((DIR_\w+)\)", _pt.group(1)):
+            _got_pt |= 1 << getattr(cell, _f)
+    _want_pt = 0
+    for _f in _cls.PASS_THROUGH:
+        _want_pt |= 1 << _f
+    assert _got_pt == _want_pt, (_cls.__name__, _got_pt, _want_pt)
+
+    if _cls.COLOUR is not None:
+        _c = _re.search(
+            rf"vec3 type_colour.*?type == {_tname}\) return "
+            rf"vec3\(([\d.]+), ([\d.]+), ([\d.]+)\)", _tables, _re.S)
+        assert _c, f"{_cls.__name__} missing from type_colour()"
+        _got_c = tuple(round(float(g), 3) for g in _c.groups())
+        assert _got_c == tuple(round(v, 3) for v in _cls.COLOUR), _cls.__name__
+
+    _g = _re.search(rf"int type_glyph.*?type == {_tname}\) return (\w+);",
+                    _tables, _re.S)
+    _got_g = _g.group(1) if _g else "GLYPH_NONE"
+    assert _got_g == glsl_types.GLYPHS[_cls.GLYPH], (_cls.__name__, _got_g)
+ok("generated footprints, control axes, colours and glyphs match Python")
+
+# A declared pass-through axis must have an output face pointing that way at
+# every orientation, or the overlay draws a channel the machine cannot
+# carry. The shader flips before rotating, like the port masks; rotating
+# alone left a mirrored machine's overlay disagreeing with its own ports.
+for _cls in STRUCTURES:
+    _want = 0
+    for _f in _cls.PASS_THROUGH:
+        _want |= 1 << _f
     for _facing in range(4):
         for _flip in (False, True):
-            for _which, _tbl in (("inputs", _glsl_in), ("outputs", _glsl_out)):
-                _want = {
-                    (xy, f) for xy, f in
-                    _cls.faces_for(0, 0, _facing, _flip)[0 if _which == "inputs" else 1]
-                }
-                # Reproduce what the shader does, cell by cell: for each cell
-                # of the PLACED footprint, invert to authored space, read the
-                # table, then flip and rotate the faces.
-                _got = set()
-                _ew, _eh = _cls.footprint_for(_facing)
-                for _px in range(_ew):
-                    for _py in range(_eh):
-                        _a = _cls.unplace_local(_px, _py, _facing, _flip)
-                        _m = _tbl.get(_a, 0)
-                        for _d in range(4):
-                            if not _m & (1 << _d):
-                                continue
-                            _f = cell.flip_dir_y(_d) if _flip else _d
-                            _got.add(((_px, _py),
-                                      cell.rotate_dir_ccw_n(_f, _facing)))
-                assert _got == _want, (
-                    f"{_cls.__name__} {_which} facing "
-                    f"{cell.DIR_NAMES[_facing]} flip={_flip}:\n"
-                    f"  shader {sorted(_got)}\n  entity {sorted(_want)}")
-ok(f"GLSL per-cell port masks match Entity.face_masks_at() ({_checked} cells)")
-ok("GLSL ports land on the right cell at every rotation and flip")
+            _out_faces = {f for _c, f in
+                          _cls.faces_for(0, 0, _facing, _flip)[1]}
+            _pm = _want
+            if _flip:
+                _pm = sum(1 << cell.flip_dir_y(_d)
+                          for _d in range(4) if _pm >> _d & 1)
+            _pm = sum(1 << ((_d + _facing) % 4)
+                      for _d in range(4) if _pm >> _d & 1)
+            for _d in range(4):
+                if not _pm >> _d & 1:
+                    continue
+                assert _d in _out_faces, (
+                    f"{_cls.__name__} facing {cell.DIR_NAMES[_facing]} "
+                    f"flip={_flip}: control axis {cell.DIR_NAMES[_d]} has no "
+                    f"output face")
+ok("control axes line up with real output faces at every orientation")
 
-# The simulation above reproduces the shader's *tables*, but a table can be
-# perfect while the lookup is wrong -- which is exactly how the rotation bug
-# happened. So pin the lookup itself: the public mask functions must invert
-# the placed offset before indexing, and must apply the flip to the faces.
+# The hand-written GLSL that *uses* the generated tables still has to do the
+# authored/placed conversion right. That is not generated, and getting it
+# wrong is what put a rotated Sink's ports on interior edges.
 for _fn in ("input_face_mask", "output_face_mask"):
     _body = _re.search(
         rf"int {_fn}\(int type, ivec2 lcl, int facing, bool flipped\)"
@@ -844,66 +862,17 @@ for _fn in ("input_face_mask", "output_face_mask"):
     assert "rotate_face_mask" in _b, f"{_fn} must rotate faces into the facing"
 ok("GLSL mask functions invert the placed offset before lookup")
 
-# The two neighbour probes are the call sites where the flip flag is easy to
-# get wrong: each must read the *neighbour's* own flip bit out of its .z
-# rather than reusing the calling cell's, exactly as it already does for the
-# neighbour's local offset and facing.
+# The two neighbour probes must read the *neighbour's* own flip bit.
 for _probe in ("feeds_into", "accepts_from"):
     _pb = _re.search(rf"bool {_probe}\([^)]*\)\s*\{{(.*?)\n\}}", _src, _re.S)
     assert _pb, f"{_probe} not found"
     assert "is_flipped(n.z)" in _pb.group(1), (
         f"{_probe} must read the neighbour's own flip bit (is_flipped(n.z))")
-# The structure-drawing path must pass its own cell's flip bit too.
-assert _re.search(r"input_face_mask\(type, lcl, facing, flipped\)", _src), \
-    "the structure draw path must pass its cell's flip flag"
-assert _re.search(r"output_face_mask\(type, lcl, facing, flipped\)", _src), \
-    "the structure draw path must pass its cell's flip flag"
+assert _re.search(r"input_face_mask\(type, lcl, facing, flipped\)", _src)
+assert _re.search(r"output_face_mask\(type, lcl, facing, flipped\)", _src)
 ok("GLSL port mask callers pass the flip flag")
 
-# The control-channel overlay is declared on both sides and must agree.
-for _cls in STRUCTURES:
-    _tname = "TYPE_" + cell.TYPE_NAMES[_cls.TYPE_ID].upper()
-    _m = _re.search(rf"type == {_tname}\)\s*return ([^;]+);",
-                    _re.search(r"int pass_through_mask\(int type\)\s*\{(.*?)\n\}",
-                               _src, _re.S).group(1))
-    _got = 0
-    if _m:
-        for _face in _re.findall(r"FACE\((DIR_\w+)\)", _m.group(1)):
-            _got |= 1 << getattr(cell, _face)
-    _want = 0
-    for _f in _cls.PASS_THROUGH:
-        _want |= 1 << _f
-    assert _got == _want, (
-        f"{_cls.__name__}: shader pass-through {_got:04b} != "
-        f"Entity.PASS_THROUGH {_want:04b}")
-    # A declared pass-through axis must actually have ports on it, or the
-    # overlay would draw a channel the machine has no way to carry. This
-    # must hold at every orientation, and the shader must transform the
-    # pass-through mask the same way it transforms the ports -- flip *then*
-    # rotate. Rotating alone left a mirrored machine's overlay pointing the
-    # wrong way, disagreeing with the very ports it describes.
-    for _facing in range(4):
-        for _flip in (False, True):
-            _out_faces = {f for _c, f in
-                          _cls.faces_for(0, 0, _facing, _flip)[1]}
-            # What the shader computes for this orientation.
-            _pm = _want
-            if _flip:
-                _pm = sum(1 << cell.flip_dir_y(_d)
-                          for _d in range(4) if _pm >> _d & 1)
-            _pm = sum(1 << ((_d + _facing) % 4)
-                      for _d in range(4) if _pm >> _d & 1)
-            for _d in range(4):
-                if not _pm >> _d & 1:
-                    continue
-                assert _d in _out_faces, (
-                    f"{_cls.__name__} facing {cell.DIR_NAMES[_facing]} "
-                    f"flip={_flip}: control axis {cell.DIR_NAMES[_d]} has no "
-                    f"output face -- overlay disagrees with the ports")
-ok("GLSL pass_through_mask() matches Entity.PASS_THROUGH")
-ok("control axes line up with real output faces at every orientation")
-
-# The shader must flip the pass-through mask, not just rotate it.
+# The overlay must flip its control axes, not merely rotate them.
 _pb = _re.search(r"int pm = pass_through_mask\(type\);(.*?)int pass_mask",
                  _src, _re.S)
 assert _pb and "flip_face_mask(pm)" in _pb.group(1), (
@@ -911,8 +880,8 @@ assert _pb and "flip_face_mask(pm)" in _pb.group(1), (
     "flipped, exactly as the port masks do")
 ok("GLSL control overlay flips with the machine")
 
-# The shader scans for a paired run over the same distance the engine will
-# pair over; if it scanned shorter the dots would stop before the exit.
+# The shader scans for a paired run over the same distance the engine pairs
+# over; scanning shorter would stop the dots before the exit.
 _glsl_span = int(_re.search(r"#define UNDER_MAX_SPAN\s+(\d+)", _src).group(1))
 assert _glsl_span == Underground.MAX_SPAN, (
     f"shader UNDER_MAX_SPAN {_glsl_span} != "
@@ -923,18 +892,6 @@ for _name, _want in [("UNDER_EXIT_SHIFT", cell.UNDER_EXIT_SHIFT),
     assert _glsl_int(_name) == _want, (
         f"{_name}: shader {_glsl_int(_name)}, cell.py {_want}")
 ok(f"GLSL underground constants match (span {_glsl_span})")
-
-# The shader's authored footprint table must match Entity.FOOTPRINT, since
-# unplace_local() uses it to invert the placement transform.
-for _cls in STRUCTURES:
-    _tname = "TYPE_" + cell.TYPE_NAMES[_cls.TYPE_ID].upper()
-    _m = _re.search(rf"type == {_tname}\)\s*return ivec2\((\d+),\s*(\d+)\);",
-                    _src)
-    assert _m, f"{_tname} missing from type_footprint() in the shader"
-    _got_fp = (int(_m.group(1)), int(_m.group(2)))
-    assert _got_fp == _cls.FOOTPRINT, (
-        f"{_cls.__name__}: shader footprint {_got_fp} != {_cls.FOOTPRINT}")
-ok("GLSL type_footprint() matches Entity.FOOTPRINT")
 
 # The shader's footprint probe must reach far enough to span the largest
 # machine, or a multi-cell body would draw as two separate shapes.
