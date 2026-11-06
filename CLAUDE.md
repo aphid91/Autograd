@@ -24,15 +24,38 @@ pip install -r requirements.txt
 # Run
 python app.py
 
-# Regression harness (headless; drives the orchestrator through a full
-# build / cancel / erase / pan flow and asserts board + device state)
+# Test suite (headless; needs a GL 4.3 context, opens no visible window)
 python test_drive.py
+
+# ...or just the scenarios whose name contains a substring
+python test_drive.py underground
 ```
 
-`test_drive.py` is the only test; there is no pytest/linter configured. It needs
-a working GL 4.3 context but opens no visible window. `core/cell.py` and
-`core/entity.py` also run self-checks at import, and the harness checks that
-the GLSL cell encoding still agrees with `core/cell.py`.
+### Tests
+
+`test_drive.py` is a thin runner; the tests live under [tests/](tests/).
+There is no pytest/linter configured.
+
+| file | holds |
+|---|---|
+| [tests/harness.py](tests/harness.py) | the fake mouse/keyboard, the shared GL context, and `reset()` |
+| [tests/test_scenarios.py](tests/test_scenarios.py) | drive the orchestrator and assert board state |
+| [tests/test_glsl.py](tests/test_glsl.py) | static checks on the generated GLSL — no context, no board |
+
+**Scenarios are independent.** `harness.reset()` clears the board, camera,
+input state and toolbelt before each one, so a failure names the scenario
+that caused it. This matters: the suite used to be a single 1172-line script
+whose sections shared state through side effects, and twice a change broke an
+assertion hundreds of lines away for unrelated reasons. Order-independence is
+worth preserving — the scenarios pass reversed and shuffled.
+
+Two habits that keep it that way: a scenario **sets up what it needs** rather
+than inheriting a previous one's board, and anything that mutates global state
+(imgui's `want_capture_mouse`, say) restores it in a `finally` so a failing
+assertion cannot poison everything after.
+
+`core/cell.py` and `core/entity.py` also run self-checks at import, so the
+cell encoding and the entity geometry are exercised by importing anything.
 
 ## Controls
 
@@ -114,7 +137,7 @@ The grid is `(H, W, 4) int32`, uploaded as an `RGBA32I` texture. Channel `.x`:
 
 ```
 bits 0-1    direction   0=+X 1=+Y 2=-X 3=-Y
-bits 2-8    type        0=empty, 1=belt, 2=add, 3=mul, 4.. future
+bits 2-8    type        0=empty, 1=belt, 2.. machines (see cell.TYPE_NAMES)
 bits 9-30   entity id   row index into the entity SSBO
 bit  31     unused — deliberately clear
 ```
@@ -136,7 +159,7 @@ Three things to know before touching this:
 - **The packing is duplicated in GLSL**, in
   [shaders/common.glsl](shaders/common.glsl) — the single GLSL copy, which
   every shader `#include`s. `cell.py` runs round-trip assertions at import, and
-  `test_drive.py` parses the constants back out of the compiled shader source
+  `tests/test_glsl.py` parses the constants back out of the shader source
   and compares them against `cell.py`, so the two copies cannot silently
   diverge.
 
@@ -351,7 +374,7 @@ forwards at the run it feeds — tapering to a throat on the buried side.
 `sd_funnel()` draws one shape and mirrors it for the entrance. The span is
 dotted by the cells *between* the ends, each scanning outward for a paired
 run that covers it; nothing is stored per-cell. `UNDER_MAX_SPAN` in the
-shader is pinned against `Underground.MAX_SPAN` by `test_drive.py`.
+shader is pinned against `Underground.MAX_SPAN` by `tests/test_glsl.py`.
 
 An underground is **not** a `Structure` — `is_structure()` excludes it, since
 it has no port tables and moves material along one facing like a belt. Only
@@ -391,7 +414,7 @@ logic and the port arrows are all generic.
   4-cell body. `Entity.face_masks_at(lx, ly)` is the Python authority and the
   GLSL `*_face_mask(type, lcl, facing, flipped)` pair mirrors it. Spreading a
   port across every cell of a footprint would draw arrows on the wrong cells
-  and stub to the wrong neighbours, so `test_drive.py` pins the two **cell by
+  and stub to the wrong neighbours, so `tests/test_glsl.py` pins them **cell by
   cell**, at every orientation, and rejects shader ports outside the
   footprint.
 
@@ -412,7 +435,7 @@ put, so the two no longer agreed.
 
 **A cell and its faces must always transform together.** The invariant worth
 remembering is that a port always faces *out* of the footprint — the cell one
-step along a port's direction is never part of the same entity. `test_drive.py`
+step along a port's direction is never part of the same entity. `core/entity.py`
 asserts exactly that for every type, rotation and flip, which is a far
 stronger check than comparing face masks: an aggregate mask over the footprint
 stays correct even when the cell-to-face pairing is scrambled.
@@ -580,7 +603,7 @@ under the glyph; `PASS_ALPHA` in [world.frag](shaders/world.frag) sets the
 opacity, with `PASS_WIDTH` and `PASS_CHEVRON` alongside it.
 
 **The axes are declared, not derived** (`Entity.PASS_THROUGH`, mirrored by
-`pass_through_mask()` in GLSL and pinned by `test_drive.py`). This is the one
+`pass_through_mask()` in GLSL and pinned by `tests/test_glsl.py`). This is the one
 piece of port information geometry cannot recover: a mutated channel enters
 one face and leaves the opposite one *exactly* as a pass-through does —
 `Shear`'s y enters `-X` and leaves `+X` just as its x enters `+Y` and leaves
@@ -609,7 +632,7 @@ Ports are derived in GLSL by `input_face_mask()` / `output_face_mask()` in
 and the mask functions take that cell's local offset — so the shader answers
 "is this face a port?" from one cell with no footprint-wide reasoning. When
 probing a *neighbour*, pass that neighbour's own `cell_local(n.y)`, not yours.
-`test_drive.py` pins these masks against `Entity.face_masks_at()` for every
+`tests/test_glsl.py` pins these masks against `Entity.face_masks_at()` for every
 type, cell and facing.
 
 Multi-cell entities recover their extent by probing neighbours for a matching
@@ -630,7 +653,7 @@ bugs:
   hot-reload work from any directory.
 - `mouse` picking scales window coords to framebuffer coords before converting,
   which matters on HiDPI displays; `Camera.screen_to_world` mirrors the shader's
-  mapping exactly, and `test_drive.py` asserts the two agree by rendering.
+  mapping exactly, and `tests/test_scenarios.py` asserts the two agree.
 - World `+Y` is up. Cell `(x, y)` covers world `[x, x+1) × [y, y+1)`.
 - `InputManager` is the **only** place that reads input or consults
   `io.want_capture_keyboard` / `io.want_capture_mouse`. It reports *that* `R`
