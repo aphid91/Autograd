@@ -10,7 +10,9 @@ duplicated in GLSL at the top of world.frag -- KEEP THE TWO IN SYNC.
     .y              packed (local_x, local_y) for multi-cell entities
     .z  bits 0-1    ghost state  0=real, 1=ghost, 2=frustrated
         bit  2       flipped: entity mirrored about its authored X axis
-        bits 3-31   reserved
+        bit  3       underground end is an exit (not an entrance)
+        bit  4       underground end is paired with a partner
+        bits 5-31   reserved
     .w              reserved
 
 GHOST_FRUSTRATED is an overlay, not an entity. A frustrated cell is one a
@@ -104,7 +106,8 @@ TYPE_SHEAR = 3   # x,y -> x, x+y
 TYPE_MAC = 4     # x,y,z -> x, y, z + x*y
 TYPE_SOURCE = 5  # emits from one tip
 TYPE_SINK = 6    # consumes on all four sides
-# 7..127 reserved for future structures.
+TYPE_UNDER = 7   # underground belt end (entrance or exit -- see .y bit)
+# 8..127 reserved for future structures.
 
 TYPE_NAMES = {
     TYPE_EMPTY: "empty",
@@ -114,6 +117,7 @@ TYPE_NAMES = {
     TYPE_MAC: "mac",
     TYPE_SOURCE: "source",
     TYPE_SINK: "sink",
+    TYPE_UNDER: "underground",
 }
 
 # --- bit field layout ---------------------------------------------------
@@ -139,6 +143,15 @@ GHOST_MASK = (1 << GHOST_BITS) - 1
 # local offset the same way the placement did.
 FLIP_SHIFT = 2
 FLIP_BIT = 1 << FLIP_SHIFT
+
+# .z bit 3: this underground end is an exit (surfacing) rather than an
+# entrance (diving). .z bit 4: it is paired with a partner end. Both live in
+# the cell because the renderer draws the funnel and the dotted span straight
+# from the grid texture, with no entity-row lookup.
+UNDER_EXIT_SHIFT = 3
+UNDER_EXIT_BIT = 1 << UNDER_EXIT_SHIFT
+UNDER_PAIRED_SHIFT = 4
+UNDER_PAIRED_BIT = 1 << UNDER_PAIRED_SHIFT
 
 GHOST_NONE = 0
 GHOST_PENDING = 1      # a ghost entity of our own, in a free cell
@@ -226,14 +239,26 @@ def unpack_local(word):
 
 
 # --- .z: ghost state ----------------------------------------------------
-def pack_flags(ghost_state=GHOST_NONE, flipped=False):
+def pack_flags(ghost_state=GHOST_NONE, flipped=False, under_exit=False,
+               under_paired=False):
     if not 0 <= ghost_state <= GHOST_MASK:
         raise ValueError(f"bad ghost state {ghost_state}")
-    return (ghost_state << GHOST_SHIFT) | (FLIP_BIT if flipped else 0)
+    return ((ghost_state << GHOST_SHIFT)
+            | (FLIP_BIT if flipped else 0)
+            | (UNDER_EXIT_BIT if under_exit else 0)
+            | (UNDER_PAIRED_BIT if under_paired else 0))
 
 
 def is_flipped(word):
     return bool(int(word) & FLIP_BIT)
+
+
+def is_under_exit(word):
+    return bool(int(word) & UNDER_EXIT_BIT)
+
+
+def is_under_paired(word):
+    return bool(int(word) & UNDER_PAIRED_BIT)
 
 
 def ghost_state(word):
@@ -290,15 +315,26 @@ def _self_check():
         # Replacing the ghost field must leave every other bit alone --
         # including the flip bit, which shares .z.
         assert ghost_state(with_ghost_state(0xFF00 | 0x3, s)) == s
-        assert (with_ghost_state(0xFF00, s) >> 3) == (0xFF00 >> 3)
+        assert (with_ghost_state(0xFF00, s) >> 5) == (0xFF00 >> 5)
         assert is_flipped(with_ghost_state(pack_flags(s, True), s))
         assert not is_flipped(with_ghost_state(pack_flags(s, False), s))
 
-    # The flip bit and the ghost field are independent.
+    # Every .z flag is independent of the others and of the ghost field --
+    # with_ghost_state() in particular must not disturb any of them.
     for s in (GHOST_NONE, GHOST_PENDING, GHOST_FRUSTRATED):
         for fl in (False, True):
-            w = pack_flags(s, fl)
-            assert ghost_state(w) == s and is_flipped(w) == fl, (s, fl)
+            for ex in (False, True):
+                for pr in (False, True):
+                    w = pack_flags(s, fl, ex, pr)
+                    assert ghost_state(w) == s, (s, fl, ex, pr)
+                    assert is_flipped(w) == fl, (s, fl, ex, pr)
+                    assert is_under_exit(w) == ex, (s, fl, ex, pr)
+                    assert is_under_paired(w) == pr, (s, fl, ex, pr)
+                    # Rewriting the ghost field preserves the rest.
+                    w2 = with_ghost_state(w, GHOST_FRUSTRATED)
+                    assert is_flipped(w2) == fl
+                    assert is_under_exit(w2) == ex
+                    assert is_under_paired(w2) == pr
 
     assert step_to_dir(1, 0) == DIR_PX and step_to_dir(0, -1) == DIR_NY
 

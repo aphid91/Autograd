@@ -228,9 +228,14 @@ class Gameboard:
         return view
 
     def _stamp_footprint(self, view):
+        # An underground end publishes its role and pairing into .z, so the
+        # renderer can draw the funnel and the dotted span from the grid
+        # alone. Re-stamp a pair after pairing them (see Engine.pair_under).
         word_z = cell.pack_flags(
             cell.GHOST_PENDING if view.is_ghost else cell.GHOST_NONE,
             flipped=view.flipped,
+            under_exit=getattr(view, "is_exit", False),
+            under_paired=getattr(view, "paired", False),
         )
         word_x = cell.pack_cell(view.type_id, view.direction, view.row)
         ox, oy = view.origin
@@ -274,6 +279,18 @@ class Gameboard:
         view = self.view(row)
         view.is_ghost = is_ghost
         self.entities_dirty.add(row)
+        self._stamp_footprint(view)
+
+    def restamp(self, view):
+        """Rewrite an entity's cells after a change that .z carries.
+
+        Entity-row state is uploaded from the SSBO, but a few flags are
+        mirrored into the grid for the renderer -- an underground's pairing,
+        for one. Changing those on the row alone would leave the grid stale.
+        """
+        if not self.is_row_alive(view.row):
+            return
+        self.entities_dirty.add(view.row)
         self._stamp_footprint(view)
 
     def spawn_cell_ghost(self, entity_cls, x, y, direction, flipped=False):

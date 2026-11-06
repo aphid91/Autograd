@@ -73,6 +73,22 @@ uniform isampler2D grid;      // RGBA32I, one texel per cell
 #define PASS_WIDTH        0.22   // spine thickness, in cells
 #define PASS_CHEVRON      1.0    // chevron opacity, relative to PASS_ALPHA
 
+// --- underground belts ---
+// Each end draws a funnel: a tapered mouth on the surface side plus a solid
+// throat on the buried side, so entrance and exit read as mirror images of
+// one another. A paired run shows a dotted line along the span it jumps.
+#define COL_UNDER         vec3(0.42, 0.45, 0.55)   // the funnel body
+#define COL_UNDER_DOT     vec3(0.62, 0.66, 0.76)   // the span dots
+#define UNDER_MOUTH       0.46   // half-width of the funnel's open end
+#define UNDER_THROAT      0.15   // half-width where it goes under
+#define UNDER_LEN         0.42   // reach from cell centre, each way
+#define UNDER_DOT_R       0.075  // span dot radius, in cells
+#define UNDER_DOT_PERIOD  0.5    // cells between span dots
+#define UNDER_DOT_ALPHA   0.55
+// Greatest distance between a pair's two ends. MUST match
+// Entity.Underground.MAX_SPAN -- test_drive.py pins the two together.
+#define UNDER_MAX_SPAN    5
+
 // --- ghosts / overlays ---
 #define GHOST_ALPHA       0.45
 #define FRUSTRATED_ALPHA  0.55
@@ -140,6 +156,12 @@ bool feeds_into(ivec2 c, int toward, int my_z) {
     if (t == TYPE_EMPTY) return false;
     if (!same_layer(my_z, n.z)) return false;
     if (t == TYPE_BELT) return cell_dir(n.x) == toward;
+    // An underground end moves material along its own facing like a belt,
+    // but only an *exit* emits onto the surface -- an entrance is diving,
+    // so it feeds the span underneath rather than the cell ahead.
+    if (t == TYPE_UNDER) {
+        return is_under_exit(n.z) && cell_dir(n.x) == toward;
+    }
     // Per-cell ports: ask the neighbour cell about its *own* local offset,
     // not ours -- only the cell of the footprint that actually carries the
     // output face emits.
@@ -347,6 +369,49 @@ float sd_glyph(int glyph, vec2 p, float r, float t) {
     return 1e9;
 }
 
+// ======================================================================
+// Underground belts
+// ======================================================================
+//
+// An end is a funnel. The *surface* side is a wide mouth that tapers to a
+// narrow throat on the *buried* side, so material visibly necks down as it
+// dives and widens as it surfaces. Entrance and exit are the same shape
+// facing opposite ways along the travel direction:
+//
+//     entrance, facing +X:   mouth at -X (surface), throat at +X (buried)
+//     exit,     facing +X:   throat at -X (buried), mouth at +X (surface)
+//
+// So the mouth always opens toward the *surface* belt this end talks to:
+// an entrance opens backwards at the run feeding it, an exit opens forwards
+// at the run it feeds. A trapezoid in cell-local space, rotated into the
+// facing, tapering from mouth (-UNDER_LEN) to throat (+UNDER_LEN); the
+// entrance is the one that needs mirroring to put its throat downstream.
+float sd_funnel(vec2 p, int dir, bool mirror) {
+    vec2 q = rotate_to_dir(p, dir);
+    if (mirror) q.x = -q.x;
+    // Half-width shrinks linearly from mouth to throat.
+    float t = clamp((q.x + UNDER_LEN) / (2.0 * UNDER_LEN), 0.0, 1.0);
+    float half_w = mix(UNDER_MOUTH, UNDER_THROAT, t);
+    float along = abs(q.x) - UNDER_LEN;
+    float across = abs(q.y) - half_w;
+    return max(along, across);
+}
+
+// Dots marching along the buried span, phase-locked to world position so a
+// run reads as one dotted line rather than restarting in each cell.
+float span_dots(vec2 p, vec2 axis, vec2 world, float px) {
+    float t = dot(world, axis);
+    float s = dot(p, vec2(-axis.y, axis.x));
+    float k = floor(t / UNDER_DOT_PERIOD + 0.5);
+    float best = 1e9;
+    for (int i = -1; i <= 1; ++i) {
+        float centre = (k + float(i)) * UNDER_DOT_PERIOD;
+        vec2 local = vec2(t - centre, s);
+        best = min(best, length(local) - UNDER_DOT_R);
+    }
+    return fill(best, px);
+}
+
 // A port arrow: a chevron at `offset` from the cell centre, pointing along
 // `face` (outward) or against it (inward).
 float port_arrow(vec2 p, int face, bool inward, float px) {
@@ -393,10 +458,67 @@ void main() {
         int gstate = ghost_state(c.z);
         float alpha_scale = (gstate == GHOST_PENDING) ? GHOST_ALPHA : 1.0;
 
+        // --- buried span -----------------------------------------------
+        // Drawn by the cells *between* a paired set of ends, before whatever
+        // occupies them, so the dotted line reads as passing underneath.
+        // Each cell scans backwards along both axes for an entrance whose
+        // partner exit lies ahead of it; nothing is stored per-cell, so the
+        // span costs nothing until it is looked for.
+        {
+            float dots = 0.0;
+            for (int d = 0; d < 4; ++d) {
+                vec2 axis = dir_vec(d);
+                // Walk back to find an entrance pointing this way.
+                for (int k = 1; k <= UNDER_MAX_SPAN; ++k) {
+                    ivec2 ec = ci - DIR_VECS[d] * k;
+                    ivec4 ev = fetch(ec);
+                    if (cell_type(ev.x) != TYPE_UNDER) continue;
+                    if (cell_dir(ev.x) != d) continue;
+                    if (is_under_exit(ev.z)) continue;
+                    // Its exit must lie ahead of us, within reach.
+                    for (int m = 1; k + m <= UNDER_MAX_SPAN; ++m) {
+                        ivec2 xc = ec + DIR_VECS[d] * (k + m);
+                        ivec4 xv = fetch(xc);
+                        if (cell_type(xv.x) != TYPE_UNDER) continue;
+                        if (cell_dir(xv.x) != d) continue;
+                        if (!is_under_exit(xv.z)) continue;
+                        // Either end claiming the pairing is enough. A
+                        // *ghost* exit points at a real entrance that does
+                        // not point back -- the link is one-way until the
+                        // placement commits -- and that preview is exactly
+                        // what should show the span while you hover.
+                        if (!is_under_paired(ev.z) && !is_under_paired(xv.z))
+                            continue;
+                        dots = max(dots, span_dots(p, axis, world, px));
+                        break;
+                    }
+                    break;
+                }
+            }
+            col = mix(col, COL_UNDER_DOT, dots * UNDER_DOT_ALPHA);
+        }
+
         if (type == TYPE_BELT) {
             BeltDraw b = draw_belt(p, ci, c, px, world);
             col = mix(col, COL_BELT, b.body * alpha_scale);
             col = mix(col, COL_CHEVRON, b.chevron * alpha_scale);
+
+        } else if (type == TYPE_UNDER) {
+            // A funnel, mouth on the surface side. An entrance's mouth faces
+            // back the way material came; an exit's faces the way it goes.
+            int facing = cell_dir(c.x);
+            bool exit_end = is_under_exit(c.z);
+            // An exit's mouth already opens along the facing; an entrance's
+            // must be mirrored so its mouth opens back at the run feeding it.
+            float a = fill(sd_funnel(p, facing, !exit_end), px);
+            col = mix(col, COL_UNDER, a * alpha_scale);
+            // A chevron on the mouth half, so travel direction is readable.
+            vec2 fv = dir_vec(facing);
+            vec2 at = fv * (exit_end ? UNDER_LEN * 0.45 : -UNDER_LEN * 0.45);
+            float chev = fill(sd_chevron(rotate_to_dir(p - at, facing),
+                                         CHEVRON_LEN, CHEVRON_SPAN,
+                                         CHEVRON_THICK), px);
+            col = mix(col, COL_CHEVRON, chev * a * alpha_scale);
 
         } else if (type != TYPE_EMPTY) {
             int facing = cell_dir(c.x);

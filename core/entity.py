@@ -407,6 +407,86 @@ class Belt(Entity):
         return float(self._get(self.F_THROUGHPUT))
 
 
+class Underground(Entity):
+    """One end of an underground belt -- an entrance or an exit.
+
+    The two ends are **separate entities**, each 1x1, each storing the other's
+    row. That matches how they are placed (one click each) and means an
+    unpaired entrance is a perfectly legal thing to have sitting on the board,
+    exactly as in Factorio. The tiles *between* the ends are not owned by
+    anything: belts and machines can be built straight over the span, which is
+    the whole point of going underground.
+
+    A single entity spanning the gap would be the obvious alternative and is
+    wrong here -- Gameboard stamps every cell of a footprint, so the span
+    would claim tiles it must leave free.
+
+    `direction` is the travel direction for both ends: an entrance at (x,y)
+    facing +X dives eastward and its exit surfaces further east, still facing
+    +X. So a pair always shares a facing, and the exit is downstream.
+    """
+
+    TYPE_ID = cell.TYPE_UNDER
+    FOOTPRINT = (1, 1)
+    ROTATABLE = True
+
+    #: Tiles that may separate the two ends, i.e. the gap they jump. Factorio's
+    #: base underground belt spans 4 tiles, putting the ends 5 apart. Faster
+    #: tiers reach further; when those arrive this becomes per-tier.
+    MAX_GAP = 4
+
+    #: Greatest distance between entrance and exit cells.
+    MAX_SPAN = MAX_GAP + 1
+
+    F_IS_EXIT = _COMMON_FIELDS + 0
+    #: Partner's entity row, or 0 for an unpaired end. Row 0 is never a live
+    #: entity, so 0 is an unambiguous "none".
+    F_PARTNER = _COMMON_FIELDS + 1
+
+    def initialise(self, x, y, direction, is_ghost=False, flipped=False,
+                   is_exit=False, partner=0):
+        super().initialise(x, y, direction, is_ghost=is_ghost, flipped=flipped)
+        self._set(self.F_IS_EXIT, 1.0 if is_exit else 0.0)
+        self._set(self.F_PARTNER, float(partner))
+
+    @property
+    def is_exit(self):
+        return bool(self._get(self.F_IS_EXIT))
+
+    @property
+    def partner(self):
+        """The other end's row, or 0 if unpaired."""
+        return int(self._get(self.F_PARTNER))
+
+    @partner.setter
+    def partner(self, row):
+        self._set(self.F_PARTNER, float(row))
+
+    @property
+    def paired(self):
+        row = self.partner
+        return row != 0 and self.board.is_row_alive(row)
+
+    @classmethod
+    def span_cells(cls, a, b):
+        """The cells strictly between two ends, or None if they cannot pair.
+
+        Ends pair when they are on a common axis, no further than MAX_SPAN
+        apart, and not on the same cell. Nothing in between blocks -- the
+        span passes under whatever is there, which is the point.
+        """
+        (ax, ay), (bx, by) = a, b
+        dx, dy = bx - ax, by - ay
+        if (dx != 0) == (dy != 0):
+            return None                      # diagonal, or the same cell
+        dist = abs(dx) + abs(dy)
+        if not 1 <= dist <= cls.MAX_SPAN:
+            return None
+        sx = (dx > 0) - (dx < 0)
+        sy = (dy > 0) - (dy < 0)
+        return [(ax + sx * i, ay + sy * i) for i in range(1, dist)]
+
+
 class Structure(Entity):
     """Base for placed buildings: rotatable, with input and output faces.
 

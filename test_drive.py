@@ -13,7 +13,8 @@ from orchestrator import Orchestrator
 from ui.input_manager import STATE_IDLE, STATE_PLANNING, STATE_ERASING
 from engine import MODE_HORIZONTAL_FIRST, MODE_VERTICAL_FIRST, MODE_LINE
 from core.builders import BeltBuilder, StructureBuilder
-from core.entity import STRUCTURES, Mac, Shear, Sink, Source, Swap
+from core.entity import (STRUCTURES, Mac, Shear, Sink, Source, Swap,
+                         Underground)
 
 W, H = 1024, 768
 
@@ -240,25 +241,37 @@ ok("interpolated erase across a 28-cell jump")
 print("=== toolbelt selection ===")
 engine.clear_board(); step()
 assert orch.toolbelt.active.name == "Belt", orch.toolbelt.active.name
-fake["keys"].add(glfw.KEY_2); step(); fake["keys"].discard(glfw.KEY_2); step()
-assert orch.toolbelt.active.name == "Swap", orch.toolbelt.active.name
-ok("key 2 selected Swap")
-fake["keys"].add(glfw.KEY_3); step(); fake["keys"].discard(glfw.KEY_3); step()
-assert orch.toolbelt.active.name == "Shear"
-ok("key 3 selected Shear")
-fake["keys"].add(glfw.KEY_6); step(); fake["keys"].discard(glfw.KEY_6); step()
-assert orch.toolbelt.active.name == "Sink"
-ok("key 6 selected Sink")
+# Select by name rather than by hardcoded digit: the slot order shifts
+# whenever a tool is added, and every test below cares about *which tool*,
+# never about which key reaches it.
+_SLOT_DIGITS = {glfw.KEY_1: 1, glfw.KEY_2: 2, glfw.KEY_3: 3, glfw.KEY_4: 4,
+                glfw.KEY_5: 5, glfw.KEY_6: 6, glfw.KEY_7: 7, glfw.KEY_8: 8,
+                glfw.KEY_9: 9, glfw.KEY_0: 0}
+_DIGIT_KEYS = {v: k for k, v in _SLOT_DIGITS.items()}
+
+def select_tool(name):
+    """Press the number key whose slot holds the named tool."""
+    idx = next(i for i, s in enumerate(orch.toolbelt.slots)
+               if s is not None and s.name == name)
+    assert idx < 10, f"{name} is past the number keys"
+    key = _DIGIT_KEYS[0 if idx == 9 else idx + 1]
+    fake["keys"].add(key); step(); fake["keys"].discard(key); step()
+    assert orch.toolbelt.active.name == name, orch.toolbelt.active.name
+    return orch.toolbelt.active
+
+for _name in ("Swap", "Shear", "Sink", "Underground"):
+    select_tool(_name)
+    ok(f"number key selected {_name}")
 fake["keys"].add(glfw.KEY_0); step(); fake["keys"].discard(glfw.KEY_0); step()
 assert orch.toolbelt.selected == 9 and orch.toolbelt.active is None
 ok("key 0 selected empty slot 10")
-fake["keys"].add(glfw.KEY_1); step(); fake["keys"].discard(glfw.KEY_1); step()
+select_tool("Belt")
 assert orch.toolbelt.active.name == "Belt"
 ok("key 1 back to Belt")
 
 print("=== structure placement is click-based and all-or-nothing ===")
 engine.clear_board(); step()
-fake["keys"].add(glfw.KEY_3); step(); fake["keys"].discard(glfw.KEY_3); step()
+select_tool("Shear")
 shear_tool = orch.toolbelt.active
 assert shear_tool.name == "Shear"
 assert not shear_tool.drag_based
@@ -307,7 +320,7 @@ ok(f"overlap tinted {frustrated} cells, built nothing, occupant intact")
 
 print("=== F flips a chiral structure, shift+F frames the board ===")
 engine.clear_board(); step()
-fake["keys"].add(glfw.KEY_3); step(); fake["keys"].discard(glfw.KEY_3); step()
+select_tool("Shear")
 _tool = orch.toolbelt.active
 _tool.direction = cell.DIR_PX
 _tool.flipped = False
@@ -334,7 +347,7 @@ assert not _tool.flipped, "F twice should return to the original"
 ok("F is an involution")
 
 # An achiral structure ignores F entirely.
-fake["keys"].add(glfw.KEY_6); step(); fake["keys"].discard(glfw.KEY_6); step()
+select_tool("Sink")
 _sink_tool = orch.toolbelt.active
 assert _sink_tool.name == "Sink" and not _sink_tool.entity_cls.is_chiral()
 fake["keys"].add(glfw.KEY_F); step(); fake["keys"].discard(glfw.KEY_F); step()
@@ -349,11 +362,11 @@ fake["keys"].discard(glfw.KEY_F); fake["keys"].discard(glfw.KEY_LEFT_SHIFT)
 step()
 assert tuple(orch.camera.center) != _before or orch.camera.center[0] == board.width * 0.5
 ok("shift+F framed the board")
-fake["keys"].add(glfw.KEY_1); step(); fake["keys"].discard(glfw.KEY_1); step()
+select_tool("Belt")
 
 print("=== structures are centred on the cursor, not cornered on it ===")
 engine.clear_board(); step()
-fake["keys"].add(glfw.KEY_5); step(); fake["keys"].discard(glfw.KEY_5); step()
+select_tool("Source")
 _src_tool = orch.toolbelt.active
 assert _src_tool.name == "Source", _src_tool.name
 _src_tool.direction = cell.DIR_PX
@@ -385,7 +398,7 @@ def put_cursor_at(wx, wy):
     fake["cursor"] = (float(sx), float(sy))
 
 engine.clear_board(); step()
-fake["keys"].add(glfw.KEY_3); step(); fake["keys"].discard(glfw.KEY_3); step()
+select_tool("Shear")
 _sh = orch.toolbelt.active
 _sh.direction = cell.DIR_PX
 _sh.flipped = False
@@ -411,7 +424,7 @@ assert board.is_empty(31, 20), "built on the wrong side of the cursor"
 ok(f"commit lands exactly where the ghost was: {_built}")
 
 # An odd axis has a middle cell, so the fraction must change nothing.
-fake["keys"].add(glfw.KEY_6); step(); fake["keys"].discard(glfw.KEY_6); step()
+select_tool("Sink")
 assert orch.toolbelt.active.name == "Sink"
 put_cursor_at(30.1, 20.1); step()
 _a = sorted(orch.last_plan.placements[0].cells())
@@ -420,7 +433,126 @@ _b = sorted(orch.last_plan.placements[0].cells())
 assert _a == _b, f"3x3 should ignore the sub-cell position: {_a} vs {_b}"
 ok("3x3 Sink ignores the sub-cell position, as an odd extent should")
 
-fake["keys"].add(glfw.KEY_1); step(); fake["keys"].discard(glfw.KEY_1); step()
+select_tool("Belt")
+
+print("=== underground belts pair end to end ===")
+engine.clear_board(); step()
+_u = select_tool("Underground")
+_u.direction = cell.DIR_PX
+_u.reset()
+assert not _u.placing_exit, "a fresh underground tool lays an entrance first"
+
+# First click lays an entrance...
+put_cursor_at_cell(10, 40); step()
+click()
+assert _u.placing_exit, "after an entrance the tool should expect an exit"
+_ent_row = cell.cell_id(board.cell_word(10, 40))
+_ent = board.view(_ent_row)
+assert _ent.type_id == cell.TYPE_UNDER and not _ent.is_exit
+assert not _ent.paired, "an entrance alone has nothing to pair with"
+ok("first click laid an unpaired entrance")
+
+# ...the second lays an exit, which pairs back to it.
+put_cursor_at_cell(14, 40); step()
+click()
+_exit_row = cell.cell_id(board.cell_word(14, 40))
+_ex = board.view(_exit_row)
+assert _ex.is_exit, "second click should lay an exit"
+assert _ex.partner == _ent_row and _ent.partner == _exit_row, "ends must pair"
+assert not _u.placing_exit, "the tool should cycle back to entrance"
+ok("second click laid an exit and paired it to the entrance")
+
+# The pairing must reach the grid, where the renderer reads it.
+_ez = int(board.grid[40, 10, cell.CH_Z])
+_xz = int(board.grid[40, 14, cell.CH_Z])
+assert cell.is_under_paired(_ez) and cell.is_under_paired(_xz)
+assert not cell.is_under_exit(_ez) and cell.is_under_exit(_xz)
+ok("both ends publish their role and pairing into .z")
+
+# The tiles between stay free: that is the whole point of going under.
+for _x in range(11, 14):
+    assert board.is_empty(_x, 40), f"span tile {_x} should be free"
+assert engine.place_belt(12, 40, cell.DIR_PY) is not None
+ok("the span is unobstructed; a belt crosses straight over it")
+
+# Beyond MAX_SPAN there is no pairing.
+engine.clear_board(); step()
+_u.reset()
+_a = engine.place_under(20, 44, cell.DIR_PX, is_exit=False)
+_b = engine.place_under(20 + Underground.MAX_SPAN + 1, 44, cell.DIR_PX,
+                        is_exit=True)
+assert not _a.paired and not _b.paired, (
+    f"ends {Underground.MAX_SPAN + 1} apart must not pair")
+_c = engine.place_under(20 + Underground.MAX_SPAN, 46, cell.DIR_PX,
+                        is_exit=True)
+_d = engine.place_under(20, 46, cell.DIR_PX, is_exit=False)
+assert _c.paired and _d.paired, f"ends {Underground.MAX_SPAN} apart must pair"
+ok(f"pairs at {Underground.MAX_SPAN} apart, not {Underground.MAX_SPAN + 1}")
+
+# Opposed facings must not pair -- both ends of a run share a direction.
+engine.clear_board(); step()
+_a = engine.place_under(30, 44, cell.DIR_PX, is_exit=False)
+_b = engine.place_under(33, 44, cell.DIR_NX, is_exit=True)
+assert not _a.paired and not _b.paired, "opposed ends must not pair"
+ok("ends facing opposite ways do not pair")
+
+# Erasing one end must release the other, or it would point at a freed row
+# that the free list can hand to something else.
+engine.clear_board(); step()
+_a = engine.place_under(40, 44, cell.DIR_PX, is_exit=False)
+_b = engine.place_under(43, 44, cell.DIR_PX, is_exit=True)
+assert _a.paired
+engine.erase(43, 44); step()
+assert not _a.paired and _a.partner == 0, "survivor must be released"
+assert not cell.is_under_paired(int(board.grid[44, 40, cell.CH_Z])), \
+    "survivor's .z still claims a partner"
+ok("erasing one end unpairs the survivor, in the row and the grid")
+
+# The nearest free entrance wins, so a long run chains naturally.
+engine.clear_board(); step()
+_far = engine.place_under(50, 44, cell.DIR_PX, is_exit=False)
+_near = engine.place_under(52, 44, cell.DIR_PX, is_exit=False)
+_ex2 = engine.place_under(54, 44, cell.DIR_PX, is_exit=True)
+assert _ex2.partner == _near.row, "the nearest unpaired entrance should win"
+assert not _far.paired
+ok("an exit pairs with the nearest entrance, not an older one further back")
+
+# Hovering a would-be exit previews the connection: the ghost claims the
+# pairing (which is what makes the shader dot the span) without touching the
+# real entrance, and shows nothing at all when out of range.
+engine.clear_board(); step()
+_u = select_tool("Underground")
+_u.direction = cell.DIR_PX
+_u.reset()
+_ent = engine.place_under(10, 50, cell.DIR_PX, is_exit=False)
+_u.placing_exit = True
+put_cursor_at_cell(14, 50); step()
+assert orch.last_plan.placements[0].under_partner == (10, 50)
+assert cell.is_under_paired(int(board.grid[50, 14, cell.CH_Z])), \
+    "an in-range ghost exit must show as paired, or no span is drawn"
+assert not _ent.paired, "previewing must not pair the real entrance"
+ok("hovering an in-range exit previews the connection")
+
+put_cursor_at_cell(10 + Underground.MAX_SPAN + 1, 50); step()
+assert orch.last_plan.placements[0].under_partner is None
+assert not cell.is_under_paired(
+    int(board.grid[50, 10 + Underground.MAX_SPAN + 1, cell.CH_Z])), \
+    "an out-of-range ghost must not claim a pairing"
+ok("an out-of-range hover shows no connection")
+
+# Abandoning the preview must leave the entrance exactly as it was.
+engine.clear_ghosts(); step()
+assert not _ent.paired and _ent.partner == 0
+assert not cell.is_under_paired(int(board.grid[50, 10, cell.CH_Z]))
+ok("a cancelled preview leaves the real entrance untouched")
+
+# Cancelling mid-pair resets the tool back to laying an entrance.
+_u.placing_exit = True
+fake["keys"].add(glfw.KEY_ESCAPE); step()
+fake["keys"].discard(glfw.KEY_ESCAPE); step()
+assert not _u.placing_exit, "cancel should reset the entrance/exit step"
+ok("cancel resets the tool to laying an entrance")
+select_tool("Belt")
 
 print("=== rotating a structure keeps its ports on the outside ===")
 # Regression: the shader looked its port tables up with the placed .y offset
@@ -447,7 +579,7 @@ ok("every port faces outward at every rotation and flip")
 
 print("=== frustration never destroys the occupant ===")
 engine.clear_board(); step()
-fake["keys"].add(glfw.KEY_1); step(); fake["keys"].discard(glfw.KEY_1); step()
+select_tool("Belt")
 engine.place_belt(8, 8, cell.DIR_PY)
 want_id = cell.cell_id(board.cell_word(8, 8))
 put_cursor_at_cell(6, 8); step()
@@ -467,7 +599,7 @@ print("=== a tool must not collide with its own preview ===")
 # Regression: plans were computed before the previous preview was cleared, so
 # dragging a structure one cell sideways frustrated against its own ghost.
 engine.clear_board(); step()
-fake["keys"].add(glfw.KEY_3); step(); fake["keys"].discard(glfw.KEY_3); step()
+select_tool("Shear")
 orch.toolbelt.active.direction = cell.DIR_PX
 for x in range(8, 18):
     put_cursor_at_cell(x, 24); step()
@@ -479,7 +611,7 @@ ok("dragging a Shear across 10 cells never self-frustrates")
 # position far more heavily, so it is the real test of the clear-then-plan
 # ordering.
 engine.clear_board(); step()
-fake["keys"].add(glfw.KEY_6); step(); fake["keys"].discard(glfw.KEY_6); step()
+select_tool("Sink")
 assert orch.toolbelt.active.name == "Sink"
 for x in range(8, 18):
     put_cursor_at_cell(x, 24); step()
@@ -503,7 +635,7 @@ assert cell.unpack_local(int(board.grid[24, 17, cell.CH_Y])) == (1, 1)
 ok("3x3 Sink centres on the cursor, one entity, correct local offsets")
 
 engine.clear_board(); step()
-fake["keys"].add(glfw.KEY_1); step(); fake["keys"].discard(glfw.KEY_1); step()
+select_tool("Belt")
 put_cursor_at_cell(5, 28); step()
 click()
 for end in range(6, 20):
@@ -515,7 +647,7 @@ fake["right"] = True; step(); fake["right"] = False; step()
 
 print("=== a blocked structure still previews the part that fits ===")
 engine.clear_board(); step()
-fake["keys"].add(glfw.KEY_3); step(); fake["keys"].discard(glfw.KEY_3); step()
+select_tool("Shear")
 # An earlier section rotated this tool; put it back to horizontal so the
 # footprint is (20,30)+(21,30) and the blocker below actually clashes.
 orch.toolbelt.active.direction = cell.DIR_PX
@@ -543,7 +675,7 @@ ok("committing the blocked Shear built nothing; fragment stayed a ghost")
 put_cursor_at_cell(40, 36); step()
 assert board.is_empty(20, 30), "fragment leaked after moving away"
 ok("fragment cleared once the cursor moved on")
-fake["keys"].add(glfw.KEY_1); step(); fake["keys"].discard(glfw.KEY_1); step()
+select_tool("Belt")
 
 print("=== switching tools drops an in-flight preview ===")
 engine.clear_board(); step()
@@ -551,7 +683,7 @@ put_cursor_at_cell(12, 12); step()
 click()
 put_cursor_at_cell(18, 12); step()
 assert len(engine.ghost_rows) > 0
-fake["keys"].add(glfw.KEY_3); step(); fake["keys"].discard(glfw.KEY_3); step()
+select_tool("Shear")
 assert orch.toolbelt.active.name == "Shear"
 assert orch.input.state == STATE_IDLE, "tool switch should cancel the gesture"
 belt_ghosts = [r for r in engine.ghost_rows
@@ -559,7 +691,7 @@ belt_ghosts = [r for r in engine.ghost_rows
                and cell.cell_type(board.cell_word(*board.view(r).origin)) == cell.TYPE_BELT]
 assert not belt_ghosts, "belt preview should be gone"
 ok("tool switch cancelled the belt run")
-fake["keys"].add(glfw.KEY_1); step(); fake["keys"].discard(glfw.KEY_1); step()
+select_tool("Belt")
 
 print("=== shader loader ===")
 from render import shader_loader
@@ -779,6 +911,19 @@ assert _pb and "flip_face_mask(pm)" in _pb.group(1), (
     "flipped, exactly as the port masks do")
 ok("GLSL control overlay flips with the machine")
 
+# The shader scans for a paired run over the same distance the engine will
+# pair over; if it scanned shorter the dots would stop before the exit.
+_glsl_span = int(_re.search(r"#define UNDER_MAX_SPAN\s+(\d+)", _src).group(1))
+assert _glsl_span == Underground.MAX_SPAN, (
+    f"shader UNDER_MAX_SPAN {_glsl_span} != "
+    f"Underground.MAX_SPAN {Underground.MAX_SPAN}")
+for _name, _want in [("UNDER_EXIT_SHIFT", cell.UNDER_EXIT_SHIFT),
+                     ("UNDER_PAIRED_SHIFT", cell.UNDER_PAIRED_SHIFT),
+                     ("TYPE_UNDER", cell.TYPE_UNDER)]:
+    assert _glsl_int(_name) == _want, (
+        f"{_name}: shader {_glsl_int(_name)}, cell.py {_want}")
+ok(f"GLSL underground constants match (span {_glsl_span})")
+
 # The shader's authored footprint table must match Entity.FOOTPRINT, since
 # unplace_local() uses it to invert the placement transform.
 for _cls in STRUCTURES:
@@ -819,7 +964,7 @@ fake["right"] = True; step(); fake["right"] = False; step()
 
 print("=== left-drag pans instead of building ===")
 engine.clear_board(); step()
-fake["keys"].add(glfw.KEY_1); step(); fake["keys"].discard(glfw.KEY_1); step()
+select_tool("Belt")
 put_cursor_at_cell(30, 30); step()
 c_before = cam.center.copy()
 live_before = board.live_count

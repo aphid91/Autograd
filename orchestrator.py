@@ -51,6 +51,18 @@ class Orchestrator:
         self.engine.clear_ghosts()
         self.input.cancel()
         self.last_plan = None
+        self._reset_tool_state()
+
+    def _reset_tool_state(self):
+        """Drop a tool's multi-step state after an abandoned gesture.
+
+        An underground part-way through a pair would otherwise still be
+        expecting to lay an exit when you come back to it, which is a
+        confusing thing to return to.
+        """
+        for slot in self.toolbelt.slots:
+            if slot is not None and hasattr(slot, "reset"):
+                slot.reset()
 
     def _preview(self, tool):
         """Rebuild the preview for the active tool's current gesture."""
@@ -115,6 +127,8 @@ class Orchestrator:
         if intents.cancel_plan:
             engine.clear_ghosts()
             self.last_plan = None
+            if tool is not None and hasattr(tool, "reset"):
+                tool.reset()
 
         if intents.commit_plan:
             # A click-based tool has no PLANNING phase, so on the very first
@@ -132,6 +146,11 @@ class Orchestrator:
             if not blocked:
                 engine.commit_ghosts()
                 self.last_plan = None
+                # Tools with multi-step state advance it here -- an
+                # underground alternates entrance/exit -- and only on a
+                # placement that actually happened.
+                if tool is not None and hasattr(tool, "committed"):
+                    tool.committed()
                 # Re-preview so a click-based tool still shows a ghost under
                 # the cursor after placing, rather than blinking empty until
                 # the mouse moves. Now that the entity is real, this correctly

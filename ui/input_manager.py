@@ -287,6 +287,11 @@ class InputManager:
 
         # --- state machine ---
         if self.state == STATE_IDLE:
+            # Escape while idle still cancels: a click-based tool never
+            # enters PLANNING, but it can hold multi-step state -- an
+            # underground part-way through a pair -- that needs a way out.
+            if escape:
+                it.cancel_plan = True
             # A click-based tool (a structure) has no drag phase, but it still
             # must not build on press -- the press might become a pan. It
             # previews under the cursor and waits for the release.

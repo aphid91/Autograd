@@ -21,7 +21,7 @@ them -- that is what makes a frustrated cell different from an absent one.
 
 from core import cell
 from core.engine_paths import plan_path, path_directions, intent_dir
-from core.entity import STRUCTURES, Belt
+from core.entity import STRUCTURES, Belt, Underground
 
 
 def quadrant_dir(frac):
@@ -45,7 +45,7 @@ class Placement:
     """One entity a plan would create, and whether it can actually happen."""
 
     __slots__ = ("entity_cls", "x", "y", "direction", "blocked_cells",
-                 "flipped")
+                 "flipped", "is_exit", "under_partner")
 
     def __init__(self, entity_cls, x, y, direction, blocked_cells=(),
                  flipped=False):
@@ -55,6 +55,12 @@ class Placement:
         self.direction = direction
         self.blocked_cells = list(blocked_cells)
         self.flipped = flipped
+        # Underground-only. `is_exit` picks which end this placement lays;
+        # `under_partner` is the cell of the end it would pair with, or None,
+        # and exists so the preview can draw the dotted span before anything
+        # is committed.
+        self.is_exit = False
+        self.under_partner = None
 
     @property
     def frustrated(self):
@@ -320,11 +326,66 @@ class StructureBuilder(EntityBuilder):
         return BuildPlan([placement], all_or_nothing=True)
 
 
+class UndergroundBuilder(EntityBuilder):
+    """Place underground belt ends, alternating entrance then exit.
+
+    Factorio-style: each click places one end. The first lays an entrance
+    (diving), the next an exit (surfacing) which auto-pairs with a reachable
+    unpaired entrance facing the same way. The tool simply alternates --
+    pairing itself is the engine's job, and an exit placed out of range of
+    any entrance is legal and just sits there unpaired.
+
+    Click-based like a structure, so it previews under the cursor while IDLE
+    and commits on release. R rotates the facing, which for an underground
+    is the travel direction both ends share.
+    """
+
+    name = "Underground"
+    drag_based = False
+
+    def __init__(self):
+        self.direction = cell.DIR_PX
+        #: False = the next click lays an entrance, True = an exit.
+        self.placing_exit = False
+
+    def cycle(self, backward=False):
+        self.direction = cell.rotate_dir(self.direction, cw=not backward)
+        return True
+
+    def status(self):
+        end = "exit" if self.placing_exit else "entrance"
+        return f"{end} facing {cell.DIR_NAMES[self.direction]}"
+
+    def reset(self):
+        """Back to laying an entrance. Called when the gesture is abandoned."""
+        self.placing_exit = False
+
+    def plan(self, engine, start, end, start_frac=(0.5, 0.5),
+             end_frac=(0.5, 0.5)):
+        x, y = end
+        blocked = [] if engine.buildable(x, y) else [(x, y)]
+        placement = Placement(Underground, x, y, self.direction, blocked)
+        placement.is_exit = self.placing_exit
+        # The span to draw dotted while previewing: only shown for an exit
+        # that would actually pair, since an entrance has nothing to join yet.
+        placement.under_partner = None
+        if self.placing_exit and not blocked:
+            partner = engine.find_under_partner(x, y, self.direction, True)
+            if partner is not None:
+                placement.under_partner = partner.origin
+        return BuildPlan([placement], all_or_nothing=True)
+
+    def committed(self):
+        """Called after a successful placement: alternate the end type."""
+        self.placing_exit = not self.placing_exit
+
+
 def default_builders():
     """The toolbelt's starting tools, in slot order.
 
-    Belt first, then one StructureBuilder per registered structure. Adding a
-    machine is a new Entity subclass in core/entity.py plus its entry in
-    STRUCTURES -- nothing here needs to change.
+    Belt and its underground form first, then one StructureBuilder per
+    registered structure. Adding a machine is a new Entity subclass in
+    core/entity.py plus its entry in STRUCTURES -- nothing here changes.
     """
-    return [BeltBuilder()] + [StructureBuilder(c) for c in STRUCTURES]
+    return ([BeltBuilder(), UndergroundBuilder()]
+            + [StructureBuilder(c) for c in STRUCTURES])

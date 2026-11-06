@@ -48,7 +48,7 @@ the GLSL cell encoding still agrees with `core/cell.py`.
 | Left-click | build with the active tool (fires on **release**) |
 | `R` / `shift+R` | **per-tool**: belt path shape, or structure rotation |
 | Right-click | cancel a plan, or drag to erase |
-| `Esc` | cancel a plan |
+| `Esc` | cancel a plan, or a tool's multi-step state |
 | `F5` | reload the world shaders |
 | `Delete` | clear the board |
 
@@ -305,6 +305,56 @@ axis, y up) alongside the cell index, and the builder uses it at both ends:
 `StructureBuilder` uses `end_frac` too, but for a different purpose: picking
 which cell boundary an even-sized footprint centres on (see "Structures").
 A tool that cares about neither simply ignores both.
+
+### Underground belts
+
+A pair of 1×1 ends that jump a gap, Factorio-style. `Underground.MAX_GAP` is
+4 tiles, putting the ends at most `MAX_SPAN` (5) apart — matching the base
+Factorio underground, with faster tiers left for later.
+
+**The two ends are separate entities**, each holding the other's row in
+`F_PARTNER`. That matches how they are placed — one click each,
+`UndergroundBuilder` alternating entrance then exit — and makes an unpaired
+entrance a perfectly legal thing to leave on the board. A single entity
+spanning the gap would be the obvious alternative and is wrong: `Gameboard`
+stamps every cell of a footprint, so the span would claim the tiles it must
+leave free. **Nothing is stored for the tiles between the ends** — belts and
+machines build straight over them, which is the entire point.
+
+Both ends share a `direction`, the travel direction, and the exit is
+downstream of the entrance. Pairing happens in `Engine`, not the builder:
+`find_under_partner()` scans along the facing for the **nearest** unpaired
+end of the opposite role, so laying a long run chains naturally instead of
+latching onto an older entrance further back. Nothing blocks a span.
+
+- **Pairing is mirrored into `.z`** (bit 3 = this end is an exit, bit 4 =
+  paired) because the renderer draws the funnels and the dotted span from the
+  grid texture alone. `Gameboard.restamp()` exists for exactly this: changing
+  the row without it would leave the grid stale.
+- **Erasing one end releases the other** (`Engine.unpair_under`). A survivor
+  left pointing at a freed row would draw a span to nothing, and the free
+  list could hand that row to an unrelated entity.
+- **A ghost exit's pairing is one-way.** While you hover a placeable exit it
+  points at a real entrance that does not point back, purely so the span
+  draws in the preview; the entrance is never mutated, so abandoning the
+  preview leaves no trace. `commit_ghosts()` therefore clears that one-way
+  link before pairing properly — otherwise `paired` reads true and the real
+  two-way link never forms. The shader draws the span when **either** end
+  claims the pairing, which is what makes the preview visible at all.
+- Out of range, nothing is drawn — no "would not connect" feedback.
+
+Rendering: each end is a funnel whose **mouth opens toward the surface belt
+it talks to** — an entrance opens backwards at the run feeding it, an exit
+forwards at the run it feeds — tapering to a throat on the buried side.
+`sd_funnel()` draws one shape and mirrors it for the entrance. The span is
+dotted by the cells *between* the ends, each scanning outward for a paired
+run that covers it; nothing is stored per-cell. `UNDER_MAX_SPAN` in the
+shader is pinned against `Underground.MAX_SPAN` by `test_drive.py`.
+
+An underground is **not** a `Structure` — `is_structure()` excludes it, since
+it has no port tables and moves material along one facing like a belt. Only
+an *exit* emits onto the surface; an entrance is diving, so `feeds_into()`
+reports nothing for it.
 
 ### Structures
 

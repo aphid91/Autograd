@@ -13,6 +13,8 @@ const int TYPE_SHIFT = 2,  TYPE_MASK  = 0x7F;
 const int ID_SHIFT   = 9,  ID_MASK    = 0x3FFFFF;
 const int GHOST_SHIFT = 0, GHOST_MASK = 0x3;
 const int FLIP_SHIFT = 2;   // .z bit 2: mirrored about the authored X axis
+const int UNDER_EXIT_SHIFT   = 3;   // .z bit 3: this end surfaces
+const int UNDER_PAIRED_SHIFT = 4;   // .z bit 4: this end has a partner
 const int LOCAL_SHIFT = 16, LOCAL_MASK = 0xFFFF;
 
 const int GHOST_NONE       = 0;
@@ -26,6 +28,7 @@ const int TYPE_SHEAR  = 3;
 const int TYPE_MAC    = 4;
 const int TYPE_SOURCE = 5;
 const int TYPE_SINK   = 6;
+const int TYPE_UNDER  = 7;   // underground belt end
 
 // Directions. These index DIR_VECS below.
 const int DIR_PX = 0;   // +X east
@@ -45,6 +48,8 @@ int cell_dir   (int w) { return (w >> DIR_SHIFT)   & DIR_MASK;   }
 int cell_id    (int w) { return (w >> ID_SHIFT)    & ID_MASK;    }
 int ghost_state(int w) { return (w >> GHOST_SHIFT) & GHOST_MASK; }
 bool is_flipped (int w) { return ((w >> FLIP_SHIFT) & 1) != 0; }
+bool is_under_exit  (int w) { return ((w >> UNDER_EXIT_SHIFT)   & 1) != 0; }
+bool is_under_paired(int w) { return ((w >> UNDER_PAIRED_SHIFT) & 1) != 0; }
 
 ivec2 cell_local(int w) {
     return ivec2((w >> LOCAL_SHIFT) & LOCAL_MASK, w & LOCAL_MASK);
@@ -210,8 +215,16 @@ const int GLYPH_CROSS = 2;   // X
 const int GLYPH_ZED   = 3;   // Z
 const int GLYPH_DOT   = 4;
 
+// A machine with declared port faces. Undergrounds are excluded: they have
+// no port tables and behave like belts for connection purposes, taking input
+// from behind and emitting ahead along their own facing.
 bool is_structure(int type) {
-    return type != TYPE_EMPTY && type != TYPE_BELT;
+    return type != TYPE_EMPTY && type != TYPE_BELT && type != TYPE_UNDER;
+}
+
+// Types that move material along a single facing, belt-style.
+bool is_beltlike(int type) {
+    return type == TYPE_BELT || type == TYPE_UNDER;
 }
 
 // Rotate a cell-local coordinate so that +X becomes `dir`.

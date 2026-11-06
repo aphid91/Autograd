@@ -12,7 +12,7 @@ commit a plan, and erase.
 from core import cell
 from core.builders import BeltBuilder
 from core.engine_paths import bresenham, intent_dir, path_directions, plan_path
-from core.entity import Belt
+from core.entity import Belt, Underground
 from core.gameboard import Gameboard
 
 # Re-exported so existing callers and tests keep working after the path
@@ -105,10 +105,24 @@ class Engine:
 
         for p in plan.previewable:
             if not p.frustrated:
+                extra = {}
+                if p.entity_cls is Underground:
+                    extra["is_exit"] = p.is_exit
                 view = self.board.spawn(
                     p.entity_cls, p.x, p.y, p.direction, is_ghost=True,
-                    flipped=p.flipped
+                    flipped=p.flipped, **extra
                 )
+                # A ghost end that *would* pair shows the dotted span while
+                # you hover, which is the whole point of the preview. Point
+                # it at the real partner's row so the cell's paired bit is
+                # set; the partner is not touched, so this stays one-way and
+                # disappears with the ghost. Real pairing happens on commit.
+                if (p.entity_cls is Underground
+                        and p.under_partner is not None):
+                    row = self.board.entity_id_at(*p.under_partner)
+                    if row:
+                        view.partner = row
+                        self.board.restamp(view)
                 self.ghost_rows.append(view.row)
                 continue
 
@@ -136,9 +150,30 @@ class Engine:
         that can exist.
         """
         n = len(self.ghost_rows)
-        for row in self.ghost_rows:
+        promoted = list(self.ghost_rows)
+        for row in promoted:
             self.board.set_ghost(row, False)
         self.ghost_rows.clear()
+        # Pair undergrounds only once they are real. find_under_partner()
+        # skips ghosts, so a pair cannot form while either end is still a
+        # preview -- which is what keeps a hovering exit from latching onto
+        # an entrance it has not actually been placed near yet.
+        for row in promoted:
+            if not self.board.is_row_alive(row):
+                continue
+            view = self.board.view(row)
+            if view.type_id != cell.TYPE_UNDER:
+                continue
+            # A preview's pairing is one-way: the ghost pointed at a partner
+            # that never pointed back, purely so the span would draw. Drop
+            # it and pair properly now, or `paired` would read true here and
+            # the real two-way link would never be made.
+            view.partner = 0
+            ox, oy = view.origin
+            partner = self.find_under_partner(
+                ox, oy, view.direction, view.is_exit)
+            if partner is not None:
+                self.pair_under(view, partner)
         for row in self.preview_only_rows:
             self.board.despawn(row)
         self.preview_only_rows.clear()
@@ -183,6 +218,78 @@ class Engine:
         self.stats["placed"] += 1
         return view
 
+    # --- underground belts ----------------------------------------------
+    def find_under_partner(self, x, y, direction, want_exit):
+        """An unpaired end this one would pair with, or None.
+
+        Looks back along `direction` from the cell being placed. A new exit
+        searches *upstream* for an entrance; a new entrance searches
+        *downstream* for an exit. Both ends of a pair share a facing, so the
+        search axis is the facing itself.
+
+        The nearest candidate wins, which is what makes laying a long run
+        feel right: a fresh exit joins the entrance you just placed rather
+        than some older one further back. Nothing in between blocks -- the
+        span passes underneath whatever is there.
+        """
+        step = cell.DIR_STEPS[direction]
+        # An exit looks back the way material came; an entrance looks ahead.
+        sign = -1 if want_exit else 1
+        for dist in range(1, Underground.MAX_SPAN + 1):
+            cx = x + step[0] * sign * dist
+            cy = y + step[1] * sign * dist
+            if not self.board.in_bounds(cx, cy):
+                break
+            row = self.board.entity_id_at(cx, cy)
+            if row == 0 or not self.board.is_row_alive(row):
+                continue
+            if row in self.ghost_rows or row in self.preview_only_rows:
+                continue
+            view = self.board.view(row)
+            if view.type_id != cell.TYPE_UNDER:
+                continue
+            # Must be the opposite role, same facing, and still free.
+            if view.is_exit == want_exit:
+                continue
+            if view.direction != direction or view.paired:
+                continue
+            return view
+        return None
+
+    def pair_under(self, a, b):
+        """Link two underground ends and restamp both cells."""
+        a.partner = b.row
+        b.partner = a.row
+        self.board.restamp(a)
+        self.board.restamp(b)
+
+    def unpair_under(self, row):
+        """Drop the link from whatever was paired with `row`."""
+        if row == 0 or not self.board.is_row_alive(row):
+            return
+        view = self.board.view(row)
+        if view.type_id != cell.TYPE_UNDER:
+            return
+        other = view.partner
+        if other == 0 or not self.board.is_row_alive(other):
+            return
+        mate = self.board.view(other)
+        if mate.type_id == cell.TYPE_UNDER and mate.partner == row:
+            mate.partner = 0
+            self.board.restamp(mate)
+
+    def place_under(self, x, y, direction=cell.DIR_PX, is_exit=False):
+        """Place one underground end, auto-pairing it if a partner is free."""
+        if not self.buildable(x, y):
+            return None
+        partner = self.find_under_partner(x, y, direction, is_exit)
+        view = self.board.spawn(Underground, x, y, direction,
+                                is_exit=is_exit)
+        if partner is not None:
+            self.pair_under(view, partner)
+        self.stats["placed"] += 1
+        return view
+
     def erase(self, x, y):
         """Remove whatever occupies a cell. Ghosts are left alone.
 
@@ -194,6 +301,10 @@ class Engine:
             return False
         if row in self.ghost_rows or row in self.preview_only_rows:
             return False
+        # An underground's partner outlives it, so it must be told: a
+        # surviving end left pointing at a freed row would draw a dotted
+        # span to nothing, and could re-pair wrongly once the row is reused.
+        self.unpair_under(row)
         self.board.despawn(row)
         self.stats["erased"] += 1
         return True
