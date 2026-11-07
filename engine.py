@@ -13,6 +13,7 @@ from core import cell
 from core.builders import BeltBuilder
 from core.engine_paths import bresenham, intent_dir, path_directions, plan_path
 from core.entity import Belt, Underground
+from core.belt_device import BeltDevice
 from core.belts import BeltSim
 from core.gameboard import Gameboard
 from core.segments import SegmentIndex
@@ -59,6 +60,10 @@ class Engine:
         # tick without a bubble.
         self.belts = BeltSim(self.segments)
         self.clock.on_phase(PHASE_BELT, self._belt_phase)
+        # The GPU mirror of belt state. The fragment shader evaluates the
+        # closed form itself, so it needs head/tail/anchor and the rings --
+        # see core/belt_device.py.
+        self.belt_device = BeltDevice(self.segments, self.belts)
         #: Debug feed, until gates drive the belts for real. When set, every
         #: segment with a dangling upstream end is offered this value each
         #: tick, and every dangling downstream end accepts. Exists so the
@@ -397,7 +402,11 @@ class Engine:
         if not self._segments_stale:
             return None
         self._segments_stale = False
-        return self.segments.rebuild()
+        n = self.segments.rebuild()
+        # A rebuild reassigns every ring's base and cap, so the device arena
+        # has to be laid out again before the next upload.
+        self.belt_device.invalidate_layout()
+        return n
 
     def clear_items(self):
         """Take every item off every belt, leaving the segmentation alone.
@@ -447,7 +456,12 @@ class Engine:
     # --- device ---------------------------------------------------------
     def create_device_resources(self, ctx):
         self.board.create_device_resources(ctx)
+        self.belt_device.create_device_resources(ctx)
 
     def sync_to_device(self):
         """Upload whatever is dirty. Called once per frame by the orchestrator."""
+        # Belt state goes up unconditionally: head/tail/anchor change on
+        # nearly every tick of every segment, so tracking which moved would
+        # cost more than the few KB the upload takes.
+        self.belt_device.sync()
         return self.board.to_device()

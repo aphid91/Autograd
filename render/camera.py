@@ -24,7 +24,12 @@ ZOOM_PER_SEC = 2.2     # held Q/E: zoom *= ZOOM_PER_SEC ** dt
 ZOOM_PER_SCROLL = 1.15  # one scroll notch
 
 GRID_TEXTURE_UNIT = 0
+# Storage-buffer bindings. These must match the `layout(binding = N)`
+# declarations in the shaders: common.glsl declares 1/2/3 for belt state.
 ENTITY_SSBO_BINDING = 0
+SEG_I_SSBO_BINDING = 1
+SEG_F_SSBO_BINDING = 2
+ITEM_SSBO_BINDING = 3
 
 
 class Camera:
@@ -199,13 +204,14 @@ class Camera:
         )
 
     # --- render ---------------------------------------------------------
-    def render(self, viewport, clock=None):
+    def render(self, viewport, clock=None, belt_device=None):
         """Draw the world.
 
         `clock` supplies the simulation time the shader interpolates item
         motion against -- `tick + alpha`, so items move smoothly between
-        ticks instead of snapping between slots. Optional so the camera can
-        still be driven with no simulation at all.
+        ticks instead of snapping between slots. `belt_device` supplies the
+        segment and item buffers the shader evaluates the closed form from.
+        Both optional, so the camera can be driven with no simulation at all.
         """
         if self.program is None or self.vao is None:
             return
@@ -217,6 +223,9 @@ class Camera:
             board.grid_texture.use(GRID_TEXTURE_UNIT)
         if board.entity_buffer is not None:
             board.entity_buffer.bind_to_storage_buffer(ENTITY_SSBO_BINDING)
+        if belt_device is not None:
+            belt_device.bind(SEG_I_SSBO_BINDING, SEG_F_SSBO_BINDING,
+                             ITEM_SSBO_BINDING)
 
         self._set("resolution", (float(w), float(h)))
         self._set("cam_center", (float(self.center[0]), float(self.center[1])))

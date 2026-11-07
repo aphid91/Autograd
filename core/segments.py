@@ -85,6 +85,7 @@ simulation actually uses and the "phantom merge" rendering goof disappears.
 """
 
 from core import cell
+from core.belts import UNIT as _UNIT
 from core.entity import Underground
 
 #: Cell types that move material along their own facing.
@@ -161,17 +162,25 @@ class Segment:
         #: underground pair is involved: the buried tiles hold items but have
         #: no cell of their own to draw in.
         self.cells = cells
-        #: Positions on this segment, counting buried tiles. The consumer
-        #: takes items at `length`.
+        #: Positions on this segment, counting buried tiles, in **cells**.
+        #: The consumer takes items at `length * belts.UNIT`.
         self.length = length
 
         # Ring state. head/tail are monotonic counters, not slot indices:
         # items on the belt are [head, tail), head nearest the consumer.
         self.head = 0
         self.tail = 0
-        #: Where the head would be if the whole run were packed tight. The
-        #: closed form's `A`.
-        self.anchor = length
+        #: Where the head would be if the whole run were packed tight -- the
+        #: closed form's `A`, in **fixed point** (UNIT-ths of a cell), unlike
+        #: `length` just above. Initialised to the far end, per
+        #: docs/belt_report.md's "Initial state: head = tail = 0, A = L".
+        #:
+        #: The mixed units here are a trap: this was briefly initialised to
+        #: `length` in cells, which the simulation hid completely because the
+        #: unblocked term of the min was always the smaller one. It only
+        #: surfaced when the renderer read the anchor directly and drew
+        #: nothing.
+        self.anchor = length * _UNIT
 
         #: Slice of the item arena this segment owns.
         self.base = 0

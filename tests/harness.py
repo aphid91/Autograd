@@ -24,7 +24,7 @@ import moderngl
 from imgui_bundle import imgui
 
 from core import cell
-from core.tick import PHASE_BELT
+from core.tick import PHASE_BELT, TICKS_PER_SEC
 
 W, H = 1024, 768
 BOARD = 64
@@ -123,6 +123,12 @@ def reset():
     # starting mid-timeline. clear_board() above already resets the tick
     # counter, but not the pause flag.
     engine.clock.resume()
+    # The tick *rate* is global state too, and clock.reset() deliberately
+    # keeps it (a rate change is configuration, not timeline). A scenario
+    # that set 30/s would otherwise leave every later one banking half a
+    # tick per frame, so `alpha` lands mid-tick and every item renders
+    # half a cell from where a whole-tick calculation expects it.
+    engine.clock.set_rate(TICKS_PER_SEC)
     engine.clock.reset()
     # The debug item feed is global state too: a scenario that leaves it on
     # would quietly fill every later scenario's belts.

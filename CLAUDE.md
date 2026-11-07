@@ -44,6 +44,7 @@ There is no pytest/linter configured.
 | [tests/test_tick.py](tests/test_tick.py) | the clock as wired into the frame loop: rate, `alpha`, keys, phase order |
 | [tests/test_segments.py](tests/test_segments.py) | belt-run derivation: tracing, cuts, undergrounds, merges, audit under churn |
 | [tests/test_belts.py](tests/test_belts.py) | the closed form against the naive oracle, on fixed and randomised configs |
+| [tests/test_item_render.py](tests/test_item_render.py) | reads the framebuffer back: do discs appear where the simulation says? |
 
 **Scenarios are independent.** `harness.reset()` clears the board, camera,
 input state and toolbelt before each one, so a failure names the scenario
@@ -74,6 +75,13 @@ mode.
 2, not 3, so a single `advance()` spanning several periods runs an unreliable
 number of ticks. Tests that care about the count use `request_step(n)` or
 one `advance()` per tick rather than pinning the division.
+
+`harness.reset()` restores the tick **rate** as well as the timeline.
+`clock.reset()` deliberately keeps the rate (it is configuration, not
+timeline), so without this a scenario that set 30/s left every later one
+banking half a tick per frame — `alpha` landing mid-tick and every item
+rendering half a cell from where a whole-tick assertion expected it. That
+surfaced as one shuffle seed in twelve failing a pixel test.
 
 ## Controls
 
@@ -140,6 +148,7 @@ everything else is grouped by layer.
 | [core/tick.py](core/tick.py) | the simulation clock: tick counter, fixed timestep, phase order |
 | [core/segments.py](core/segments.py) | belt runs coalesced into the O(1) simulation unit; derived from the grid |
 | [core/belts.py](core/belts.py) | closed-form item transport, and the naive oracle it is tested against |
+| [core/belt_device.py](core/belt_device.py) | packs segment + item state into SSBOs for the renderer |
 | [engine.py](engine.py) | preview/commit a plan, erase, ghost lifecycle |
 | [render/camera.py](render/camera.py) | pan/zoom, world↔screen, the world render pass |
 | [render/shader_loader.py](render/shader_loader.py) | reads `shaders/`, resolves `#include` |
@@ -457,6 +466,89 @@ engine's transport is on that list, and a blanket clear silently stops the
 whole simulation. A test cleanup did exactly that, and the symptom surfaced
 three files later as "the belt phase ran but nothing moved"; `harness.reset()`
 now asserts the callback is still there.
+
+### Item rendering
+
+Items draw as discs with a coloured ring — **green above zero, red at or
+below** — sized by `ITEM_RADIUS` in [world.frag](shaders/world.frag)'s
+tunables. No text: glyph rendering is a project of its own, and sign is what
+is worth reading at a glance.
+
+**The shader recomputes positions; it never reads them.** Materialising
+O(items) of state per frame is exactly the cost the closed form avoids, so
+[core/belt_device.py](core/belt_device.py) uploads `head`/`tail`/`anchor`,
+the ring contents, and the constants, and `item_position()` in
+`common.glsl` evaluates `min(unblocked, packed)` per pixel. It is a second
+implementation of the formula, so `tests/test_glsl.py` pins its pieces
+against `BeltSim.position_of()`.
+
+Layout: two parallel arrays of fixed-size vectors (`ivec4` + `vec4` per
+segment, indexed by segment id) plus a flat item arena carved by prefix sum
+over `cap`. Not one packed struct — std430 alignment for mixed-type structs
+is a reliable source of silent corruption. Bindings 1/2/3, pinned against
+`render/camera.py` by a test.
+
+**Finding which items cover a pixel is by bisection over `k`.** A pixel knows
+its segment and offset from `.w`; the items that could reach it are found by
+bisecting on position, then scanning a few forward. The only property that
+always holds is monotonicity — position strictly decreases in `k` whichever
+term of the `min` binds — so bisection is correct in every case. Two
+cheaper-looking brackets were tried first and both drew discs in some
+situations and not others:
+
+- Inverting the **packed** term algebraically. It is an upper bound derived
+  from the anchor, which on a free-flowing belt sits far ahead of every real
+  item, so the result lands past `tail` and finds nothing.
+- Clamping that result into range. It then skips the *oldest* items — a run
+  drew its first four discs and dropped the rest.
+
+**Items draw last, over the frustration tint.** An item is cargo *on* a cell,
+not part of it. The tint is a 55%-alpha red wash over the whole cell, so
+drawing items under it made a green item read as red-brown — reporting the
+wrong sign — for as long as the player held a blocked structure over the
+belt.
+
+**Only `GHOST_PENDING` suppresses items**, not `GHOST_FRUSTRATED`: a
+frustrated cell is a real belt with real items, the same distinction segment
+derivation makes. (The guard is currently defensive rather than
+load-bearing — a ghost only spawns on an empty cell and `clear_cell()` zeroes
+`.w`, so `draw_items()` returns early anyway. A future tool that previews
+*over* existing belt would make it matter.)
+
+Buried underground positions hold items but have no cell to draw in, so items
+pop out of existence across a span and back — deliberate, per the design.
+
+#### Pixel tests
+
+[tests/test_item_render.py](tests/test_item_render.py) renders offscreen and
+reads the framebuffer back. These are the only tests that can catch a bug
+living between a correct simulation and a correct-looking picture, and writing
+them found four:
+
+1. **`Segment.anchor` was initialised in cells, not fixed point.** The
+   simulation hid it completely — the unblocked term of the `min` is the
+   smaller one until a belt backs up — so it surfaced only when the renderer
+   read the anchor directly and drew nothing. `BeltSim.audit()` now checks it
+   on a fresh segment.
+2. and 3. The two broken brackets above.
+4. **Items drawn under the frustration tint** (above).
+
+Three habits these tests need:
+
+- **Sample by peak colour cast, not mean.** A disc is antialiased and blended
+  over the belt; averaging in the surrounding grey drops the hue below any
+  threshold.
+- **Pin `alpha` to 0** (`_at_whole_tick()`) when comparing against whole-cell
+  offsets. `harness.step()` banks real dt, so two screenshots either side of
+  one are taken at different sub-tick times and items legitimately move
+  between them — which looks exactly like a rendering bug.
+- **Reload the shader first.** `Camera` compiles once at harness import, so an
+  edit to the shader source afterwards is invisible otherwise. This hid a
+  whole round of mutation testing.
+
+Note that a *red* item under the red frustration tint is indistinguishable
+from the tint alone — the frustration test uses green items for that reason,
+and passed for the wrong reason until it did.
 
 #### Observability
 
@@ -785,6 +877,10 @@ implements a minimal one by textual substitution, with an implicit include
 guard (a file already pulled in is skipped). That exists so the cell encoding
 has exactly one GLSL copy.
 
+**`packed` and `patch` are GLSL reserved words.** Both were used as local
+variable names and both produced a bare `syntax error, unexpected '='` with
+no mention of the keyword. Worth knowing before debugging one.
+
 `load()` also takes a set of `defines`, injected as `#define` lines
 immediately after `#version` (which GLSL requires to stay first). Optional
 features live behind `#ifdef` rather than a uniform branch so a disabled
@@ -968,9 +1064,9 @@ Noted so they are not mistaken for oversights: **structure** simulation
 oracle-verified — but no gate fires: none of the signatures in the machine
 table are evaluated, no arithmetic happens, and `Source`/`Sink` neither
 produce nor consume. `Engine.debug_feed` stands in for them);
-**item rendering** (positions are computed and inspectable but nothing is
-drawn — `sim_tick`/`sim_alpha` reach the shader and are still unused, so
-GLSL strips them);
+**item-to-gate transit** (items pop in and out of existence at the ends of a
+run rather than being seen to enter or leave a machine — deliberate for now);
+**numbers on items** (a disc shows only the sign of its value, via colour);
 **incremental segment rebuild** (currently whole-board on any real edit;
 the inspector reports rebuild counts so there is a number to point at before
 anyone optimises it);

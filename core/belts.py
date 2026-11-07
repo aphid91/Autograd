@@ -285,6 +285,27 @@ class BeltSim:
                 problems.append(
                     f"segment {seg.sid}: anchor {seg.anchor} past the end "
                     f"{length}")
+            if seg.anchor < 0:
+                problems.append(
+                    f"segment {seg.sid}: anchor {seg.anchor} is negative")
+            # The anchor must be on the fixed-point scale, not the cell
+            # scale. A units mix-up here is invisible to the simulation --
+            # the unblocked term of the min is the smaller one until a belt
+            # actually backs up, so a wrong anchor sits there for thousands
+            # of ticks doing nothing -- and then places every item wrongly
+            # the moment a clump forms or the renderer reads it. That
+            # happened: Segment.__init__ initialised it in cells.
+            #
+            # Only checkable on a segment nothing has touched yet: after a
+            # pop the anchor legitimately sits at max(0, L - spacing), which
+            # on a short belt can be 0 even though the run is empty.
+            if (seg.head == 0 and seg.tail == 0
+                    and seg.anchor != length):
+                problems.append(
+                    f"segment {seg.sid}: untouched but anchor is "
+                    f"{seg.anchor}, expected the far end {length} "
+                    f"(a units mix-up? length is in cells, anchor in "
+                    f"UNIT-ths of a cell)")
         return problems
 
     def total_items(self):

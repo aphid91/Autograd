@@ -275,7 +275,7 @@ class Orchestrator:
 
         # 8. device sync, then render
         self.ui.last_upload = engine.sync_to_device()
-        self.camera.render(viewport, engine.clock)
+        self.camera.render(viewport, engine.clock, engine.belt_device)
 
     def seed_demo(self):
         """A few belts so the board is not empty on first run."""

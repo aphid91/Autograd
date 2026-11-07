@@ -91,6 +91,27 @@ uniform float sim_alpha;      // fraction into the next tick, 0..1
 // Entity.Underground.MAX_SPAN -- test_drive.py pins the two together.
 #define UNDER_MAX_SPAN    5
 
+// --- belt items ---
+// Each item is a disc with a coloured ring, green when its value is above
+// zero and red otherwise. No text: glyph rendering is a project of its own,
+// and sign is the one thing worth reading at a glance.
+#define ITEM_RADIUS       0.22   // disc radius, in cells
+#define ITEM_RING         0.055  // ring thickness, in cells
+#define COL_ITEM_POS      vec3(0.38, 0.82, 0.42)   // value > 0
+#define COL_ITEM_NEG      vec3(0.90, 0.36, 0.34)   // value <= 0
+#define COL_ITEM_FILL     vec3(0.14, 0.15, 0.18)   // disc interior
+// How many items to examine per pixel once bisection has found the first
+// candidate. Only items within (0.5 + ITEM_RADIUS) cells can colour a pixel
+// and consecutive items are at least `spacing` apart, so at the default
+// spacing of one cell a handful is plenty -- the scan breaks out as soon as
+// it passes behind the cell. Raise it only if spacing drops well below the
+// disc radius.
+#define ITEM_SCAN         4
+// Bisection steps to locate that first candidate. Needs ceil(log2(ring
+// capacity)); 16 covers a 65536-slot ring, far past the 16-bit cap on a
+// segment's length.
+#define ITEM_BISECT       16
+
 // --- segment debug overlay ---
 // Tints each belt cell by a hash of its segment id, so a run's extent and
 // where it is cut are visible at a glance. Compiled out entirely unless
@@ -428,6 +449,115 @@ vec3 segment_colour(int sid) {
 }
 #endif
 
+// ======================================================================
+// Belt items
+// ======================================================================
+//
+// A pixel knows, from its own cell's .w, which segment it is on and how far
+// along (`offset`). Items are indexed by the monotonic counter `k`, so the
+// job is to find the handful of k whose position lands within a disc radius
+// of this cell -- without looping over every item on the run.
+//
+// The one property that always holds is **monotonicity**: position strictly
+// decreases in k (item k is at least `spacing` ahead of k+1), whichever term
+// of the min happens to be binding. So the first item at or behind this cell
+// can be found by **bisection** over k, then a short forward scan covers the
+// two or three whose discs could overlap.
+//
+// Bisection rather than inverting a formula, because neither term inverts
+// usefully:
+//
+//   * The **packed** term inverts algebraically, but it is an upper bound
+//     derived from the anchor -- and on a free-flowing belt the anchor sits
+//     far ahead of every actual item, so the result lands past `tail` and
+//     finds nothing. Clamping it into range then skips the *oldest* items
+//     instead. Both were tried; both drew discs in some situations and not
+//     others.
+//   * The **unblocked** term depends on each item's own enter_tick and does
+//     not invert at all.
+//
+// Bisection needs only the ordering, so it is correct in every case rather
+// than in some, and costs log2(cap) steps -- a handful, bounded by
+// ITEM_BISECT.
+//
+// `travel` is the direction material moves through this cell, so the disc
+// can be placed along the right axis: an item's position is a distance along
+// the run, and the cell has to convert that into a local offset.
+
+// Coverage of one item's disc at cell-local position `p`, given the item's
+// distance along the run relative to this cell's centre.
+//
+// Returns (body, ring) coverage. `along` is in cells, signed, measured
+// along `axis` from the cell centre.
+vec2 item_disc(vec2 p, vec2 axis, float along, float px) {
+    vec2 at = axis * along;
+    float d = length(p - at);
+    float body = fill(d - ITEM_RADIUS, px);
+    // The ring is the annulus just inside the rim.
+    float ring = fill(d - ITEM_RADIUS, px)
+               * (1.0 - fill(d - (ITEM_RADIUS - ITEM_RING), px));
+    return vec2(body, ring);
+}
+
+// Draw whatever items overlap this cell. Returns colour-with-coverage:
+// .rgb premultiplied tint, .a total coverage.
+vec4 draw_items(ivec4 c, vec2 p, int travel, float px) {
+    vec4 out_col = vec4(0.0);
+
+    int sid = segment_id(c.w);
+    if (sid == 0) return out_col;
+
+    ivec4 si = seg_i[sid];
+    int head = si.x, tail = si.y;
+    if (head == tail) return out_col;          // nothing on this run
+
+    vec4 sf = seg_f[sid];
+    float spacing = max(sf.w, 1.0);
+    // This cell's centre as a distance along the run, in fixed point.
+    float here = float(segment_offset(c.w)) * BELT_UNIT;
+    vec2 axis = dir_vec(travel);
+    // How far along the run an item can be and still touch this cell.
+    float reach = (0.5 + ITEM_RADIUS) * BELT_UNIT;
+
+    // Bisect for the smallest k whose position is within reach behind us.
+    // Everything at smaller k is further forward and cannot touch this cell.
+    int lo = head, hi = tail - 1;
+    for (int i = 0; i < ITEM_BISECT; ++i) {
+        if (lo >= hi) break;
+        int mid = lo + (hi - lo) / 2;
+        if (item_position(sid, mid, sim_tick, sim_alpha) > here + reach) {
+            lo = mid + 1;
+        } else {
+            hi = mid;
+        }
+    }
+
+    // Scan forward from there. Positions are ordered, so once an item is
+    // behind us by more than `reach` every later one is too and the loop can
+    // stop.
+    for (int i = 0; i < ITEM_SCAN; ++i) {
+        int k = lo + i;
+        if (k >= tail) break;
+
+        float pos = item_position(sid, k, sim_tick, sim_alpha);
+        float delta = pos - here;
+        if (delta < -reach) break;      // behind us, and so is everything after
+        if (delta > reach) continue;    // still ahead of this cell
+
+        vec2 cov = item_disc(p, axis, delta / BELT_UNIT, px);
+        if (cov.x <= 0.0) continue;
+
+        float value = item_payload(sid, k);
+        vec3 edge = (value > 0.0) ? COL_ITEM_POS : COL_ITEM_NEG;
+        // Fill first, then the ring over it.
+        vec3 col = mix(COL_ITEM_FILL, edge, cov.y);
+        // Whichever disc covers this pixel most wins, so overlapping discs
+        // (possible when spacing < 2 * radius) do not flicker by index.
+        if (cov.x > out_col.a) out_col = vec4(col, cov.x);
+    }
+    return out_col;
+}
+
 // A port arrow: a chevron at `offset` from the cell centre, pointing along
 // `face` (outward) or against it (inward).
 float port_arrow(vec2 p, int face, bool inward, float px) {
@@ -518,7 +648,6 @@ void main() {
             BeltDraw b = draw_belt(p, ci, c, px, world);
             col = mix(col, COL_BELT, b.body * alpha_scale);
             col = mix(col, COL_CHEVRON, b.chevron * alpha_scale);
-
         } else if (type == TYPE_UNDER) {
             // A funnel, mouth on the surface side. An entrance's mouth faces
             // back the way material came; an exit's faces the way it goes.
@@ -536,6 +665,10 @@ void main() {
                                          CHEVRON_LEN, CHEVRON_SPAN,
                                          CHEVRON_THICK), px);
             col = mix(col, COL_CHEVRON, chev * a * alpha_scale);
+            // An underground *end* is an ordinary position on its run, so it
+            // carries items like any belt cell. The buried span between a
+            // pair holds items too, but has no cell to draw them in -- they
+            // deliberately pop out of existence and back, per the design.
 
         } else if (type != TYPE_EMPTY) {
             int facing = cell_dir(c.x);
@@ -738,6 +871,25 @@ void main() {
         if (gstate == GHOST_FRUSTRATED) {
             float sd = sd_box(p, vec2(FRUSTRATED_INSET));
             col = mix(col, COL_FRUSTRATED, fill(sd, px) * FRUSTRATED_ALPHA);
+        }
+
+        // --- belt items, last ------------------------------------------
+        // Items are cargo *on* a cell, not part of it, so they draw over
+        // everything the cell itself put down -- including the frustration
+        // tint. That ordering matters: the tint is a 55%-alpha red wash over
+        // the whole cell, and drawing items under it left a green item
+        // reading as red-brown, i.e. reporting the wrong sign, for as long
+        // as the player held a blocked structure over the belt.
+        //
+        // A ghost draws none: it has no simulation state, and its .w holds
+        // whatever the cell carried before the preview covered it. A
+        // *frustrated* cell is a real belt with real items -- the overlay
+        // leaves .x and .w untouched -- so it keeps drawing them. Same
+        // distinction segment derivation makes: only GHOST_PENDING is
+        // fictional.
+        if (gstate != GHOST_PENDING && is_beltlike(type)) {
+            vec4 it = draw_items(c, p, cell_dir(c.x), px);
+            col = mix(col, it.rgb, it.a);
         }
     }
 

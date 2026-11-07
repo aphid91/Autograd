@@ -13,9 +13,9 @@ GLSL consuming those tables does the authored/placed conversion correctly.
 """
 import re as _re
 
-from core import cell, glsl_types
+from core import belt_device, belts, cell, glsl_types
 from core.entity import STRUCTURES, Underground
-from render import shader_loader
+from render import camera, shader_loader
 
 from tests.harness import ok
 
@@ -226,6 +226,100 @@ def test_glsl_underground_constants_match():
         assert _glsl_int(_name) == _want, (
             f"{_name}: shader {_glsl_int(_name)}, cell.py {_want}")
     ok(f"GLSL underground constants match (span {_glsl_span})")
+
+def test_glsl_segment_encoding_matches_python():
+    # The shader unpacks .w to find which segment a cell is on and how far
+    # along; a shifted field would put every item on the wrong belt.
+    for _name, _want in [("SEG_OFF_SHIFT", cell.SEG_OFF_SHIFT),
+                         ("SEG_OFF_MASK", cell.SEG_OFF_MASK),
+                         ("SEG_ID_SHIFT", cell.SEG_ID_SHIFT),
+                         ("SEG_ID_MASK", cell.SEG_ID_MASK)]:
+        assert _glsl_int(_name) == _want, (
+            f"{_name}: shader {_glsl_int(_name)}, cell.py {_want}")
+    ok("GLSL segment field layout matches core/cell.py")
+
+
+def test_glsl_belt_unit_matches_python():
+    # BELT_UNIT scales every position the shader computes. If it disagreed
+    # with belts.UNIT, items would render at a constant multiple of their
+    # real positions -- which looks like a plausible belt at a glance.
+    _m = _re.search(r"const float BELT_UNIT\s*=\s*([0-9.]+)", _src)
+    assert _m, "BELT_UNIT not found in shader source"
+    _glsl_unit = float(_m.group(1))
+    assert _glsl_unit == float(belts.UNIT), (
+        f"shader BELT_UNIT {_glsl_unit} != belts.UNIT {belts.UNIT}")
+    ok(f"GLSL BELT_UNIT matches belts.UNIT ({belts.UNIT})")
+
+
+def test_glsl_ssbo_bindings_match_the_camera():
+    # The camera binds buffers to numbered slots and the shader declares
+    # those numbers; a mismatch is silent -- the shader reads whatever else
+    # happens to be bound there, or zeroes.
+    _bindings = dict(_re.findall(
+        r"layout\(std430,\s*binding\s*=\s*(\d+)\)\s*buffer\s+(\w+)", _src))
+    _by_name = {name: int(slot) for slot, name in _bindings.items()}
+    assert _by_name.get("SegmentsI") == camera.SEG_I_SSBO_BINDING, _by_name
+    assert _by_name.get("SegmentsF") == camera.SEG_F_SSBO_BINDING, _by_name
+    assert _by_name.get("BeltItems") == camera.ITEM_SSBO_BINDING, _by_name
+    # Every declared binding must be distinct, including the entity SSBO the
+    # camera binds at 0 even though no shader reads it yet.
+    _slots = sorted(_by_name.values()) + [camera.ENTITY_SSBO_BINDING]
+    assert len(set(_slots)) == len(_slots), f"duplicate SSBO binding: {_slots}"
+    ok(f"GLSL SSBO bindings match render/camera.py ({_by_name})")
+
+
+def test_glsl_segment_record_layout_matches_the_device():
+    # The shader reads head/tail/base/cap from an ivec4 and
+    # anchor/length/speed/spacing from a vec4, by swizzle. Those positions
+    # are decided by core/belt_device.py, so the field order has to agree --
+    # a transposed pair here would be read as a plausible-looking number.
+    _body = _re.search(r"float item_position\([^)]*\)\s*\{(.*?)\n\}",
+                       _src, _re.S)
+    assert _body, "item_position() not found"
+    _b = _body.group(1)
+    # si.x head, si.y tail (unused here), si.z base, si.w cap
+    assert "si.z + (k % si.w)" in _b, (
+        "the ring slot must be base + k % cap, i.e. si.z + k % si.w")
+    assert "float(k - si.x)" in _b, (
+        "the packed term must offset from head, i.e. si.x")
+    # sf.x anchor, sf.y length, sf.z speed, sf.w spacing
+    assert "min(sf.x + alpha * sf.z, sf.y)" in _b, (
+        "the render-time anchor must be min(anchor + alpha*speed, length)")
+    assert "* sf.w" in _b, "the packed term must use spacing, i.e. sf.w"
+    for _name, _idx, _want in [
+            ("SEG_I_HEAD", belt_device.SEG_I_HEAD, 0),
+            ("SEG_I_TAIL", belt_device.SEG_I_TAIL, 1),
+            ("SEG_I_BASE", belt_device.SEG_I_BASE, 2),
+            ("SEG_I_CAP", belt_device.SEG_I_CAP, 3),
+            ("SEG_F_ANCHOR", belt_device.SEG_F_ANCHOR, 0),
+            ("SEG_F_LENGTH", belt_device.SEG_F_LENGTH, 1),
+            ("SEG_F_SPEED", belt_device.SEG_F_SPEED, 2),
+            ("SEG_F_SPACING", belt_device.SEG_F_SPACING, 3)]:
+        assert _idx == _want, (
+            f"{_name} is {_idx}; the shader's swizzles assume {_want}")
+    ok("GLSL item_position() reads the belt_device record layout correctly")
+
+
+def test_glsl_item_position_mirrors_the_python_closed_form():
+    # The shader recomputes positions rather than reading them, so it is a
+    # second implementation of the closed form and can drift from
+    # BeltSim.position_of(). Pin the pieces that encode the actual maths.
+    _body = _re.search(r"float item_position\([^)]*\)\s*\{(.*?)\n\}",
+                       _src, _re.S).group(1)
+    # The age term, capped, exactly as Python caps it.
+    assert "tick - int(items[slot].x)" in _body and "+ alpha" in _body, (
+        "age must be (tick - enter_tick) + alpha")
+    assert "min(age," in _body, "age must be capped, as in Python"
+    # The result is the min of the two terms -- the heart of the formula.
+    assert "min(unblocked, packed_pos)" in _body, (
+        "position must be min(unblocked, packed)")
+    # And the anchor clamp, which is the bug that let a blocked clump slide
+    # off the end of the belt between ticks.
+    assert "min(sf.x + alpha * sf.z, sf.y)" in _body, (
+        "the fractional anchor must be clamped to the belt length, matching "
+        "the whole-tick min(anchor + speed, length)")
+    ok("GLSL item_position() mirrors BeltSim.position_of()")
+
 
 def test_probe_reach_spans_the_longest_footprint():
     # The shader's footprint probe must reach far enough to span the largest

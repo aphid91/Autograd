@@ -62,6 +62,69 @@ int segment_id(int w) { return (w >> SEG_ID_SHIFT) & SEG_ID_MASK; }
 // contributing a drawn cell, which is why it is stored rather than counted.
 int segment_offset(int w) { return (w >> SEG_OFF_SHIFT) & SEG_OFF_MASK; }
 
+// --- belt item transport -------------------------------------------------
+//
+// The closed form from docs/belt_report.md, evaluated per pixel. MUST match
+// BeltSim.position_of() in core/belts.py -- tests/test_glsl.py pins the two.
+//
+// Positions are never stored, so the shader recomputes them rather than
+// reading them: materialising O(items) of state per frame is exactly the
+// cost the closed form exists to avoid. What it reads instead is the three
+// mutable per-segment values the CPU tick maintains, plus the ring.
+//
+// Layout mirrors core/belt_device.py. Two parallel arrays of fixed-size
+// vectors rather than one struct: std430's alignment rules for mixed-type
+// structs are a reliable source of silent corruption.
+
+//: Fixed-point scale. MUST match belts.UNIT in core/belts.py.
+const float BELT_UNIT = 256.0;
+
+layout(std430, binding = 1) buffer SegmentsI {
+    // .x head, .y tail, .z base, .w cap
+    ivec4 seg_i[];
+};
+layout(std430, binding = 2) buffer SegmentsF {
+    // .x anchor, .y length, .z speed, .w spacing
+    vec4 seg_f[];
+};
+layout(std430, binding = 3) buffer BeltItems {
+    // .x enter_tick, .y payload
+    vec2 items[];
+};
+
+// Where item `k` of a segment sits at `tick + alpha`, in fixed point.
+//
+// `tick` and `alpha` stay separate rather than arriving as one float: the
+// tick counter grows without bound and a float32 loses sub-tick resolution
+// past ~16.7M ticks, and `anchor` is the value as of the *whole* tick, so
+// alpha has to be applied to it explicitly rather than recovered with
+// fract().
+//
+// The anchor advances with alpha *including* the clamp at the end, matching
+// the whole-tick `min(anchor + v, L)`. Without that clamp a blocked clump
+// slides forward between ticks and the head drifts off the end of the belt.
+float item_position(int sid, int k, int tick, float alpha) {
+    ivec4 si = seg_i[sid];
+    vec4  sf = seg_f[sid];
+    int   slot = si.z + (k % si.w);
+
+    float age = float(tick - int(items[slot].x)) + alpha;
+    // Cap the age so a long-settled item cannot lose precision in the
+    // product; anything past the end is clamped by the min anyway.
+    age = min(age, sf.y / max(sf.z, 1.0) + 1.0);
+    float unblocked = age * sf.z;
+
+    float anchor = min(sf.x + alpha * sf.z, sf.y);
+    // Not named `packed` -- that is a GLSL reserved word.
+    float packed_pos = anchor - float(k - si.x) * sf.w;
+    return min(unblocked, packed_pos);
+}
+
+float item_payload(int sid, int k) {
+    ivec4 si = seg_i[sid];
+    return items[si.z + (k % si.w)].y;
+}
+
 bool is_empty(int w) { return cell_type(w) == TYPE_EMPTY; }
 
 // --- structure ports ----------------------------------------------------
