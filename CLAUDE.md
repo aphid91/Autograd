@@ -89,7 +89,7 @@ surfaced as one shuffle seed in twelve failing a pixel test.
 | Input | Action |
 |---|---|
 | `WASD` | pan |
-| `Q` / `E` | zoom out / in |
+| `Q` | **pipette**: fill an empty hand from the board, or empty a full one |
 | Scroll | zoom, anchored at the cursor |
 | Left-drag | pan the camera |
 | `F` | **per-tool**: flip (mirror) the held structure |
@@ -109,6 +109,52 @@ manager reports only that they were pressed and the active builder decides.
 Adding a tool with its own notion of "cycle" or "flip" needs no input-layer
 change. `F` took the bare key from frame-the-board (now `shift+F`) because
 flipping is the far more frequent action.
+
+`Q` is resolved the same way: the input manager reports the press, the
+**orchestrator** decides, because only it knows what the hand holds. Zoom has
+no key binding at all now — scroll is the only one.
+
+### The empty hand is a real state
+
+The default is holding **nothing**, Factorio-style: clicking the board does
+nothing, and no slot is highlighted. `Toolbelt.selected` is `NO_SELECTION`
+(`-1`) then, which is deliberately *not* the same as selecting an empty slot —
+`empty_handed` distinguishes them where `active is None` cannot. The
+distinction earns its keep twice: selecting an empty slot is a deliberate act
+that should look different from holding nothing, and the planned
+structure-selection tool lives on the empty hand rather than on slot 7.
+
+`harness.reset()` leaves the hand empty, so every scenario starts from the
+app's real default and declares the tool it needs. That also stops `reset()`
+leaving a stray ghost — its trailing `step()` would otherwise have a
+drag-based tool preview its idle run, and a scenario opening with
+`live_count == 0` would fail on a board it never touched.
+
+**Q never consults the board when the hand is full.** It is the universal
+"put this down", so it must not depend on what happens to be under the
+cursor. Only an empty hand looks at the board, and picking up copies the
+*orientation* as well as the type (`EntityBuilder.adopt()`) — both halves,
+since a mirrored chiral machine looks identical in outline and wires up
+differently. `Engine.entity_at()` skips ghosts for this: a preview ghost sits
+under the cursor when Q is pressed, and picking up the topmost entity would
+hand back what the player already holds.
+
+Every tool names the type it places (`EntityBuilder.entity_cls`), so
+`Toolbelt.select_tool_for()` is a generic lookup rather than a per-type
+branch. A type with no builder fails softly and leaves the hand empty.
+
+### A drag-based tool previews while idle
+
+The belt planner ghosts a single cell under the cursor even with no plan
+started. Without it, "belt planner, no plan" and "empty hand" are
+pixel-identical and the player cannot tell whether a click will build. The
+ghost's facing comes from `quadrant_dir()`, so it swivels within the cell to
+show exactly the heading a single click would produce.
+
+Cancelling a run clears the input manager's hover memo, so the idle preview
+returns on the **next** frame rather than waiting for the cursor to move —
+otherwise a cancel leaves the hand looking empty. Tests that assert the
+settled state after a cancel need that extra `step()`.
 
 ### A left-press is ambiguous, so building happens on release
 
@@ -721,6 +767,7 @@ The two builders differ in exactly two ways:
 | `drag_based` | `True` (press, move, click) | `False` (hover, click) |
 | `R` means | cycle path shape | rotate 90° (`shift+R` reverses) |
 | `F` means | nothing | mirror, if the type is chiral |
+| `adopt()` takes | nothing | the rotation and the flip |
 
 `drag_based` is the one place the gesture style leaks out: a click-based tool
 never enters `PLANNING`, it previews under the cursor while `IDLE` and commits

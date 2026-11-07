@@ -89,6 +89,21 @@ class Engine:
         """Can a new entity go here? Occupied and out-of-bounds cells cannot."""
         return self.board.is_empty(x, y)
 
+    def entity_at(self, x, y, skip_ghosts=True):
+        """The real entity occupying (x, y), or None.
+
+        Ghosts are skipped by default, which is what the pipette needs: a
+        preview ghost sits under the cursor at the moment Q is pressed, so
+        picking up the topmost entity would hand back whatever the player is
+        already holding instead of what is built there.
+        """
+        view = self.board.entity_at(x, y)
+        if view is None:
+            return None
+        if skip_ghosts and view.is_ghost:
+            return None
+        return view
+
     # --- plan preview / commit ------------------------------------------
     def clear_ghosts(self):
         """Drop the whole preview: ghost entities and frustration overlays.

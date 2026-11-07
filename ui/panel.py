@@ -332,9 +332,14 @@ class UI:
                     req.select_slot = i
                 imgui.pop_style_color(2)
 
-            # Active tool's state, under the bar.
+            # Active tool's state, under the bar. An empty hand says so: it is
+            # the default state and clicking does nothing, which is worth
+            # stating rather than leaving the line blank.
             active = belt.active
-            if active is not None:
+            if belt.empty_handed:
+                imgui.text_disabled("(empty hand)  —  Q picks up what is "
+                                    "under the cursor")
+            elif active is not None:
                 status = active.status()
                 imgui.text_disabled(f"{active.name}" + (f"  —  {status}" if status else ""))
                 imgui.same_line()
@@ -484,9 +489,10 @@ class UI:
 
         imgui.separator()
         imgui.text_unformatted("Controls")
-        imgui.text("WASD pan    Q/E or scroll: zoom    F frame")
+        imgui.text("WASD pan    scroll: zoom    shift+F frame")
         imgui.text("Left-drag: pan the camera")
         imgui.text("1-9,0: select tool")
+        imgui.text("Q: pick up what's under the cursor / empty the hand")
         imgui.text("Left-click: build with the active tool")
         imgui.text("R / shift+R: per-tool (belt shape, structure rotation)")
         imgui.text("Right-click: cancel plan / drag to erase")

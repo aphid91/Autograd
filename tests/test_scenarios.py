@@ -37,7 +37,12 @@ def test_seeded_board_renders():
 
 def test_plan_a_belt_run_cycle_modes_commit():
     """Plan a belt run, cycle modes, commit."""
-    assert board.live_count == 0
+    select_tool("Belt")
+    # Nothing *built* yet. Not live_count == 0: selecting a drag-based tool
+    # starts previewing a one-cell idle run straight away, and a ghost is a
+    # live row occupying a real cell -- so the count that means "empty board"
+    # is belt cells minus ghosted ones.
+    assert cells_of_type(cell.TYPE_BELT) - ghost_cell_count() == 0
     put_cursor_at_cell(10, 10); step()
 
     click()                               # press+release -> PLANNING
@@ -73,21 +78,39 @@ def test_plan_a_belt_run_cycle_modes_commit():
 
 def test_cancel_with_right_click():
     """Cancel with right click."""
-    # Baseline BEFORE planning: ghosts are real rows and do count toward
-    # live_count, so the invariant is "cancel returns to the pre-plan count".
-    live_before = board.live_count
+    select_tool("Belt")
+    # Baseline is a plain *hover*, not an untouched board: a drag-based tool
+    # previews a one-cell run while idle (that ghost is what distinguishes
+    # "belt planner, no plan" from "empty hand"), so cancelling a run returns
+    # to one ghost rather than to none. Ghosts are real rows and do count
+    # toward live_count, hence measuring the hover rather than assuming zero.
     put_cursor_at_cell(40, 40); step()
+    live_hovering = board.live_count
+    ghosts_hovering = len(engine.ghost_rows)
+    assert ghosts_hovering == 1, (
+        f"idle hover should preview exactly one belt, got {ghosts_hovering}")
+
     click()
     assert orch.input.state == STATE_PLANNING
     put_cursor_at_cell(46, 44); step()
-    assert len(engine.ghost_rows) > 0
-    assert board.live_count > live_before, "ghosts should be live rows"
+    assert len(engine.ghost_rows) > ghosts_hovering
+    assert board.live_count > live_hovering, "ghosts should be live rows"
     fake["right"] = True; step()
     assert orch.input.state == STATE_IDLE, orch.input.state
-    assert not engine.ghost_rows, "cancel must drop ghosts"
-    assert board.live_count == live_before, (
-        f"cancel must restore the pre-plan count: {board.live_count} != {live_before}")
-    assert int((cell.ghost_state_arr(board.grid[:, :, cell.CH_Z]) == cell.GHOST_PENDING).sum()) == 0
+    assert not engine.ghost_rows, "the cancel frame itself drops every ghost"
+    # The idle preview comes back on the next frame, with the cursor still
+    # where it was -- the cancel forgets the hover memo precisely so the hand
+    # does not look empty until the mouse moves.
+    step()
+    assert board.live_count == live_hovering, (
+        f"cancel must restore the hovering count: {board.live_count} != "
+        f"{live_hovering}")
+    assert len(engine.ghost_rows) == ghosts_hovering, (
+        "cancel must drop the planned run, leaving only the idle preview")
+    # Nothing was *built*: every ghost flag still on the board belongs to the
+    # idle preview, which is one cell.
+    assert int((cell.ghost_state_arr(board.grid[:, :, cell.CH_Z])
+                == cell.GHOST_PENDING).sum()) == ghosts_hovering
     ok("right-click cancelled, nothing built")
 
     # The cancelling right-press must NOT have started an erase.
@@ -115,6 +138,7 @@ def test_crossing_an_existing_belt_skips_locked_cells():
 
 def test_blocked_cells_must_not_change_belt_orientation():
     """Blocked cells must not change belt orientation."""
+    select_tool("Belt")
     # Directions come from the unfiltered path, so what the player drew survives
     # interference. Regression for: a run whose neighbour is blocked used to fall
     # back to +X.
@@ -184,7 +208,11 @@ def test_fast_drag_leaves_no_gaps():
 
 def test_toolbelt_selection():
     """Toolbelt selection."""
-    assert orch.toolbelt.active.name == "Belt", orch.toolbelt.active.name
+    # The hand starts *empty*, Factorio-style -- not on slot 0. An empty hand
+    # is a distinct state from a selected-but-empty slot, so check both the
+    # tool and the hand.
+    assert orch.toolbelt.active is None, orch.toolbelt.active
+    assert orch.toolbelt.empty_handed, orch.toolbelt.selected
     # Select by name rather than by hardcoded digit: the slot order shifts
     # whenever a tool is added, and every test below cares about *which tool*,
     # never about which key reaches it.
@@ -386,6 +414,135 @@ def test_structures_are_centred_on_the_cursor_not_cornered_on_it():
     ok("2x1 Source tracks the pointer across x, ignores it up y")
 
     select_tool("Belt")
+
+def test_an_empty_hand_builds_nothing():
+    """The default state is an empty hand, and clicking does nothing.
+
+    Not the same as a selected-but-empty slot: an empty hand is its own
+    state, and a future structure-selection tool will live on it.
+    """
+    assert orch.toolbelt.empty_handed, orch.toolbelt.selected
+    assert orch.toolbelt.active is None
+
+    put_cursor_at_cell(20, 20); step()
+    assert not engine.ghost_rows, "an empty hand must not preview anything"
+    click()
+    assert board.live_count == 0, "an empty hand must not build"
+    assert board.is_empty(20, 20)
+    ok("an empty hand previews nothing and builds nothing")
+
+    # Erase still works -- it is not a tool, it is the right mouse button.
+    select_tool("Belt")
+    put_cursor_at_cell(21, 21); step(); click(); click()
+    assert not board.is_empty(21, 21), "setup: a belt should exist to erase"
+    orch.toolbelt.clear(); step()
+    fake["right"] = True; step(); fake["right"] = False; step()
+    assert board.is_empty(21, 21), "right-drag erase must work empty-handed"
+    ok("erase works with an empty hand")
+
+
+def test_q_picks_up_and_puts_down():
+    """Q is the pipette: fill an empty hand, or empty a full one."""
+    # Build something to pick up, with a non-default orientation so the
+    # clone has something to get wrong.
+    _sh = select_tool("Shear")
+    _sh.direction = cell.DIR_PY
+    _sh.flipped = True
+    put_cursor_at_cell(25, 25); step()
+    click()
+    _built = board.entity_at(25, 25)
+    assert _built is not None, "setup: a Shear should be placed"
+    _dir, _flip = _built.direction, bool(_built.flipped)
+
+    # Empty the hand, then pipette it back.
+    orch.toolbelt.clear(); step()
+    assert orch.toolbelt.empty_handed
+    press_key(glfw.KEY_Q)
+    tool = orch.toolbelt.active
+    assert tool is not None, "Q over a Shear should fill the hand"
+    assert tool.name == "Shear", tool.name
+    # Orientation must come across, both halves: rotation *and* flip. A
+    # mirrored chiral machine looks identical in outline and wires up
+    # differently, so taking only the rotation is a silent error.
+    assert tool.direction == _dir, (tool.direction, _dir)
+    assert tool.flipped == _flip, (tool.flipped, _flip)
+    ok(f"Q cloned a Shear at {cell.DIR_NAMES[_dir]} flipped={_flip}")
+
+    # Q again puts it down, whatever is under the cursor.
+    press_key(glfw.KEY_Q)
+    assert orch.toolbelt.empty_handed, orch.toolbelt.selected
+    assert not engine.ghost_rows, "putting down must drop the preview"
+    ok("Q with a full hand empties it")
+
+    # Q over bare ground leaves the hand empty rather than grabbing a slot.
+    put_cursor_at_cell(60, 60); step()
+    press_key(glfw.KEY_Q)
+    assert orch.toolbelt.empty_handed, (
+        f"Q over empty ground should stay empty, got {orch.toolbelt.active}")
+    ok("Q over bare ground is a no-op")
+
+
+def test_q_pipettes_a_belt_and_an_underground():
+    """The pipette is generic: every tool names the type it places."""
+    select_tool("Belt")
+    put_cursor_at_cell(30, 30); step(); click(); click()
+    assert not board.is_empty(30, 30), "setup: a belt"
+    orch.toolbelt.clear(); step()
+    put_cursor_at_cell(30, 30); step()
+    press_key(glfw.KEY_Q)
+    assert orch.toolbelt.active is not None and \
+        orch.toolbelt.active.name == "Belt", orch.toolbelt.active
+    ok("Q picked up a belt")
+
+    # An underground end carries its role as well as its facing: pipetting
+    # an exit should leave you holding an exit, not resuming the alternation.
+    _u = select_tool("Underground")
+    _u.direction = cell.DIR_PY
+    put_cursor_at_cell(35, 35); step(); click()      # entrance
+    put_cursor_at_cell(35, 38); step(); click()      # exit, pairs upward
+    _exit = board.entity_at(35, 38)
+    assert _exit is not None and _exit.is_exit, "setup: an exit at (35,38)"
+    orch.toolbelt.clear(); step()
+    put_cursor_at_cell(35, 38); step()
+    press_key(glfw.KEY_Q)
+    _t = orch.toolbelt.active
+    assert _t is not None and _t.name == "Underground", _t
+    assert _t.direction == cell.DIR_PY, cell.DIR_NAMES[_t.direction]
+    assert _t.placing_exit, "pipetting an exit should leave you laying an exit"
+    ok("Q picked up an underground exit with its facing and role")
+
+
+def test_the_belt_planner_shows_a_ghost_when_idle():
+    """A drag-based tool previews while idle, so the hand is never ambiguous.
+
+    Without this, "belt planner with no plan started" and "empty hand" are
+    pixel-identical and the player cannot tell whether a click will build.
+    """
+    put_cursor_at_cell(40, 40); step()
+    assert not engine.ghost_rows, "empty hand: nothing"
+
+    select_tool("Belt")
+    put_cursor_at_cell(40, 40); step()
+    assert len(engine.ghost_rows) == 1, (
+        f"the idle belt planner should ghost exactly one cell, got "
+        f"{len(engine.ghost_rows)}")
+    ok("the idle belt planner ghosts one cell")
+
+    # It follows the cursor rather than sticking where it first appeared.
+    put_cursor_at_cell(44, 41); step()
+    assert len(engine.ghost_rows) == 1
+    _g = board.entity_at(44, 41)
+    assert _g is not None and _g.is_ghost, "the idle ghost should follow"
+    ok("the idle ghost follows the cursor")
+
+    # And the facing tracks the sub-cell position, which is the heading a
+    # single click would actually produce.
+    put_cursor_at(50.9, 50.5); step()
+    assert cell.cell_dir(board.cell_word(50, 50)) == cell.DIR_PX
+    put_cursor_at(50.5, 50.9); step()
+    assert cell.cell_dir(board.cell_word(50, 50)) == cell.DIR_PY
+    ok("the idle ghost's facing follows the pointer within the cell")
+
 
 def test_underground_belts_pair_end_to_end():
     """Underground belts pair end to end."""
@@ -634,6 +791,7 @@ def test_a_blocked_structure_still_previews_the_part_that_fits():
 
 def test_switching_tools_drops_an_in_flight_preview():
     """Switching tools drops an in-flight preview."""
+    select_tool("Belt")
     put_cursor_at_cell(12, 12); step()
     click()
     put_cursor_at_cell(18, 12); step()
@@ -722,6 +880,7 @@ def test_save_load():
 
     # A preview must never reach the file: ghosts belong to a gesture, not the
     # board, and would reload as entities nobody placed.
+    select_tool("Belt")
     put_cursor_at_cell(40, 40); step()
     click()
     put_cursor_at_cell(46, 44); step()
@@ -770,6 +929,7 @@ def test_device_round_trip_after_all_that():
 
 def test_partial_upload_really_is_partial():
     """Partial upload really is partial."""
+    select_tool("Belt")
     board.to_device(force=True)
     put_cursor_at_cell(50, 50); step()
     click()
@@ -786,10 +946,16 @@ def test_left_drag_pans_instead_of_building():
     put_cursor_at_cell(30, 30); step()
     c_before = cam.center.copy()
     live_before = board.live_count
+    built_before = cells_of_type(cell.TYPE_BELT) - ghost_cell_count()
     drag_px(120.0, 0.0)
     assert orch.input.state == STATE_IDLE, orch.input.state
     assert board.live_count == live_before, "a drag must not build"
-    assert not engine.ghost_rows, "a drag must leave no preview"
+    # No *planned run* survives -- but the one-cell idle preview does, since
+    # the gesture ends back in IDLE with the cursor still over the board.
+    assert len(engine.ghost_rows) <= 1, (
+        f"a drag must leave no planned run, got {len(engine.ghost_rows)} ghosts")
+    assert cells_of_type(cell.TYPE_BELT) - ghost_cell_count() == built_before, \
+        "a drag must not build"
     assert abs(cam.center[0] - c_before[0]) > 1.0, (c_before, cam.center)
     ok(f"left-drag panned {c_before[0]:.1f} -> {cam.center[0]:.1f}, built nothing")
 
@@ -846,6 +1012,7 @@ def test_scroll_zooms_at_the_cursor():
 
 def test_sub_cell_aiming_through_the_full_stack():
     """Sub-cell aiming through the full stack."""
+    select_tool("Belt")
 
     def click_at_frac(cx, cy, fx, fy):
         """Click at a specific sub-cell position."""
@@ -885,11 +1052,15 @@ def test_camera_pan_zoom():
     fake["keys"].add(glfw.KEY_W); step(10); fake["keys"].discard(glfw.KEY_W)
     assert cam.center[1] > c0[1]
     ok(f"WASD panned to {cam.center.round(1)}")
+
+    # Q and E no longer zoom -- scroll is the only zoom binding, and Q is the
+    # pipette. Holding either must leave the zoom alone.
+    z1 = cam.zoom
     fake["keys"].add(glfw.KEY_E); step(10); fake["keys"].discard(glfw.KEY_E)
-    assert cam.zoom > z0, (z0, cam.zoom)
-    fake["keys"].add(glfw.KEY_Q); step(30); fake["keys"].discard(glfw.KEY_Q)
-    assert cam.zoom < z0, (z0, cam.zoom)
-    ok(f"Q/E zoomed to {cam.zoom:.1f}")
+    fake["keys"].add(glfw.KEY_Q); step(10); fake["keys"].discard(glfw.KEY_Q)
+    assert cam.zoom == z1, (
+        f"Q/E must not zoom any more: {z1} -> {cam.zoom}")
+    ok("Q and E no longer touch the zoom")
 
 def test_imgui_capture_gating():
     """Imgui capture gating."""

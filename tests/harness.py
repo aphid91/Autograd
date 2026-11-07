@@ -115,7 +115,12 @@ def reset():
             slot.direction = cell.DIR_PX
         if hasattr(slot, "flipped"):
             slot.flipped = False
-    orch.toolbelt.select(0)
+    # An empty hand is the app's default state, so it is the baseline every
+    # scenario starts from. It also keeps `reset()` from leaving a stray
+    # ghost: the trailing step() below would otherwise have a drag-based tool
+    # preview its one-cell idle run, and a scenario opening with
+    # `live_count == 0` would fail on a board it never touched.
+    orch.toolbelt.clear()
     cam.center[:] = (BOARD / 2, BOARD / 2)
     cam.zoom = 16.0
     # The clock is global state like everything else here: a scenario that

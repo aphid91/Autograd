@@ -33,6 +33,11 @@ cursor while IDLE and commits on a left *release* that was not a drag. Both
 styles hand the builder the same (anchor, target) pair, so builders need not
 care which gesture produced them.
 
+**Both styles preview while IDLE.** A drag-based tool shows a degenerate
+one-cell run, which is what distinguishes "holding the belt planner with no
+plan started" from "holding nothing" -- two states that are otherwise
+pixel-identical, leaving the player unable to tell whether a click will build.
+
 Right-press is consumed by the cancel when PLANNING, so a cancel never also
 starts an erase -- the erase gesture needs a fresh press.
 
@@ -41,6 +46,11 @@ they were pressed and the active builder decides what they mean (cycle a
 belt's path shape, rotate a structure, mirror a chiral one). `F` takes the
 bare key and the camera's frame-the-board moves to `shift+F`, since framing
 is much the rarer action.
+
+`Q` is the pipette, and like `R`/`F` its meaning is not decided here: this
+class reports the press and the orchestrator resolves it against what the
+hand holds -- pick up the type under the cursor when empty, put down what is
+held otherwise. It used to be zoom-out; zoom is scroll-only now.
 
 `Space` and `.` drive the simulation clock -- pause and single-step. They are
 global rather than per-tool: the clock is not something a builder has an
@@ -80,7 +90,7 @@ _SLOT_KEYS = {
 }
 _EDGE_KEYS = (
     glfw.KEY_R, glfw.KEY_ESCAPE, glfw.KEY_F, glfw.KEY_F5, glfw.KEY_DELETE,
-    glfw.KEY_SPACE, glfw.KEY_PERIOD,
+    glfw.KEY_SPACE, glfw.KEY_PERIOD, glfw.KEY_Q,
 ) + tuple(_SLOT_KEYS)
 
 
@@ -88,18 +98,17 @@ class Intents:
     """What the player asked for this frame. Plain data, consumed once."""
 
     __slots__ = (
-        "pan_x", "pan_y", "zoom", "cycle_tool", "cycle_backward", "flip_tool",
+        "pan_x", "pan_y", "cycle_tool", "cycle_backward", "flip_tool",
         "frame_board", "reload_shader", "clear_board",
         "begin_plan", "update_plan", "commit_plan", "cancel_plan",
         "erase_at", "cursor_cell", "cursor_in_world", "cursor_frac",
         "select_slot", "scroll_steps", "scroll_at",
-        "drag_pan_px", "toggle_pause", "step_tick",
+        "drag_pan_px", "toggle_pause", "step_tick", "pipette",
     )
 
     def __init__(self):
         self.pan_x = 0.0
         self.pan_y = 0.0
-        self.zoom = 0.0
         # R (or shift+R) -- meaning is the active tool's to decide.
         self.cycle_tool = False
         self.cycle_backward = False
@@ -126,6 +135,10 @@ class Intents:
         # is the primary way to watch one tick's worth of state change.
         self.toggle_pause = False
         self.step_tick = False
+        # Q. Means "pick up what is under the cursor" with an empty hand and
+        # "put down what I am holding" otherwise -- the orchestrator decides
+        # which, since only it knows what the hand contains.
+        self.pipette = False
 
 
 class InputManager:
@@ -227,6 +240,8 @@ class InputManager:
         it = Intents()
 
         # --- camera: held keys, scaled by dt ---
+        # Q and E are no longer zoom -- scroll does that, and Q is the
+        # pipette. Zoom has no key binding at all now.
         if not want_kb:
             if self._key(glfw.KEY_A):
                 it.pan_x -= 1.0
@@ -236,15 +251,12 @@ class InputManager:
                 it.pan_y += 1.0
             if self._key(glfw.KEY_S):
                 it.pan_y -= 1.0
-            if self._key(glfw.KEY_E):
-                it.zoom += 1.0
-            if self._key(glfw.KEY_Q):
-                it.zoom -= 1.0
 
         it.reload_shader = self._edge(glfw.KEY_F5, not want_kb)
         it.clear_board = self._edge(glfw.KEY_DELETE, not want_kb)
         cycle = self._edge(glfw.KEY_R, not want_kb)
         escape = self._edge(glfw.KEY_ESCAPE, not want_kb)
+        it.pipette = self._edge(glfw.KEY_Q, not want_kb)
 
         # --- simulation clock ---
         # Space pauses; '.' runs exactly one tick, which works whether or not
@@ -308,10 +320,18 @@ class InputManager:
             # underground part-way through a pair -- that needs a way out.
             if escape:
                 it.cancel_plan = True
-            # A click-based tool (a structure) has no drag phase, but it still
-            # must not build on press -- the press might become a pan. It
-            # previews under the cursor and waits for the release.
-            if not drag_based and not want_mouse and board.in_bounds(cx, cy):
+            # Preview under the cursor while idle. A click-based tool (a
+            # structure) does this because it has no drag phase but still must
+            # not build on press -- the press might become a pan.
+            #
+            # A drag-based tool previews too, as a degenerate one-cell run.
+            # That is what makes "belt planner holding nothing" look different
+            # from an empty hand: without a ghost the two states are visually
+            # identical, and the player cannot tell whether a click will
+            # build. The ghost's facing comes from quadrant_dir(), so it
+            # swivels to follow the pointer within the cell -- which is
+            # exactly the heading a single click would produce.
+            if not want_mouse and board.in_bounds(cx, cy):
                 self.anchor = self.target = (cx, cy)
                 # Carry the sub-cell position too: a click-based tool plans
                 # from target_frac, and a structure whose footprint is even
@@ -396,6 +416,12 @@ class InputManager:
                 self.anchor = self.target = None
                 self._pending_commit = False
                 it.cancel_plan = True
+                # Forget the hover memo so next frame's IDLE branch rebuilds
+                # the one-cell idle preview straight away. Without this the
+                # cancel leaves the hand looking empty until the cursor
+                # happens to move to another cell.
+                self._last_hover = None
+                self._last_frac = None
             elif left_press:
                 # Arm the commit: it fires on release, unless this turns into
                 # a drag, in which case the plan survives and we keep planning.

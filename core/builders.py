@@ -144,6 +144,21 @@ class EntityBuilder:
     #: acting on a single click.
     drag_based = True
 
+    #: The entity type this tool places. The pipette (Q) reads the type under
+    #: the cursor and asks the toolbelt for the slot whose builder claims it,
+    #: so every tool must name its type for Q to find it -- see
+    #: Toolbelt.select_tool_for().
+    entity_cls = None
+
+    def adopt(self, entity):
+        """Match this tool's state to an existing entity, for the pipette.
+
+        Called after Q has selected this slot. The default takes nothing,
+        which is right for a tool with no orientation to copy; a structure
+        takes the rotation and flip so the clone comes out identical.
+        """
+        return False
+
     def plan(self, engine, start, end, start_frac=(0.5, 0.5),
              end_frac=(0.5, 0.5)):
         """Build a BuildPlan for a gesture from `start` to `end` cells.
@@ -183,6 +198,7 @@ class BeltBuilder(EntityBuilder):
 
     name = "Belt"
     drag_based = True
+    entity_cls = Belt
 
     MODE_HORIZONTAL_FIRST = 0
     MODE_VERTICAL_FIRST = 1
@@ -294,6 +310,17 @@ class StructureBuilder(EntityBuilder):
         self.flipped = not self.flipped
         return True
 
+    def adopt(self, entity):
+        """Match the picked-up structure's orientation exactly.
+
+        Both halves matter: taking the rotation without the flip would hand
+        back a mirrored copy of a chiral machine, which looks identical in
+        outline and wires up differently.
+        """
+        self.direction = entity.direction
+        self.flipped = bool(entity.flipped)
+        return True
+
     def status(self):
         w, h = self.entity_cls.footprint_for(self.direction)
         s = f"{w}x{h} facing {cell.DIR_NAMES[self.direction]}"
@@ -342,6 +369,7 @@ class UndergroundBuilder(EntityBuilder):
 
     name = "Underground"
     drag_based = False
+    entity_cls = Underground
 
     def __init__(self):
         self.direction = cell.DIR_PX
@@ -350,6 +378,17 @@ class UndergroundBuilder(EntityBuilder):
 
     def cycle(self, backward=False):
         self.direction = cell.rotate_dir(self.direction, cw=not backward)
+        return True
+
+    def adopt(self, entity):
+        """Take the facing off a picked-up end, and lay the same kind next.
+
+        Pipetting an exit should leave you holding an exit: the alternation
+        is a convenience for laying a fresh pair, not something that should
+        override an explicit pick.
+        """
+        self.direction = entity.direction
+        self.placing_exit = entity.is_exit
         return True
 
     def status(self):

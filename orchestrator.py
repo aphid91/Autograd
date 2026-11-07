@@ -65,6 +65,37 @@ class Orchestrator:
         self.last_plan = None
         self._reset_tool_state()
 
+    def _pipette(self, cursor_cell, in_world):
+        """Q: fill an empty hand from the board, or empty a full one.
+
+        Factorio's context key. The asymmetry is deliberate: with something
+        held, Q always clears -- it is the universal "put this down", so it
+        must not depend on what happens to be under the cursor. Only an empty
+        hand looks at the board.
+
+        Picking up copies the *orientation* as well as the type, via the
+        builder's adopt(), so the clone comes out identical rather than at
+        whatever rotation the tool was last left in.
+        """
+        if not self.toolbelt.empty_handed:
+            # Holding something: put it down. Cancels any in-flight plan.
+            self.toolbelt.clear()
+            self._on_tool_changed()
+            return
+
+        if not in_world or cursor_cell is None:
+            return
+        entity = self.engine.entity_at(*cursor_cell)
+        if entity is None:
+            return
+        tool = self.toolbelt.select_tool_for(type(entity))
+        if tool is None:
+            # A type with no builder -- nothing to pick it up with. Leave the
+            # hand empty rather than selecting an unrelated slot.
+            return
+        self._on_tool_changed()
+        tool.adopt(entity)
+
     def _reset_tool_state(self):
         """Drop a tool's multi-step state after an abandoned gesture.
 
@@ -140,7 +171,6 @@ class Orchestrator:
 
         # 2. camera
         self.camera.pan(intents.pan_x, intents.pan_y, dt)
-        self.camera.zoom_by(intents.zoom, dt)
         if intents.scroll_steps and intents.scroll_at is not None:
             self.camera.zoom_at(
                 intents.scroll_steps, intents.scroll_at, viewport
@@ -164,6 +194,11 @@ class Orchestrator:
         if intents.select_slot is not None:
             if self.toolbelt.select(intents.select_slot):
                 self._on_tool_changed()
+
+        # Q: pick up or put down. Resolved here rather than in the input
+        # manager because only the orchestrator knows what the hand holds.
+        if intents.pipette:
+            self._pipette(intents.cursor_cell, intents.cursor_in_world)
 
         tool = self.toolbelt.active
 
