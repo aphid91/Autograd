@@ -32,7 +32,28 @@ _COMMON_FIELDS = 8
 # Room for subclass fields after the common prefix. Keep this a multiple of 4
 # so each row lands on a vec4 boundary in the SSBO -- GLSL std430 arrays of
 # vec4 are the easiest thing to index from a compute shader later.
-ENTITY_STRIDE = 12
+#
+# A gate needs, per port: the value held at each input, the value waiting at
+# each output, and an occupancy flag for both. The widest machine (Mac) has
+# three of each, so 8 common + 3*2 values + 3*2 flags = 20, rounded up to 24.
+# Rows are cheap and branching is not, so every type carries the full set
+# rather than packing per-type -- Source's 4x1 row simply has unused slots.
+ENTITY_STRIDE = 24
+
+#: Most *channels* of one kind any machine has -- not port faces. Fixes the
+#: per-row gate layout, so a machine with more channels means bumping this
+#: and ENTITY_STRIDE together.
+#:
+#: Faces and channels are not the same thing, and Sink is why. It accepts on
+#: eight perimeter faces, but those are eight ways in to one consumer, not
+#: eight independent values: whatever arrives gets destroyed, and a stack per
+#: *face* would be meaningless. The arithmetic machines are the opposite --
+#: Mac's three inputs are genuinely distinct channels (x, y, z) and must not
+#: be conflated.
+#:
+#: Sizing the row by faces would mean 8 channels for every entity, so a belt
+#: row would carry 32 unused floats. Sizing by channels keeps it at 3.
+MAX_CHANNELS = 3
 
 
 class Entity:
@@ -64,6 +85,29 @@ class Entity:
     # path they are drawn along, so rotating one in isolation is meaningless.
     ROTATABLE = False
 
+    # --- firing ----------------------------------------------------------
+    #: When this type fires. Declared rather than special-cased: the tick
+    #: reads FIRE_RULE and never names a machine, which is what keeps
+    #: core/gates.py generic (and what lets glsl_types.py emit it later).
+    #:
+    #: FIRE_ALL  -- every input port must be fed. The normal arithmetic rule:
+    #:              a Shear cannot compute x+y with only x.
+    #: FIRE_ANY  -- any one fed input is enough. Sink's rule: it destroys
+    #:              whatever arrives, and waiting for all four sides would
+    #:              deadlock a sink fed from one direction.
+    #:
+    #: A type with no inputs at all (Source) is vacuously ready under either,
+    #: so it fires whenever its output is clear -- which is what we want, and
+    #: falls out rather than being special-cased. _self_check() pins that.
+    FIRE_ALL = 0
+    FIRE_ANY = 1
+    FIRE_RULE = FIRE_ALL
+
+    #: Value a Source emits. Only meaningful for types with no inputs; one
+    #: day this becomes per-instance configuration, hence the class attribute
+    #: rather than a literal in the tick.
+    EMIT_VALUE = -1.0
+
     # --- appearance ------------------------------------------------------
     # Declared here, beside the ports, so a machine is defined in exactly one
     # place. core/glsl_types.py emits these into GLSL at shader-load time;
@@ -79,6 +123,136 @@ class Entity:
     F_W = _F_W
     F_H = _F_H
     F_FLIPPED = _F_FLIPPED
+
+    # --- gate state, shared by every type ---------------------------------
+    # Laid out on the base class rather than per-subclass so the tick can read
+    # any machine's ports without knowing which it is. Slots are indexed by
+    # **channel**, which for every machine but Sink is the port's position in
+    # INPUTS / OUTPUTS -- see MAX_CHANNELS and in_channel().
+    #
+    #   F_IN_VALUE  + c   value held on input channel c
+    #   F_IN_HELD   + c   1 if that channel is fed, else 0
+    #   F_OUT_VALUE + c   value waiting on output channel c
+    #   F_OUT_HELD  + c   1 if that waiting zone is occupied, else 0
+    #
+    # The waiting zone is the whole trick behind firing every tick -- see
+    # core/tick.py. A gate reads F_OUT_HELD to decide whether it is blocked,
+    # and the belt phase drains it, so the two phases never need to see each
+    # other's intermediate state.
+    F_IN_VALUE = _COMMON_FIELDS
+    F_IN_HELD = _COMMON_FIELDS + MAX_CHANNELS
+    F_OUT_VALUE = _COMMON_FIELDS + 2 * MAX_CHANNELS
+    F_OUT_HELD = _COMMON_FIELDS + 3 * MAX_CHANNELS
+    _GATE_FIELDS_END = _COMMON_FIELDS + 4 * MAX_CHANNELS
+
+    #: Which channel each declared port face belongs to. Defaults to one
+    #: channel per face, in declaration order, which is what every
+    #: arithmetic machine wants. Sink overrides it to fold its eight
+    #: perimeter faces onto a single channel -- see MAX_CHANNELS.
+    @classmethod
+    def in_channel(cls, port_index):
+        return port_index
+
+    @classmethod
+    def out_channel(cls, port_index):
+        return port_index
+
+    @classmethod
+    def in_channels(cls):
+        """How many distinct input channels this type has."""
+        if not cls.INPUTS:
+            return 0
+        return max(cls.in_channel(i) for i in range(len(cls.INPUTS))) + 1
+
+    @classmethod
+    def out_channels(cls):
+        if not cls.OUTPUTS:
+            return 0
+        return max(cls.out_channel(i) for i in range(len(cls.OUTPUTS))) + 1
+
+    # --- gate state accessors --------------------------------------------
+    # These are indexed by **channel**, not by port face. A Sink's eight
+    # faces all map to channel 0, so feeding any of them fills the same slot.
+    def input_count(self):
+        return self.in_channels()
+
+    def output_count(self):
+        return self.out_channels()
+
+    def in_held(self, i):
+        return bool(self._get(self.F_IN_HELD + i))
+
+    def in_value(self, i):
+        return float(self._get(self.F_IN_VALUE + i))
+
+    def set_input(self, i, value):
+        """Feed input port i. Overwrites whatever was there."""
+        self._set(self.F_IN_VALUE + i, float(value))
+        self._set(self.F_IN_HELD + i, 1.0)
+
+    def clear_input(self, i):
+        self._set(self.F_IN_VALUE + i, 0.0)
+        self._set(self.F_IN_HELD + i, 0.0)
+
+    def out_held(self, i):
+        return bool(self._get(self.F_OUT_HELD + i))
+
+    def out_value(self, i):
+        return float(self._get(self.F_OUT_VALUE + i))
+
+    def set_output(self, i, value):
+        """Put a value in output port i's waiting zone."""
+        self._set(self.F_OUT_VALUE + i, float(value))
+        self._set(self.F_OUT_HELD + i, 1.0)
+
+    def clear_output(self, i):
+        self._set(self.F_OUT_VALUE + i, 0.0)
+        self._set(self.F_OUT_HELD + i, 0.0)
+
+    def fire(self, values):
+        """Transform fed input channel values into output channel values.
+
+        `values` is a list of length input_count(); entries for unfed
+        channels are None (only reachable under FIRE_ANY). Returns a list of
+        length output_count(), where None means "emit nothing on this
+        channel".
+
+        Overridden per machine. The base implementation emits nothing, which
+        is correct for a type with no outputs and a safe default for a type
+        whose arithmetic has not been written.
+
+        Channels are numbered by `in_channel()` / `out_channel()`, which for
+        every machine but Sink is just the port's position in INPUTS /
+        OUTPUTS. So a subclass reads `values[i]` for its i'th declared input
+        and returns its i'th declared output in the same order. That
+        indexing is the only contract between a machine's geometry and its
+        arithmetic.
+        """
+        return [None] * self.output_count()
+
+    def inputs_ready(self):
+        """Does this gate's firing rule consider it fed?
+
+        Reads FIRE_RULE rather than branching on type. A machine with no
+        inputs is vacuously ready under either rule, which is what makes
+        Source fire without a special case.
+        """
+        n = self.input_count()
+        if n == 0:
+            return True
+        if self.FIRE_RULE == self.FIRE_ANY:
+            return any(self.in_held(i) for i in range(n))
+        return all(self.in_held(i) for i in range(n))
+
+    def outputs_clear(self):
+        """Is every output's waiting zone free?
+
+        A gate cannot fire with anything still waiting -- that is the
+        back-pressure signal, and it is why a backed-up belt eventually
+        stalls the machine feeding it rather than losing items.
+        """
+        return not any(self.out_held(i)
+                       for i in range(self.output_count()))
 
     #: True if mirroring this type produces a genuinely different machine.
     #: A type whose port layout is symmetric about the authored X axis is
@@ -397,23 +571,15 @@ class Belt(Entity):
     TYPE_ID = cell.TYPE_BELT
     FOOTPRINT = (1, 1)
 
-    # Belt-specific fields, after the common prefix. Unused this pass --
-    # item simulation is deferred -- but the slots are reserved so adding
-    # it later does not reshuffle the row.
-    F_THROUGHPUT = _COMMON_FIELDS + 0
-    F_ITEM_COUNT = _COMMON_FIELDS + 1
+    # No belt-specific row fields. Items belong to the *segment* a belt is
+    # part of, not to the cell -- see core/segments.py -- so per-cell item
+    # state would be a second home for something that already has one.
 
-    def initialise(self, x, y, direction, is_ghost=False, flipped=False,
-                   throughput=1.0):
+    def initialise(self, x, y, direction, is_ghost=False, flipped=False):
         # A belt is 1x1 with no ports, so `flipped` is meaningless for it --
         # accepted and passed through only so every entity type takes the
         # same orientation arguments and callers need no special case.
         super().initialise(x, y, direction, is_ghost=is_ghost, flipped=flipped)
-        self._set(self.F_THROUGHPUT, float(throughput))
-
-    @property
-    def throughput(self):
-        return float(self._get(self.F_THROUGHPUT))
 
 
 class Underground(Entity):
@@ -545,6 +711,18 @@ class Swap(Structure):
     # x survives untouched; y and z are the pair that may be exchanged.
     PASS_THROUGH = (cell.DIR_NY,)
 
+    def fire(self, values):
+        """x,y,z -> x, (y,z if x>0 else z,y).
+
+        x is the control: it passes through unchanged (it is the declared
+        PASS_THROUGH axis) and its sign decides whether y and z swap.
+        x == 0 means no swap.
+        """
+        x, y, z = values
+        if x > 0.0:
+            return [x, y, z]
+        return [x, z, y]
+
 
 class Shear(Structure):
     """Shear: x,y -> x, x+y.
@@ -571,6 +749,11 @@ class Shear(Structure):
 
     # x survives untouched; y is what the machine rewrites.
     PASS_THROUGH = (cell.DIR_NY,)
+
+    def fire(self, values):
+        """x,y -> x, x+y. Outputs are declared (x out, x+y out)."""
+        x, y = values
+        return [x, x + y]
 
 
 class Mac(Structure):
@@ -601,6 +784,11 @@ class Mac(Structure):
     # Both control channels survive untouched; z picks up the product.
     PASS_THROUGH = (cell.DIR_NY,)
 
+    def fire(self, values):
+        """x,y,z -> x, y, z + x*y. Declared order is (x out, y out, z' out)."""
+        x, y, z = values
+        return [x, y, z + x * y]
+
 
 class Source(Structure):
     """4x1 emitter with a single output at one short end.
@@ -617,6 +805,16 @@ class Source(Structure):
     INPUTS = ()
     OUTPUTS = ((3, 0, cell.DIR_PX),)
 
+    def fire(self, values):
+        """Emit a constant. No inputs, so `values` is empty.
+
+        With no inputs this type is vacuously ready every tick, so it emits
+        whenever its waiting zone is clear -- i.e. at whatever rate the belt
+        downstream will take. That self-regulation falls out of the
+        back-pressure rule rather than needing a rate here.
+        """
+        return [self.EMIT_VALUE]
+
 
 class Sink(Structure):
     """2x2 consumer that accepts on every perimeter face.
@@ -629,12 +827,18 @@ class Sink(Structure):
     in practice, but it stays ROTATABLE rather than special-casing the
     toolbelt. Being achiral, F does nothing either (is_chiral() derives that
     from this port layout).
+
+    Fires on *any* fed input rather than all of them, and destroys what it
+    takes. Waiting for all eight would deadlock a sink fed from one side,
+    which is the normal way to use one. Nothing is recorded yet; a stack per
+    input is the obvious next step.
     """
 
     TYPE_ID = cell.TYPE_SINK
     FOOTPRINT = (2, 2)
     COLOUR = (0.34, 0.34, 0.40)
     GLYPH = "dot"
+    FIRE_RULE = Structure.FIRE_ANY
 
     INPUTS = (
         (0, 1, cell.DIR_NX), (0, 1, cell.DIR_PY),   # top-left corner
@@ -644,6 +848,17 @@ class Sink(Structure):
     )
     OUTPUTS = ()
 
+    @classmethod
+    def in_channel(cls, port_index):
+        """Every face feeds the same channel.
+
+        The eight perimeter faces are eight ways *in* to one consumer, not
+        eight independent values: a sink destroys whatever arrives, so a
+        separate slot per face would be meaningless -- and would size every
+        entity row in the game for eight channels. See MAX_CHANNELS.
+        """
+        return 0
+
 
 #: Every placeable structure, in the order the toolbelt offers them.
 STRUCTURES = (Swap, Shear, Mac, Source, Sink)
@@ -652,7 +867,114 @@ STRUCTURES = (Swap, Shear, Mac, Source, Sink)
 def _self_check():
     """The field layout must fit the stride, and ids must be unique."""
     assert _COMMON_FIELDS <= ENTITY_STRIDE
-    assert Belt.F_ITEM_COUNT < ENTITY_STRIDE, "belt fields overflow the stride"
+    # The gate block must fit, and every machine's ports must fit MAX_PORTS.
+    assert Entity._GATE_FIELDS_END <= ENTITY_STRIDE, (
+        f"gate fields need {Entity._GATE_FIELDS_END} slots, stride is "
+        f"{ENTITY_STRIDE}")
+    assert ENTITY_STRIDE % 4 == 0, "rows must land on vec4 boundaries"
+    for c in STRUCTURES:
+        # Channels, not faces: Sink has 8 faces on 1 channel.
+        assert c.in_channels() <= MAX_CHANNELS, (c.__name__, c.in_channels())
+        assert c.out_channels() <= MAX_CHANNELS, (c.__name__, c.out_channels())
+        # Every face must map to a channel inside the row's range.
+        for i in range(len(c.INPUTS)):
+            assert 0 <= c.in_channel(i) < MAX_CHANNELS, (c.__name__, i)
+        for i in range(len(c.OUTPUTS)):
+            assert 0 <= c.out_channel(i) < MAX_CHANNELS, (c.__name__, i)
+
+    # --- firing rules and arithmetic --------------------------------------
+    # Every machine's fire() must return one value per declared output, and
+    # the tick indexes ports positionally, so a signature that disagrees with
+    # the declaration order would wire the wrong channel to the wrong face.
+    class _FakeBoard:
+        def __init__(self):
+            import numpy as _np
+            self.entities = _np.zeros((4, ENTITY_STRIDE), dtype=_np.float32)
+            self.entities_dirty = type("_D", (), {"add": lambda s, r: None})()
+            self.grid = _np.zeros((1, 1, 4), dtype=_np.int32)
+
+        def in_bounds(self, x, y):
+            return False
+
+    def _view(cls):
+        v = cls(_FakeBoard(), 1)
+        v._ghost = False
+        return v
+
+    # Swap: x is the control and passes through; y and z exchange iff x > 0.
+    sw = _view(Swap)
+    assert sw.fire([1.0, 7.0, 9.0]) == [1.0, 7.0, 9.0], "x>0 must not swap"
+    assert sw.fire([-1.0, 7.0, 9.0]) == [-1.0, 9.0, 7.0], "x<=0 must swap"
+    assert sw.fire([0.0, 7.0, 9.0]) == [0.0, 9.0, 7.0], "x==0 means swap"
+
+    # Shear: x passes through, y becomes x+y.
+    sh = _view(Shear)
+    assert sh.fire([3.0, 4.0]) == [3.0, 7.0]
+    assert sh.fire([-2.0, 5.0]) == [-2.0, 3.0]
+
+    # Mac: both controls pass through, z accumulates x*y.
+    mc = _view(Mac)
+    assert mc.fire([2.0, 3.0, 10.0]) == [2.0, 3.0, 16.0]
+    assert mc.fire([0.0, 9.0, 4.0]) == [0.0, 9.0, 4.0], "x==0 adds nothing"
+
+    # Source emits its constant; Sink emits nothing at all.
+    src = _view(Source)
+    assert src.fire([]) == [Source.EMIT_VALUE]
+    assert len(src.fire([])) == Source.out_channels()
+    snk = _view(Sink)
+    assert snk.fire([None]) == [], "a sink emits nothing"
+    # Sink's eight faces fold onto one channel, so the row holds one value.
+    assert Sink.in_channels() == 1, Sink.in_channels()
+    assert all(Sink.in_channel(i) == 0 for i in range(len(Sink.INPUTS)))
+    assert Sink.out_channels() == 0
+
+    # Every machine returns exactly one value per output channel.
+    for c, args in ((Swap, [1.0, 2.0, 3.0]), (Shear, [1.0, 2.0]),
+                    (Mac, [1.0, 2.0, 3.0]), (Source, []),
+                    (Sink, [1.0])):
+        got = _view(c).fire(args)
+        assert len(got) == c.out_channels(), (
+            f"{c.__name__}.fire() returned {len(got)} values for "
+            f"{c.out_channels()} output channels")
+
+    # --- readiness --------------------------------------------------------
+    # FIRE_ALL waits for every input; FIRE_ANY needs one. A type with no
+    # inputs is vacuously ready under either, which is what makes Source
+    # fire with no special case anywhere.
+    assert Sink.FIRE_RULE == Entity.FIRE_ANY, "a sink fires on any input"
+    for c in (Swap, Shear, Mac, Source):
+        assert c.FIRE_RULE == Entity.FIRE_ALL, c.__name__
+
+    v = _view(Shear)
+    assert not v.inputs_ready(), "nothing fed yet"
+    v.set_input(0, 1.0)
+    assert not v.inputs_ready(), "FIRE_ALL needs every input"
+    v.set_input(1, 2.0)
+    assert v.inputs_ready()
+    assert v.in_value(0) == 1.0 and v.in_value(1) == 2.0
+    v.clear_input(0)
+    assert not v.inputs_ready()
+
+    v = _view(Sink)
+    assert not v.inputs_ready()
+    v.set_input(0, 5.0)
+    assert v.inputs_ready(), "FIRE_ANY needs only one"
+
+    assert _view(Source).inputs_ready(), "no inputs is vacuously ready"
+
+    # --- back pressure ----------------------------------------------------
+    # A gate with anything still in a waiting zone is blocked. That is the
+    # whole back-pressure mechanism: see core/tick.py.
+    v = _view(Shear)
+    assert v.outputs_clear()
+    v.set_output(1, 9.0)
+    assert not v.outputs_clear()
+    assert v.out_held(1) and v.out_value(1) == 9.0
+    assert not v.out_held(0)
+    v.clear_output(1)
+    assert v.outputs_clear()
+    # A type with no outputs is always clear, so a sink never self-blocks.
+    assert _view(Sink).outputs_clear()
     assert Entity.view_for(cell.TYPE_BELT) is Belt
     assert Entity.view_for(999) is Entity
     for c in (Belt,) + STRUCTURES:

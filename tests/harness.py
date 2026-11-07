@@ -135,6 +135,8 @@ def reset():
     engine.debug_feed = None
     for k in engine.belts.stats:
         engine.belts.stats[k] = 0
+    for k in engine.gates.stats:
+        engine.gates.stats[k] = 0
     # The engine registers belt transport on the belt phase at construction.
     # A scenario that clears the phase instead of removing its own callback
     # silently stops the simulation for everything after it -- which happened,

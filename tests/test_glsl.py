@@ -13,14 +13,18 @@ GLSL consuming those tables does the authored/placed conversion correctly.
 """
 import re as _re
 
-from core import belt_device, belts, cell, glsl_types
-from core.entity import STRUCTURES, Underground
+from core import belt_device, belts, cell, entity, glsl_types
+from core.entity import STRUCTURES, Sink, Underground
 from render import camera, shader_loader
 
 from tests.harness import ok
 
 #: The fully resolved shader source, includes and generated tables expanded.
 _src = shader_loader.load("world.frag")
+
+#: Direction constant -> its GLSL name, for matching generated table text.
+_DIR_NAMES_GLSL = {cell.DIR_PX: "DIR_PX", cell.DIR_PY: "DIR_PY",
+                   cell.DIR_NX: "DIR_NX", cell.DIR_NY: "DIR_NY"}
 
 #: The generated pieces on their own, so a check can test the *generator*
 #: without the surrounding hand-written GLSL getting in the way.
@@ -261,10 +265,16 @@ def test_glsl_ssbo_bindings_match_the_camera():
     assert _by_name.get("SegmentsI") == camera.SEG_I_SSBO_BINDING, _by_name
     assert _by_name.get("SegmentsF") == camera.SEG_F_SSBO_BINDING, _by_name
     assert _by_name.get("BeltItems") == camera.ITEM_SSBO_BINDING, _by_name
-    # Every declared binding must be distinct, including the entity SSBO the
-    # camera binds at 0 even though no shader reads it yet.
-    _slots = sorted(_by_name.values()) + [camera.ENTITY_SSBO_BINDING]
+    assert _by_name.get("Entities") == camera.ENTITY_SSBO_BINDING, _by_name
+    # Every declared binding must be distinct, or two buffers would collide.
+    _slots = sorted(_by_name.values())
     assert len(set(_slots)) == len(_slots), f"duplicate SSBO binding: {_slots}"
+    # ...and the camera must not bind anything to a slot no shader declares,
+    # nor leave a declared slot unbound.
+    assert set(_slots) == {camera.ENTITY_SSBO_BINDING,
+                           camera.SEG_I_SSBO_BINDING,
+                           camera.SEG_F_SSBO_BINDING,
+                           camera.ITEM_SSBO_BINDING}, _by_name
     ok(f"GLSL SSBO bindings match render/camera.py ({_by_name})")
 
 
@@ -319,6 +329,65 @@ def test_glsl_item_position_mirrors_the_python_closed_form():
         "the fractional anchor must be clamped to the belt length, matching "
         "the whole-tick min(anchor + speed, length)")
     ok("GLSL item_position() mirrors BeltSim.position_of()")
+
+
+def test_glsl_entity_row_layout_matches_python():
+    # The shader reads gate state straight out of the entity SSBO, so the
+    # stride and the field offsets must come from core/entity.py. A stale
+    # stride here reads a neighbouring row's fields -- plausible floats in
+    # the wrong place, which is the worst kind of wrong.
+    for _name, _want in [("ENTITY_STRIDE", entity.ENTITY_STRIDE),
+                         ("MAX_CHANNELS", entity.MAX_CHANNELS),
+                         ("F_IN_VALUE", entity.Entity.F_IN_VALUE),
+                         ("F_IN_HELD", entity.Entity.F_IN_HELD),
+                         ("F_OUT_VALUE", entity.Entity.F_OUT_VALUE),
+                         ("F_OUT_HELD", entity.Entity.F_OUT_HELD)]:
+        assert _glsl_int(_name) == _want, (
+            f"{_name}: shader {_glsl_int(_name)}, entity.py {_want}")
+    # The gate block must fit inside the stride, in the shader's terms too.
+    assert (_glsl_int("F_OUT_HELD") + _glsl_int("MAX_CHANNELS")
+            <= _glsl_int("ENTITY_STRIDE")), "gate fields overrun the stride"
+    ok(f"GLSL entity row layout matches core/entity.py "
+       f"(stride {entity.ENTITY_STRIDE})")
+
+
+def test_generated_channel_tables_match_python():
+    # output_channel_at() tells the renderer which gate-state slot a port
+    # face drives. It cannot assume "port index == channel": Sink folds eight
+    # faces onto one channel, and indexing by face would read slots that do
+    # not exist.
+    for c in STRUCTURES:
+        for which, ports, chan in (("input", c.INPUTS, c.in_channel),
+                                   ("output", c.OUTPUTS, c.out_channel)):
+            for i, (lx, ly, face) in enumerate(ports):
+                want = chan(i)
+                needle = (f"if (lcl == ivec2({lx}, {ly}) && face == "
+                          f"{_DIR_NAMES_GLSL[face]}) return {want};")
+                assert needle in _tables, (
+                    f"{c.__name__} {which} port {i} should map to channel "
+                    f"{want}; missing from the generated table:\n  {needle}")
+    # Sink specifically: eight faces, all channel 0.
+    assert Sink.in_channels() == 1, Sink.in_channels()
+    assert _tables.count("return 0;") >= len(Sink.INPUTS), (
+        "Sink's faces should all generate channel 0")
+    ok("generated channel tables match in_channel()/out_channel()")
+
+
+def test_glsl_unrotate_face_inverts_the_placement():
+    # Looking up a port's *channel* needs the authored face, not the placed
+    # one -- the masks only answer "is this a port?", which is
+    # orientation-independent, but a channel index is not. unrotate_face()
+    # must invert exactly what the masks apply, in the opposite order.
+    assert "int unrotate_face(int placed, int facing, bool flipped)" in _src
+    _body = _re.search(r"int unrotate_face\([^)]*\)\s*\{(.*?)\n\}",
+                       _src, _re.S).group(1)
+    assert "(placed - facing + 8) % 4" in _body, (
+        "un-rotation must subtract the facing")
+    # The flip must be undone *after* the rotation, mirroring flip-then-rotate.
+    assert _body.index("placed - facing") < _body.index("flipped"), (
+        "unrotate_face must un-rotate before un-flipping, since placement "
+        "flips then rotates")
+    ok("GLSL unrotate_face() inverts flip-then-rotate in the right order")
 
 
 def test_probe_reach_spans_the_longest_footprint():

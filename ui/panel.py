@@ -178,6 +178,53 @@ class UI:
                             f"    ... {seg.tail - k - 1} more")
                         break
 
+        # --- the hovered gate ---
+        # A gate's channels are the one piece of simulation state with no
+        # visual representation except the squished waiting zone, so this is
+        # the only way to see why a machine is or is not firing.
+        imgui.separator()
+        imgui.text_unformatted("Gate under cursor")
+        gate = None
+        if orch.cursor_cell is not None:
+            cx, cy = orch.cursor_cell
+            if board.in_bounds(cx, cy):
+                row = board.entity_id_at(cx, cy)
+                if row and board.is_row_alive(row):
+                    v = board.view(row)
+                    if v.input_count() or v.output_count():
+                        gate = v
+        if gate is None:
+            imgui.text_disabled("no gate under the cursor")
+        else:
+            name = cell.TYPE_NAMES.get(gate.type_id, "?")
+            imgui.text(f"{name} row {gate.row} at {gate.origin}")
+            rule = "ANY" if gate.FIRE_RULE == gate.FIRE_ANY else "ALL"
+            ready = gate.inputs_ready()
+            clear = gate.outputs_clear()
+            imgui.text(f"  fires on {rule}   "
+                       f"ready {'yes' if ready else 'no'}   "
+                       f"outputs {'clear' if clear else 'BLOCKED'}")
+            if ready and clear:
+                imgui.push_style_color(
+                    imgui.Col_.text, imgui.ImVec4(0.4, 1, 0.4, 1))
+                imgui.text("  -> fires next tick")
+                imgui.pop_style_color()
+            elif not ready:
+                imgui.text_disabled("  -> starved, waiting for input")
+            else:
+                imgui.push_style_color(
+                    imgui.Col_.text, imgui.ImVec4(1, 0.8, 0.3, 1))
+                imgui.text("  -> blocked, waiting zone not drained")
+                imgui.pop_style_color()
+            for i in range(gate.input_count()):
+                state = (f"{gate.in_value(i):+.4g}" if gate.in_held(i)
+                         else "empty")
+                imgui.text(f"    in  {i}: {state}")
+            for i in range(gate.output_count()):
+                state = (f"{gate.out_value(i):+.4g}" if gate.out_held(i)
+                         else "empty")
+                imgui.text(f"    out {i}: {state}")
+
         # --- debug feed ---
         # Gates do not drive the belts yet, so this is how transport gets
         # exercised on a real board: every run with a dangling upstream end
@@ -347,6 +394,9 @@ class UI:
         if clock.dropped_ticks:
             imgui.text_disabled(f"dropped {clock.dropped_ticks} ticks")
         imgui.text(f"Segments: {engine.segments.count}")
+        gst = engine.gates.stats
+        imgui.text(f"Gates fired {gst['fired']}  blocked {gst['blocked']}  "
+                   f"starved {gst['starved']}")
         _changed, self.show_segments = imgui.checkbox(
             "Inspect segments", self.show_segments)
 

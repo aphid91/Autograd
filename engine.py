@@ -17,7 +17,8 @@ from core.belt_device import BeltDevice
 from core.belts import BeltSim
 from core.gameboard import Gameboard
 from core.segments import SegmentIndex
-from core.tick import Clock, PHASE_BELT
+from core.gates import GateSim
+from core.tick import Clock, PHASE_BELT, PHASE_STRUCTURE
 from core import persistence
 
 # Re-exported so existing callers and tests keep working after the path
@@ -59,6 +60,10 @@ class Engine:
         # see core/tick.py for why that order is what lets a gate fire every
         # tick without a bubble.
         self.belts = BeltSim(self.segments)
+        # Gates: the structure phase, plus the port pass that joins them to
+        # belts. Registered on both phases -- see core/gates.py.
+        self.gates = GateSim(self.board, self.segments, self.belts)
+        self.clock.on_phase(PHASE_STRUCTURE, self._structure_phase)
         self.clock.on_phase(PHASE_BELT, self._belt_phase)
         # The GPU mirror of belt state. The fragment shader evaluates the
         # closed form itself, so it needs head/tail/anchor and the rings --
@@ -419,30 +424,53 @@ class Engine:
             seg.head = seg.tail = 0
             seg.anchor = self.belts.length_of(seg)
 
+    def _structure_phase(self):
+        """Fire every gate that can. Registered on PHASE_STRUCTURE.
+
+        Runs before the belt phase, which is what lets a well-fed gate fire
+        every tick with no bubble -- see core/tick.py for the trace.
+        """
+        self.gates.set_tick(self.clock.tick)
+        self.gates.structure_phase()
+
     def _belt_phase(self):
         """The belt half of a tick. Registered on PHASE_BELT.
 
-        Gates do not exist yet, so the only producers and consumers available
-        are the debug feed's: a dangling upstream end offers, a dangling
-        downstream end accepts. Once the gate layer lands these callbacks come
-        from waiting zones and input ports instead, and nothing else here
-        changes.
+        One BeltSim.tick() with the gate callbacks wired in, so the report's
+        advance-pop-push order holds within each segment -- splitting the
+        gate work into passes around it inverts pop and push and silently
+        costs about one tick in seven. See core/gates.py.
+
+        Direct gate-to-gate transfers run after, since they involve no
+        segment for the belt tick to own.
         """
+        tick = self.clock.tick
+        self.gates.set_tick(tick)
+
         if self.debug_feed is None:
-            self.belts.tick(self.clock.tick)
-            return
+            self.gates.tick_belts(tick)
+        else:
+            # The debug feed stands in for a Source/Sink pair on runs that
+            # have neither, so transport can be exercised without building a
+            # whole chain. A run wired to a real gate keeps the gate's
+            # callbacks; only dangling ends get the feed.
+            value = float(self.debug_feed)
+            gates = self.gates
 
-        value = float(self.debug_feed)
+            def offer(seg):
+                if seg.src is not None:
+                    return gates.offer_to(seg)
+                return value
 
-        def offer(seg):
-            # Only feed a run nothing else is feeding, so the debug source
-            # cannot inject items into the middle of a real chain.
-            return value if seg.src is None else None
+            def accept(seg, payload):
+                if seg.dst is not None:
+                    return gates.accept_from(seg, payload)
+                return True
 
-        def accept(seg, _payload):
-            return seg.dst is None
+            self.belts.tick(tick, offer=offer, accept=accept,
+                            took=gates.took_from)
 
-        self.belts.tick(self.clock.tick, offer=offer, accept=accept)
+        self.gates.deliver_direct()
 
     def tick(self, dt):
         """Advance the simulation clock, running whatever ticks are due.

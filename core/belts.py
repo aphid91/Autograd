@@ -171,11 +171,16 @@ class BeltSim:
         return float(seg.payload[k % seg.cap])
 
     # --- the tick --------------------------------------------------------
-    def tick_segment(self, seg, tick, offer=None, accept=None):
+    def tick_segment(self, seg, tick, offer=None, accept=None, took=None):
         """Advance one segment by one tick. O(1), no loops over items.
 
         Order is load-bearing and comes straight from the report: advance the
         anchor, then pop, then push. Returns `(popped, pushed)`.
+
+        `took(seg)` is called after a push actually happens. It is separate
+        from `offer()` because offering must not commit: a full belt declines,
+        and the item has to stay with its producer as the back-pressure
+        signal the next structure phase reads.
         """
         length = self.length_of(seg)
 
@@ -222,6 +227,9 @@ class BeltSim:
                     seg.payload[slot] = payload
                     seg.tail += 1
                     pushed = True
+                    # Only now has the producer actually parted with it.
+                    if took is not None:
+                        took(seg)
 
         if popped:
             self.stats["popped"] += 1
@@ -229,11 +237,12 @@ class BeltSim:
             self.stats["pushed"] += 1
         return popped, pushed
 
-    def tick(self, tick, offer=None, accept=None):
+    def tick(self, tick, offer=None, accept=None, took=None):
         """Advance every segment by one tick.
 
-        `offer` / `accept` are called per segment, so one pair of callbacks
-        can serve the whole board. Returns `(popped, pushed)` totals.
+        `offer` / `accept` / `took` are called per segment, so one set of
+        callbacks can serve the whole board. Returns `(popped, pushed)`
+        totals.
 
         Segments are independent: the report's only shared state is at the
         *nodes*, and nothing here touches a node. That independence is what
@@ -242,7 +251,7 @@ class BeltSim:
         """
         popped = pushed = 0
         for seg in self.index.segments.values():
-            p, q = self.tick_segment(seg, tick, offer, accept)
+            p, q = self.tick_segment(seg, tick, offer, accept, took)
             popped += int(p)
             pushed += int(q)
         self.stats["ticks"] += 1

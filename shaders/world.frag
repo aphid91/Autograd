@@ -112,6 +112,14 @@ uniform float sim_alpha;      // fraction into the next tick, 0..1
 // segment's length.
 #define ITEM_BISECT       16
 
+// A gate's output waiting zone, when the belt refused to take it. Drawn
+// squished into the gap between the body edge and the cell boundary, which
+// is the only place it can go -- it is not on the belt and not inside the
+// machine. Narrower than a normal disc on the travel axis so it reads as
+// compressed rather than simply mispositioned.
+#define WAIT_SQUISH       0.46   // scale along the travel axis
+#define WAIT_OFFSET       0.44   // distance from the gate cell's centre
+
 // --- segment debug overlay ---
 // Tints each belt cell by a hash of its segment id, so a run's extent and
 // where it is cut are visible at a glance. Compiled out entirely unless
@@ -558,6 +566,62 @@ vec4 draw_items(ivec4 c, vec2 p, int travel, float px) {
     return out_col;
 }
 
+// ======================================================================
+// Waiting zones
+// ======================================================================
+//
+// A gate's output waiting zone is normally empty by the end of a tick: the
+// belt phase drains it. It stays occupied only when the belt refused -- the
+// run is backed up all the way to the machine -- and that is precisely the
+// state the gate reads to know it is blocked. Drawing it makes the
+// back-pressure visible instead of leaving the player to wonder why a
+// machine stopped.
+//
+// Squished, because it is physically nowhere: not on the belt, not inside
+// the body. Compressing it along the travel axis is what distinguishes it
+// from an item that has simply stopped.
+vec4 draw_waiting(ivec4 c, ivec2 ci, vec2 p, float px) {
+    vec4 out_col = vec4(0.0);
+    int type = cell_type(c.x);
+    if (!is_structure(type)) return out_col;
+
+    int row = cell_id(c.x);
+    if (row == 0) return out_col;
+    int facing = cell_dir(c.x);
+    bool flipped = is_flipped(c.z);
+    ivec2 lcl = cell_local(c.y);
+    int out_mask = output_face_mask(type, lcl, facing, flipped);
+
+    // Walk this cell's output faces. The channel index is the port's
+    // position in the authored OUTPUTS list, so it has to be recovered in
+    // authored space -- the same inversion the port masks do.
+    ivec2 authored = unplace_local(type, lcl, facing, flipped);
+    for (int d = 0; d < 4; ++d) {
+        if (!has_face(out_mask, d)) continue;
+        int channel = output_channel_at(type, authored,
+                                        unrotate_face(d, facing, flipped));
+        if (channel < 0) continue;
+        if (!gate_out_held(row, channel)) continue;
+
+        // Sit in the gap between the body edge and the cell boundary.
+        vec2 axis = dir_vec(d);
+        vec2 at = axis * WAIT_OFFSET;
+        // Compress along travel, full width across it.
+        vec2 local = rotate_to_dir(p - at, d);
+        local.x /= WAIT_SQUISH;
+        float dist = length(local);
+        float body = fill(dist - ITEM_RADIUS, px);
+        if (body <= 0.0) continue;
+        float ring = body * (1.0 - fill(dist - (ITEM_RADIUS - ITEM_RING), px));
+
+        float value = gate_out_value(row, channel);
+        vec3 edge = (value > 0.0) ? COL_ITEM_POS : COL_ITEM_NEG;
+        vec3 col = mix(COL_ITEM_FILL, edge, ring);
+        if (body > out_col.a) out_col = vec4(col, body);
+    }
+    return out_col;
+}
+
 // A port arrow: a chevron at `offset` from the cell centre, pointing along
 // `face` (outward) or against it (inward).
 float port_arrow(vec2 p, int face, bool inward, float px) {
@@ -890,6 +954,14 @@ void main() {
         if (gstate != GHOST_PENDING && is_beltlike(type)) {
             vec4 it = draw_items(c, p, cell_dir(c.x), px);
             col = mix(col, it.rgb, it.a);
+        }
+
+        // A gate's undrained waiting zone, for the same reason and in the
+        // same layer: it is cargo sitting on the boundary, not part of the
+        // machine. Only real cells -- a ghost has no gate state.
+        if (gstate != GHOST_PENDING) {
+            vec4 w = draw_waiting(c, ci, p, px);
+            col = mix(col, w.rgb, w.a);
         }
     }
 

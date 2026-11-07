@@ -92,6 +92,30 @@ layout(std430, binding = 3) buffer BeltItems {
     vec2 items[];
 };
 
+// The entity table, as flat floats. Row `r` starts at `r * ENTITY_STRIDE`.
+// Generated constants give the field offsets -- see core/glsl_types.py, which
+// emits ENTITY_STRIDE and the gate-state offsets from core/entity.py so the
+// two cannot drift.
+layout(std430, binding = 0) buffer Entities {
+    float ent[];
+};
+
+float ent_field(int row, int offset) {
+    return ent[row * ENTITY_STRIDE + offset];
+}
+
+// Is output channel `c` of this gate still holding a value the belt has not
+// taken? That is the back-pressure signal, and at the end of a tick it means
+// the gate produced something its belt refused -- drawn squished between the
+// two. While material flows it is always empty by end of tick.
+bool gate_out_held(int row, int c) {
+    return ent_field(row, F_OUT_HELD + c) != 0.0;
+}
+
+float gate_out_value(int row, int c) {
+    return ent_field(row, F_OUT_VALUE + c);
+}
+
 // Where item `k` of a segment sits at `tick + alpha`, in fixed point.
 //
 // `tick` and `alpha` stay separate rather than arriving as one float: the
@@ -226,6 +250,23 @@ int output_face_mask(int type, ivec2 lcl, int facing, bool flipped) {
 }
 
 bool has_face(int mask, int dir) { return (mask & (1 << dir)) != 0; }
+
+// A placed face direction -> the authored one. Inverse of the rotate-then-
+// flip that input_face_mask()/output_face_mask() apply, and in the opposite
+// order: they flip then rotate, so undoing means un-rotate then un-flip.
+//
+// Needed when the *identity* of a port matters rather than merely whether a
+// face is one -- looking up which channel a port drives, say. The masks only
+// answer "is this a port?", which is orientation-independent; a channel
+// index is not.
+int unrotate_face(int placed, int facing, bool flipped) {
+    int d = (placed - facing + 8) % 4;
+    if (flipped) {
+        if (d == DIR_PY) return DIR_NY;
+        if (d == DIR_NY) return DIR_PY;
+    }
+    return d;
+}
 
 // pass_through_mask() -- the authored axes a type passes through unchanged
 // -- is generated above from Entity.PASS_THROUGH. It is declared data, not

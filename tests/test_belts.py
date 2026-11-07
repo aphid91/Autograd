@@ -548,30 +548,43 @@ def test_sim_runs_on_the_belt_phase():
         engine.debug_feed = None
 
 
-def test_debug_feed_respects_real_ends():
-    """The debug feed must not inject into a run a gate already feeds.
+def test_debug_feed_defers_to_real_gates():
+    """On a run with real gates at both ends, the feed changes nothing.
 
-    Otherwise it would conjure items out of the middle of a chain and make
-    the gate layer's behaviour impossible to read.
+    The feed exists to stand in for a Source/Sink pair on a *dangling* run.
+    Where real gates are wired up they must win, or the feed would conjure
+    items into the middle of a chain and make the gate layer unreadable.
+
+    Asserted by running the same chain with and without the feed and
+    comparing: it is the *difference* that matters, not the item count --
+    a Source legitimately fills the belt either way.
     """
-    src = engine.place_structure(Source, 5, 5)
-    engine.place_belt_path((9, 5), (14, 5))
-    snk = engine.place_structure(Sink, 15, 5)
-    engine.sync_segments()
-    seg = next(iter(engine.segments.segments.values()))
-    assert seg.src is not None and seg.dst is not None
+    def run(feed):
+        harness.reset()
+        engine.place_structure(Source, 5, 5)
+        engine.place_belt_path((9, 5), (14, 5))
+        engine.place_structure(Sink, 15, 5)
+        engine.sync_segments()
+        seg = next(iter(engine.segments.segments.values()))
+        assert seg.src is not None and seg.dst is not None
+        engine.debug_feed = feed
+        try:
+            engine.clock.set_rate(60.0)
+            step(20)
+            return (seg.count, seg.head, seg.tail,
+                    engine.gates.stats["consumed"])
+        finally:
+            engine.debug_feed = None
 
-    engine.debug_feed = -1.0
-    try:
-        engine.clock.set_rate(60.0)
-        step(15)
-        # Both ends are real gates, so the debug feed declines to touch it.
-        assert seg.count == 0, (
-            f"the debug feed injected {seg.count} items into a run with a "
-            f"Source at one end and a Sink at the other")
-        ok("a Source->belt->Sink run was left alone by the debug feed")
-    finally:
-        engine.debug_feed = None
+    without = run(None)
+    with_feed = run(-1.0)
+    assert without == with_feed, (
+        f"the debug feed altered a fully-wired chain:\n"
+        f"  without: count/head/tail/consumed = {without}\n"
+        f"  with:    count/head/tail/consumed = {with_feed}")
+    assert without[3] > 0, "the chain should have moved items at all"
+    ok(f"a Source->belt->Sink chain behaves identically with and without "
+       f"the feed ({without[3]} consumed)")
 
 
 def test_items_dropped_when_the_run_is_edited():

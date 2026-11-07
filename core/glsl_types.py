@@ -133,6 +133,28 @@ def generate():
                      body, "0")
         lines.append("")
 
+    # --- port -> channel index ---
+    # Which gate-state slot a port face uses. For every machine but Sink this
+    # is just the port's position in OUTPUTS/INPUTS, but the renderer cannot
+    # assume that -- it has to look up the same mapping the simulation uses,
+    # or a Sink's eight faces would index eight slots that do not exist.
+    for which, attr, chan in (("output", "OUTPUTS", "out_channel"),
+                              ("input", "INPUTS", "in_channel")):
+        body = []
+        for c in types:
+            ports = getattr(c, attr)
+            if not ports:
+                continue
+            body.append(f"if (type == {_type_const(c)}) {{")
+            for i, (lx, ly, face) in enumerate(ports):
+                body.append(
+                    f"    if (lcl == ivec2({lx}, {ly}) && face == "
+                    f"{_DIR_GLSL[face]}) return {getattr(c, chan)(i)};")
+            body.append("}")
+        lines += _fn(f"int {which}_channel_at(int type, ivec2 lcl, int face)",
+                     body, "-1")
+        lines.append("")
+
     # --- control channels ---
     body = []
     for c in types:
@@ -178,9 +200,21 @@ def type_constants():
     """`const int TYPE_* = n;` for every registered type, plus TYPE_EMPTY.
 
     Emitted alongside the tables so the id numbering also has a single
-    source: cell.TYPE_NAMES.
+    source: cell.TYPE_NAMES. Also carries the entity-row layout, which the
+    shader needs to read gate state out of the entity SSBO -- the stride and
+    the field offsets are decided in core/entity.py and nowhere else.
     """
-    lines = [f"const int TYPE_EMPTY = {cell.TYPE_EMPTY};"]
+    from core.entity import ENTITY_STRIDE, Entity, MAX_CHANNELS
+
+    lines = [
+        f"const int ENTITY_STRIDE = {ENTITY_STRIDE};",
+        f"const int MAX_CHANNELS = {MAX_CHANNELS};",
+        f"const int F_IN_VALUE  = {Entity.F_IN_VALUE};",
+        f"const int F_IN_HELD   = {Entity.F_IN_HELD};",
+        f"const int F_OUT_VALUE = {Entity.F_OUT_VALUE};",
+        f"const int F_OUT_HELD  = {Entity.F_OUT_HELD};",
+        f"const int TYPE_EMPTY = {cell.TYPE_EMPTY};",
+    ]
     for tid, name in sorted(cell.TYPE_NAMES.items()):
         if tid == cell.TYPE_EMPTY:
             continue

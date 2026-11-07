@@ -45,6 +45,7 @@ There is no pytest/linter configured.
 | [tests/test_segments.py](tests/test_segments.py) | belt-run derivation: tracing, cuts, undergrounds, merges, audit under churn |
 | [tests/test_belts.py](tests/test_belts.py) | the closed form against the naive oracle, on fixed and randomised configs |
 | [tests/test_item_render.py](tests/test_item_render.py) | reads the framebuffer back: do discs appear where the simulation says? |
+| [tests/test_gates.py](tests/test_gates.py) | firing rules, arithmetic, back pressure, and the bubble-free claim |
 
 **Scenarios are independent.** `harness.reset()` clears the board, camera,
 input state and toolbelt before each one, so a failure names the scenario
@@ -149,6 +150,7 @@ everything else is grouped by layer.
 | [core/segments.py](core/segments.py) | belt runs coalesced into the O(1) simulation unit; derived from the grid |
 | [core/belts.py](core/belts.py) | closed-form item transport, and the naive oracle it is tested against |
 | [core/belt_device.py](core/belt_device.py) | packs segment + item state into SSBOs for the renderer |
+| [core/gates.py](core/gates.py) | gate firing, and the port callbacks joining gates to belts |
 | [engine.py](engine.py) | preview/commit a plan, erase, ghost lifecycle |
 | [render/camera.py](render/camera.py) | pan/zoom, world↔screen, the world render pass |
 | [render/shader_loader.py](render/shader_loader.py) | reads `shaders/`, resolves `#include` |
@@ -466,6 +468,106 @@ engine's transport is on that list, and a blanket clear silently stops the
 whole simulation. A test cleanup did exactly that, and the symptom surfaced
 three files later as "the belt phase ran but nothing moved"; `harness.reset()`
 now asserts the callback is still there.
+
+### Gates
+
+[core/gates.py](core/gates.py) fires machines; [core/entity.py](core/entity.py)
+says what each one computes. A gate fires when its inputs are ready **and
+every output waiting zone is clear**, then consumes its inputs and puts
+results in those zones.
+
+| machine | operation |
+|---|---|
+| `Shear` | x,y → x, x+y |
+| `Mac` | x,y,z → x, y, z + x·y |
+| `Swap` | x,y,z → x, (y,z if x>0 else z,y) — x is the control |
+| `Source` | → a constant (`EMIT_VALUE`, currently −1) |
+| `Sink` | destroys whatever arrives |
+
+**Firing is declared, not special-cased.** `FIRE_RULE` is `FIRE_ALL`
+(every input needed — a Shear cannot compute x+y from x alone) or `FIRE_ANY`
+(Sink's rule; waiting for all eight faces would deadlock a sink fed from one
+side). A type with **no** inputs is vacuously ready under either rule, so
+`Source` fires whenever its output is clear with no special case anywhere —
+and its rate self-regulates to whatever the belt will take.
+
+**Each machine's arithmetic is one `fire()` method** taking channel values
+and returning channel values, indexed by declaration order. That indexing is
+the only contract between a machine's geometry and its arithmetic.
+
+#### Channels are not port faces
+
+`Sink` accepts on eight perimeter faces, but those are eight ways *in* to one
+consumer — not eight independent values. `in_channel()` / `out_channel()` map
+a port face to a gate-state slot, defaulting to the port's index and
+overridden by `Sink` to fold all eight onto channel 0.
+
+This matters for sizing: `MAX_CHANNELS` is 3 (Mac's x,y,z), so a row needs
+`8 + 4×3 = 20` slots and `ENTITY_STRIDE` is 24. Sizing by *faces* would mean
+8 channels for every entity and a belt row carrying 32 unused floats.
+
+The renderer needs the same mapping — `output_channel_at()` is generated from
+Python, because "port index == channel" is false for Sink and indexing by
+face would read slots that do not exist.
+
+#### Back pressure is the only mechanism
+
+Nothing anywhere asks "is the belt full". A gate reads **its own** output
+waiting zones; the belt phase empties them when it can. If a belt is full the
+zone stays occupied and the gate does not fire next tick. That is required,
+not merely tidy: a gate must not read belt state during the structure phase,
+or firing would become order-dependent.
+
+**An occupied waiting zone at the end of a tick is a renderable state** — it
+means the gate produced something the belt refused. `draw_waiting()` draws it
+squished into the gap between the body edge and the cell boundary, compressed
+along the travel axis so it reads as *nowhere* rather than mispositioned.
+While material flows the zones are always empty by end of tick, so nothing
+shows.
+
+A practical consequence when building: **every output must be drained, not
+just the interesting one.** A Shear emits x unchanged as well as x+y, and
+leaving the pass-through dangling stalls the machine completely after a
+single fire rather than degrading it. Pinned by a test.
+
+#### The port work happens *inside* the belt tick
+
+This is the subtle part, and getting it wrong is cheap to do and expensive to
+notice. `offer_to()` / `accept_from()` are passed to `BeltSim.tick()` as the
+producer and consumer callbacks, so one belt tick does
+**advance-anchor → pop → push** exactly as docs/belt_report.md requires.
+
+Doing the gate work in separate passes *around* the belt tick — drain, then
+transport, then load — breaks that sequence. The drain pushes before the
+anchor has advanced and before the pop, so it sees a belt one slot fuller
+than it is about to be and declines. A saturated chain loses roughly **one
+tick in seven** (measured: 26 items over 30 ticks against the correct 30).
+
+It presents exactly like the one-tick stall recovery the design *does*
+document, which is what makes it easy to accept. It was written that way
+first, and `test_well_fed_gate_fires_every_tick` caught it — which is the
+main reason that test exists. Note that merely transposing the pop and push
+blocks *within* `tick_segment` is a different and much louder bug: the
+oracle comparison in `tests/test_belts.py` catches that one immediately,
+while the throughput test does not notice.
+
+A separate `took()` callback clears the waiting zone only after a push
+actually happened, so offering is not committing. That split is **defensive
+rather than load-bearing today**: `BeltSim` tests for room *before* calling
+`offer()`, so the only refusal possible is the gate having nothing to give,
+and clearing the zone inside `offer_to()` would behave identically — no test
+catches a mutation that does. It stays split because the protocol is then
+correct by construction rather than by where the room check happens to sit,
+and a producer that can be asked speculatively (a splitter choosing between
+two belts) would make it matter at once.
+
+**Direct gate-to-gate connections** (`deliver_direct()`) are handled apart
+from the belt path, since there is no segment to own the transfer. One tick
+per hop, same as a belt, which keeps the two cases consistent.
+
+A port face has exactly one neighbour, so each (gate, channel) pair has one
+upstream source and the writes are disjoint — no contention even though many
+gates write inputs in the same pass.
 
 ### Item rendering
 
@@ -895,11 +997,11 @@ loader at two markers in [shaders/common.glsl](shaders/common.glsl):
 
 | marker | emits |
 |---|---|
-| `// @generated type-ids` | `TYPE_*` constants, from `cell.TYPE_NAMES` |
-| `// @generated type-tables` | `type_footprint`, `input_face_mask_local`, `output_face_mask_local`, `pass_through_mask`, `type_colour`, `type_glyph` |
+| `// @generated type-ids` | `TYPE_*` constants from `cell.TYPE_NAMES`, plus the entity row layout (`ENTITY_STRIDE`, `MAX_CHANNELS`, the `F_*` gate-state offsets) |
+| `// @generated type-tables` | `type_footprint`, `input_face_mask_local`, `output_face_mask_local`, `input_channel_at`, `output_channel_at`, `pass_through_mask`, `type_colour`, `type_glyph` |
 
 **No shader names a machine by hand.** Adding a type in Python makes it
-appear in all six tables automatically.
+appear in all eight tables automatically.
 
 This replaced six hand-mirrored GLSL tables that had to be kept in step with
 Python by test assertions. The mechanism failed twice in practice — ports
@@ -1059,20 +1161,27 @@ bugs:
 
 ## Deferred
 
-Noted so they are not mistaken for oversights: **structure** simulation
-(belts now carry items — the closed form runs on the belt phase and is
-oracle-verified — but no gate fires: none of the signatures in the machine
-table are evaluated, no arithmetic happens, and `Source`/`Sink` neither
-produce nor consume. `Engine.debug_feed` stands in for them);
+Simulation now works end to end — belts carry items, gates fire, and a
+saturated chain moves one item per tick. What is still missing:
+
+**Cooldown ticks** (every gate fires every tick it can; a per-type rate limit
+is the obvious next knob, and `FIRE_RULE` is where it would go);
+**a Sink's record** (it destroys what it eats; a stack per input channel is
+the stated next step);
+**configurable Source values** (`EMIT_VALUE` is a class attribute, so every
+Source on the board emits −1);
 **item-to-gate transit** (items pop in and out of existence at the ends of a
 run rather than being seen to enter or leave a machine — deliberate for now);
 **numbers on items** (a disc shows only the sign of its value, via colour);
+**int and bool item types** (the storage is float32 throughout, as designed;
+nothing yet reinterprets it);
 **incremental segment rebuild** (currently whole-board on any real edit;
 the inspector reports rebuild counts so there is a number to point at before
 anyone optimises it);
-compute shader passes (the context is 4.3 and the SSBO is bound, but nothing
-dispatches); curved corner geometry (corners are currently a right-angle join
-of two straight arms, which reads fine but is not a true curve); entity-row
+**compute shader passes** (the context is 4.3 and all four SSBOs are bound
+and read, but nothing dispatches);
+curved corner geometry (corners are currently a right-angle join of two
+straight arms, which reads fine but is not a true curve); entity-row
 compaction; a growable or chunked board (fixed 512×512).
 
 **Simulation is being built CPU-first, then ported.** The tick phases, the
