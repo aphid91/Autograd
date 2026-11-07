@@ -292,15 +292,82 @@ def test_sink_fires_on_any_single_input():
     """FIRE_ANY: waiting for all eight faces would deadlock a normal sink."""
     snk = engine.place_structure(Sink, 10, 10)
     engine.sync_segments()
-    assert snk.input_count() == 1, (
-        f"Sink's eight faces should fold onto one channel, got "
-        f"{snk.input_count()}")
+    assert snk.input_count() == 4, (
+        f"Sink's eight faces should fold onto four channels, one per "
+        f"footprint cell, got {snk.input_count()}")
     snk.set_input(0, 42.0)
     _run(1)
     assert not snk.in_held(0), "the sink should have consumed it"
     assert snk.outputs_clear(), "a sink emits nothing"
     assert engine.gates.stats["consumed"] > 0
     ok("a Sink fed on one face consumed immediately")
+
+
+def test_a_sink_clears_every_channel_in_one_tick():
+    """Four fed channels must all be consumed by a single tick, not queued.
+
+    `structure_phase()` clears every held input under FIRE_ANY, so this is
+    really pinning that the channels are independent slots rather than
+    aliases of one. With all eight faces folded onto channel 0 there was only
+    ever one value to clear, and this test could not have been written.
+    """
+    snk = engine.place_structure(Sink, 10, 10)
+    engine.sync_segments()
+    for ch in range(snk.input_count()):
+        snk.set_input(ch, float(ch) + 1.0)
+    before = engine.gates.stats["consumed"]
+    _run(1)
+    held = [c for c in range(snk.input_count()) if snk.in_held(c)]
+    assert not held, f"channels {held} survived the tick"
+    took = engine.gates.stats["consumed"] - before
+    assert took == 4, f"a sink should eat 4 channels in one tick, ate {took}"
+    ok("a Sink consumed all four channels in a single tick")
+
+
+def test_two_saturated_belts_feed_one_sink_at_full_rate():
+    """A sink must eat several saturated belts at once, not one belt's worth.
+
+    This is the test the per-cell channel fold exists for. A channel is one
+    slot with one occupancy flag, so it carries **one item per tick** -- when
+    all eight faces folded onto channel 0, the first belt to load it made
+    `accept_from()` refuse the other until the next structure phase, and two
+    saturated belts delivered the throughput of one. The symptom is a
+    bottleneck that looks like the belts are at fault.
+
+    Asserts the rate rather than merely "items arrived": one belt alone would
+    still pass a non-zero check, which is exactly how this went unnoticed.
+    """
+    # Two independent Source -> belt -> Sink runs, arriving at two *different*
+    # cells of the same 2x2 sink. Different cells is the point: two faces of
+    # one cell still share a channel by design.
+    engine.place_structure(Source, 4, 11)          # 2x1 over (4,11)-(5,11)
+    for x in range(6, 12):
+        engine.place_belt(x, 11, cell.DIR_PX)
+    engine.place_structure(Source, 4, 8)           # 2x1 over (4,8)-(5,8)
+    for x in range(6, 12):
+        engine.place_belt(x, 8, cell.DIR_PX)
+    # Sink origin (12,10) covers (12,10)-(13,11), so the y=11 run lands on
+    # its top-left cell. A second sink would defeat the point of the test, so
+    # route the lower run into the same one via a vertical approach.
+    snk = engine.place_structure(Sink, 12, 10)
+    for y in range(8, 10):
+        engine.place_belt(12, y, cell.DIR_PY)
+    engine.sync_segments()
+
+    # Let the pipeline fill, then measure over a window where both runs are
+    # saturated -- the first few ticks are latency, not throughput.
+    _run(40)
+    before = engine.gates.stats["consumed"]
+    _run(20)
+    took = engine.gates.stats["consumed"] - before
+
+    assert took >= 38, (
+        f"two saturated belts into one sink consumed {took} items over 20 "
+        f"ticks; expected ~40 (2/tick). A rate near 20 means the two runs "
+        f"are sharing one input channel and serialising.")
+    channels = {c for c in range(snk.input_count())}
+    assert len(channels) == 4, snk.input_count()
+    ok(f"two saturated belts fed one Sink {took} items in 20 ticks")
 
 
 def test_back_pressure_stalls_a_blocked_gate():

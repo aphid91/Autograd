@@ -76,6 +76,11 @@ def rotate_dir(direction, cw=True):
     return (direction - 1 if cw else direction + 1) % 4
 
 
+def opposite_dir(direction):
+    """The reverse of a direction. Two quarter-turns, so `cw` is irrelevant."""
+    return (direction + 2) % 4
+
+
 def rotate_dir_ccw_n(direction, turns):
     """Rotate a direction CCW by `turns` quarter-turns.
 

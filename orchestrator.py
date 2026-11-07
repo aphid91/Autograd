@@ -25,9 +25,10 @@ import os
 
 import glfw
 
-from core import persistence
+from core import config, persistence
 from core.builders import PasteBuilder, default_builders
 from core.clipboard import Clipboard, MODE_COPY, MODE_PASTE, capture
+from core.entity import Source
 from render.camera import Camera
 from engine import Engine
 from ui.input_manager import InputManager, STATE_PLANNING
@@ -57,6 +58,14 @@ class Orchestrator:
         self.select_rect = None
 
         self.cursor_cell = None
+        #: Entity row the Status window is inspecting, or None when closed.
+        #:
+        #: A **row**, not a view: views must never be cached across frames,
+        #: since a row can be freed and reused underneath one. The panel
+        #: rebuilds a view each frame from this and checks it is still alive,
+        #: so erasing the inspected entity closes the window rather than
+        #: reading a recycled row.
+        self.inspect_row = None
         #: Segments rebuilt this frame, or None if the index was already
         #: current. Shown in the inspection panel.
         self.last_rebuild = None
@@ -200,6 +209,65 @@ class Orchestrator:
         self._on_tool_changed()
         tool.adopt(entity)
 
+    def _inspect_at(self, cursor_cell):
+        """Open the Status window on the entity at `cursor_cell`, or close it.
+
+        The empty hand's one gesture. Clicking a structure inspects it;
+        clicking bare board closes the window, which makes "click away to
+        dismiss" work without the player hunting for the close button.
+
+        Stores the **row** rather than the view, because a view must not
+        outlive the frame it was made in -- see `inspect_row`.
+
+        Ghosts are skipped for the same reason the pipette skips them: a
+        preview ghost can sit under the cursor, and inspecting it would open
+        a window on an entity that is about to be despawned. An empty hand
+        has no preview of its own, so this only matters on the frame a tool
+        was just put down.
+        """
+        if cursor_cell is None:
+            self.inspect_row = None
+            return
+        entity = self.engine.entity_at(*cursor_cell)
+        self.inspect_row = None if entity is None else entity.row
+
+    def _set_emit(self, row, value):
+        """Change a Source's emitted constant and flush material in flight.
+
+        The flush is the point, and it is the same bargain editing the belt
+        network already makes: an item on a belt is a payload and an entry
+        tick with no record of which machine produced it, so there is no way
+        to retire just the stale ones. Without it the old value keeps
+        arriving for as long as the longest run takes to drain, mixed in with
+        the new one and looking like the setting did not take.
+
+        Guarded on the row still being a live Source, because a request is
+        built from the previous frame's state -- the entity could have been
+        erased between the panel drawing and this running.
+        """
+        board = self.engine.board
+        if not board.is_row_alive(row):
+            return
+        view = board.view(row)
+        if not isinstance(view, Source):
+            return
+        if view.emit_value == value:
+            return
+        view.emit_value = value
+        self.engine.flush_material()
+
+    def inspected(self):
+        """A fresh view of the inspected entity, or None.
+
+        Built per call rather than held, and `None` the moment the row dies,
+        so erasing or overwriting the inspected entity closes the window
+        instead of reading a row the free list has handed to something else.
+        """
+        row = self.inspect_row
+        if row is None or not self.engine.board.is_row_alive(row):
+            return None
+        return self.engine.board.view(row)
+
     def _reset_tool_state(self):
         """Drop a tool's multi-step state after an abandoned gesture.
 
@@ -212,10 +280,20 @@ class Orchestrator:
                 slot.reset()
 
     # --- quicksave -------------------------------------------------------
+    def _save_path(self):
+        """Where the save buttons point, honouring the panel's filename box.
+
+        An empty box means the default quicksave, which is what keeps the
+        buttons working with nothing typed. Read from `self.ui` rather than
+        held here so there is one copy of the value.
+        """
+        return config.resolve_save_path(
+            getattr(self.ui, "save_name", ""), persistence.DEFAULT_SAVE)
+
     def _quicksave(self):
         """Save, returning (ok, message) for the panel to show."""
         try:
-            path = self.engine.save_board()
+            path = self.engine.save_board(self._save_path())
         except (persistence.SaveError, OSError) as exc:
             return (False, f"Save failed: {exc}")
         self.last_plan = None
@@ -225,7 +303,7 @@ class Orchestrator:
     def _quickload(self, quiet=False):
         """Load, returning (ok, message). `quiet` suppresses "no save yet",
         which is the normal case on a first run rather than an error."""
-        path = persistence.DEFAULT_SAVE
+        path = self._save_path()
         if not os.path.exists(path):
             return None if quiet else (False, f"No save at {path}")
         try:
@@ -268,10 +346,17 @@ class Orchestrator:
         # 1. input. The active tool decides the gesture style, so it has to be
         # known before polling -- and in paste mode that is the paste tool,
         # not whatever the toolbelt holds.
+        #
+        # An empty hand is **click-based**. It has no plan to build up, so a
+        # drag-based gesture would park it in STATE_PLANNING on the first
+        # click and only commit on the second -- which for the inspect
+        # gesture means the Status window needing two clicks to open. The
+        # old `True` default was harmless only because an empty hand had no
+        # gesture at all.
         tool_now = self._active_tool()
         intents = self.input.poll(
             dt, board,
-            drag_based=(tool_now.drag_based if tool_now else True),
+            drag_based=(tool_now.drag_based if tool_now else False),
             mode=self.clipboard.mode,
         )
         self.cursor_cell = intents.cursor_cell
@@ -368,7 +453,14 @@ class Orchestrator:
             if tool is not None and hasattr(tool, "reset"):
                 tool.reset()
 
-        if intents.commit_plan:
+        if intents.commit_plan and tool is None:
+            # Empty hand: a click inspects instead of building. This is the
+            # one gesture the empty hand has, and it is why the state is
+            # distinct from "an empty slot is selected" -- see the note on
+            # NO_SELECTION in CLAUDE.md.
+            self._inspect_at(intents.cursor_cell if intents.cursor_in_world
+                             else None)
+        elif intents.commit_plan:
             # A click-based tool has no PLANNING phase, so on the very first
             # frame the cursor is over the board there may be no preview yet.
             # Only build one if it is genuinely missing -- rebuilding an
@@ -443,6 +535,10 @@ class Orchestrator:
             self.ui.last_save = self._quicksave()
         if requests.quickload:
             self.ui.last_save = self._quickload()
+        if requests.close_status:
+            self.inspect_row = None
+        if requests.set_emit is not None:
+            self._set_emit(*requests.set_emit)
         if requests.toggle_pause:
             engine.clock.toggle_pause()
         if requests.step_tick:

@@ -26,6 +26,7 @@ import moderngl
 from imgui_bundle import imgui
 from imgui_bundle.python_backends.glfw_backend import GlfwRenderer
 
+from core import config
 from orchestrator import Orchestrator
 
 WINDOW_W, WINDOW_H = 1280, 720
@@ -61,8 +62,17 @@ def main():
     renderer = GlfwRenderer(window)
 
     orch = Orchestrator(window, ctx, BOARD_W, BOARD_H)
+    # Remembered UI preferences. Loaded here rather than in the Orchestrator
+    # or UI constructor on purpose: the test harness builds both, and an
+    # implicit load would give every test run the player's own save filename.
+    # See core/config.py.
+    prefs = config.load()
+    orch.ui.save_name = prefs["save_name"]
+
     # Pick up the quicksave if there is one; otherwise start from the demo
-    # layout, so a first run still has something on the board.
+    # layout, so a first run still has something on the board. This reads the
+    # filename box, so it has to follow the line above -- autoloading first
+    # would always open the default rather than the file the player last used.
     loaded = orch.autoload()
     if loaded is not None:
         print(loaded[1])
@@ -92,6 +102,14 @@ def main():
 
         ctx.clear(0.07, 0.07, 0.09)
         orch.frame(dt)
+
+        # Persist the filename box when it changes. Writing on the edit rather
+        # than at shutdown means a crash cannot lose it, and the file is tiny
+        # enough that the cost does not matter at typing speed.
+        if orch.ui.save_name_dirty:
+            orch.ui.save_name_dirty = False
+            prefs["save_name"] = orch.ui.save_name
+            config.save(prefs)
 
         imgui.render()
         renderer.render(imgui.get_draw_data())

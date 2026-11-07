@@ -69,10 +69,10 @@ class StampEntry:
     """One captured entity: a type, an offset in the stamp, an orientation."""
 
     __slots__ = ("entity_cls", "dx", "dy", "direction", "flipped",
-                 "is_exit", "partner")
+                 "is_exit", "partner", "emit")
 
     def __init__(self, entity_cls, dx, dy, direction, flipped=False,
-                 is_exit=False, partner=None):
+                 is_exit=False, partner=None, emit=None):
         self.entity_cls = entity_cls
         self.dx = dx
         self.dy = dy
@@ -84,10 +84,20 @@ class StampEntry:
         # onto whatever happens to be near the paste site.
         self.is_exit = bool(is_exit)
         self.partner = partner
+        # Source-only: the captured emit value, or None for "use the type's
+        # default". Carried because a Source's emitted constant is per
+        # instance, so copying a configured one and pasting it back at -1
+        # would silently discard a setting the player made -- and the paste
+        # looks identical, which is the worst kind of loss.
+        #
+        # Orientation-independent, so rotate() and mirror() carry it through
+        # untouched.
+        self.emit = emit
 
     def copy(self):
         return StampEntry(self.entity_cls, self.dx, self.dy, self.direction,
-                          self.flipped, self.is_exit, self.partner)
+                          self.flipped, self.is_exit, self.partner,
+                          self.emit)
 
     def cells(self, ox=0, oy=0):
         """Cells this entry covers, offset by a paste origin."""

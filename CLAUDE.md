@@ -48,6 +48,7 @@ There is no pytest/linter configured.
 | [tests/test_gates.py](tests/test_gates.py) | firing rules, arithmetic, back pressure, and the bubble-free claim |
 | [tests/test_stamp.py](tests/test_stamp.py) | what the stamp transforms preserve: wiring, topology, arithmetic |
 | [tests/test_clipboard.py](tests/test_clipboard.py) | the copy/paste mode machine, driven through the fake mouse and keyboard |
+| [tests/test_inspect.py](tests/test_inspect.py) | the Status window, the per-Source emit value, the save filename box |
 
 **Scenarios are independent.** `harness.reset()` clears the board, camera,
 input state and toolbelt before each one, so a failure names the scenario
@@ -100,7 +101,7 @@ surfaced as one shuffle seed in twelve failing a pixel test.
 | `ctrl+C` | copy mode — left-drag a selection box |
 | `ctrl+V` | paste mode, if anything has been copied |
 | shift+scroll | **paste mode**: walk the copy history (older / newer) |
-| Left-click | build with the active tool (fires on **release**) |
+| Left-click | build with the active tool (fires on **release**); with an **empty hand**, inspect what is there |
 | `R` / `shift+R` | **per-tool**: belt path shape, or structure rotation |
 | Right-click | cancel a plan, or drag to erase |
 | `Esc` | cancel a plan, or a tool's multi-step state |
@@ -121,13 +122,20 @@ no key binding at all now — scroll is the only one.
 
 ### The empty hand is a real state
 
-The default is holding **nothing**, Factorio-style: clicking the board does
-nothing, and no slot is highlighted. `Toolbelt.selected` is `NO_SELECTION`
-(`-1`) then, which is deliberately *not* the same as selecting an empty slot —
-`empty_handed` distinguishes them where `active is None` cannot. The
-distinction earns its keep twice: selecting an empty slot is a deliberate act
-that should look different from holding nothing, and the planned
-structure-selection tool lives on the empty hand rather than on slot 7.
+The default is holding **nothing**, Factorio-style: no slot is highlighted,
+and clicking the board **inspects** rather than builds (see "The Status
+window" below). `Toolbelt.selected` is `NO_SELECTION` (`-1`) then, which is
+deliberately *not* the same as selecting an empty slot — `empty_handed`
+distinguishes them where `active is None` cannot. The distinction earns its
+keep twice: selecting an empty slot is a deliberate act that should look
+different from holding nothing, and the inspect gesture lives on the empty
+hand rather than on a slot.
+
+**An empty hand is click-based**, not drag-based. It has no plan to build up,
+so the `drag_based=True` fallback would park it in `STATE_PLANNING` on the
+first click and only commit on the second — which for inspect means the
+Status window needing two clicks to open. That fallback was harmless only for
+as long as the empty hand had no gesture at all.
 
 `harness.reset()` leaves the hand empty, so every scenario starts from the
 app's real default and declares the tool it needs. That also stops `reset()`
@@ -222,7 +230,96 @@ can tell a drawn rectangle from an undrawn one.
 `harness.reset()` clears the mode, the stash and the history. Without it a
 scenario that left paste mode on would hand the next one a different gesture
 machine, and a leftover stamp would make a paste test pass for the wrong
-reason.
+reason. It also clears `inspect_row` and `ui.save_name` for the same class of
+reason: a scenario that left the Status window open would have the next one's
+`clear_board()` free the row under it, and a leftover filename would point
+the save tests somewhere unexpected.
+
+### The Status window
+
+Clicking the board with an empty hand opens **Status** on whatever entity is
+there; clicking bare board closes it. That is the whole interaction, and the
+click-away dismissal is why bare board is not simply ignored.
+
+The orchestrator holds `inspect_row` — a **row, not a view**. Views must never
+outlive the frame they were made in, since a row can be freed and handed to an
+unrelated entity, so `Orchestrator.inspected()` rebuilds a view per call and
+returns `None` once the row is dead. Erasing the inspected entity therefore
+closes the window rather than reporting a recycled row's contents under the
+erased entity's name.
+
+Ghosts are skipped (`Engine.entity_at()`), for the same reason the pipette
+skips them: a ghost is about to be despawned. An empty hand has no preview of
+its own, so this is reachable only on the frame a tool was just put down —
+which is exactly when it happens.
+
+The panel only **requests**: `close_status` and `set_emit` come back in
+`UIRequests` and the orchestrator applies them, so the window never mutates
+board state. `set_emit` carries a `(row, value)` pair for the same reason
+`inspect_row` is a row.
+
+Most machines have no affordance yet and the window just reports type,
+orientation, footprint, and channel contents — an occupied output zone shows
+as `(waiting)`, which is back pressure made visible.
+
+#### A Source's emitted value is per instance
+
+`Source.EMIT_VALUE` is now only the value a freshly placed one *starts* at.
+The live value lives in the entity row at `Source.F_EMIT`, and `fire()` reads
+it, so two Sources on one board can emit different numbers.
+
+**`F_EMIT` deliberately squats on an input slot** (`F_IN_VALUE + 0`). A
+generator has no input channels — `INPUTS` is empty — so nothing in the tick,
+the port pass or the renderer can ever read those twelve slots on a Source.
+That matters because the row was exactly full: `MAX_CHANNELS = 6` consumes all
+24 post-prefix slots, so appending a field would have pushed `ENTITY_STRIDE`
+from 32 to 36 and widened **every** row in the game, including every belt's,
+to carry a number one machine has. A self-check asserts `Source.in_channels()
+== 0`, because giving Source an input would alias its emit value onto that
+channel.
+
+Two consequences:
+
+- **`initialise()` seeds the default.** A zeroed row reads as `0.0`, which is
+  a legal emit value and so indistinguishable from a deliberate one. Done on
+  the Source class rather than in `Gameboard.spawn()`, the same seam
+  Underground uses for its role and partner fields.
+- **Changing it flushes every item in flight** (`Engine.flush_material()`),
+  belts *and* gate channels. Clearing only the rings leaves a value already
+  pulled into a gate's input, or a result already in its waiting zone, to
+  re-enter the network next tick. The flush is board-wide because an item is
+  a payload and an entry tick with no record of which machine produced it —
+  tracing descendants of one Source is not expressible in the closed form.
+  Same bargain an edit to the belt network already makes. Setting the
+  *current* value is not a change and does not flush, because imgui reports a
+  change per keystroke and typing `-1` into a Source already at `-1` would
+  otherwise wipe the board mid-edit.
+
+The value travels with copy/paste (`StampEntry.emit` → `Placement.emit` →
+`Engine._spawn_fields()`), or a configured Source would paste back at the
+default — invisibly, since the paste looks identical. `Placement.emit`
+defaults to `None` so the *toolbelt* still places the type default rather than
+inheriting whatever was last copied.
+
+### Persistent UI preferences
+
+[core/config.py](core/config.py) holds a flat JSON file of panel state that
+should survive a restart — currently just the quicksave filename. Not part of
+the `.npz`: a save file is a *board*, and putting the name there would change
+it every time you loaded a different file.
+
+**Nothing loads it implicitly.** `app.py` calls `load()` at startup and
+`save()` when the value changes; `Orchestrator` and `UI` take it as plain
+data. That is not ceremony — the test harness builds a real `Orchestrator`,
+so a constructor that read the config would give every test run the player's
+own filename, and a test exercising the save path would then write wherever
+the player had last pointed it. A test asserts neither `__init__` calls into
+`config`, checked against the compiled code rather than the source text.
+
+The filename box drives both buttons. **Empty means the default quicksave**,
+so the pair behaves exactly as it did before the box existed; a bare name
+gets `.npz` appended, and anything with an extension or a directory component
+is left alone.
 
 ### A drag-based tool previews while idle
 
@@ -274,6 +371,7 @@ everything else is grouped by layer.
 | [core/clipboard.py](core/clipboard.py) | copy/paste mode state, the stashed tool, and `capture()` |
 | [core/glsl_types.py](core/glsl_types.py) | emits the per-type GLSL tables from the entity classes |
 | [core/persistence.py](core/persistence.py) | save/load the board to a single `.npz` (`.w` zeroed — derived) |
+| [core/config.py](core/config.py) | persistent panel preferences (the quicksave filename), loaded only by `app.py` |
 | [core/toolbelt.py](core/toolbelt.py) | ten slots, one active tool |
 | [core/tick.py](core/tick.py) | the simulation clock: tick counter, fixed timestep, phase order |
 | [core/segments.py](core/segments.py) | belt runs coalesced into the O(1) simulation unit; derived from the grid |
@@ -621,8 +719,8 @@ results in those zones.
 | `Shear` | x,y → x, x+y |
 | `Mac` | x,y,z → x, y, z + x·y |
 | `Swap` | x,y,z → x, (y,z if x>0 else z,y) — x is the control |
-| `Source` | → a constant (`EMIT_VALUE`, currently −1) on every connected port |
-| `Sink` | destroys whatever arrives |
+| `Source` | → a per-instance constant on every connected port |
+| `Sink` | destroys whatever arrives, up to 4 per tick |
 
 #### Generators are the one machine that skips its own outputs
 
@@ -658,8 +756,8 @@ because it reads belt *presence* (static for the whole phase) rather than belt
 
 **Firing is declared, not special-cased.** `FIRE_RULE` is `FIRE_ALL`
 (every input needed — a Shear cannot compute x+y from x alone) or `FIRE_ANY`
-(Sink's rule; waiting for all eight faces would deadlock a sink fed from one
-side). A type with **no** inputs is vacuously ready under either rule, so
+(Sink's rule; waiting for all four channels would deadlock a sink fed from
+one side). A type with **no** inputs is vacuously ready under either rule, so
 `Source` fires whenever its output is clear with no special case anywhere —
 and its rate self-regulates to whatever the belt will take.
 
@@ -669,21 +767,40 @@ the only contract between a machine's geometry and its arithmetic.
 
 #### Channels are not port faces
 
-`Sink` accepts on eight perimeter faces, but those are eight ways *in* to one
-consumer — not eight independent values. `in_channel()` / `out_channel()` map
-a port face to a gate-state slot, defaulting to the port's index and
-overridden by `Sink` to fold all eight onto channel 0.
+`in_channel()` / `out_channel()` map a port face to a gate-state slot,
+defaulting to the port's index. `Sink` overrides it to fold its eight faces
+onto four channels, one per footprint cell.
 
-**`Source` is the opposite case and must *not* fold.** Its six faces are six
-independent channels, because a waiting zone is cleared by whoever drains it:
-two belts sharing one channel would split one item per tick between them
-instead of each getting a full run. That is what makes "one Source fills two
-belts" work (`test_one_source_fills_two_belts`).
+**A channel is one item per tick, because it is one slot** with one occupancy
+flag. That single fact decides every fold on the board, and it cuts both ways:
+
+- **`Sink` folds, but only per cell.** The eight faces really are
+  interchangeable as *values* — a sink destroys whatever arrives — so folding
+  them looked free. It was not: all eight on channel 0 meant the first belt
+  to load it made `accept_from()` refuse the rest until the next structure
+  phase, so **two saturated belts into one sink delivered one belt's
+  throughput**. Measured at 20 items per 20 ticks against the correct 40.
+  Per cell, each of the four tiles drains independently.
+- **`Source` does not fold at all.** Same arithmetic from the output side:
+  two belts sharing a channel would split one *emit* per tick instead of each
+  getting a full run. That is what makes "one Source fills two belts" work
+  (`test_one_source_fills_two_belts`).
+
+So the two machines pull in opposite directions for the same reason, and
+`test_two_saturated_belts_feed_one_sink_at_full_rate` asserts the **rate**
+rather than merely that items arrived — one belt alone still passes a
+non-zero check, which is exactly how the bottleneck went unnoticed.
+
+The remaining cost is that a single tile's two faces share a slot, so feeding
+one corner from both sides gets one item per tick between them. Spread the
+belts across tiles.
 
 This matters for sizing: `MAX_CHANNELS` is 6, set by Source, so a row needs
-`8 + 4×6 = 32` slots and `ENTITY_STRIDE` is 32. Sizing by *faces* would mean
-8 channels for every entity. Note the stride is baked into save files, so the
-persistence shape check rejects older ones.
+`8 + 4×6 = 32` slots and `ENTITY_STRIDE` is 32. Sink's four fit inside that,
+which is why widening the sink cost no stride at all — one channel per *face*
+would have needed 8 and widened every row in the game, including every belt's.
+Note the stride is baked into save files, so the persistence shape check
+rejects older ones.
 
 The renderer needs the same mapping — `output_channel_at()` is generated from
 Python, because "port index == channel" is false for Sink and indexing by
@@ -981,6 +1098,36 @@ axis, y up) alongside the cell index, and the builder uses it at both ends:
   along the travel axis already means "keep going", and pulling backwards
   would reverse the belt into the run it came from.
 
+**`quadrant_dir()` is the single authority, and both questions go through
+it.** They did not always, and the bug is instructive: `_exit_turn` carried
+its own threshold-box version, testing one axis directly. A box has corner
+regions where *both* axes are past the threshold, and whichever axis the code
+tested first won — and since that test ran perpendicular to the diagonal
+split, it flipped the answer systematically. Tracing a circle around the cell
+centre, **24 of 36 sampled angles faced the wrong way**, with the middle of
+the north-east arc reading as east.
+
+Two things keep it fixed, and only the first is load-bearing:
+
+- `_exit_turn` asks `quadrant_dir()` which way to turn, then applies the
+  threshold on the axis the turn is actually onto. So the turn a corner
+  produces and the heading a single click produces can never be different
+  directions for the same pointer position. The threshold still does its one
+  real job — making *straight* sticky, since the quadrant alone would turn
+  the moment the pointer crossed a diagonal.
+- A single-cell run skips the exit-turn entirely. Mutation-testing shows this
+  guard is **redundant**: `_exit_turn` now returns `None` there anyway,
+  because a one-cell run's heading *is* the quadrant and so reads as
+  "straight on". It stays because asking a question that does not apply and
+  relying on the answer being `None` is a subtler thing to depend on than not
+  asking.
+
+Pinned by a 36-angle sweep of the **ghost** (what the player reads before
+committing) plus a 12-angle sweep asserting the committed belt matches its
+own preview. The four axis-aligned samples the older test used are exactly
+the points where the two rules happened to agree, which is how a bug covering
+two thirds of the cell survived them.
+
 `StructureBuilder` uses `end_frac` too, but for a different purpose: picking
 which cell boundary an even-sized footprint centres on (see "Structures").
 A tool that cares about neither simply ignores both.
@@ -1047,7 +1194,7 @@ rotated; all are continuous rectangles.
 | `Shear` | 2×1 | x,y → x, x+y |
 | `Mac` | 2×1 | x,y,z → x, y, z + x·y |
 | `Source` | 2×1 | an output on each of its six perimeter faces |
-| `Sink` | 3×3 | one input at the middle of each side |
+| `Sink` | 2×2 | two inputs per cell, folded to one channel each |
 
 The three arithmetic machines share an idiom: a **pass-through channel**
 crosses the body on one axis unchanged, while the channel taking the *long
@@ -1337,7 +1484,8 @@ bugs:
 - Mouse *presses* are suppressed over imgui windows but *releases* are always
   honoured, so a gesture cannot get stuck on.
 - `dt` is clamped to 0.1s in the main loop so a hitch does not fling the camera.
-- `imgui.ini` (saved window layout) is generated at runtime and gitignored.
+- `imgui.ini` (saved window layout) and `gates_config.json` (panel
+  preferences) are generated at runtime and gitignored.
 
 ## Deferred
 
@@ -1348,8 +1496,6 @@ saturated chain moves one item per tick. What is still missing:
 is the obvious next knob, and `FIRE_RULE` is where it would go);
 **a Sink's record** (it destroys what it eats; a stack per input channel is
 the stated next step);
-**configurable Source values** (`EMIT_VALUE` is a class attribute, so every
-Source on the board emits −1);
 **item-to-gate transit** (items pop in and out of existence at the ends of a
 run rather than being seen to enter or leave a machine — deliberate for now);
 **numbers on items** (a disc shows only the sign of its value, via colour);
@@ -1374,6 +1520,15 @@ CPU implementation is kept afterwards as the test oracle, per
 Copy/paste landed as `PasteBuilder` plus [core/clipboard.py](core/clipboard.py)
 and needed no change to the builder abstraction, which is the evidence that
 shape was right. Still shaped for but not built: **undo** (which would record
-the rows a committed `BuildPlan` produced), named/persisted blueprints (the
-stamp history is in-session only), and a structure-selection tool on the empty
-hand — the reason the empty hand is a distinct state.
+the rows a committed `BuildPlan` produced) and named/persisted blueprints (the
+stamp history is in-session only).
+
+The empty hand's gesture is now **inspect** rather than the
+structure-selection tool originally planned for it — that slot is taken, so a
+selection tool would need a different home.
+
+Per-machine configuration has one worked example (a Source's emit value) and
+no general mechanism. The next type to need a setting will want one: `F_EMIT`
+reuses an input slot that happens to be dead on a generator, which is exact
+but not a pattern — a machine with both inputs and a setting has no such slot
+and would need `ENTITY_STRIDE` to grow.

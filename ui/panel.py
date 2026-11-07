@@ -2,8 +2,9 @@
 
 from imgui_bundle import imgui
 
-from core import cell
+from core import cell, persistence
 from core.belts import UNIT
+from core.entity import Source
 from ui.input_manager import STATE_NAMES
 from core.toolbelt import SLOT_COUNT, SPLIT_AFTER
 
@@ -16,7 +17,8 @@ class UIRequests:
                  "cycle_backward", "flip_tool", "quicksave", "quickload",
                  "toggle_pause", "step_tick", "tick_rate",
                  "segment_debug", "rebuild_segments", "audit_segments",
-                 "debug_feed", "clear_items")
+                 "debug_feed", "clear_items", "close_status",
+                 "set_emit")
 
     def __init__(self):
         self.reload_shader = False
@@ -41,6 +43,14 @@ class UIRequests:
         #: Not just a float: None and "off" are different requests.
         self.debug_feed = None
         self.clear_items = False
+        #: True when the Status window's own close button was used. The
+        #: orchestrator owns what is being inspected, so the panel asks
+        #: rather than clearing it.
+        self.close_status = False
+        #: (row, value) to set a Source's emitted constant, or None. Carries
+        #: the row rather than a view, matching Orchestrator.inspect_row --
+        #: a view must not cross a frame boundary.
+        self.set_emit = None
 
 
 class UI:
@@ -49,6 +59,17 @@ class UI:
         self.last_upload = (0, 0)
         #: None, or (ok, message) from the last save/load attempt.
         self.last_save = None
+        #: Filename typed into the Save box. Empty means "use the default
+        #: quicksave path", so an untouched box behaves exactly as the
+        #: buttons did before the box existed.
+        #:
+        #: Seeded from core/config.py by app.py, never by the constructor --
+        #: the test harness builds a real UI, and an implicit load would hand
+        #: every test run the player's own filename. See core/config.py.
+        self.save_name = ""
+        #: Set when save_name changes, so app.py knows to persist it. The UI
+        #: does not write files itself.
+        self.save_name_dirty = False
         #: Whether the segment inspector window is open. Everything expensive
         #: it does is inside this guard, so a closed inspector costs one bool
         #: test per frame.
@@ -381,6 +402,77 @@ class UI:
         if tinted:
             imgui.pop_style_color()
 
+    # --- status window --------------------------------------------------
+    def draw_status(self, orch, req):
+        """Inspect the clicked entity. Only drawn when something is selected.
+
+        Opened by clicking the board with an empty hand, and dismissed three
+        ways: the window's close button, clicking bare board, or erasing the
+        entity. The orchestrator owns *what* is inspected (as a row, not a
+        view), so this reports a close rather than clearing it -- the panel
+        returns requests and never mutates game state.
+
+        Most machines have nothing configurable, and that is fine: the window
+        earns its place by reporting what a machine is and what it holds,
+        which is otherwise only visible in the segment inspector. A Source is
+        the one type with a setting so far.
+        """
+        entity = orch.inspected()
+        if entity is None:
+            # The row died -- erased, or overwritten -- while the window was
+            # open. Close rather than render a recycled row's contents.
+            req.close_status = True
+            return
+
+        expanded, keep_open = imgui.begin("Status", True)
+        if not keep_open:
+            req.close_status = True
+        if not expanded:
+            imgui.end()
+            return
+
+        name = cell.TYPE_NAMES.get(entity.type_id, f"type{entity.type_id}")
+        ox, oy = entity.origin
+        imgui.text(f"{name}  at ({ox}, {oy})")
+        imgui.text(f"facing {cell.DIR_NAMES[entity.direction]}"
+                   f"{'  flipped' if entity.flipped else ''}")
+        imgui.text(f"{entity.footprint_w}x{entity.footprint_h}"
+                   f"   row {entity.row}")
+
+        # Per-type affordances. Only Source has one so far; everything else
+        # shows its channels and nothing more.
+        if isinstance(entity, Source):
+            imgui.separator()
+            imgui.text_unformatted("Emits")
+            imgui.set_next_item_width(140)
+            # A float entry, so any value is reachable -- the emitted number
+            # is the machine's whole purpose and should not be clamped to a
+            # slider's range.
+            changed, value = imgui.input_float(
+                "##emit", float(entity.emit_value))
+            if changed:
+                req.set_emit = (entity.row, value)
+            imgui.text_disabled(
+                "changing this clears every item in flight")
+
+        n_in = entity.input_count()
+        n_out = entity.output_count()
+        if n_in or n_out:
+            imgui.separator()
+            imgui.text_unformatted("Channels")
+            for c in range(n_in):
+                held = entity.in_held(c)
+                imgui.text(f"  in  {c}: "
+                           + (f"{entity.in_value(c):g}" if held else "-"))
+            for c in range(n_out):
+                held = entity.out_held(c)
+                # An occupied output zone at rest means back pressure: the
+                # gate produced something the belt would not take.
+                imgui.text(f"  out {c}: "
+                           + (f"{entity.out_value(c):g}  (waiting)"
+                              if held else "-"))
+        imgui.end()
+
     # --- main panel -----------------------------------------------------
     def draw(self, orch):
         req = UIRequests()
@@ -393,6 +485,8 @@ class UI:
         self.draw_toolbelt(orch, req)
         if self.show_segments:
             self.draw_segment_inspector(orch, req)
+        if orch.inspect_row is not None:
+            self.draw_status(orch, req)
 
         imgui.begin("Gates")
 
@@ -469,6 +563,19 @@ class UI:
 
         imgui.separator()
         imgui.text_unformatted("Save")
+        # The filename box drives both buttons. Left empty it falls back to
+        # the default quicksave path, so the pair behaves exactly as it did
+        # before the box existed -- the box adds named slots without taking
+        # the one-click case away.
+        imgui.set_next_item_width(180)
+        changed, self.save_name = imgui.input_text(
+            "##save_name", self.save_name)
+        if changed:
+            # app.py persists it; the UI does not touch the filesystem.
+            self.save_name_dirty = True
+        if not self.save_name.strip():
+            imgui.same_line()
+            imgui.text_disabled(f"({persistence.DEFAULT_SAVE})")
         if imgui.button("Quicksave"):
             req.quicksave = True
         imgui.same_line()

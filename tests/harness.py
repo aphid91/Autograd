@@ -132,6 +132,12 @@ def reset():
     orch.clipboard.history.active_index = 0
     orch.paste_tool = None
     orch.select_rect = None
+    # The Status window's target is global state too. A scenario that left it
+    # open would have the next one's clear_board() free the row underneath
+    # it, and any test asserting the window is closed would pass or fail on
+    # what ran before it.
+    orch.inspect_row = None
+    orch.ui.save_name = ""
     cam.center[:] = (BOARD / 2, BOARD / 2)
     cam.zoom = 16.0
     # The clock is global state like everything else here: a scenario that

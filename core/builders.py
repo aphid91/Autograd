@@ -28,24 +28,52 @@ def quadrant_dir(frac):
     """Which way a sub-cell cursor position points, as a direction constant.
 
     The cell is split by its diagonals into four triangles; the one the point
-    falls in names the direction. Used to aim a belt placed with a single
-    click, where there is no drag to take a heading from -- clicking the right
-    part of a square gives an east-facing belt, the top part north, and so on.
-    Dead centre is +X, matching the old fixed default.
+    falls in names the direction -- equivalently, *which edge is nearest*.
+    Used to aim a belt placed with a single click, where there is no drag to
+    take a heading from -- clicking the right part of a square gives an
+    east-facing belt, the top part north, and so on. Dead centre is +X,
+    matching the old fixed default.
+
+    **This is the single authority on the question**, and both places that ask
+    it go through here. They did not always: the exit-turn rule below used to
+    carry its own threshold-box version, which disagreed with this one over
+    most of the cell. The two rules differ in kind -- a box has corner regions
+    where *both* axes are past the threshold, and whichever axis the code
+    tested first won. Since that test ran perpendicular to the diagonal split,
+    it flipped the answer systematically: tracing a circle round the centre,
+    two thirds of the way round came out facing the wrong way, with the
+    north-east arc reading as east. See `quadrant_offsets()` for the piece
+    `_exit_turn` needs to stay consistent with this.
     """
-    ox, oy = frac[0] - 0.5, frac[1] - 0.5
-    if ox == 0.0 and oy == 0.0:
+    d = quadrant_offsets(frac)
+    if d is None:
         return cell.DIR_PX
+    ox, oy = d
     if abs(ox) >= abs(oy):
         return cell.DIR_PX if ox > 0 else cell.DIR_NX
     return cell.DIR_PY if oy > 0 else cell.DIR_NY
+
+
+def quadrant_offsets(frac):
+    """Cursor offset from the cell centre as (ox, oy), each -0.5..0.5.
+
+    Positive toward +X / +Y. `None` for dead centre, which has no direction
+    at all and which every caller has to special-case anyway.
+
+    Factored out so `quadrant_dir()` and `BeltBuilder._exit_turn()` measure
+    the same thing from the same origin rather than each recomputing it.
+    """
+    ox, oy = frac[0] - 0.5, frac[1] - 0.5
+    if ox == 0.0 and oy == 0.0:
+        return None
+    return (ox, oy)
 
 
 class Placement:
     """One entity a plan would create, and whether it can actually happen."""
 
     __slots__ = ("entity_cls", "x", "y", "direction", "blocked_cells",
-                 "flipped", "is_exit", "under_partner")
+                 "flipped", "is_exit", "under_partner", "emit")
 
     def __init__(self, entity_cls, x, y, direction, blocked_cells=(),
                  flipped=False):
@@ -61,6 +89,11 @@ class Placement:
         # is committed.
         self.is_exit = False
         self.under_partner = None
+        # Source-only: the emit value to spawn with, or None for the type
+        # default. Only a paste sets it -- placing a fresh Source from the
+        # toolbelt should start at the default, not inherit whatever the last
+        # copied one happened to emit.
+        self.emit = None
 
     @property
     def frustrated(self):
@@ -234,10 +267,24 @@ class BeltBuilder(EntityBuilder):
         path = plan_path(start, end, self.mode)
         dirs = path_directions(path, fallback=quadrant_dir(start_frac))
 
-        if dirs:
+        if len(dirs) > 1:
             # The last belt exits the run, and the pointer's position in that
             # final cell says which way. Straight on by default; past the
             # threshold toward a side edge, it turns and forms a corner.
+            #
+            # A single-cell run is excluded because the question does not
+            # apply to it: there is no travel direction to deflect *from*,
+            # its heading already came from quadrant_dir(start_frac), and
+            # that is the final answer.
+            #
+            # Note this guard is **not** what fixes the wrong-facing ghost --
+            # `_exit_turn` now returns None here anyway, since a single-cell
+            # run's heading *is* the quadrant and so reads as "straight on".
+            # Sharing the quadrant rule is the fix; mutation-testing the
+            # guard alone leaves every test passing. It stays because
+            # asking the question at all is meaningless on a one-cell run,
+            # and relying on the answer coming back None is a subtler thing
+            # to depend on than simply not asking.
             turn = self._exit_turn(dirs[-1], end_frac)
             if turn is not None:
                 dirs[-1] = turn
@@ -255,25 +302,43 @@ class BeltBuilder(EntityBuilder):
         direction of travel means "keep going", which is already the default,
         and pulling it backwards would reverse the belt into the run it just
         came from.
+
+        **Which way to turn is `quadrant_dir()`'s answer, not a separate
+        rule.** This used to test one axis directly, which made it disagree
+        with the quadrant split near the cell's corners -- see the note in
+        `quadrant_dir()`. Going through the shared function means the turn a
+        corner produces and the heading a single click produces can never
+        again come out as different directions for the same pointer position.
+
+        The threshold survives on top of it, and does the one job it is for:
+        making *straight* sticky. The quadrant alone would turn the belt the
+        moment the pointer crossed a diagonal, which is far too eager when
+        the run already has a heading -- so a turn additionally needs the
+        pointer genuinely out toward that edge.
         """
-        fx, fy = frac
-        # Offsets from the cell centre, -0.5..0.5, positive toward +X / +Y.
-        ox, oy = fx - 0.5, fy - 0.5
+        offsets = quadrant_offsets(frac)
+        if offsets is None:
+            return None
+        ox, oy = offsets
         margin = self.TURN_THRESHOLD - 0.5
 
-        if travel_dir in (cell.DIR_PX, cell.DIR_NX):
-            # Travelling horizontally: a vertical push turns the belt.
-            if oy > margin:
-                return cell.DIR_PY
-            if oy < -margin:
-                return cell.DIR_NY
-        else:
-            # Travelling vertically: a horizontal push turns the belt.
-            if ox > margin:
-                return cell.DIR_PX
-            if ox < -margin:
-                return cell.DIR_NX
-        return None
+        want = quadrant_dir(frac)
+        if want == travel_dir:
+            # Pointing the way we are already going: that is "straight on".
+            return None
+        if want == cell.opposite_dir(travel_dir):
+            # Pulling backwards down the run we just came from. Not a turn --
+            # reversing the final belt into its own predecessor would make the
+            # two point at each other.
+            return None
+
+        # A genuine sideways quadrant. Require the pointer to be properly out
+        # toward that edge before committing to a corner, measuring on the
+        # axis the turn is actually onto.
+        reach = ox if want in (cell.DIR_PX, cell.DIR_NX) else oy
+        if abs(reach) <= margin:
+            return None
+        return want
 
 
 class StructureBuilder(EntityBuilder):
@@ -469,6 +534,8 @@ class PasteBuilder(EntityBuilder):
             p = Placement(entry.entity_cls, x, y, entry.direction, blocked,
                           flipped=entry.flipped)
             p.is_exit = entry.is_exit
+            # A captured Source keeps the value it was emitting.
+            p.emit = entry.emit
             placements.append(p)
 
         # Intra-stamp underground pairing travels with the plan, so a copied

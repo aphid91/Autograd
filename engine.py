@@ -162,9 +162,7 @@ class Engine:
 
         for p in plan.previewable:
             if not p.frustrated:
-                extra = {}
-                if p.entity_cls is Underground:
-                    extra["is_exit"] = p.is_exit
+                extra = self._spawn_fields(p)
                 view = self.board.spawn(
                     p.entity_cls, p.x, p.y, p.direction, is_ghost=True,
                     flipped=p.flipped, **extra
@@ -278,12 +276,27 @@ class Engine:
         self.stats["placed"] += n
         return n
 
+    def _spawn_fields(self, placement):
+        """Per-type spawn kwargs a placement carries, as `initialise` names.
+
+        One place rather than a branch at each spawn site, so a new per-type
+        field is added once. Only non-default values are passed, which keeps
+        the normal path identical to what it was before any of these existed.
+        """
+        extra = {}
+        if placement.entity_cls is Underground:
+            extra["is_exit"] = placement.is_exit
+        if placement.emit is not None:
+            extra["emit"] = placement.emit
+        return extra
+
     def build_plan(self, plan):
         """Commit a plan directly, with no preview step."""
         rows = []
         for p in plan.buildable:
             view = self.board.spawn(p.entity_cls, p.x, p.y, p.direction,
-                                    flipped=p.flipped)
+                                    flipped=p.flipped,
+                                    **self._spawn_fields(p))
             rows.append(view.row)
         self.stats["placed"] += len(rows)
         return rows
@@ -535,6 +548,32 @@ class Engine:
         for seg in self.segments.segments.values():
             seg.head = seg.tail = 0
             seg.anchor = self.belts.length_of(seg)
+
+    def flush_material(self):
+        """Discard every item in flight, on belts *and* inside gates.
+
+        `clear_items()` alone is not enough for this: a value already pulled
+        off a belt sits in a gate's input channel, and a result already
+        computed sits in its output waiting zone, so clearing only the rings
+        leaves material that re-enters the network on the next tick. After a
+        Source's emitted value changes, that stale material is exactly what
+        the player does not want to see trickling out mixed with the new
+        value.
+
+        Deliberately a board-wide reset rather than a targeted one. Tracing
+        which items descend from one Source means knowing an item's
+        provenance, which the closed form does not store -- an item is a
+        payload and an entry tick, nothing more. Clearing everything is the
+        honest version of "start fresh", and it is the same bargain an edit
+        to the belt network already makes (see "An edit drops the items on
+        the segments it touches").
+        """
+        self.clear_items()
+        for gate in self.gates.gates():
+            for c in range(gate.input_count()):
+                gate.clear_input(c)
+            for c in range(gate.output_count()):
+                gate.clear_output(c)
 
     def _structure_phase(self):
         """Fire every gate that can. Registered on PHASE_STRUCTURE.

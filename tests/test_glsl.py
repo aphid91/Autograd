@@ -353,9 +353,9 @@ def test_glsl_entity_row_layout_matches_python():
 
 def test_generated_channel_tables_match_python():
     # output_channel_at() tells the renderer which gate-state slot a port
-    # face drives. It cannot assume "port index == channel": Sink folds eight
-    # faces onto one channel, and indexing by face would read slots that do
-    # not exist.
+    # face drives. It cannot assume "port index == channel": Sink folds its
+    # eight faces onto four channels, and indexing by face would read slots
+    # that do not exist.
     for c in STRUCTURES:
         for which, ports, chan in (("input", c.INPUTS, c.in_channel),
                                    ("output", c.OUTPUTS, c.out_channel)):
@@ -366,10 +366,26 @@ def test_generated_channel_tables_match_python():
                 assert needle in _tables, (
                     f"{c.__name__} {which} port {i} should map to channel "
                     f"{want}; missing from the generated table:\n  {needle}")
-    # Sink specifically: eight faces, all channel 0.
-    assert Sink.in_channels() == 1, Sink.in_channels()
-    assert _tables.count("return 0;") >= len(Sink.INPUTS), (
-        "Sink's faces should all generate channel 0")
+    # Sink specifically: eight faces folded onto four channels, one per
+    # footprint cell. The loop above already pins each face's channel; what
+    # matters here is that the *shape* of the fold survived into GLSL, since
+    # a channel is one item per tick and collapsing these would silently cap
+    # a sink's throughput at one belt.
+    assert Sink.in_channels() == 4, Sink.in_channels()
+    by_cell = {}
+    for i, (lx, ly, face) in enumerate(Sink.INPUTS):
+        needle = (f"if (lcl == ivec2({lx}, {ly}) && face == "
+                  f"{_DIR_NAMES_GLSL[face]}) return {Sink.in_channel(i)};")
+        assert needle in _tables, needle
+        by_cell.setdefault((lx, ly), set()).add(Sink.in_channel(i))
+    assert len(by_cell) == 4, f"expected 4 sink cells, got {sorted(by_cell)}"
+    for xy, channels in by_cell.items():
+        assert channels == {Sink.in_channel(
+            next(i for i, p in enumerate(Sink.INPUTS) if p[:2] == xy))}, (
+            f"sink cell {xy} generated channels {sorted(channels)} -- both "
+            f"faces of a cell must drive the same one")
+    assert len(set().union(*by_cell.values())) == 4, (
+        "two sink cells share a channel; they must drain independently")
     ok("generated channel tables match in_channel()/out_channel()")
 
 

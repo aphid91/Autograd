@@ -200,6 +200,10 @@ def capture(board, x0, y0, x1, y1, include_ghosts=False):
         entry = StampEntry(
             type(view), ox, oy, view.direction, bool(view.flipped),
             is_exit=bool(getattr(view, "is_exit", False)),
+            # A Source's emitted constant is per instance, so it has to
+            # travel with the copy or pasting a configured Source would
+            # silently hand back one emitting the type default.
+            emit=getattr(view, "emit_value", None),
         )
         row_to_index[view.row] = len(entries)
         entries.append(entry)

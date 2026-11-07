@@ -1044,6 +1044,116 @@ def test_sub_cell_aiming_through_the_full_stack():
         f"last belt should turn north, got {cell.DIR_NAMES[dirs[-1]]}")
     ok("final belt turns north when the pointer is high in its cell")
 
+
+def test_the_idle_ghost_agrees_with_the_quadrant_all_the_way_round():
+    """Trace a circle inside one cell: the ghost must never disagree.
+
+    The four axis-aligned samples above are exactly the points where the old
+    threshold-box rule happened to agree with the quadrant split, which is
+    how a bug covering two thirds of the cell survived them. Sweeping the
+    whole circle is the test that catches it: at 24 of 36 sampled angles the
+    ghost faced the wrong way, most visibly in the middle of the north-east
+    arc, where "north" rendered as east.
+
+    Checks the *ghost* specifically, because that is the feedback the player
+    reads before committing -- a click that builds something other than what
+    was previewed is the actual complaint.
+    """
+    import math
+    from core.builders import quadrant_dir
+
+    select_tool("Belt")
+    wrong = []
+    for deg in range(0, 360, 10):
+        a = math.radians(deg)
+        # 0.45 from the centre: well clear of the diagonals, so every sample
+        # is unambiguously inside one quadrant.
+        fx, fy = 0.5 + 0.45 * math.cos(a), 0.5 + 0.45 * math.sin(a)
+        engine.clear_board()
+        step()
+        sx, sy = cam.world_to_screen(20 + fx, 20 + fy, (W, H))
+        fake["cursor"] = (float(sx), float(sy))
+        step()
+
+        want = quadrant_dir((fx, fy))
+        plan = orch.last_plan
+        assert plan is not None and plan.placements, (
+            f"no idle ghost at {deg} degrees")
+        got = plan.placements[0].direction
+        if got != want:
+            wrong.append((deg, cell.DIR_NAMES[want], cell.DIR_NAMES[got]))
+
+    assert not wrong, (
+        f"the idle ghost disagreed with quadrant_dir() at {len(wrong)} of 36 "
+        f"angles: {wrong[:6]}")
+    ok("the belt ghost matched the quadrant at all 36 angles round the cell")
+
+
+def test_a_single_cell_click_is_not_second_guessed_by_the_exit_turn():
+    """What the ghost previews is what a click builds, at every angle.
+
+    The exit-turn rule answers a different question -- "should this run's
+    final belt form a corner" -- and a one-cell run has no travel direction
+    to deflect from. Letting it run anyway overrode a correct quadrant
+    heading, so the committed belt could differ from the previewed ghost.
+    """
+    import math
+    from core.builders import quadrant_dir
+
+    select_tool("Belt")
+    for deg in range(0, 360, 30):
+        a = math.radians(deg)
+        fx, fy = 0.5 + 0.45 * math.cos(a), 0.5 + 0.45 * math.sin(a)
+        engine.clear_board()
+        step()
+        sx, sy = cam.world_to_screen(20 + fx, 20 + fy, (W, H))
+        fake["cursor"] = (float(sx), float(sy))
+        step()
+        ghost = orch.last_plan.placements[0].direction
+        click()      # press+release at one spot -> PLANNING
+        click()      # again -> commit the single cell
+        assert not board.is_empty(20, 20), f"nothing built at {deg} degrees"
+        built = cell.cell_dir(board.cell_word(20, 20))
+        want = quadrant_dir((fx, fy))
+        assert built == want == ghost, (
+            f"{deg} degrees: quadrant says {cell.DIR_NAMES[want]}, ghost "
+            f"showed {cell.DIR_NAMES[ghost]}, built {cell.DIR_NAMES[built]}")
+    ok("a single-cell click built exactly what its ghost previewed")
+
+
+def test_straight_stays_sticky_on_a_multi_cell_run():
+    """The turn threshold survives the shared quadrant rule.
+
+    Sharing the quadrant function must not make a run turn the instant the
+    pointer crosses a diagonal: with a heading already established, a corner
+    needs the pointer genuinely out toward that edge. Pulling *backwards*
+    must not turn at all, or the final belt would reverse into its own run.
+    """
+    select_tool("Belt")
+
+    def run_ending_at_frac(fx, fy):
+        engine.clear_board()
+        step()
+        sx, sy = cam.world_to_screen(5 + 0.5, 15 + 0.5, (W, H))
+        fake["cursor"] = (float(sx), float(sy))
+        step()
+        click()
+        sx, sy = cam.world_to_screen(11 + fx, 15 + fy, (W, H))
+        fake["cursor"] = (float(sx), float(sy))
+        step()
+        click()
+        return cell.cell_dir(board.cell_word(11, 15))
+
+    # Inside the threshold: straight on, even though the quadrant is +Y.
+    assert run_ending_at_frac(0.5, 0.58) == cell.DIR_PX, "turned too eagerly"
+    # Past it: a corner.
+    assert run_ending_at_frac(0.5, 0.75) == cell.DIR_PY, "should have turned"
+    assert run_ending_at_frac(0.5, 0.25) == cell.DIR_NY, "should have turned"
+    # Backwards along the run: never a turn, whatever the quadrant says.
+    assert run_ending_at_frac(0.1, 0.5) == cell.DIR_PX, (
+        "pulling backwards reversed the final belt into its own run")
+    ok("straight stayed sticky; only sideways deflection past 0.6 turned")
+
 def test_camera_pan_zoom():
     """Camera pan/zoom."""
     c0 = cam.center.copy(); z0 = cam.zoom

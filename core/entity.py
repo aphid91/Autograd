@@ -47,18 +47,27 @@ ENTITY_STRIDE = 32
 #: Faces and channels are not the same thing, and the two ends of the scale
 #: show why it has to be channels.
 #:
-#: **Sink folds eight faces onto one channel.** Those are eight ways *in* to
-#: one consumer, not eight independent values: whatever arrives is destroyed,
-#: so a stack per face would be meaningless.
+#: **A channel is one item per tick**, in either direction, because it is one
+#: slot with one occupancy flag. That makes every fold a throughput decision
+#: rather than a storage one, and it is the fact behind both cases below.
 #:
-#: **Source does the opposite -- six faces, six channels.** They cannot fold,
-#: because a waiting zone is cleared by whoever drains it: two belts sharing
-#: one channel would split one item per tick between them instead of each
-#: getting their own. Independent channels are what let one Source fill
-#: several belts at once, with the unconnected faces simply staying empty.
+#: **Sink folds eight faces onto four channels, one per footprint cell.** The
+#: values really are interchangeable -- a sink destroys whatever arrives --
+#: but the rate is not, so folding all eight onto a single channel capped the
+#: machine at one item per tick and made two saturated belts into one sink
+#: deliver one belt's worth. Per cell, each of the four tiles drains
+#: independently. See Sink.in_channel().
+#:
+#: **Source does not fold at all -- six faces, six channels.** Same
+#: arithmetic from the other side: a waiting zone is cleared by whoever
+#: drains it, so two belts sharing one channel would split one item per tick
+#: between them instead of each getting their own. Independent channels are
+#: what let one Source fill several belts at once, with the unconnected faces
+#: simply staying empty.
 #:
 #: Sizing the row by *faces* would mean 8 channels for every entity. Sizing
-#: by channels keeps it at 6, set by Source.
+#: by channels keeps it at 6, set by Source -- Sink's four fit inside that,
+#: which is why widening the sink cost no stride at all.
 MAX_CHANNELS = 6
 
 
@@ -813,6 +822,10 @@ class Source(Structure):
 
     This is what sets MAX_CHANNELS, and so ENTITY_STRIDE.
 
+    **The emitted value is per instance**, stored in the row (see `F_EMIT`),
+    so two Sources on one board can emit different numbers. `EMIT_VALUE` is
+    now only the value a freshly placed one starts at.
+
     Even on x and odd on y, so it is the type that exercises both halves of
     the centred-placement rule at once -- see origin_for_cursor().
 
@@ -830,8 +843,52 @@ class Source(Structure):
         (1, 0, cell.DIR_PX), (1, 0, cell.DIR_PY), (1, 0, cell.DIR_NY),
     )
 
+    #: Where this Source's own emit value lives in its row.
+    #:
+    #: Deliberately an **input** slot. A generator has no input channels at
+    #: all -- `INPUTS` is empty, so `in_channels()` is 0 and nothing in the
+    #: tick, the port pass or the renderer can ever read or write these
+    #: twelve slots on a Source. Reusing one costs no stride, where appending
+    #: a field would have pushed ENTITY_STRIDE from 32 to 36 and widened
+    #: every row in the game (including every belt's) to carry a number only
+    #: one machine has.
+    #:
+    #: `F_IN_HELD + 0` stays zero regardless, so even code that wrongly
+    #: treated a Source as having an input would read the channel as unfed
+    #: rather than as holding this value.
+    F_EMIT = Structure.F_IN_VALUE
+
+    def initialise(self, x, y, direction, is_ghost=False, flipped=False,
+                   emit=None):
+        """Seed the emit value, since `initialise()` zeroes the whole row.
+
+        Done here rather than in `Gameboard.spawn()` so the board needs no
+        per-type knowledge -- the same seam Underground uses for its role and
+        partner fields. Without it a Source would spawn emitting 0.0, which is
+        a perfectly legal value and therefore indistinguishable from a
+        deliberate one.
+        """
+        super().initialise(x, y, direction, is_ghost=is_ghost, flipped=flipped)
+        self._set(self.F_EMIT,
+                  float(self.EMIT_VALUE if emit is None else emit))
+
+    @property
+    def emit_value(self):
+        """What this Source emits, per instance.
+
+        Zero in a freshly-spawned row, which is a legal emit value and not a
+        sentinel -- `Gameboard.spawn()` is what seeds the class default, so a
+        Source placed by any path starts at EMIT_VALUE and the player's
+        edits persist from there.
+        """
+        return self._get(self.F_EMIT)
+
+    @emit_value.setter
+    def emit_value(self, v):
+        self._set(self.F_EMIT, float(v))
+
     def fire(self, values):
-        """Emit the same constant on every output channel. `values` is empty.
+        """Emit this instance's constant on every output channel.
 
         With no inputs this type is vacuously ready every tick, so it emits
         whenever its waiting zones are clear -- i.e. at whatever rate the
@@ -844,8 +901,12 @@ class Source(Structure):
         core/gates.py, the only place allowed to look at the board -- see
         GateSim._connected_channels(). Without it, five dangling zones would
         block this machine permanently the first time it fired.
+
+        Reads `emit_value` rather than the class attribute, so two Sources on
+        one board can emit different numbers. `EMIT_VALUE` survives as the
+        value a newly placed one starts at.
         """
-        return [self.EMIT_VALUE] * self.out_channels()
+        return [self.emit_value] * self.out_channels()
 
 
 class Sink(Structure):
@@ -864,6 +925,9 @@ class Sink(Structure):
     takes. Waiting for all eight would deadlock a sink fed from one side,
     which is the normal way to use one. Nothing is recorded yet; a stack per
     input is the obvious next step.
+
+    **Its eight faces fold onto four channels, one per footprint cell** --
+    which is a throughput decision, not a tidiness one. See `in_channel()`.
     """
 
     TYPE_ID = cell.TYPE_SINK
@@ -872,6 +936,9 @@ class Sink(Structure):
     GLYPH = "dot"
     FIRE_RULE = Structure.FIRE_ANY
 
+    #: Grouped in pairs, one pair per footprint cell, because `in_channel()`
+    #: folds by `port_index // 2`. Reordering these without reordering the
+    #: fold would put two faces of different cells on one channel.
     INPUTS = (
         (0, 1, cell.DIR_NX), (0, 1, cell.DIR_PY),   # top-left corner
         (1, 1, cell.DIR_PY), (1, 1, cell.DIR_PX),   # top-right
@@ -882,14 +949,36 @@ class Sink(Structure):
 
     @classmethod
     def in_channel(cls, port_index):
-        """Every face feeds the same channel.
+        """Two faces per channel, grouped by the footprint cell they sit on.
 
-        The eight perimeter faces are eight ways *in* to one consumer, not
-        eight independent values: a sink destroys whatever arrives, so a
-        separate slot per face would be meaningless -- and would size every
-        entity row in the game for eight channels. See MAX_CHANNELS.
+        **A channel is one item per tick, because it is one slot.** `in_held`
+        is a single flag per channel, so once a belt has loaded a channel,
+        `GateSim.accept_from()` refuses every other belt on that channel
+        until the structure phase clears it. That is what a fold costs, and
+        it is the same arithmetic that stops Source from folding -- there, a
+        shared channel splits one *emit* per tick between belts; here, it
+        splits one *drain*.
+
+        All eight faces used to fold onto channel 0, on the reasoning that
+        eight ways into one consumer are not eight independent values. True
+        of the *semantics* -- a sink destroys everything, so the values really
+        are interchangeable -- and wrong about the rate: it capped the whole
+        machine at one item per tick, so pointing two saturated belts at a
+        sink got one belt's throughput. A sink is meant to eat several
+        saturated belts at once.
+
+        Folding per cell rather than per face is the compromise that keeps
+        the entity row narrow. Four channels is a 2x2's cell count, so each
+        of the four tiles drains independently -- four items per tick, from
+        up to four separate belts -- while `MAX_CHANNELS` stays at 6 (set by
+        Source) and `ENTITY_STRIDE` stays at 32. One channel per *face* would
+        allow eight, and would widen every row in the game to do it.
+
+        The cost is that the two faces of a single corner tile still share a
+        slot, so feeding one tile from both its sides gets one item per tick
+        between them. Spread the belts across tiles and each gets its own.
         """
-        return 0
+        return port_index // 2
 
 
 #: Every placeable structure, in the order the toolbelt offers them.
@@ -951,19 +1040,69 @@ def _self_check():
 
     # Source emits its constant; Sink emits nothing at all.
     src = _view(Source)
-    assert src.fire([]) == [Source.EMIT_VALUE] * Source.out_channels()
+    # A bare view sits on a zeroed row, so its emit value is 0.0 -- `spawn()`
+    # is what seeds EMIT_VALUE, via Source.initialise(). Assert what fire()
+    # actually promises: whatever this instance holds, on every channel.
+    assert src.emit_value == 0.0, "a zeroed row should read as 0.0"
+    assert src.fire([]) == [0.0] * Source.out_channels()
     assert len(src.fire([])) == Source.out_channels()
+
+    # The value is per instance, and fire() must follow it rather than the
+    # class attribute. This is the whole point of F_EMIT living in the row.
+    src.emit_value = 7.5
+    assert src.emit_value == 7.5
+    assert src.fire([]) == [7.5] * Source.out_channels(), (
+        "fire() must read the instance's value, not Source.EMIT_VALUE")
+
+    # It lives in an *input* slot, which is safe only because a generator has
+    # no input channels. If Source ever gains one, F_EMIT must move.
+    assert Source.in_channels() == 0, (
+        "Source.F_EMIT squats on an input slot; giving Source an input "
+        "channel would alias its emit value onto that channel")
+    assert Source.F_EMIT == Structure.F_IN_VALUE
+    # The occupancy flag stays clear, so nothing reads the emit value as a
+    # held input even by mistake.
+    assert not src.in_held(0)
+
+    # initialise() seeds the class default, which is how a placed Source
+    # starts at EMIT_VALUE rather than at 0.0.
+    seeded = _view(Source)
+    seeded.initialise(3, 4, cell.DIR_PX)
+    assert seeded.emit_value == Source.EMIT_VALUE, seeded.emit_value
+    override = _view(Source)
+    override.initialise(3, 4, cell.DIR_PX, emit=2.25)
+    assert override.emit_value == 2.25
     snk = _view(Sink)
-    assert snk.fire([None]) == [], "a sink emits nothing"
-    # Sink's eight faces fold onto one channel, so the row holds one value.
-    assert Sink.in_channels() == 1, Sink.in_channels()
-    assert all(Sink.in_channel(i) == 0 for i in range(len(Sink.INPUTS)))
+    assert snk.fire([None] * Sink.in_channels()) == [], "a sink emits nothing"
+
+    # Sink's eight faces fold onto four channels, one per footprint cell.
+    # Pinned because the fold is what sets the machine's throughput: one
+    # channel is one slot is one item per tick, so collapsing these to a
+    # single channel silently caps a sink at one belt's worth of drain.
+    assert Sink.in_channels() == 4, Sink.in_channels()
     assert Sink.out_channels() == 0
+    fw, fh = Sink.FOOTPRINT
+    assert Sink.in_channels() == fw * fh, "one channel per footprint cell"
+
+    # Each channel must cover exactly the faces of one cell, and each cell
+    # must get its own channel. This is the pairing in_channel() assumes of
+    # INPUTS' ordering, and the thing that breaks silently if either is
+    # reordered without the other.
+    by_channel = {}
+    for i, (lx, ly, _face) in enumerate(Sink.INPUTS):
+        by_channel.setdefault(Sink.in_channel(i), set()).add((lx, ly))
+    assert len(by_channel) == 4, by_channel
+    for ch, cells in by_channel.items():
+        assert len(cells) == 1, (
+            f"Sink channel {ch} spans {sorted(cells)} -- a channel must "
+            f"belong to one cell, or two tiles share one item per tick")
+    assert len({next(iter(c)) for c in by_channel.values()}) == 4, (
+        "two channels on the same cell")
 
     # Every machine returns exactly one value per output channel.
     for c, args in ((Swap, [1.0, 2.0, 3.0]), (Shear, [1.0, 2.0]),
                     (Mac, [1.0, 2.0, 3.0]), (Source, []),
-                    (Sink, [1.0])):
+                    (Sink, [1.0] * Sink.in_channels())):
         got = _view(c).fire(args)
         assert len(got) == c.out_channels(), (
             f"{c.__name__}.fire() returned {len(got)} values for "
@@ -991,6 +1130,21 @@ def _self_check():
     assert not v.inputs_ready()
     v.set_input(0, 5.0)
     assert v.inputs_ready(), "FIRE_ANY needs only one"
+
+    # A sink's channels are independent slots: filling one must leave the
+    # others free to take their own item the same tick. That is the whole
+    # point of the per-cell fold -- if these shared a slot, a second belt
+    # would find the sink full and the machine would drain one item per tick
+    # however many belts fed it.
+    v = _view(Sink)
+    for ch in range(Sink.in_channels()):
+        assert not v.in_held(ch), f"channel {ch} should start empty"
+    for ch in range(Sink.in_channels()):
+        v.set_input(ch, float(ch))
+    for ch in range(Sink.in_channels()):
+        assert v.in_held(ch) and v.in_value(ch) == float(ch), (
+            f"channel {ch} did not hold its own value -- channels are "
+            f"aliasing, so the fold is not independent")
 
     assert _view(Source).inputs_ready(), "no inputs is vacuously ready"
 
@@ -1103,8 +1257,10 @@ def _self_check():
     # cleared by whoever drains it, so folding would make two belts split
     # one item per tick instead of each getting their own.
     assert len({Source.out_channel(i) for i in range(6)}) == 6
-    # Firing produces one value per channel.
-    assert _view(Source).fire([]) == [Source.EMIT_VALUE] * 6
+    # Firing produces one value per channel, all of them this instance's.
+    _s = _view(Source)
+    _s.initialise(0, 0, cell.DIR_PX)
+    assert _s.fire([]) == [Source.EMIT_VALUE] * 6
 
     # Sink: a 2x2 accepting on every perimeter face, and no outputs. Each
     # cell carries exactly the two faces that point out of the footprint.
