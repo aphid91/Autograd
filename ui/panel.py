@@ -300,6 +300,18 @@ class UI:
                  | imgui.WindowFlags_.no_nav)
         imgui.set_next_window_bg_alpha(0.85)
 
+        # Copy and paste tint the whole bar, so a mode that overrides the
+        # toolbelt is never mistaken for a slot selection. Blue for copy,
+        # a warmer shade for paste -- the bar is the one piece of UI always
+        # on screen, which makes it the right place to say what mode you are
+        # in.
+        cb = orch.clipboard
+        tinted = cb.active
+        if tinted:
+            tint = (imgui.ImVec4(0.14, 0.26, 0.40, 0.92) if cb.copying
+                    else imgui.ImVec4(0.30, 0.24, 0.12, 0.92))
+            imgui.push_style_color(imgui.Col_.window_bg, tint)
+
         if imgui.begin("##toolbelt", None, flags):
             for i in range(SLOT_COUNT):
                 if i:
@@ -336,7 +348,18 @@ class UI:
             # the default state and clicking does nothing, which is worth
             # stating rather than leaving the line blank.
             active = belt.active
-            if belt.empty_handed:
+            if cb.active:
+                # A mode overrides the hand, so report the mode rather than
+                # whatever slot is stashed behind it.
+                imgui.text_disabled(cb.status())
+                if cb.pasting:
+                    imgui.same_line()
+                    if imgui.small_button("R"):
+                        req.cycle_tool = True
+                    imgui.same_line()
+                    if imgui.small_button("F"):
+                        req.flip_tool = True
+            elif belt.empty_handed:
                 imgui.text_disabled("(empty hand)  —  Q picks up what is "
                                     "under the cursor")
             elif active is not None:
@@ -355,6 +378,8 @@ class UI:
             else:
                 imgui.text_disabled("empty slot")
         imgui.end()
+        if tinted:
+            imgui.pop_style_color()
 
     # --- main panel -----------------------------------------------------
     def draw(self, orch):
@@ -493,6 +518,9 @@ class UI:
         imgui.text("Left-drag: pan the camera")
         imgui.text("1-9,0: select tool")
         imgui.text("Q: pick up what's under the cursor / empty the hand")
+        imgui.text("ctrl+C: copy (drag a box)   ctrl+V: paste")
+        imgui.text("  paste: click places, shift+click places what fits")
+        imgui.text("  shift+scroll: older/newer copy")
         imgui.text("Left-click: build with the active tool")
         imgui.text("R / shift+R: per-tool (belt shape, structure rotation)")
         imgui.text("Right-click: cancel plan / drag to erase")

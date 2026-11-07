@@ -68,6 +68,7 @@ STATE_PLANNING = 1
 STATE_ERASING = 2
 STATE_ARMED = 3      # left button down, not yet known to be click or drag
 STATE_PANNING = 4
+STATE_SELECTING = 5  # copy mode: left-drag is drawing a selection rectangle
 
 STATE_NAMES = {
     STATE_IDLE: "Idle",
@@ -75,6 +76,7 @@ STATE_NAMES = {
     STATE_ERASING: "Erasing",
     STATE_ARMED: "Armed",
     STATE_PANNING: "Panning",
+    STATE_SELECTING: "Selecting",
 }
 
 # How far the cursor must move, in framebuffer pixels, before a held left
@@ -83,6 +85,13 @@ STATE_NAMES = {
 # a click does not steal the build.
 DRAG_THRESHOLD_PX = 6.0
 
+# Clipboard modes, mirrored from core/clipboard.py rather than imported: this
+# module is the input layer and deliberately depends on nothing in core. The
+# values are pinned against the originals by tests/test_clipboard.py.
+_MODE_OFF = 0
+_MODE_COPY = 1
+_MODE_PASTE = 2
+
 # Keys that are edge-triggered (act once per press) rather than held.
 _SLOT_KEYS = {
     glfw.KEY_1: 1, glfw.KEY_2: 2, glfw.KEY_3: 3, glfw.KEY_4: 4, glfw.KEY_5: 5,
@@ -90,7 +99,7 @@ _SLOT_KEYS = {
 }
 _EDGE_KEYS = (
     glfw.KEY_R, glfw.KEY_ESCAPE, glfw.KEY_F, glfw.KEY_F5, glfw.KEY_DELETE,
-    glfw.KEY_SPACE, glfw.KEY_PERIOD, glfw.KEY_Q,
+    glfw.KEY_SPACE, glfw.KEY_PERIOD, glfw.KEY_Q, glfw.KEY_C, glfw.KEY_V,
 ) + tuple(_SLOT_KEYS)
 
 
@@ -104,6 +113,8 @@ class Intents:
         "erase_at", "cursor_cell", "cursor_in_world", "cursor_frac",
         "select_slot", "scroll_steps", "scroll_at",
         "drag_pan_px", "toggle_pause", "step_tick", "pipette",
+        "copy_mode", "paste_mode", "exit_mode", "shift_held",
+        "select_rect", "commit_select", "stamp_steps",
     )
 
     def __init__(self):
@@ -139,6 +150,22 @@ class Intents:
         # "put down what I am holding" otherwise -- the orchestrator decides
         # which, since only it knows what the hand contains.
         self.pipette = False
+        # ctrl+C / ctrl+V, and the ways out of a mode.
+        self.copy_mode = False
+        self.paste_mode = False
+        #: A right-press or a plain left-click while in copy/paste mode: end
+        #: the mode and go back to the stashed tool.
+        self.exit_mode = False
+        #: Shift at the moment of acting. Paste reads it per *click* -- a
+        #: plain click is all-or-nothing, shift places what fits -- so the
+        #: policy cannot live on the tool.
+        self.shift_held = False
+        #: Live selection rectangle in cells, (x0, y0, x1, y1), or None.
+        self.select_rect = None
+        #: True on the frame a selection drag is released.
+        self.commit_select = False
+        #: shift+scroll notches in paste mode: walk the stamp history.
+        self.stamp_steps = 0.0
 
 
 class InputManager:
@@ -161,6 +188,8 @@ class InputManager:
         self._press_frac = (0.5, 0.5)
         self._pending_commit = False
         self._pan_last_px = None
+        #: Cell a copy-mode selection drag started from, or None.
+        self._select_anchor = None
 
         self._prev_keys = {k: False for k in _EDGE_KEYS}
         self._prev_left = False
@@ -226,12 +255,16 @@ class InputManager:
         return fired
 
     # --- main poll ------------------------------------------------------
-    def poll(self, dt, board, drag_based=True):
+    def poll(self, dt, board, drag_based=True, mode=0):
         """Read input and return the frame's Intents.
 
         `drag_based` comes from the active tool: a belt needs press-move-click
         to define a run, while a structure previews continuously under the
         cursor and places on a single click.
+
+        `mode` is the clipboard mode (see core/clipboard.py). It changes what
+        a left-drag means -- in copy mode it draws a selection rectangle
+        instead of panning the camera -- so the gesture machine has to know.
         """
         io = imgui.get_io()
         want_kb = io.want_capture_keyboard
@@ -258,6 +291,14 @@ class InputManager:
         escape = self._edge(glfw.KEY_ESCAPE, not want_kb)
         it.pipette = self._edge(glfw.KEY_Q, not want_kb)
 
+        # ctrl+C / ctrl+V. Gated strictly on ctrl so bare C and V stay free.
+        ctrl = (self._key(glfw.KEY_LEFT_CONTROL)
+                or self._key(glfw.KEY_RIGHT_CONTROL))
+        c_key = self._edge(glfw.KEY_C, not want_kb)
+        v_key = self._edge(glfw.KEY_V, not want_kb)
+        it.copy_mode = c_key and ctrl
+        it.paste_mode = v_key and ctrl
+
         # --- simulation clock ---
         # Space pauses; '.' runs exactly one tick, which works whether or not
         # the sim is paused. Both are edge-triggered: holding them must not
@@ -270,6 +311,9 @@ class InputManager:
                  or self._key(glfw.KEY_RIGHT_SHIFT))
         it.cycle_tool = cycle
         it.cycle_backward = shift
+        # Reported as state, not as an edge: paste reads it at the moment of
+        # the click to choose all-or-nothing vs place-what-fits.
+        it.shift_held = shift
 
         # F is per-tool like R (the active builder decides what a flip means);
         # shift+F is the camera's frame-the-board, which is the rarer action
@@ -285,11 +329,17 @@ class InputManager:
                 it.select_slot = (SLOT_COUNT - 1) if digit == 0 else digit - 1
                 break
 
-        # --- scroll zoom, anchored at the cursor ---
+        # --- scroll: zoom, or walk the stamp history ---
+        # shift+scroll in paste mode is the history walk, Factorio-style, so
+        # it must not also zoom. Outside paste mode shift+scroll still zooms,
+        # since there is nothing else for it to mean.
         scroll = 0.0 if want_mouse else self._take_scroll()
         if scroll:
-            it.scroll_steps = scroll
-            it.scroll_at = self._cursor_px()
+            if shift and mode == _MODE_PASTE:
+                it.stamp_steps = scroll
+            else:
+                it.scroll_steps = scroll
+                it.scroll_at = self._cursor_px()
 
         # --- cursor ---
         (cx, cy), frac = self._cursor_cell_frac()
@@ -312,6 +362,73 @@ class InputManager:
         # cursor happens to end up over a panel.
         if want_mouse:
             left_press = right_press = False
+
+        # --- copy mode: its own small gesture machine ---
+        # Left-drag is the selection rectangle, which means there is no camera
+        # pan in copy mode -- the gesture is spoken for. A plain click or any
+        # right-press leaves the mode.
+        if mode == _MODE_COPY:
+            if escape:
+                it.exit_mode = True
+                self.state = STATE_IDLE
+                self._select_anchor = None
+                return it
+
+            if self.state == STATE_SELECTING:
+                a = self._select_anchor
+                if a is not None:
+                    it.select_rect = (a[0], a[1], cx, cy)
+                if left_release:
+                    # Release always ends copy mode; the orchestrator decides
+                    # whether anything was caught.
+                    it.commit_select = True
+                    self.state = STATE_IDLE
+                    self._select_anchor = None
+            elif self.state == STATE_ARMED:
+                moved = ((mx - self._press_px[0]) ** 2
+                         + (my - self._press_px[1]) ** 2) ** 0.5
+                if moved > DRAG_THRESHOLD_PX:
+                    self.state = STATE_SELECTING
+                    self._select_anchor = self._press_cell
+                    it.select_rect = (self._press_cell[0], self._press_cell[1],
+                                      cx, cy)
+                elif left_release:
+                    # A click that never became a drag: cancel the mode.
+                    it.exit_mode = True
+                    self.state = STATE_IDLE
+            else:
+                if right_press:
+                    # Right-press leaves copy mode even mid-drag.
+                    it.exit_mode = True
+                    self.state = STATE_IDLE
+                    self._select_anchor = None
+                elif left_press and board.in_bounds(cx, cy):
+                    self.state = STATE_ARMED
+                    self._press_px = (mx, my)
+                    self._press_cell = (cx, cy)
+                    self._press_frac = frac
+
+            # A right-press during a drag also aborts, without selecting.
+            if self.state == STATE_SELECTING and right_press:
+                it.exit_mode = True
+                it.select_rect = None
+                it.commit_select = False
+                self.state = STATE_IDLE
+                self._select_anchor = None
+            return it
+
+        # --- paste mode: click to stamp, right-press to leave ---
+        # Left-drag still pans here: the stamp follows the cursor and needs no
+        # drag of its own, so the camera keeps the gesture.
+        if mode == _MODE_PASTE:
+            if escape:
+                it.exit_mode = True
+                self.state = STATE_IDLE
+                return it
+            if right_press:
+                it.exit_mode = True
+                self.state = STATE_IDLE
+                return it
 
         # --- state machine ---
         if self.state == STATE_IDLE:
@@ -467,6 +584,7 @@ class InputManager:
         self._last_frac = None
         self._pending_commit = False
         self._pan_last_px = None
+        self._select_anchor = None
 
 
 def _trace(a, b):

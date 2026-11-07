@@ -24,8 +24,8 @@ importing anything here exercises the cell encoding and the entity geometry.
 import sys
 
 from tests import (
-    harness, test_belts, test_gates, test_glsl, test_item_render,
-    test_scenarios, test_segments, test_stamp, test_tick,
+    harness, test_belts, test_clipboard, test_gates, test_glsl,
+    test_item_render, test_scenarios, test_segments, test_stamp, test_tick,
 )
 
 
@@ -50,6 +50,7 @@ def main(argv):
     ran += harness.run_all(_scenarios(test_item_render), only=only)
     ran += harness.run_all(_scenarios(test_gates), only=only)
     ran += harness.run_all(_scenarios(test_stamp), only=only)
+    ran += harness.run_all(_scenarios(test_clipboard), only=only)
     if not ran:
         print(f"no tests matched {only!r}")
         return 1

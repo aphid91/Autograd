@@ -204,7 +204,8 @@ class Camera:
         )
 
     # --- render ---------------------------------------------------------
-    def render(self, viewport, clock=None, belt_device=None):
+    def render(self, viewport, clock=None, belt_device=None,
+               select_rect=None):
         """Draw the world.
 
         `clock` supplies the simulation time the shader interpolates item
@@ -212,6 +213,11 @@ class Camera:
         ticks instead of snapping between slots. `belt_device` supplies the
         segment and item buffers the shader evaluates the closed form from.
         Both optional, so the camera can be driven with no simulation at all.
+
+        `select_rect` is copy mode's live selection box as cell indices
+        (x0, y0, x1, y1), inclusive, in any corner order. It is screen
+        furniture rather than board state -- nothing is stored for it -- so
+        it arrives as a uniform and is drawn over everything.
         """
         if self.program is None or self.vao is None:
             return
@@ -242,6 +248,23 @@ class Camera:
         else:
             self._set("sim_tick", 0)
             self._set("sim_alpha", 0.0)
+
+        # The selection box, in *world* units so the shader needs no cell
+        # maths: lo is the box's lower-left corner and hi is one past its
+        # upper-right, since a cell (x, y) covers [x, x+1) x [y, y+1) and the
+        # rectangle includes both end cells. An inactive box sends a
+        # degenerate rect, which the shader tests for.
+        if select_rect is not None:
+            x0, y0, x1, y1 = select_rect
+            lo_x, hi_x = (x0, x1) if x0 <= x1 else (x1, x0)
+            lo_y, hi_y = (y0, y1) if y0 <= y1 else (y1, y0)
+            self._set("select_lo", (float(lo_x), float(lo_y)))
+            self._set("select_hi", (float(hi_x + 1), float(hi_y + 1)))
+            self._set("select_on", 1)
+        else:
+            self._set("select_lo", (0.0, 0.0))
+            self._set("select_hi", (0.0, 0.0))
+            self._set("select_on", 0)
 
         self.vao.render(moderngl.TRIANGLE_STRIP)
 

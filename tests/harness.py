@@ -24,6 +24,7 @@ import moderngl
 from imgui_bundle import imgui
 
 from core import cell
+from core.clipboard import MODE_OFF
 from core.tick import PHASE_BELT, TICKS_PER_SEC
 
 W, H = 1024, 768
@@ -121,6 +122,16 @@ def reset():
     # preview its one-cell idle run, and a scenario opening with
     # `live_count == 0` would fail on a board it never touched.
     orch.toolbelt.clear()
+    # The clipboard is global state like everything else here: a scenario
+    # that left copy or paste mode on would hand the next one a different
+    # gesture machine, and a leftover stamp history would make a paste test
+    # pass for the wrong reason.
+    orch.clipboard.mode = MODE_OFF
+    orch.clipboard.exit_to_empty()
+    orch.clipboard.history.stamps.clear()
+    orch.clipboard.history.active_index = 0
+    orch.paste_tool = None
+    orch.select_rect = None
     cam.center[:] = (BOARD / 2, BOARD / 2)
     cam.zoom = 16.0
     # The clock is global state like everything else here: a scenario that
@@ -192,6 +203,54 @@ def drag_px(dx, dy, steps=4):
         step()
     fake["left"] = False
     step()
+
+
+def ctrl_key(key):
+    """Tap a key with ctrl held -- ctrl+C / ctrl+V."""
+    fake["keys"].add(glfw.KEY_LEFT_CONTROL)
+    fake["keys"].add(key)
+    step()
+    fake["keys"].discard(key)
+    step()
+    fake["keys"].discard(glfw.KEY_LEFT_CONTROL)
+    step()
+
+
+def drag_cells(a, b, steps=3):
+    """Left-drag from cell `a` to cell `b`, in enough hops to pass threshold.
+
+    Used for copy mode's selection rectangle. Goes through the real cursor
+    and button state, so the gesture machine sees exactly what it would in
+    the app -- including the ARMED -> SELECTING promotion.
+    """
+    put_cursor_at_cell(*a)
+    step()
+    fake["left"] = True
+    step()
+    for i in range(1, steps + 1):
+        t = i / steps
+        put_cursor_at(a[0] + (b[0] - a[0]) * t + 0.5,
+                      a[1] + (b[1] - a[1]) * t + 0.5)
+        step()
+    fake["left"] = False
+    step()
+
+
+def real_cells_at(y, xs):
+    """Cells in row `y` holding a *real* (non-ghost) entity.
+
+    Ghosts occupy real cells, so `board.is_empty()` reports them as taken --
+    which makes it the wrong question when asking "what got built". Preview
+    tests want this instead.
+    """
+    out = []
+    for x in xs:
+        if board.is_empty(x, y):
+            continue
+        if cell.is_ghost(board.grid[y, x, cell.CH_Z]):
+            continue
+        out.append(x)
+    return out
 
 
 def press_key(key, frames=1):

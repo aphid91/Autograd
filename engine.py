@@ -199,19 +199,54 @@ class Engine:
         for (x, y) in blocked:
             self.board.set_frustrated(x, y)
 
-    def commit_ghosts(self):
+    def commit_ghosts(self, paired_cells=()):
         """Turn the ghost preview into real entities. Returns the count.
 
         Preview-only rows are discarded rather than promoted: they are
         fragments of a blocked placement, and half a structure is not a thing
         that can exist.
+
+        `paired_cells` names underground ends whose partner the *plan* already
+        decided -- a pasted pair, which must join to itself. Those are joined
+        here, before the search below runs, because the search's
+        nearest-candidate rule would otherwise grab an unrelated unpaired end
+        sitting at the paste site and leave the pair's real other half with
+        nothing. Pairing explicitly first also marks both ends `paired`, so
+        the search skips them naturally.
         """
         n = len(self.ghost_rows)
         promoted = list(self.ghost_rows)
         for row in promoted:
             self.board.set_ghost(row, False)
         self.ghost_rows.clear()
-        # Pair undergrounds only once they are real. find_under_partner()
+
+        # Explicit pairs first -- see `paired_cells` above.
+        for (a_xy, b_xy) in paired_cells:
+            a = self.board.entity_at(*a_xy)
+            b = self.board.entity_at(*b_xy)
+            if a is None or b is None:
+                continue
+            if a.type_id != cell.TYPE_UNDER or b.type_id != cell.TYPE_UNDER:
+                continue
+            if a.is_ghost or b.is_ghost or a.row == b.row:
+                continue
+            # A preview's pairing is **one-way**: the ghost exit points at
+            # the entrance, which never points back, purely so the span
+            # draws. `paired` therefore reads true on that end even though no
+            # real pair exists, so testing occupancy directly would skip this
+            # pair -- and the nearest-candidate search below would then hand
+            # the exit to an unrelated end at the paste site, which is the
+            # exact bug this path exists to prevent.
+            #
+            # So ask whether either end is committed to *somebody else*, and
+            # treat a link pointing at our intended partner as the half-built
+            # state it is. pair_under() makes it two-way.
+            if self._under_spoken_for(a, b.row) \
+                    or self._under_spoken_for(b, a.row):
+                continue
+            self.pair_under(a, b)
+
+        # Pair the rest only once they are real. find_under_partner()
         # skips ghosts, so a pair cannot form while either end is still a
         # preview -- which is what keeps a hovering exit from latching onto
         # an entrance it has not actually been placed near yet.
@@ -220,6 +255,11 @@ class Engine:
                 continue
             view = self.board.view(row)
             if view.type_id != cell.TYPE_UNDER:
+                continue
+            # Skip ends the explicit pass above already joined. The test has
+            # to be *mutual*: a one-way link is a leftover preview and must
+            # still be re-derived, which is what the clear below handles.
+            if self._under_mutually_paired(view):
                 continue
             # A preview's pairing is one-way: the ghost pointed at a partner
             # that never pointed back, purely so the span would draw. Drop
@@ -247,6 +287,63 @@ class Engine:
             rows.append(view.row)
         self.stats["placed"] += len(rows)
         return rows
+
+    def _under_mutually_paired(self, end):
+        """True only for a real two-way pairing.
+
+        `Underground.paired` is satisfied by a one-way link, which a preview
+        legitimately creates (a ghost exit points at an entrance that never
+        points back, so the span draws). Anything deciding whether a pair is
+        already *made* has to check both directions.
+        """
+        row = end.partner
+        if not row or not self.board.is_row_alive(row):
+            return False
+        return self.board.view(row).partner == end.row
+
+    def _under_spoken_for(self, end, intended_row):
+        """Is this underground end already committed to someone *else*?
+
+        A link to `intended_row` does not count -- that is either the pair we
+        are about to complete or a preview's one-way link to it. A link to any
+        other live row does, and must not be stolen.
+        """
+        row = end.partner
+        if not row or row == intended_row:
+            return False
+        return self.board.is_row_alive(row)
+
+    @staticmethod
+    def planned_under_pairs(plan):
+        """[(cell_a, cell_b)] for underground ends a plan pairs explicitly.
+
+        A paste records which ends were copied *together* (as
+        `Placement.under_partner`), and that beats re-deriving: a pasted pair
+        must join to itself rather than to some unpaired end that happens to
+        sit near the paste site. Feed the result to commit_ghosts().
+
+        Only pairs where **both** halves will actually be built: under a
+        partial paste one may have been refused, and a survivor pointing at a
+        row that was never created is precisely the dangling state
+        unpair_under() exists to avoid.
+        """
+        if plan is None:
+            return []
+        built = {(p.x, p.y) for p in plan.buildable}
+        pairs = []
+        seen = set()
+        for p in plan.buildable:
+            if p.entity_cls is not Underground or p.under_partner is None:
+                continue
+            a, b = (p.x, p.y), tuple(p.under_partner)
+            if b not in built:
+                continue
+            key = tuple(sorted((a, b)))
+            if key in seen:
+                continue
+            seen.add(key)
+            pairs.append((a, b))
+        return pairs
 
     # --- direct mutation (convenience; tests and seeding) ---------------
     def place_belt(self, x, y, direction=cell.DIR_PX):

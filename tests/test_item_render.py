@@ -457,3 +457,82 @@ def test_audits_stay_clean_while_rendering():
            "all clean")
     finally:
         engine.debug_feed = None
+
+
+# --- the copy-mode selection rectangle -------------------------------------
+# Screen furniture rather than board state: nothing is stored per cell for it,
+# so the only way to check it exists is to look at the pixels.
+
+def _render_with_rect(rect):
+    """Draw the world offscreen with a selection rectangle, as uint8 RGB."""
+    engine.sync_to_device()
+    fbo = _target()
+    fbo.use()
+    ctx.clear(0.07, 0.07, 0.09)
+    cam.render((W, H), engine.clock, engine.belt_device, select_rect=rect)
+    raw = fbo.read(components=3, dtype="f1")
+    img = np.frombuffer(raw, dtype=np.uint8).reshape(H, W, 3)[::-1]
+    ctx.screen.use()
+    return img
+
+
+def _blue_cast(img, wx, wy, half=3):
+    """How blue the pixels near a world point are, at their most extreme."""
+    sx, sy = cam.world_to_screen(wx, wy, (W, H))
+    x, y = int(round(sx)), int(round(sy))
+    patch = img[max(0, y - half):y + half + 1,
+                max(0, x - half):x + half + 1].astype(float)
+    if patch.size == 0:
+        return 0.0
+    flat = patch.reshape(-1, 3)
+    # Blue minus the warmer channels: the selection colour is the only strongly
+    # blue thing on an empty board.
+    return float(np.max(flat[:, 2] - (flat[:, 0] + flat[:, 1]) * 0.5))
+
+
+def test_the_selection_rectangle_draws_where_it_is_asked():
+    """Copy mode's rubber band must appear, and only where it is dragged."""
+    harness.reset()
+    cam.center[:] = (20.0, 20.0)
+    cam.zoom = PROBE_ZOOM
+
+    off = _render_with_rect(None)
+    # The box covers cells 18..22 inclusive, so world 18..23.
+    on = _render_with_rect((18, 18, 22, 22))
+
+    # An edge of the box lights up; the same point is plain without it.
+    edge_on = _blue_cast(on, 18.0, 20.0)
+    edge_off = _blue_cast(off, 18.0, 20.0)
+    assert edge_on > edge_off + 20, (
+        f"no selection edge drawn: {edge_off:.1f} -> {edge_on:.1f}")
+    ok(f"the selection edge drew (blue cast {edge_off:.1f} -> {edge_on:.1f})")
+
+    # The interior gets a faint wash, weaker than the outline.
+    mid_on = _blue_cast(on, 20.5, 20.5)
+    mid_off = _blue_cast(off, 20.5, 20.5)
+    assert mid_on > mid_off + 4, (
+        f"no interior wash: {mid_off:.1f} -> {mid_on:.1f}")
+    assert mid_on < edge_on, "the wash should be fainter than the outline"
+    ok(f"the interior washed faintly ({mid_off:.1f} -> {mid_on:.1f})")
+
+    # Well outside the box, nothing changed. This is the assertion that would
+    # catch the shader's `edge` going large and negative far away and lighting
+    # up the whole screen.
+    far_on = _blue_cast(on, 28.0, 28.0)
+    far_off = _blue_cast(off, 28.0, 28.0)
+    assert abs(far_on - far_off) < 3, (
+        f"the selection leaked outside its box: {far_off:.1f} -> {far_on:.1f}")
+    ok("nothing drew outside the selection box")
+
+
+def test_the_selection_rectangle_normalises_its_corners():
+    """A drag up-and-left must draw the same box as down-and-right."""
+    harness.reset()
+    cam.center[:] = (20.0, 20.0)
+    cam.zoom = PROBE_ZOOM
+
+    forward = _render_with_rect((18, 18, 22, 22))
+    backward = _render_with_rect((22, 22, 18, 18))
+    assert np.array_equal(forward, backward), (
+        "corner order changed the rendered box")
+    ok("the selection box is corner-order independent")

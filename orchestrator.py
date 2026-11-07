@@ -26,7 +26,8 @@ import os
 import glfw
 
 from core import persistence
-from core.builders import default_builders
+from core.builders import PasteBuilder, default_builders
+from core.clipboard import Clipboard, MODE_COPY, MODE_PASTE, capture
 from render.camera import Camera
 from engine import Engine
 from ui.input_manager import InputManager, STATE_PLANNING
@@ -45,8 +46,15 @@ class Orchestrator:
         self.camera = Camera(ctx, self.engine.board)
         self.input = InputManager(window, self.camera)
         self.toolbelt = Toolbelt(default_builders())
+        self.clipboard = Clipboard()
         self.ui = UI()
         self.last_plan = None
+        #: The paste tool, rebuilt whenever the active stamp or the shift
+        #: modifier changes. Not a toolbelt slot -- paste mode overrides
+        #: whatever the hand holds.
+        self.paste_tool = None
+        #: Live selection rectangle in cells, or None. Drawn by the camera.
+        self.select_rect = None
 
         self.cursor_cell = None
         #: Segments rebuilt this frame, or None if the index was already
@@ -64,6 +72,102 @@ class Orchestrator:
         self.input.cancel()
         self.last_plan = None
         self._reset_tool_state()
+
+    # --- copy / paste modes ----------------------------------------------
+    def _active_tool(self):
+        """The builder in charge this frame.
+
+        Paste mode **overrides** the toolbelt rather than occupying a slot,
+        so everything downstream -- the gesture style, preview, commit --
+        goes through one accessor and needs no mode branch of its own.
+        """
+        if self.clipboard.pasting:
+            return self.paste_tool
+        return self.toolbelt.active
+
+    def _enter_copy(self):
+        """ctrl+C: stash the held tool and start selecting."""
+        self.clipboard.enter_copy(self._stashable_slot())
+        self._on_tool_changed()
+        self.select_rect = None
+
+    def _enter_paste(self):
+        """ctrl+V: stash the held tool and hold the active stamp.
+
+        Does nothing if nothing has been copied yet -- there is no empty
+        paste mode to be in.
+        """
+        if not self.clipboard.enter_paste(self._stashable_slot()):
+            return False
+        self._on_tool_changed()
+        self._refresh_paste_tool()
+        return True
+
+    def _stashable_slot(self):
+        """The slot to return to, or None for an empty hand.
+
+        None is a real answer here, not a failure: leaving a mode must give
+        back an empty hand if that is what the player had, rather than
+        collapsing to slot 0.
+        """
+        if self.toolbelt.empty_handed:
+            return None
+        return self.toolbelt.selected
+
+    def _end_mode(self, to_empty=False):
+        """Leave copy or paste mode.
+
+        `to_empty` is Q's behaviour -- drop the stash and hold nothing. Every
+        other exit (right-press, a plain click, Esc) restores the tool the
+        player was using, so a mode entered mid-gesture gives the belt back.
+        """
+        if not self.clipboard.active:
+            return
+        if to_empty:
+            self.clipboard.exit_to_empty()
+            self.toolbelt.clear()
+        else:
+            slot, had = self.clipboard.exit_to_stash()
+            if had:
+                if slot is None:
+                    self.toolbelt.clear()
+                else:
+                    self.toolbelt.select(slot)
+        self.paste_tool = None
+        self.select_rect = None
+        self._on_tool_changed()
+
+    def _capture_selection(self, rect):
+        """Turn a released selection rectangle into a stamp.
+
+        An empty selection returns the player to their tool -- there is
+        nothing to paste, so dropping them into paste mode would be a dead
+        end. Anything caught becomes the active stamp and we go straight to
+        paste mode, which is what makes copy-then-place one gesture.
+        """
+        self.select_rect = None
+        stamp = capture(self.engine.board, *rect) if rect else None
+        if stamp is None or not stamp:
+            self._end_mode(to_empty=False)
+            return None
+        self.clipboard.adopt(stamp)
+        self._on_tool_changed()
+        self._refresh_paste_tool()
+        return stamp
+
+    def _refresh_paste_tool(self, partial=None):
+        """Rebuild the paste tool for the active stamp.
+
+        Cheap and called whenever the stamp or the shift modifier changes: a
+        PasteBuilder is a thin wrapper around a stamp, and rebuilding keeps
+        the "all-or-nothing is per click" rule honest without the tool
+        holding mutable policy.
+        """
+        if partial is None:
+            partial = self.paste_tool.partial if self.paste_tool else False
+        self.paste_tool = PasteBuilder(self.clipboard.stamp, partial=partial)
+        self.last_plan = None
+        return self.paste_tool
 
     def _pipette(self, cursor_cell, in_world):
         """Q: fill an empty hand from the board, or empty a full one.
@@ -162,10 +266,13 @@ class Orchestrator:
         board = engine.board
 
         # 1. input. The active tool decides the gesture style, so it has to be
-        # known before polling.
-        tool_now = self.toolbelt.active
+        # known before polling -- and in paste mode that is the paste tool,
+        # not whatever the toolbelt holds.
+        tool_now = self._active_tool()
         intents = self.input.poll(
-            dt, board, drag_based=(tool_now.drag_based if tool_now else True)
+            dt, board,
+            drag_based=(tool_now.drag_based if tool_now else True),
+            mode=self.clipboard.mode,
         )
         self.cursor_cell = intents.cursor_cell
 
@@ -195,18 +302,64 @@ class Orchestrator:
             if self.toolbelt.select(intents.select_slot):
                 self._on_tool_changed()
 
-        # Q: pick up or put down. Resolved here rather than in the input
-        # manager because only the orchestrator knows what the hand holds.
+        # Q: pick up or put down. In copy or paste mode it means neither --
+        # it leaves the mode with an *empty* hand, dropping the stashed tool
+        # rather than returning to it.
         if intents.pipette:
-            self._pipette(intents.cursor_cell, intents.cursor_in_world)
+            if self.clipboard.active:
+                self._end_mode(to_empty=True)
+            else:
+                self._pipette(intents.cursor_cell, intents.cursor_in_world)
 
-        tool = self.toolbelt.active
+        # ctrl+C / ctrl+V, and the ways back out.
+        if intents.copy_mode:
+            self._enter_copy()
+        elif intents.paste_mode:
+            self._enter_paste()
+        if intents.exit_mode:
+            self._end_mode(to_empty=False)
 
-        # 4. per-tool R / shift+R and F
-        if intents.cycle_tool and tool is not None:
-            tool.cycle(backward=intents.cycle_backward)
-        if intents.flip_tool and tool is not None:
-            tool.flip()
+        # shift+scroll in paste mode walks the stamp history.
+        if intents.stamp_steps:
+            step = 1 if intents.stamp_steps > 0 else -1
+            if self.clipboard.cycle_stamp(step):
+                self._refresh_paste_tool()
+
+        # A completed selection drag becomes a stamp.
+        self.select_rect = intents.select_rect
+        if intents.commit_select:
+            self._capture_selection(intents.select_rect)
+
+        tool = self._active_tool()
+
+        # In paste mode, shift is read per *click* rather than held on the
+        # tool: a plain click is all-or-nothing, shift places what fits. The
+        # preview must show the policy that is actually armed, so a change to
+        # the modifier rebuilds the tool and re-previews.
+        if self.clipboard.pasting and self.paste_tool is not None:
+            if self.paste_tool.partial != intents.shift_held:
+                self._refresh_paste_tool(partial=intents.shift_held)
+                tool = self.paste_tool
+                intents.update_plan = True
+
+        # 4. per-tool R / shift+R and F. In paste mode these transform the
+        # *stamp*, which outlives any one plan, so they go to the clipboard
+        # and the tool is rebuilt around the result.
+        if self.clipboard.pasting:
+            if intents.cycle_tool or intents.flip_tool:
+                self.clipboard.transform_active(
+                    rotate=(-1 if intents.cycle_backward else 1)
+                    if intents.cycle_tool else 0,
+                    mirror=intents.flip_tool,
+                )
+                self._refresh_paste_tool()
+                tool = self.paste_tool
+                intents.update_plan = True
+        else:
+            if intents.cycle_tool and tool is not None:
+                tool.cycle(backward=intents.cycle_backward)
+            if intents.flip_tool and tool is not None:
+                tool.flip()
 
         # 5. build / erase
         if intents.cancel_plan:
@@ -229,7 +382,11 @@ class Orchestrator:
             plan = self.last_plan
             blocked = plan is not None and plan.all_or_nothing and not plan.ok
             if not blocked:
-                engine.commit_ghosts()
+                # A pasted underground pair must join to *itself* rather than
+                # to whatever happens to sit near the paste site, so the
+                # plan's own pairing goes in first and the engine's
+                # nearest-candidate search only handles what is left.
+                engine.commit_ghosts(engine.planned_under_pairs(plan))
                 self.last_plan = None
                 # Tools with multi-step state advance it here -- an
                 # underground alternates entrance/exit -- and only on a
@@ -259,14 +416,27 @@ class Orchestrator:
         if requests.select_slot is not None:
             if self.toolbelt.select(requests.select_slot):
                 self._on_tool_changed()
-        if requests.cycle_tool and self.toolbelt.active is not None:
-            self.toolbelt.active.cycle(backward=requests.cycle_backward)
-            if self.input.anchor is not None:
-                self._preview(self.toolbelt.active)
-        if requests.flip_tool and self.toolbelt.active is not None:
-            self.toolbelt.active.flip()
-            if self.input.anchor is not None:
-                self._preview(self.toolbelt.active)
+        # The panel's R / F buttons go through the same path as the keys, so
+        # they transform the stamp in paste mode rather than reaching past it
+        # into the toolbelt.
+        if requests.cycle_tool or requests.flip_tool:
+            if self.clipboard.pasting:
+                self.clipboard.transform_active(
+                    rotate=(-1 if requests.cycle_backward else 1)
+                    if requests.cycle_tool else 0,
+                    mirror=requests.flip_tool,
+                )
+                self._refresh_paste_tool()
+                self._preview(self.paste_tool)
+            else:
+                active = self.toolbelt.active
+                if active is not None:
+                    if requests.cycle_tool:
+                        active.cycle(backward=requests.cycle_backward)
+                    if requests.flip_tool:
+                        active.flip()
+                    if self.input.anchor is not None:
+                        self._preview(active)
         if requests.verify_round_trip:
             self.ui.last_verify = board.verify_round_trip()
         if requests.quicksave:
@@ -310,7 +480,8 @@ class Orchestrator:
 
         # 8. device sync, then render
         self.ui.last_upload = engine.sync_to_device()
-        self.camera.render(viewport, engine.clock, engine.belt_device)
+        self.camera.render(viewport, engine.clock, engine.belt_device,
+                           select_rect=self.select_rect)
 
     def seed_demo(self):
         """A few belts so the board is not empty on first run."""

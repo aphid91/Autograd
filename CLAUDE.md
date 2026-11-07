@@ -46,6 +46,8 @@ There is no pytest/linter configured.
 | [tests/test_belts.py](tests/test_belts.py) | the closed form against the naive oracle, on fixed and randomised configs |
 | [tests/test_item_render.py](tests/test_item_render.py) | reads the framebuffer back: do discs appear where the simulation says? |
 | [tests/test_gates.py](tests/test_gates.py) | firing rules, arithmetic, back pressure, and the bubble-free claim |
+| [tests/test_stamp.py](tests/test_stamp.py) | what the stamp transforms preserve: wiring, topology, arithmetic |
+| [tests/test_clipboard.py](tests/test_clipboard.py) | the copy/paste mode machine, driven through the fake mouse and keyboard |
 
 **Scenarios are independent.** `harness.reset()` clears the board, camera,
 input state and toolbelt before each one, so a failure names the scenario
@@ -95,6 +97,9 @@ surfaced as one shuffle seed in twelve failing a pixel test.
 | `F` | **per-tool**: flip (mirror) the held structure |
 | `shift+F` | frame the whole board |
 | `1`-`9`, `0` | select a toolbelt slot |
+| `ctrl+C` | copy mode — left-drag a selection box |
+| `ctrl+V` | paste mode, if anything has been copied |
+| shift+scroll | **paste mode**: walk the copy history (older / newer) |
 | Left-click | build with the active tool (fires on **release**) |
 | `R` / `shift+R` | **per-tool**: belt path shape, or structure rotation |
 | Right-click | cancel a plan, or drag to erase |
@@ -143,6 +148,82 @@ Every tool names the type it places (`EntityBuilder.entity_cls`), so
 `Toolbelt.select_tool_for()` is a generic lookup rather than a per-type
 branch. A type with no builder fails softly and leaves the hand empty.
 
+### Copy and paste are modes, not tools
+
+[core/clipboard.py](core/clipboard.py) owns a mode flag, a stashed toolbelt
+slot, and the stamp history. Copy and paste **override** whatever the hand
+holds and give it back when they finish, so `ctrl+C` mid-belt-run does not
+lose the belt tool. `Orchestrator._active_tool()` is the single accessor that
+resolves the override, which is why nothing downstream — gesture style,
+preview, commit — needs a mode branch.
+
+**Every exit restores the stashed tool except `Q`,** which drops the stash and
+leaves the hand empty. That asymmetry is the point: right-press, a plain
+click, and `Esc` all mean "done with this mode", while `Q` means "I want to be
+holding nothing". A stash of `None` is a real value — an empty hand must be
+restored as empty, not collapsed to slot 0.
+
+**Copy mode has no camera pan.** Left-drag is the selection gesture, so the
+camera cannot also have it. Paste mode keeps left-drag for panning, since the
+stamp follows the cursor and needs no drag of its own. An empty selection
+returns you to your tool rather than stranding you in a paste mode with
+nothing to paste.
+
+The stash survives the copy→paste switch (`Clipboard._stash()` refuses to
+overwrite an existing stash), or capturing would replace the player's real
+tool with copy mode's own empty hand.
+
+#### Paste policy is per click, not per tool
+
+A plain click is all-or-nothing; shift places what fits and rejects only the
+clashes. Since the preview is built continuously *before* the click, the
+orchestrator watches the shift modifier and rebuilds `PasteBuilder` when it
+changes — the previewed plan must use the policy the click will actually use.
+
+`R` and `F` in paste mode transform the **stamp**, not the tool: a stamp
+outlives any one plan, so they go to `Clipboard.transform_active()` and the
+builder is rebuilt around the result. The panel's R/F buttons route through
+the same path rather than reaching past the mode into the toolbelt.
+
+#### A pasted underground pair must join to itself
+
+`capture()` records intra-stamp pairing as an **index into the stamp**, and
+`PasteBuilder` turns that into the partner's cell.
+`Engine.commit_ghosts(paired_cells)` joins those *before* its
+nearest-candidate search runs, because the search would otherwise hand a
+pasted exit to an unrelated unpaired end sitting at the paste site and leave
+the pair's real other half dangling.
+
+Two traps here, both of which bit:
+
+- **A preview's pairing is one-way**, so `Underground.paired` reads true on a
+  ghost exit that nothing points back at. Code deciding whether a pair is
+  already *made* must check both directions
+  (`Engine._under_mutually_paired()`); code deciding whether an end is
+  *taken* must ignore a link to the partner it is about to be joined to
+  (`_under_spoken_for()`). Using `paired` directly breaks one case or the
+  other — the first attempt at each broke the opposite one.
+- **Only pair ends that both actually got built.** A partial paste may place
+  one half, and a survivor pointing at a row that was never created is
+  exactly the dangling state `unpair_under()` exists to prevent.
+
+#### The selection rectangle is screen furniture
+
+Nothing is stored per cell for it. The orchestrator holds the live rect and
+`Camera.render()` passes it as `select_lo`/`select_hi`/`select_on` uniforms in
+**world** units, so the shader needs no cell arithmetic. It draws over
+everything including the board border — a transient overlay must never be
+occluded by what it is dragged across — and the outline band is clamped to the
+box, since `edge` goes large and negative far away and would otherwise light
+up the whole screen. Pinned by framebuffer-readback tests in
+[tests/test_item_render.py](tests/test_item_render.py), the only place that
+can tell a drawn rectangle from an undrawn one.
+
+`harness.reset()` clears the mode, the stash and the history. Without it a
+scenario that left paste mode on would hand the next one a different gesture
+machine, and a leftover stamp would make a paste test pass for the wrong
+reason.
+
 ### A drag-based tool previews while idle
 
 The belt planner ghosts a single cell under the cursor even with no plan
@@ -188,7 +269,9 @@ everything else is grouped by layer.
 | [core/entity.py](core/entity.py) | `Entity` view base, `Belt`, `Structure` and the machine set, type registry |
 | [core/gameboard.py](core/gameboard.py) | grid array, entity table, free list, dirty tracking, device transfer |
 | [core/engine_paths.py](core/engine_paths.py) | pure path geometry (elbows, Bresenham) |
-| [core/builders.py](core/builders.py) | `EntityBuilder`/`BuildPlan`; `BeltBuilder`, `StructureBuilder`, `UndergroundBuilder` |
+| [core/builders.py](core/builders.py) | `EntityBuilder`/`BuildPlan`; `BeltBuilder`, `StructureBuilder`, `UndergroundBuilder`, `PasteBuilder` |
+| [core/stamp.py](core/stamp.py) | copy-stamps: entries, the rotate/mirror algebra, the history ring |
+| [core/clipboard.py](core/clipboard.py) | copy/paste mode state, the stashed tool, and `capture()` |
 | [core/glsl_types.py](core/glsl_types.py) | emits the per-type GLSL tables from the entity classes |
 | [core/persistence.py](core/persistence.py) | save/load the board to a single `.npz` (`.w` zeroed — derived) |
 | [core/toolbelt.py](core/toolbelt.py) | ten slots, one active tool |
@@ -1288,6 +1371,9 @@ the sequencing alone — see "The simulation clock and the two-phase tick". The
 CPU implementation is kept afterwards as the test oracle, per
 [docs/belt_report.md](docs/belt_report.md).
 
-Tools the builder abstraction is shaped for but which do not exist yet:
-blueprint capture/paste, and undo (which would record the rows a committed
-`BuildPlan` produced).
+Copy/paste landed as `PasteBuilder` plus [core/clipboard.py](core/clipboard.py)
+and needed no change to the builder abstraction, which is the evidence that
+shape was right. Still shaped for but not built: **undo** (which would record
+the rows a committed `BuildPlan` produced), named/persisted blueprints (the
+stamp history is in-session only), and a structure-selection tool on the empty
+hand — the reason the empty hand is a distinct state.

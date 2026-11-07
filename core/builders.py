@@ -419,6 +419,71 @@ class UndergroundBuilder(EntityBuilder):
         self.placing_exit = not self.placing_exit
 
 
+class PasteBuilder(EntityBuilder):
+    """Place every entity of a copy-stamp at once.
+
+    Not a toolbelt tool -- paste mode hands this to the engine in place of
+    the held tool, which is why it takes its stamp at construction and is
+    rebuilt whenever the active stamp changes. Fitting the builder shape is
+    the point: the engine's preview/commit path needs no paste-specific code.
+
+    `all_or_nothing` is **per click**, not per tool: a plain click places the
+    stamp only if every entity fits, while shift places whatever fits and
+    rejects only the frustrated ones. The flag is therefore set from the
+    modifier at plan time rather than fixed on the class.
+
+    Rotation and flip are not handled here. They transform the *stamp*, which
+    outlives any one plan -- see Clipboard.transform_active().
+    """
+
+    name = "Paste"
+    drag_based = False
+
+    def __init__(self, stamp, partial=False):
+        self.stamp = stamp
+        #: True when shift is held: place what fits, reject only clashes.
+        self.partial = partial
+
+    def status(self):
+        if self.stamp is None:
+            return "nothing copied"
+        _x, _y, w, h = self.stamp.bounds()
+        mode = "partial" if self.partial else "all-or-nothing"
+        return f"{len(self.stamp)} entities {w}x{h} ({mode})"
+
+    def plan(self, engine, start, end, start_frac=(0.5, 0.5),
+             end_frac=(0.5, 0.5)):
+        stamp = self.stamp
+        if stamp is None or not stamp:
+            return BuildPlan([], all_or_nothing=False)
+
+        # The cursor sits in the middle of the stamp's full box, so a long
+        # copied run straddles the pointer rather than hanging off it.
+        ox, oy = stamp.origin_for_cursor(*end)
+
+        placements = []
+        for (entry, x, y) in stamp.place(ox, oy):
+            blocked = [c for c in entry.entity_cls.cells_for(
+                x, y, entry.direction, entry.flipped)
+                if not engine.buildable(*c)]
+            p = Placement(entry.entity_cls, x, y, entry.direction, blocked,
+                          flipped=entry.flipped)
+            p.is_exit = entry.is_exit
+            placements.append(p)
+
+        # Intra-stamp underground pairing travels with the plan, so a copied
+        # pair joins to itself rather than to whatever sits near the paste
+        # site. Expressed as the partner's *cell*, which is what the engine's
+        # pairing step already speaks.
+        for (entry, _x, _y), p in zip(stamp.place(ox, oy), placements):
+            if entry.partner is None:
+                continue
+            mate = placements[entry.partner]
+            p.under_partner = (mate.x, mate.y)
+
+        return BuildPlan(placements, all_or_nothing=not self.partial)
+
+
 def default_builders():
     """The toolbelt's starting tools, in slot order.
 

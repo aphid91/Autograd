@@ -20,6 +20,12 @@ uniform isampler2D grid;      // RGBA32I, one texel per cell
 // resolution the interpolation depends on. Render time is sim_tick + sim_alpha.
 uniform int   sim_tick;       // whole ticks elapsed
 uniform float sim_alpha;      // fraction into the next tick, 0..1
+// Copy mode's live selection rectangle, in world units: `lo` is the lower
+// left corner, `hi` is one past the upper right. Screen furniture rather
+// than board state -- nothing is stored per cell for it.
+uniform vec2  select_lo;
+uniform vec2  select_hi;
+uniform int   select_on;      // 0 when no selection is in progress
 
 // ======================================================================
 // TUNABLES -- everything here is safe to fiddle with.
@@ -38,6 +44,11 @@ uniform float sim_alpha;      // fraction into the next tick, 0..1
 #define COL_IN          vec3(0.35, 0.60, 0.95)   // input ports  (blue)
 #define COL_OUT         vec3(0.95, 0.35, 0.30)   // output ports (red)
 #define COL_FRUSTRATED  vec3(0.90, 0.25, 0.22)
+// Copy mode's selection rectangle: a bright outline with a faint wash, so
+// what is caught reads clearly over belts and machines alike.
+#define COL_SELECT      vec3(0.35, 0.72, 0.98)
+#define SELECT_EDGE     0.06   // outline half-width, in cells
+#define SELECT_FILL     0.13   // interior wash alpha
 
 // --- belts ---
 #define BELT_WIDTH        0.34   // spine thickness, in cells
@@ -976,6 +987,29 @@ void main() {
     bool near_board = all(greaterThanEqual(world, vec2(-2.0)))
                    && all(lessThanEqual(world, vec2(board_size) + 2.0));
     if (near_board) col = mix(col, COL_BORDER, border * 0.8);
+
+    // Copy mode's selection rectangle, over everything including the border:
+    // it is a transient overlay and must never be occluded by the thing it
+    // is being dragged across. A faint wash inside shows the catchment, and
+    // the outline is drawn at a constant *world* width so it thickens with
+    // zoom like the rest of the scene rather than staying a hairline.
+    if (select_on != 0) {
+        vec2 d0 = world - select_lo;
+        vec2 d1 = select_hi - world;
+        bool inside = all(greaterThan(d0, vec2(0.0)))
+                   && all(greaterThan(d1, vec2(0.0)));
+        if (inside) col = mix(col, COL_SELECT, SELECT_FILL);
+        // Distance to the nearest edge of the box, signed inward.
+        float edge = min(min(d0.x, d0.y), min(d1.x, d1.y));
+        float aa = max(px, 1e-6);
+        float line = 1.0 - smoothstep(SELECT_EDGE - aa, SELECT_EDGE + aa,
+                                      abs(edge));
+        // Only draw the outline band near the box, so `edge` being large
+        // and negative far away cannot light up the whole screen.
+        bool near_box = all(greaterThan(d0, vec2(-SELECT_EDGE - aa)))
+                     && all(greaterThan(d1, vec2(-SELECT_EDGE - aa)));
+        if (near_box) col = mix(col, COL_SELECT, line);
+    }
 
     fragColor = vec4(col, 1.0);
 }
