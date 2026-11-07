@@ -92,7 +92,7 @@ def test_gate_cuts_a_run_in_two():
 
 def test_source_and_sink_are_ends():
     """A Source feeds a segment and a Sink drains one."""
-    src = engine.place_structure(Source, 5, 5)      # 4x1, output on the +X tip
+    src = engine.place_structure(Source, 7, 5)      # 2x1, output on the +X tip
     engine.place_belt_path((9, 5), (14, 5))
     snk = engine.place_structure(Sink, 15, 5)
     index = _segs()

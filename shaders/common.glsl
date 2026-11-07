@@ -166,8 +166,8 @@ bool is_empty(int w) { return cell_type(w) == TYPE_EMPTY; }
 //   Shear  2x1  x down through cell 0 only; y in at cell 0's west face,
 //               out at cell 1's east face as x+y
 //   Mac    2x1  Shear plus a second vertical channel down cell 1
-//   Source 4x1  one output on the +X tip
-//   Sink   3x3  one input at the middle of each side
+//   Source 2x1  one output on the +X tip
+//   Sink   2x2  two inputs per cell, on that cell's two outward faces
 //
 // .y holds the *placed* offset (flipped, then rotated, then shifted into the
 // +X/+Y quadrant -- see Entity.place_local()), NOT the authored one. The

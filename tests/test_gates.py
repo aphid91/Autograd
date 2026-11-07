@@ -34,7 +34,7 @@ def _chain(gate_cls, gate_at, direction=cell.DIR_PX):
     machine needs its other channels fed by hand, which the tests that care
     do explicitly.
     """
-    src = engine.place_structure(Source, 1, 10)
+    src = engine.place_structure(Source, 3, 10)
     engine.place_belt_path((5, 10), (gate_at[0] - 1, 10))
     gate = engine.place_structure(gate_cls, *gate_at, direction)
     engine.sync_segments()
@@ -43,7 +43,7 @@ def _chain(gate_cls, gate_at, direction=cell.DIR_PX):
 
 def test_source_emits_and_sink_consumes():
     """The simplest complete chain moves items end to end."""
-    src = engine.place_structure(Source, 5, 10)
+    src = engine.place_structure(Source, 7, 10)
     engine.place_belt_path((9, 10), (14, 10))
     snk = engine.place_structure(Sink, 15, 10)
     engine.sync_segments()
@@ -70,7 +70,7 @@ def test_well_fed_gate_fires_every_tick():
     Measured in steady state, after the belt has filled, so start-up
     transients are excluded.
     """
-    engine.place_structure(Source, 5, 10)
+    engine.place_structure(Source, 7, 10)
     engine.place_belt_path((9, 10), (14, 10))
     engine.place_structure(Sink, 15, 10)
     engine.sync_segments()
@@ -148,6 +148,52 @@ def test_mac_and_swap_compute_on_the_board():
     ok("Swap with x<=0 exchanged y and z")
 
 
+def test_a_dangling_generator_stays_inert():
+    """A Source with nothing at its tip never fills its waiting zone.
+
+    Firing a generator is free and repeatable, so a dangling port is pure
+    waste rather than something to hold material in. Contrast
+    test_an_undrained_output_blocks_the_whole_gate: a machine that *consumes*
+    inputs must write its result and let the block stop it, because dropping
+    it would destroy material.
+    """
+    src = engine.place_structure(Source, 7, 10)
+    engine.sync_segments()
+    _run(10)
+    assert src.outputs_clear(), (
+        f"a dangling Source should hold nothing, got {src.out_value(0)}")
+    assert engine.gates.stats["unconnected"] > 0, engine.gates.stats
+    assert engine.gates.stats["fired"] == 0, (
+        f"it should not have fired at all: {engine.gates.stats}")
+    ok("a Source with nothing at its tip stayed inert for 10 ticks")
+
+    # Give it somewhere to go and it starts immediately -- the check is on
+    # live topology, not something latched at placement.
+    engine.place_belt(9, 10, cell.DIR_PX)
+    engine.sync_segments()
+    _run(1)
+    assert engine.gates.stats["fired"] > 0, engine.gates.stats
+    ok("attaching a belt to the dangling tip started it on the next tick")
+
+
+def test_a_generator_skips_only_its_unconnected_channels():
+    """Connectivity is per channel: a connected port works regardless.
+
+    Source has one output today, so this pins the mechanism rather than a
+    multi-output generator that does not exist yet -- the channel loop is
+    what a future two-port source would rely on.
+    """
+    src = engine.place_structure(Source, 7, 10)
+    engine.place_belt(9, 10, cell.DIR_PX)
+    engine.sync_segments()
+    _run(1)
+    assert src.out_held(0) or engine.gates.stats["fired"] > 0, (
+        engine.gates.stats)
+    # Its one channel is connected, so nothing is ever counted unconnected.
+    assert engine.gates.stats["unconnected"] == 0, engine.gates.stats
+    ok("a connected generator channel is never skipped")
+
+
 def test_a_gate_missing_an_input_does_not_fire():
     """FIRE_ALL means all: a Shear cannot compute x+y from x alone."""
     gate = engine.place_structure(Shear, 10, 10)
@@ -209,7 +255,7 @@ def test_back_pressure_stalls_a_blocked_gate():
 
 def test_a_backed_up_belt_eventually_stalls_its_source():
     """Back pressure propagates: belt full -> zone full -> gate blocked."""
-    src = engine.place_structure(Source, 5, 10)
+    src = engine.place_structure(Source, 7, 10)
     engine.place_belt_path((9, 10), (12, 10))   # nowhere to go
     engine.sync_segments()
     seg = next(iter(engine.segments.segments.values()))
@@ -241,7 +287,7 @@ def test_a_full_belt_is_never_even_offered_an_item():
     speculatively (a splitter choosing between two belts, say) would make
     the distinction matter immediately.
     """
-    src = engine.place_structure(Source, 5, 10)
+    src = engine.place_structure(Source, 7, 10)
     engine.place_belt_path((9, 10), (12, 10))     # short, and drains nowhere
     engine.sync_segments()
     seg = next(iter(engine.segments.segments.values()))
@@ -278,7 +324,7 @@ def test_a_full_belt_is_never_even_offered_an_item():
 def test_two_gates_connect_directly_with_no_belt():
     """Adjacent gates hand items over, one tick per hop like a belt."""
     # A Source's +X tip at (8,10) touching a Sink at (9,10).
-    src = engine.place_structure(Source, 5, 10)
+    src = engine.place_structure(Source, 7, 10)
     snk = engine.place_structure(Sink, 9, 10)
     engine.sync_segments()
     assert engine.segments.count == 0, "no belts in this layout"
@@ -310,7 +356,7 @@ def test_ghost_gates_never_fire():
 
 def test_erasing_a_gate_leaves_no_stale_state():
     """A freed row must not keep feeding or blocking anything."""
-    engine.place_structure(Source, 5, 10)
+    engine.place_structure(Source, 7, 10)
     engine.place_belt_path((9, 10), (14, 10))
     snk = engine.place_structure(Sink, 15, 10)
     engine.sync_segments()
@@ -359,7 +405,7 @@ def test_long_chain_reaches_steady_throughput():
     pipeline is full every stage fires every tick. If the belt phase has pop
     and push inverted, this is where it shows as a shortfall.
     """
-    engine.place_structure(Source, 1, 10)
+    engine.place_structure(Source, 3, 10)
     engine.place_belt_path((5, 10), (9, 10))
     sh = engine.place_structure(Shear, 10, 10)        # 2x1 at (10,10)
     engine.place_belt_path((12, 10), (16, 10))
@@ -401,7 +447,7 @@ def test_a_fully_wired_shear_computes_through_belts():
     for y in range(21, 27):
         engine.place_belt(20, y, cell.DIR_NY)
     # y channel: a Source whose tip emits +X at (13,20), then belts east.
-    engine.place_structure(Source, 10, 20, cell.DIR_PX)
+    engine.place_structure(Source, 12, 20, cell.DIR_PX)
     for x in range(14, 20):
         engine.place_belt(x, 20, cell.DIR_PX)
     # Drain the mutated channel east, and the pass-through south.
@@ -448,7 +494,7 @@ def test_an_undrained_output_blocks_the_whole_gate():
     engine.place_structure(Source, 20, 27, cell.DIR_NY)
     for y in range(21, 27):
         engine.place_belt(20, y, cell.DIR_NY)
-    engine.place_structure(Source, 10, 20, cell.DIR_PX)
+    engine.place_structure(Source, 12, 20, cell.DIR_PX)
     for x in range(14, 20):
         engine.place_belt(x, 20, cell.DIR_PX)
     # Drain the mutated channel only; leave the pass-through dangling.
@@ -471,10 +517,10 @@ def test_an_undrained_output_blocks_the_whole_gate():
 
 def test_audits_clean_through_a_running_chain():
     """Every audit stays clean while gates and belts run together."""
-    engine.place_structure(Source, 5, 10)
+    engine.place_structure(Source, 7, 10)
     engine.place_belt_path((9, 10), (14, 10))
     engine.place_structure(Sink, 15, 10)
-    engine.place_structure(Source, 5, 20)
+    engine.place_structure(Source, 7, 20)
     engine.place_belt_path((9, 20), (12, 20))
     engine.sync_segments()
 

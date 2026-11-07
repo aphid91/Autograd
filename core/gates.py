@@ -57,6 +57,16 @@ is a renderable state.** It means "this gate produced something the belt
 would not take", and the renderer draws it squished between the gate and the
 belt. While things flow it is always empty by end of tick, so nothing shows.
 
+**Generators are the one exception**, and it is about material rather than
+about Source. A machine with no inputs can fire for free and repeatedly, so
+it skips output channels with nothing on the far side instead of filling a
+waiting zone nobody will drain; with *no* channel connected it stays inert.
+A machine that consumes inputs must never do this -- discarding a result it
+has no room for would destroy material, so the value goes to the zone and the
+block that follows is the back pressure. See `_connected_channels()`,
+including why reading the grid there does not break the phase's
+order-independence the way reading belt state would.
+
 
 Direct gate-to-gate connections
 -------------------------------
@@ -89,7 +99,8 @@ class GateSim:
         self.index = index
         self.belts = belts
         self.stats = {"fired": 0, "blocked": 0, "starved": 0,
-                      "drained": 0, "loaded": 0, "consumed": 0, "direct": 0}
+                      "drained": 0, "loaded": 0, "consumed": 0, "direct": 0,
+                      "unconnected": 0}
 
     # --- gate discovery ---------------------------------------------------
     def gates(self):
@@ -131,6 +142,31 @@ class GateSim:
                 continue
 
             n_in = gate.input_count()
+
+            # A generator -- a machine with no inputs -- only bothers with
+            # output channels that have somewhere to go. Everything else
+            # writes every result and lets a dangling channel block it.
+            #
+            # The asymmetry is about *material*, not about Source. Firing a
+            # generator costs nothing and can be repeated, so a dangling port
+            # is pure waste and skipping it is free. An arithmetic machine's
+            # fire *consumes its inputs*, so dropping a result it has no room
+            # for would silently destroy material -- there the value must go
+            # to the waiting zone and the resulting block is the back
+            # pressure that stops the machine. Leaving a Shear's
+            # pass-through dangling therefore still stalls it after one fire,
+            # which is the documented consequence builders have to design
+            # around.
+            if n_in == 0:
+                drains = self._connected_channels(gate)
+                if not drains:
+                    # Nothing to produce into at all: stay inert rather than
+                    # filling a zone once and counting as blocked forever.
+                    self.stats["unconnected"] += 1
+                    continue
+            else:
+                drains = None
+
             values = [gate.in_value(i) if gate.in_held(i) else None
                       for i in range(n_in)]
             results = gate.fire(values)
@@ -143,8 +179,12 @@ class GateSim:
                     self.stats["consumed"] += 1
 
             for i, value in enumerate(results):
-                if value is not None:
-                    gate.set_output(i, value)
+                if value is None:
+                    continue
+                if drains is not None and i not in drains:
+                    self.stats["unconnected"] += 1
+                    continue
+                gate.set_output(i, value)
             fired += 1
 
         self.stats["fired"] += fired
@@ -301,6 +341,57 @@ class GateSim:
         if channel is None:
             return None
         return gate, channel
+
+    # --- output connectivity ----------------------------------------------
+    def _connected_channels(self, gate):
+        """Which of `gate`'s output channels have somewhere to send a result.
+
+        A channel counts as connected if *any* of its faces has a genuine
+        counterpart on the other side: a belt, or another gate whose own input
+        face points back at us. Per channel rather than per face because a
+        Sink-like fold maps several faces onto one slot, and draining any of
+        them drains the channel. For every machine but Sink the two are the
+        same thing, since channel == port index.
+
+        Only generators consult this -- see structure_phase() for why a
+        machine that consumes inputs must write its results regardless.
+
+        **This reads the grid, which the structure phase otherwise must not
+        do -- and it is safe for a specific reason.** The prohibition exists
+        so a fire decision cannot depend on belt *state*, which the belt phase
+        mutates mid-tick and whose read order would then matter. Connectivity
+        is belt *presence*: a function of the grid alone, frozen for the whole
+        phase because the player cannot edit mid-tick. So this stays
+        order-independent, exactly like the port geometry beside it.
+        """
+        reached = set()
+        for (xy, face, channel) in self._output_faces(gate):
+            if channel in reached:
+                continue
+            if self._face_has_consumer(gate, xy, face):
+                reached.add(channel)
+        return reached
+
+    def _face_has_consumer(self, gate, xy, face):
+        """Would anything accept material pushed out of this port face?"""
+        step = cell.DIR_STEPS[face]
+        nx, ny = xy[0] + step[0], xy[1] + step[1]
+        if not self.board.in_bounds(nx, ny):
+            return False
+        # A belt (or an underground end, which segments own) takes anything.
+        if self.index.at(nx, ny) is not None:
+            return True
+        row = self.board.entity_id_at(nx, ny)
+        if not row or not self.board.is_row_alive(row):
+            return False
+        other = self.board.view(row)
+        if other.row == gate.row or other.is_ghost:
+            return False
+        # Another gate counts only if it has an input face pointing back at
+        # us -- the same predicate the renderer's stubs use, so a drawn join
+        # and a working one mean the same thing.
+        back = (face + 2) % 4
+        return self._input_channel_for(other, back, at=(nx, ny)) is not None
 
     # --- port geometry ----------------------------------------------------
     def _output_faces(self, gate):

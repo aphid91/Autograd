@@ -481,8 +481,23 @@ results in those zones.
 | `Shear` | x,y → x, x+y |
 | `Mac` | x,y,z → x, y, z + x·y |
 | `Swap` | x,y,z → x, (y,z if x>0 else z,y) — x is the control |
-| `Source` | → a constant (`EMIT_VALUE`, currently −1) |
+| `Source` | → a constant (`EMIT_VALUE`, currently −1), on connected ports only |
 | `Sink` | destroys whatever arrives |
+
+**A generator only emits where something can take it.** A machine with *no
+inputs* skips output channels with nothing on the far side, and with none
+connected it stays inert rather than filling a zone nobody drains. This is
+the one place the structure phase reads the grid, and it is safe because it
+reads belt *presence* (static for the whole phase) rather than belt *state* —
+see `GateSim._connected_channels()`.
+
+The asymmetry is about **material, not about Source**. Firing a generator is
+free and repeatable, so a dangling port is waste. A machine that *consumes*
+its inputs must write every result and let the resulting block stop it —
+discarding one would silently destroy material. So leaving a `Shear`'s
+pass-through dangling still stalls it after a single fire, and both halves are
+pinned (`test_a_dangling_generator_stays_inert` against
+`test_an_undrained_output_blocks_the_whole_gate`).
 
 **Firing is declared, not special-cased.** `FIRE_RULE` is `FIRE_ALL`
 (every input needed — a Shear cannot compute x+y from x alone) or `FIRE_ANY`
@@ -866,7 +881,7 @@ rotated; all are continuous rectangles.
 | `Swap` | 1×2 | x,y,z → x, (y,z if x>0 else z,y) |
 | `Shear` | 2×1 | x,y → x, x+y |
 | `Mac` | 2×1 | x,y,z → x, y, z + x·y |
-| `Source` | 4×1 | one output on the +X tip |
+| `Source` | 2×1 | one output on the +X tip |
 | `Sink` | 3×3 | one input at the middle of each side |
 
 The three arithmetic machines share an idiom: a **pass-through channel**

@@ -316,11 +316,14 @@ def test_structures_are_centred_on_the_cursor_not_cornered_on_it():
     _src_tool.direction = cell.DIR_PX
     put_cursor_at_cell(30, 10); step()
     click()
-    # A 4x1 placed at (30,10) must straddle the cursor, not start there.
+    # A 2x1 must straddle the cursor. Its midline is a cell *boundary*, and a
+    # cursor at dead centre rounds to the cell's far edge, so the footprint
+    # lands on (30,10)-(31,10) -- the cursor cell plus one, never a corner at
+    # the cursor with the body running off to one side only.
     assert not board.is_empty(30, 10), "cursor cell must be covered"
-    assert not board.is_empty(29, 10), "footprint should extend behind the cursor"
-    assert not board.is_empty(32, 10) and board.is_empty(33, 10)
-    ok("4x1 Source straddles the cursor (29..32, not 30..33)")
+    assert not board.is_empty(31, 10), "footprint should extend past the cursor"
+    assert board.is_empty(29, 10) and board.is_empty(32, 10)
+    ok("2x1 Source straddles the cursor (30..31)")
 
     # Rotating turns about the middle: the cursor cell stays covered.
     engine.clear_board(); step()
@@ -368,7 +371,7 @@ def test_structures_are_centred_on_the_cursor_not_cornered_on_it():
     ok(f"commit lands exactly where the ghost was: {_built}")
 
     # An odd axis has a middle cell, so the fraction must change nothing there.
-    # Source is 4x1 -- even on x, odd on y -- so it exercises both rules at once:
+    # Source is 2x1 -- even on x, odd on y -- so it exercises both rules at once:
     # moving across the cell shifts it, moving up the cell does not.
     _src = select_tool("Source")
     _src.direction = cell.DIR_PX
@@ -380,7 +383,7 @@ def test_structures_are_centred_on_the_cursor_not_cornered_on_it():
     put_cursor_at(30.8, 20.2); step()
     _right2 = sorted(orch.last_plan.placements[0].cells())
     assert _right2 != _lo, f"even axis must track the fraction: {_lo} vs {_right2}"
-    ok("4x1 Source tracks the pointer across x, ignores it up y")
+    ok("2x1 Source tracks the pointer across x, ignores it up y")
 
     select_tool("Belt")
 

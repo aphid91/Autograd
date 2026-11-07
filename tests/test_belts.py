@@ -561,7 +561,7 @@ def test_debug_feed_defers_to_real_gates():
     """
     def run(feed):
         harness.reset()
-        engine.place_structure(Source, 5, 5)
+        engine.place_structure(Source, 7, 5)
         engine.place_belt_path((9, 5), (14, 5))
         engine.place_structure(Sink, 15, 5)
         engine.sync_segments()

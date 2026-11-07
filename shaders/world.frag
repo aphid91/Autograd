@@ -65,7 +65,10 @@ uniform float sim_alpha;      // fraction into the next tick, 0..1
 #define STUB_WIDTH        0.34   // matches BELT_WIDTH by default
 #define STUB_REACH        0.50   // out to the cell edge
 // How far a cell probes for siblings when recovering its footprint extent.
-// Must be >= (longest footprint axis - 1); Source is 4x1, so 3.
+// Must be >= (longest footprint axis - 1); the longest is 2, so 1 would do.
+// Kept at 3 deliberately: it is headroom for the next machine added, and
+// test_glsl.py asserts only the lower bound, so a too-small value would
+// surface as a multi-cell body drawing in pieces rather than as a failure.
 #define PROBE_REACH       3
 // A faint belt drawn straight through a machine on any cell whose ports pass
 // a signal through unchanged -- the "control" channels, which enter one face
@@ -741,8 +744,8 @@ void main() {
 
             // Recover the footprint extent by probing neighbours for the same
             // entity id, so a multi-cell entity draws as one merged shape.
-            // PROBE_REACH must be at least (longest footprint axis - 1):
-            // Source is 4x1, so 3. Raise it if a bigger machine is added.
+            // PROBE_REACH must be at least (longest footprint axis - 1).
+            // Raise it if a machine longer than PROBE_REACH+1 is added.
             ivec2 lo = ivec2(0), hi = ivec2(0);
             for (int k = 1; k <= PROBE_REACH; ++k) {
                 if (cell_id(fetch(ci + ivec2(k, 0)).x) != id) break; hi.x = k;

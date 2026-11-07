@@ -37,7 +37,7 @@ _COMMON_FIELDS = 8
 # each output, and an occupancy flag for both. The widest machine (Mac) has
 # three of each, so 8 common + 3*2 values + 3*2 flags = 20, rounded up to 24.
 # Rows are cheap and branching is not, so every type carries the full set
-# rather than packing per-type -- Source's 4x1 row simply has unused slots.
+# rather than packing per-type -- a Source row simply has unused slots.
 ENTITY_STRIDE = 24
 
 #: Most *channels* of one kind any machine has -- not port faces. Fixes the
@@ -791,19 +791,22 @@ class Mac(Structure):
 
 
 class Source(Structure):
-    """4x1 emitter with a single output at one short end.
+    """2x1 emitter with a single output at one short end.
 
     Authored at DIR_PX lying along X with the port on the +X tip, so the
     default placement emits east and R walks it around.
+
+    Even on x and odd on y, so it is the type that exercises both halves of
+    the centred-placement rule at once -- see origin_for_cursor().
     """
 
     TYPE_ID = cell.TYPE_SOURCE
-    FOOTPRINT = (4, 1)
+    FOOTPRINT = (2, 1)
     COLOUR = (0.42, 0.52, 0.60)
     GLYPH = "dot"
 
     INPUTS = ()
-    OUTPUTS = ((3, 0, cell.DIR_PX),)
+    OUTPUTS = ((1, 0, cell.DIR_PX),)
 
     def fire(self, values):
         """Emit a constant. No inputs, so `values` is empty.
@@ -812,6 +815,12 @@ class Source(Structure):
         whenever its waiting zone is clear -- i.e. at whatever rate the belt
         downstream will take. That self-regulation falls out of the
         back-pressure rule rather than needing a rate here.
+
+        Note this says *what* to emit, not *where* it can go: a channel whose
+        face has nothing on the other side is skipped by the caller and its
+        waiting zone stays empty. That check is topology and so lives in
+        core/gates.py, the only place allowed to look at the board -- see
+        GateSim._connected_channels().
         """
         return [self.EMIT_VALUE]
 
@@ -1050,11 +1059,11 @@ def _self_check():
     assert Mac.face_masks_at(1, 0) == (1 << cell.DIR_PY,
                                        (1 << cell.DIR_NY) | (1 << cell.DIR_PX))
 
-    # Source: one output, on the +X tip of a 4x1 and nowhere else.
-    assert Source.FOOTPRINT == (4, 1)
+    # Source: one output, on the +X tip of a 2x1 and nowhere else.
+    assert Source.FOOTPRINT == (2, 1)
     assert not Source.INPUTS and len(Source.OUTPUTS) == 1
-    assert Source.face_masks_at(3, 0) == (0, 1 << cell.DIR_PX)
-    for lx in range(3):
+    assert Source.face_masks_at(1, 0) == (0, 1 << cell.DIR_PX)
+    for lx in range(1):
         assert Source.face_masks_at(lx, 0) == (0, 0), lx
 
     # Sink: a 2x2 accepting on every perimeter face, and no outputs. Each
