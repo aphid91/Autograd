@@ -33,27 +33,33 @@ _COMMON_FIELDS = 8
 # so each row lands on a vec4 boundary in the SSBO -- GLSL std430 arrays of
 # vec4 are the easiest thing to index from a compute shader later.
 #
-# A gate needs, per port: the value held at each input, the value waiting at
-# each output, and an occupancy flag for both. The widest machine (Mac) has
-# three of each, so 8 common + 3*2 values + 3*2 flags = 20, rounded up to 24.
+# A gate needs, per channel: the value held at each input, the value waiting
+# at each output, and an occupancy flag for both. The widest is Source's six
+# independent output channels, so 8 common + 6*2 values + 6*2 flags = 32.
 # Rows are cheap and branching is not, so every type carries the full set
-# rather than packing per-type -- a Source row simply has unused slots.
-ENTITY_STRIDE = 24
+# rather than packing per-type -- a belt row simply has unused slots.
+ENTITY_STRIDE = 32
 
 #: Most *channels* of one kind any machine has -- not port faces. Fixes the
 #: per-row gate layout, so a machine with more channels means bumping this
 #: and ENTITY_STRIDE together.
 #:
-#: Faces and channels are not the same thing, and Sink is why. It accepts on
-#: eight perimeter faces, but those are eight ways in to one consumer, not
-#: eight independent values: whatever arrives gets destroyed, and a stack per
-#: *face* would be meaningless. The arithmetic machines are the opposite --
-#: Mac's three inputs are genuinely distinct channels (x, y, z) and must not
-#: be conflated.
+#: Faces and channels are not the same thing, and the two ends of the scale
+#: show why it has to be channels.
 #:
-#: Sizing the row by faces would mean 8 channels for every entity, so a belt
-#: row would carry 32 unused floats. Sizing by channels keeps it at 3.
-MAX_CHANNELS = 3
+#: **Sink folds eight faces onto one channel.** Those are eight ways *in* to
+#: one consumer, not eight independent values: whatever arrives is destroyed,
+#: so a stack per face would be meaningless.
+#:
+#: **Source does the opposite -- six faces, six channels.** They cannot fold,
+#: because a waiting zone is cleared by whoever drains it: two belts sharing
+#: one channel would split one item per tick between them instead of each
+#: getting their own. Independent channels are what let one Source fill
+#: several belts at once, with the unconnected faces simply staying empty.
+#:
+#: Sizing the row by *faces* would mean 8 channels for every entity. Sizing
+#: by channels keeps it at 6, set by Source.
+MAX_CHANNELS = 6
 
 
 class Entity:
@@ -791,13 +797,26 @@ class Mac(Structure):
 
 
 class Source(Structure):
-    """2x1 emitter with a single output at one short end.
+    """2x1 emitter with an output on every one of its six perimeter faces.
 
-    Authored at DIR_PX lying along X with the port on the +X tip, so the
-    default placement emits east and R walks it around.
+    Each cell carries its own outward faces: both carry +Y and -Y, cell 0
+    carries -X and cell 1 carries +X. So material can be drawn off from any
+    side without aiming at a particular tile.
+
+    **The six faces are six independent channels, not one folded channel**
+    -- the opposite of Sink. A waiting zone is cleared by whoever drains it,
+    so two belts sharing a channel would split one item per tick between
+    them; separate channels let one Source fill several belts at once. The
+    faces nobody connected simply stay empty rather than filling a zone and
+    blocking the machine, which is what makes a 6-port generator usable at
+    all (see GateSim._connected_channels()).
+
+    This is what sets MAX_CHANNELS, and so ENTITY_STRIDE.
 
     Even on x and odd on y, so it is the type that exercises both halves of
     the centred-placement rule at once -- see origin_for_cursor().
+
+    Symmetric about the authored X axis, so it is achiral and F is a no-op.
     """
 
     TYPE_ID = cell.TYPE_SOURCE
@@ -806,23 +825,27 @@ class Source(Structure):
     GLYPH = "dot"
 
     INPUTS = ()
-    OUTPUTS = ((1, 0, cell.DIR_PX),)
+    OUTPUTS = (
+        (0, 0, cell.DIR_NX), (0, 0, cell.DIR_PY), (0, 0, cell.DIR_NY),
+        (1, 0, cell.DIR_PX), (1, 0, cell.DIR_PY), (1, 0, cell.DIR_NY),
+    )
 
     def fire(self, values):
-        """Emit a constant. No inputs, so `values` is empty.
+        """Emit the same constant on every output channel. `values` is empty.
 
         With no inputs this type is vacuously ready every tick, so it emits
-        whenever its waiting zone is clear -- i.e. at whatever rate the belt
-        downstream will take. That self-regulation falls out of the
+        whenever its waiting zones are clear -- i.e. at whatever rate the
+        belts downstream will take. That self-regulation falls out of the
         back-pressure rule rather than needing a rate here.
 
         Note this says *what* to emit, not *where* it can go: a channel whose
         face has nothing on the other side is skipped by the caller and its
         waiting zone stays empty. That check is topology and so lives in
         core/gates.py, the only place allowed to look at the board -- see
-        GateSim._connected_channels().
+        GateSim._connected_channels(). Without it, five dangling zones would
+        block this machine permanently the first time it fired.
         """
-        return [self.EMIT_VALUE]
+        return [self.EMIT_VALUE] * self.out_channels()
 
 
 class Sink(Structure):
@@ -928,7 +951,7 @@ def _self_check():
 
     # Source emits its constant; Sink emits nothing at all.
     src = _view(Source)
-    assert src.fire([]) == [Source.EMIT_VALUE]
+    assert src.fire([]) == [Source.EMIT_VALUE] * Source.out_channels()
     assert len(src.fire([])) == Source.out_channels()
     snk = _view(Sink)
     assert snk.fire([None]) == [], "a sink emits nothing"
@@ -1059,12 +1082,29 @@ def _self_check():
     assert Mac.face_masks_at(1, 0) == (1 << cell.DIR_PY,
                                        (1 << cell.DIR_NY) | (1 << cell.DIR_PX))
 
-    # Source: one output, on the +X tip of a 2x1 and nowhere else.
+    # Source: a 2x1 emitting on all six perimeter faces, each its own
+    # channel. Each cell carries exactly the faces pointing out of the body.
     assert Source.FOOTPRINT == (2, 1)
-    assert not Source.INPUTS and len(Source.OUTPUTS) == 1
-    assert Source.face_masks_at(1, 0) == (0, 1 << cell.DIR_PX)
-    for lx in range(1):
-        assert Source.face_masks_at(lx, 0) == (0, 0), lx
+    assert not Source.INPUTS and len(Source.OUTPUTS) == 6
+    assert Source.out_channels() == 6, Source.out_channels()
+    for lx in (0, 1):
+        in_mask, out_mask = Source.face_masks_at(lx, 0)
+        assert in_mask == 0, lx
+        outward = {cell.DIR_PY, cell.DIR_NY,
+                   cell.DIR_NX if lx == 0 else cell.DIR_PX}
+        assert out_mask == sum(1 << d for d in outward), (
+            lx, bin(out_mask))
+    # Every perimeter face covered exactly once, and no interior face.
+    _, souts = Source.faces_for(0, 0, cell.DIR_PX)
+    assert len(set(souts)) == 6, souts
+    assert ((0, 0), cell.DIR_PX) not in souts, "interior face is not a port"
+    assert ((1, 0), cell.DIR_NX) not in souts, "interior face is not a port"
+    # Six independent channels, not one folded channel: a waiting zone is
+    # cleared by whoever drains it, so folding would make two belts split
+    # one item per tick instead of each getting their own.
+    assert len({Source.out_channel(i) for i in range(6)}) == 6
+    # Firing produces one value per channel.
+    assert _view(Source).fire([]) == [Source.EMIT_VALUE] * 6
 
     # Sink: a 2x2 accepting on every perimeter face, and no outputs. Each
     # cell carries exactly the two faces that point out of the footprint.

@@ -135,37 +135,18 @@ class GateSim:
             if not gate.inputs_ready():
                 self.stats["starved"] += 1
                 continue
+
+            n_in = gate.input_count()
+            if n_in == 0:
+                if self._fire_generator(gate):
+                    fired += 1
+                continue
+
             if not gate.outputs_clear():
                 # Something is still waiting to leave. This is back pressure
                 # arriving: the belt downstream did not take the last result.
                 self.stats["blocked"] += 1
                 continue
-
-            n_in = gate.input_count()
-
-            # A generator -- a machine with no inputs -- only bothers with
-            # output channels that have somewhere to go. Everything else
-            # writes every result and lets a dangling channel block it.
-            #
-            # The asymmetry is about *material*, not about Source. Firing a
-            # generator costs nothing and can be repeated, so a dangling port
-            # is pure waste and skipping it is free. An arithmetic machine's
-            # fire *consumes its inputs*, so dropping a result it has no room
-            # for would silently destroy material -- there the value must go
-            # to the waiting zone and the resulting block is the back
-            # pressure that stops the machine. Leaving a Shear's
-            # pass-through dangling therefore still stalls it after one fire,
-            # which is the documented consequence builders have to design
-            # around.
-            if n_in == 0:
-                drains = self._connected_channels(gate)
-                if not drains:
-                    # Nothing to produce into at all: stay inert rather than
-                    # filling a zone once and counting as blocked forever.
-                    self.stats["unconnected"] += 1
-                    continue
-            else:
-                drains = None
 
             values = [gate.in_value(i) if gate.in_held(i) else None
                       for i in range(n_in)]
@@ -179,12 +160,8 @@ class GateSim:
                     self.stats["consumed"] += 1
 
             for i, value in enumerate(results):
-                if value is None:
-                    continue
-                if drains is not None and i not in drains:
-                    self.stats["unconnected"] += 1
-                    continue
-                gate.set_output(i, value)
+                if value is not None:
+                    gate.set_output(i, value)
             fired += 1
 
         self.stats["fired"] += fired
@@ -342,6 +319,58 @@ class GateSim:
             return None
         return gate, channel
 
+    # --- generators -------------------------------------------------------
+    def _fire_generator(self, gate):
+        """Fire a machine with no inputs. True if it produced anything.
+
+        A generator's output channels are **independent**, which is what
+        separates this from the arithmetic path:
+
+        * It only fills channels with somewhere to go. A dangling face is
+          pure waste rather than something to hold material in, and firing a
+          generator is free and repeatable, so skipping costs nothing. A
+          6-port Source would otherwise block permanently the first time it
+          fired, with five zones nobody will ever drain.
+        * It fills whichever free zones it finds instead of demanding that
+          *all* of them be clear. `outputs_clear()` is all-or-nothing, so
+          using it here would let one slow belt stall every other belt the
+          same Source feeds -- the exact opposite of "fill both of them".
+
+        A machine that consumes inputs must do neither: it has to write every
+        result and let a full zone stop it, because dropping one would
+        silently destroy material. That is why leaving a Shear's pass-through
+        dangling still stalls it after a single fire.
+        """
+        drains = self._connected_channels(gate)
+        if not drains:
+            # Nothing connected at all: stay inert rather than filling a zone
+            # once and then counting as blocked forever.
+            self.stats["unconnected"] += 1
+            return False
+
+        # Only the connected channels that are also free. Independent, so a
+        # busy one does not hold up the rest.
+        free = [c for c in drains if not gate.out_held(c)]
+        if not free:
+            self.stats["blocked"] += 1
+            return False
+
+        results = gate.fire([])
+        produced = 0
+        for channel in free:
+            if channel >= len(results):
+                continue
+            value = results[channel]
+            if value is None:
+                continue
+            gate.set_output(channel, value)
+            produced += 1
+        if not produced:
+            return False
+        self.stats["unconnected"] += len(
+            [c for c in range(gate.output_count()) if c not in drains])
+        return True
+
     # --- output connectivity ----------------------------------------------
     def _connected_channels(self, gate):
         """Which of `gate`'s output channels have somewhere to send a result.
@@ -378,9 +407,26 @@ class GateSim:
         nx, ny = xy[0] + step[0], xy[1] + step[1]
         if not self.board.in_bounds(nx, ny):
             return False
-        # A belt (or an underground end, which segments own) takes anything.
-        if self.index.at(nx, ny) is not None:
-            return True
+        # A belt (or an underground end, which segments own) takes anything --
+        # but only through the one port the segment actually named as its
+        # source. A multi-port machine can have two faces touching the same
+        # run, and a segment takes from exactly one of them (take_dir()); the
+        # loser would otherwise fill a waiting zone nothing will ever drain
+        # and sit there as a permanently stuck item.
+        #
+        # Asking _src_port() rather than comparing seg.src by hand is what
+        # makes this exact: the face direction alone cannot tell two ports of
+        # the same gate apart (a 2x1 Source has two +Y faces), and _src_port()
+        # resolves the gate *cell* adjacent to the tail, which can.
+        seg = self.index.at(nx, ny)
+        if seg is not None:
+            owner = self._src_port(seg)
+            if owner is None:
+                return False
+            owner_gate, owner_channel = owner
+            if owner_gate.row != gate.row:
+                return False
+            return owner_channel == self._channel_of_face(gate, xy, face)
         row = self.board.entity_id_at(nx, ny)
         if not row or not self.board.is_row_alive(row):
             return False
@@ -392,6 +438,13 @@ class GateSim:
         # and a working one mean the same thing.
         back = (face + 2) % 4
         return self._input_channel_for(other, back, at=(nx, ny)) is not None
+
+    def _channel_of_face(self, gate, xy, face):
+        """Which output channel sits on this (cell, face) pair, or None."""
+        for (oxy, oface, channel) in self._output_faces(gate):
+            if oxy == xy and oface == face:
+                return channel
+        return None
 
     # --- port geometry ----------------------------------------------------
     def _output_faces(self, gate):

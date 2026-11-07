@@ -27,6 +27,20 @@ def _run(ticks):
         engine.clock.advance(0.0)
 
 
+def _feeding_channel(gate, seg):
+    """Which of `gate`'s output channels actually feeds `seg`.
+
+    A Source has six faces and so six channels; which one owns a given run
+    depends on where the belts were laid, so a test must ask rather than
+    assume channel 0.
+    """
+    port = engine.gates._src_port(seg)
+    assert port is not None, f"nothing feeds segment {seg.sid}"
+    owner, channel = port
+    assert owner.row == gate.row, (owner.row, gate.row)
+    return channel
+
+
 def _chain(gate_cls, gate_at, direction=cell.DIR_PX):
     """Source -> belt -> gate -> belt -> Sink, returning the pieces.
 
@@ -176,22 +190,90 @@ def test_a_dangling_generator_stays_inert():
     ok("attaching a belt to the dangling tip started it on the next tick")
 
 
-def test_a_generator_skips_only_its_unconnected_channels():
-    """Connectivity is per channel: a connected port works regardless.
+def test_one_source_fills_two_belts():
+    """Six independent output channels, each feeding its own run.
 
-    Source has one output today, so this pins the mechanism rather than a
-    multi-output generator that does not exist yet -- the channel loop is
-    what a future two-port source would rely on.
+    This is why generators skip unconnected channels at all: with six ports
+    and one belt, five waiting zones would fill once and block the machine
+    for good. It is also why the channels must not fold onto one slot the way
+    a Sink's inputs do -- a waiting zone is cleared by whoever drains it, so
+    two belts sharing a channel would split one item per tick between them
+    instead of each getting a full run.
     """
-    src = engine.place_structure(Source, 7, 10)
-    engine.place_belt(9, 10, cell.DIR_PX)
+    src = engine.place_structure(Source, 10, 10)   # 2x1 over (10,10)-(11,10)
+    # North face of cell 0 feeds an eastward run; south face feeds another.
+    for x in range(10, 16):
+        engine.place_belt(x, 11, cell.DIR_PX)
+    engine.place_structure(Sink, 16, 11)
+    for x in range(10, 16):
+        engine.place_belt(x, 9, cell.DIR_PX)
+    engine.place_structure(Sink, 16, 9)
     engine.sync_segments()
-    _run(1)
-    assert src.out_held(0) or engine.gates.stats["fired"] > 0, (
-        engine.gates.stats)
-    # Its one channel is connected, so nothing is ever counted unconnected.
-    assert engine.gates.stats["unconnected"] == 0, engine.gates.stats
-    ok("a connected generator channel is never skipped")
+    assert engine.segments.count == 2, engine.segments.count
+
+    _run(30)
+    segs = list(engine.segments.segments.values())
+    assert all(s.count > 0 for s in segs), [s.count for s in segs]
+    assert engine.gates.stats["blocked"] == 0, (
+        f"independent channels must not block each other: "
+        f"{engine.gates.stats}")
+    stuck = [c for c in range(src.output_count()) if src.out_held(c)]
+    assert not stuck, f"channels {stuck} filled a zone nothing drains"
+    ok(f"one Source filled two runs: {engine.gates.stats['consumed']} items "
+       f"consumed, no channel blocked another")
+
+
+def test_a_generator_skips_its_dangling_faces():
+    """The four faces with nothing attached stay empty, and nothing stalls."""
+    src = engine.place_structure(Source, 10, 10)
+    for x in range(10, 16):
+        engine.place_belt(x, 11, cell.DIR_PX)
+    engine.place_structure(Sink, 16, 11)
+    engine.sync_segments()
+
+    connected = engine.gates._connected_channels(src)
+    assert len(connected) == 1, (
+        f"exactly one face should own that run, got {sorted(connected)}")
+    _run(30)
+    # Every other channel stayed empty rather than filling once and jamming.
+    for c in range(src.output_count()):
+        if c in connected:
+            continue
+        assert not src.out_held(c), f"dangling channel {c} filled its zone"
+    assert engine.gates.stats["blocked"] == 0, engine.gates.stats
+    assert engine.gates.stats["unconnected"] > 0, engine.gates.stats
+    assert engine.gates.stats["consumed"] > 0, "the connected face must flow"
+    ok(f"5 dangling faces stayed empty while one fed "
+       f"{engine.gates.stats['consumed']} items")
+
+
+def test_two_faces_on_one_run_do_not_both_fill():
+    """A run takes from one port, so the losing face must not fill a zone.
+
+    A 2x1 Source has two +Y faces, and a long enough run touches both. Only
+    one can be the segment's source (take_dir decides), and the other must
+    read as unconnected -- otherwise it fills a waiting zone nothing will
+    ever drain and sits there as a permanently stuck item.
+    """
+    src = engine.place_structure(Source, 10, 10)
+    # The run spans both cells of the footprint, so both +Y faces touch it.
+    for x in range(10, 16):
+        engine.place_belt(x, 11, cell.DIR_PX)
+    engine.place_structure(Sink, 16, 11)
+    engine.sync_segments()
+
+    faces = engine.gates._output_faces(src)
+    plus_y = [ch for (_xy, f, ch) in faces if f == cell.DIR_PY]
+    assert len(plus_y) == 2, plus_y
+    connected = engine.gates._connected_channels(src)
+    assert len([c for c in plus_y if c in connected]) == 1, (
+        f"exactly one of the two +Y faces should own the run, got "
+        f"{sorted(connected)}")
+
+    _run(30)
+    assert not [c for c in plus_y if src.out_held(c)], (
+        "the losing face filled a zone that nothing drains")
+    ok("two faces touching one run: only the owning face emits")
 
 
 def test_a_gate_missing_an_input_does_not_fire():
@@ -264,7 +346,8 @@ def test_a_backed_up_belt_eventually_stalls_its_source():
     assert seg.count == engine.belts.capacity_of(seg), (
         f"{seg.count} items on a belt with capacity "
         f"{engine.belts.capacity_of(seg)}")
-    assert src.out_held(0), (
+    _ch = _feeding_channel(src, seg)
+    assert src.out_held(_ch), (
         "with the belt full the Source's waiting zone should stay occupied")
     assert engine.gates.stats["blocked"] > 0, engine.gates.stats
     ok(f"belt packed to {seg.count}, Source blocked with its zone full")
@@ -294,8 +377,9 @@ def test_a_full_belt_is_never_even_offered_an_item():
 
     _run(25)
     assert seg.count == engine.belts.capacity_of(seg), seg.count
-    held = src.out_value(0)
-    assert src.out_held(0), "the Source should be holding a refused item"
+    _ch = _feeding_channel(src, seg)
+    held = src.out_value(_ch)
+    assert src.out_held(_ch), "the Source should be holding a refused item"
 
     offers = []
     real_offer = engine.gates.offer_to
@@ -314,8 +398,8 @@ def test_a_full_belt_is_never_even_offered_an_item():
     assert not offers, (
         f"a packed belt should not be asked for items at all, got "
         f"{len(offers)} offers")
-    assert src.out_held(0) and src.out_value(0) == held, (
-        f"the held value changed from {held} to {src.out_value(0)}")
+    assert src.out_held(_ch) and src.out_value(_ch) == held, (
+        f"the held value changed from {held} to {src.out_value(_ch)}")
     assert seg.count == engine.belts.capacity_of(seg), seg.count
     ok(f"10 ticks against a packed belt: no offers made, the Source kept "
        f"its item ({held:+g})")

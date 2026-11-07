@@ -601,16 +601,41 @@ class SegmentIndex:
         seg.dst = self._node_ahead(seg.cells[-1])
 
     def _node_behind(self, xy):
-        """The structure output port feeding this cell, or None."""
+        """The structure output port feeding this cell, or None.
+
+        Probes **every** side, not just the one directly behind the belt's
+        facing. A machine may emit into a belt from any direction -- a
+        Source's north face feeding an eastward run is the common case, and
+        with six ports on a 2x1 it is the normal way to use one. Probing only
+        `behind` made such a run read as dangling: the items flowed nowhere
+        and the generator blocked forever with a full waiting zone.
+
+        Contention is resolved by `take_dir()`, the same authority the belt
+        path and the renderer use, so a cell with several things pointing at
+        it takes from exactly one and the picture matches the simulation.
+        """
         x, y = xy
         here = self._cell_at(x, y)
         if here is None:
             return None
         _t, facing, _row = here
-        behind = (facing + 2) % 4
-        step = cell.DIR_STEPS[behind]
-        nx, ny = x + step[0], y + step[1]
-        return self._port_at(nx, ny, (behind + 2) % 4, want_output=True)
+
+        candidates = []
+        for d in range(4):
+            # The cell we output into is never a source, as in _incoming().
+            if d == facing:
+                continue
+            step = cell.DIR_STEPS[d]
+            nx, ny = x + step[0], y + step[1]
+            if self._port_at(nx, ny, (d + 2) % 4, want_output=True):
+                candidates.append(d)
+
+        d = take_dir(facing, candidates)
+        if d is None:
+            return None
+        step = cell.DIR_STEPS[d]
+        return self._port_at(x + step[0], y + step[1], (d + 2) % 4,
+                             want_output=True)
 
     def _node_ahead(self, xy):
         """The structure input port this cell drains into, or None."""

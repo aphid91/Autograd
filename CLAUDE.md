@@ -437,6 +437,17 @@ faces back at us. Without it two nose-to-nose belts each name the other as
 upstream, neither is a tail, and the pair falls through the closed-loop path
 as one bogus segment.
 
+**A machine can feed a run from any side, so `_node_behind()` probes all
+four.** It used to look only at the cell directly behind the belt's own
+facing, which silently missed the normal way to use a multi-port machine — a
+Source's north face feeding an eastward run read as *dangling*, so items
+flowed nowhere and the generator blocked with a full zone. Contention there is
+resolved by the same `take_dir()` the belt path and renderer use, so a cell
+with several things pointing at it takes from exactly one.
+
+`_node_ahead()` deliberately stays single-directional: a belt delivers to the
+one cell it faces.
+
 ### Belt transport: the closed form
 
 [core/belts.py](core/belts.py) implements docs/belt_report.md. Every item's
@@ -527,23 +538,40 @@ results in those zones.
 | `Shear` | x,y → x, x+y |
 | `Mac` | x,y,z → x, y, z + x·y |
 | `Swap` | x,y,z → x, (y,z if x>0 else z,y) — x is the control |
-| `Source` | → a constant (`EMIT_VALUE`, currently −1), on connected ports only |
+| `Source` | → a constant (`EMIT_VALUE`, currently −1) on every connected port |
 | `Sink` | destroys whatever arrives |
 
-**A generator only emits where something can take it.** A machine with *no
-inputs* skips output channels with nothing on the far side, and with none
-connected it stays inert rather than filling a zone nobody drains. This is
-the one place the structure phase reads the grid, and it is safe because it
-reads belt *presence* (static for the whole phase) rather than belt *state* —
-see `GateSim._connected_channels()`.
+#### Generators are the one machine that skips its own outputs
 
-The asymmetry is about **material, not about Source**. Firing a generator is
-free and repeatable, so a dangling port is waste. A machine that *consumes*
-its inputs must write every result and let the resulting block stop it —
-discarding one would silently destroy material. So leaving a `Shear`'s
-pass-through dangling still stalls it after a single fire, and both halves are
-pinned (`test_a_dangling_generator_stays_inert` against
+A machine with **no inputs** fires differently
+(`GateSim._fire_generator()`), and both differences exist to make a
+six-port `Source` usable:
+
+- **It only fills channels with somewhere to go.** With six faces and one
+  belt, five waiting zones would fill once and block the machine for good.
+- **It fills whichever free zones it finds**, rather than requiring *all* of
+  them clear. `outputs_clear()` is all-or-nothing, so using it here would let
+  one slow belt stall every other belt the same Source feeds — the opposite
+  of what a multi-port generator is for.
+
+A machine that *consumes* inputs must do neither: it writes every result and
+lets a full zone stop it, because discarding one would silently destroy
+material. So leaving a `Shear`'s pass-through dangling still stalls it after a
+single fire. Both halves are pinned against each other
+(`test_a_generator_skips_its_dangling_faces` vs
 `test_an_undrained_output_blocks_the_whole_gate`).
+
+**A face only counts as connected if its channel actually owns the run.** A
+2×1 Source has two `+Y` faces and a long run touches both, but a segment
+takes from exactly one port (`take_dir()`); the loser must read as
+unconnected or it fills a zone nothing will ever drain and sits there as a
+permanently stuck item. `_face_has_consumer()` asks `_src_port()` rather than
+comparing `seg.src` by hand, because a face *direction* cannot tell two ports
+of the same gate apart — the gate **cell** adjacent to the tail can.
+
+This is the one place the structure phase reads the grid, and it is safe
+because it reads belt *presence* (static for the whole phase) rather than belt
+*state*, whose read order would make firing nondeterministic.
 
 **Firing is declared, not special-cased.** `FIRE_RULE` is `FIRE_ALL`
 (every input needed — a Shear cannot compute x+y from x alone) or `FIRE_ANY`
@@ -563,9 +591,16 @@ consumer — not eight independent values. `in_channel()` / `out_channel()` map
 a port face to a gate-state slot, defaulting to the port's index and
 overridden by `Sink` to fold all eight onto channel 0.
 
-This matters for sizing: `MAX_CHANNELS` is 3 (Mac's x,y,z), so a row needs
-`8 + 4×3 = 20` slots and `ENTITY_STRIDE` is 24. Sizing by *faces* would mean
-8 channels for every entity and a belt row carrying 32 unused floats.
+**`Source` is the opposite case and must *not* fold.** Its six faces are six
+independent channels, because a waiting zone is cleared by whoever drains it:
+two belts sharing one channel would split one item per tick between them
+instead of each getting a full run. That is what makes "one Source fills two
+belts" work (`test_one_source_fills_two_belts`).
+
+This matters for sizing: `MAX_CHANNELS` is 6, set by Source, so a row needs
+`8 + 4×6 = 32` slots and `ENTITY_STRIDE` is 32. Sizing by *faces* would mean
+8 channels for every entity. Note the stride is baked into save files, so the
+persistence shape check rejects older ones.
 
 The renderer needs the same mapping — `output_channel_at()` is generated from
 Python, because "port index == channel" is false for Sink and indexing by
@@ -928,7 +963,7 @@ rotated; all are continuous rectangles.
 | `Swap` | 1×2 | x,y,z → x, (y,z if x>0 else z,y) |
 | `Shear` | 2×1 | x,y → x, x+y |
 | `Mac` | 2×1 | x,y,z → x, y, z + x·y |
-| `Source` | 2×1 | one output on the +X tip |
+| `Source` | 2×1 | an output on each of its six perimeter faces |
 | `Sink` | 3×3 | one input at the middle of each side |
 
 The three arithmetic machines share an idiom: a **pass-through channel**
