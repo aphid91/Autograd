@@ -362,3 +362,93 @@ float sd_chevron(vec2 p, float half_len, float half_span, float thick) {
     float d = min(sd_segment(p, tip, up), sd_segment(p, tip, dn));
     return d - thick;
 }
+
+// --- seven-segment digits ----------------------------------------------
+//
+// Numbers on items, drawn as a calculator display: seven bars per cell, lit
+// by a bitmask. No texture and no atlas, so there is no asset to ship, no
+// sampler binding, and no resolution to outgrow -- a digit is an SDF like
+// everything else here and stays crisp at any zoom.
+//
+// Bar order, one bit each:
+//
+//        --- 0 ---
+//       |         |
+//       5         1
+//       |         |
+//        --- 6 ---
+//       |         |
+//       4         2
+//       |         |
+//        --- 3 ---
+//
+// Glyph space is x in [-SEG_HALF_W, SEG_HALF_W], y in [-1, 1], so a digit is
+// two units tall and centred on the origin. Callers scale it.
+#define SEG_HALF_W   0.60   // glyph half-width, in glyph units
+#define SEG_THICK    0.16   // bar half-thickness
+#define SEG_INSET    0.14   // how far bar ends stop short of the corner
+
+// Masks, indexed by digit. Bit i lights bar i above.
+const int SEG_DIGITS[10] = int[10](
+    0x3F,  // 0: 0,1,2,3,4,5
+    0x06,  // 1: 1,2
+    0x5B,  // 2: 0,1,6,4,3
+    0x4F,  // 3: 0,1,2,3,6
+    0x66,  // 4: 5,6,1,2
+    0x6D,  // 5: 0,5,6,2,3
+    0x7D,  // 6: 0,5,4,3,2,6
+    0x07,  // 7: 0,1,2
+    0x7F,  // 8: all
+    0x6F   // 9: 0,1,2,3,5,6
+);
+
+// Non-digit glyphs, same encoding.
+#define SEG_MINUS   0x40    // bar 6 alone
+#define SEG_E       0x79    // 0,5,4,3,6
+// A negative exponent needs a sign and there is no column to spare, so the
+// middle column *becomes* the sign: "1-9" for 1e-9 against "1E9" for 1e9.
+//
+// The obvious alternative -- an "E" with its middle bar dropped, giving a
+// "C" -- was tried first and is wrong. E (0x79) and C (0x39) differ by
+// exactly one bar out of four, so at the handful of pixels these are drawn
+// at the two are nearly the same shape: a whole-frame pixel diff between
+// 1e9 and 1e-9 came to 16 pixels. A bare minus is one bar against four and
+// cannot be misread, which matters more than notational tidiness when the
+// failure is an eighteen-order-of-magnitude misreading.
+#define SEG_E_NEG   SEG_MINUS
+
+// A seven-segment glyph from its bitmask, in glyph space (see above).
+// Bars are inset from the corners so neighbours meet at a notch instead of
+// fusing into a blob where three of them coincide.
+float sd_seven_seg(int mask, vec2 p) {
+    float d = 1e9;
+    float top = 1.0 - SEG_THICK, bot = -(1.0 - SEG_THICK);
+    float mid_y = 0.0;
+    float side = SEG_HALF_W - SEG_THICK;
+    // Vertical bars span half the glyph height, centred between the
+    // horizontal bar they sit between.
+    float vhalf = (top - mid_y) * 0.5 - SEG_INSET * 0.5;
+    vec2 vext = vec2(SEG_THICK, max(vhalf, 0.02));
+    vec2 hext = vec2(SEG_HALF_W - SEG_THICK - SEG_INSET * 0.5, SEG_THICK);
+
+    if ((mask & 0x01) != 0) d = min(d, sd_box(p - vec2(0.0, top), hext));
+    if ((mask & 0x02) != 0) d = min(d, sd_box(p - vec2( side, (top + mid_y) * 0.5), vext));
+    if ((mask & 0x04) != 0) d = min(d, sd_box(p - vec2( side, (bot + mid_y) * 0.5), vext));
+    if ((mask & 0x08) != 0) d = min(d, sd_box(p - vec2(0.0, bot), hext));
+    if ((mask & 0x10) != 0) d = min(d, sd_box(p - vec2(-side, (bot + mid_y) * 0.5), vext));
+    if ((mask & 0x20) != 0) d = min(d, sd_box(p - vec2(-side, (top + mid_y) * 0.5), vext));
+    if ((mask & 0x40) != 0) d = min(d, sd_box(p - vec2(0.0, mid_y), hext));
+    return d;
+}
+
+// The decimal point: a square pip on the baseline. Centred on the origin in
+// glyph space, so the caller positions it between two columns.
+float sd_seg_point(vec2 p) {
+    return sd_box(p - vec2(0.0, -(1.0 - SEG_THICK)), vec2(SEG_THICK));
+}
+
+// Digit `i` of `v` counting from the most significant, for a value already
+// known to be in [0, 10^digits). Returns 0..9.
+int decimal_digit(float v, int place) {
+    return int(mod(floor(v / pow(10.0, float(place))), 10.0));
+}

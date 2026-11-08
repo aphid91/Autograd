@@ -106,11 +106,36 @@ uniform int   select_on;      // 0 when no selection is in progress
 #define UNDER_MAX_SPAN    5
 
 // --- belt items ---
-// Each item is a disc with a coloured ring, green when its value is above
-// zero and red otherwise. No text: glyph rendering is a project of its own,
-// and sign is the one thing worth reading at a glance.
+// Each item is a disc with a coloured ring -- green when its value is above
+// zero, red otherwise -- carrying its value as a three-figure seven-segment
+// number. The ring still reads at a glance when the digits are too small to
+// resolve, so the sign survives all the way down the zoom range.
 #define ITEM_RADIUS       0.22   // disc radius, in cells
 #define ITEM_RING         0.055  // ring thickness, in cells
+
+// The number on the face of an item.
+// Digits are drawn in glyph space (see sd_seven_seg in common.glsl) scaled
+// by ITEM_NUM_SIZE, so one glyph is 2*ITEM_NUM_SIZE cells tall.
+// Sized so the three columns sit inside the ring: the corner of the text box
+// is at hypot(2.1, 1) * ITEM_NUM_SIZE cells, which must stay under
+// ITEM_RADIUS - ITEM_RING (0.165).
+#define ITEM_NUM_SIZE     0.068  // glyph unit, in cells
+#define NUM_GAP           0.30   // space between glyph columns, in glyph units
+#define COL_ITEM_NUM      vec3(0.93, 0.95, 1.00)
+// Format thresholds, as powers of ten. A value whose exponent falls in
+// [NUM_FIXED_LO, NUM_FIXED_HI) shows as d.dd; everything else goes
+// scientific. Fixed covers 0.01 .. 9.99, which is where gameplay values
+// mostly sit.
+#define NUM_FIXED_HI      1
+#define NUM_FIXED_LO     -2
+// Digits fade out once a glyph is too small to read, leaving the plain disc.
+// Expressed in *glyph pixel height* rather than in zoom, because that is the
+// quantity legibility actually depends on: a glyph is 2*ITEM_NUM_SIZE cells
+// tall, and `px` is cells-per-pixel (1/cam_zoom), so the height in pixels is
+// 2*ITEM_NUM_SIZE/px. Seven-segment digits stay readable down to about 8px
+// and are noise below 5.
+#define NUM_MIN_PX        5.0   // gone at or below this glyph height
+#define NUM_GOOD_PX       8.0   // fully drawn at or above it
 #define COL_ITEM_POS      vec3(0.38, 0.82, 0.42)   // value > 0
 #define COL_ITEM_NEG      vec3(0.90, 0.36, 0.34)   // value <= 0
 #define COL_ITEM_FILL     vec3(0.14, 0.15, 0.18)   // disc interior
@@ -521,6 +546,95 @@ vec2 item_disc(vec2 p, vec2 axis, float along, float px) {
     return vec2(body, ring);
 }
 
+// How opaque the digits should be at this zoom. 1 when a glyph is comfortably
+// readable, falling to 0 once it is a few pixels tall -- below that the digits
+// are noise over the disc, and worse, they dilute the ring colour that
+// carries the sign at every zoom.
+float text_opacity(float px) {
+    float glyph_px = (2.0 * ITEM_NUM_SIZE) / max(px, 1e-6);
+    return smoothstep(NUM_MIN_PX, NUM_GOOD_PX, glyph_px);
+}
+
+// --- the number on an item ---------------------------------------------
+//
+// Three significant figures across the face of a disc, as a calculator
+// display. Two formats, chosen by magnitude:
+//
+//   d.dd     for values that fit, e.g. 3.14, -0.50
+//   dEe      for the rest, e.g. 5E7, 2E-9  (one mantissa digit, signed exp)
+//
+// The format decision happens here rather than CPU-side because the shader
+// already holds the payload -- pre-formatting it would mean per-item state in
+// the SSBO, which is exactly the O(items) upload the closed form avoids.
+// It is evaluated only for pixels a disc actually covers.
+//
+// `p` is glyph-layout space: x in roughly [-1.5, 1.5] across the three
+// columns, y in [-1, 1]. Returns coverage, not a distance, because the
+// caller composites it over the disc fill.
+// The sign is deliberately *not* drawn. The ring already carries it -- red
+// for negative, green for positive -- and it carries it at every zoom, below
+// where a glyph can be resolved at all. Spending a column on a minus would
+// cost a significant figure, and a minus hanging off the left does not fit
+// inside the disc at any legible glyph size (checked: it needs r=0.19 cells
+// against an inner radius of 0.165). So three columns are three digits.
+float item_number(float value, vec2 p, float px) {
+    float mag = abs(value);
+
+    // Column centres, in glyph units.
+    float adv = SEG_HALF_W * 2.0 + NUM_GAP;
+
+    int m0, m1, m2;          // the three glyph masks, left to right
+    bool point = false;      // decimal point after column 0
+
+    if (mag == 0.0) {
+        // Exactly zero reads better as 0.00 than as 0E0.
+        m0 = SEG_DIGITS[0]; m1 = SEG_DIGITS[0]; m2 = SEG_DIGITS[0];
+        point = true;
+    } else {
+        float e = floor(log(mag) / log(10.0));
+        // Rounding to two decimals can carry a value over the fixed-point
+        // ceiling -- 9.996 rounds to 10.00, which needs three integer
+        // columns. Promote it to scientific rather than clamping to 9.99,
+        // which would show a value as smaller than it is.
+        if (e == float(NUM_FIXED_HI) - 1.0 && mag * 100.0 + 0.5 >= 1000.0) {
+            e = float(NUM_FIXED_HI);
+        }
+        if (e >= NUM_FIXED_HI || e < NUM_FIXED_LO) {
+            // Scientific: one mantissa digit, then the E (or a bare minus
+            // when the exponent is negative), then the exponent digit.
+            // There is no fourth column for a sign, so the middle column
+            // carries it -- see SEG_E_NEG in common.glsl.
+            float mant = mag / pow(10.0, e);
+            int md = int(floor(mant + 0.5));
+            // Rounding the mantissa can carry it to 10, which is a digit too
+            // many -- renormalise instead of clamping, or 9.6e3 would show
+            // as "0E3" rather than "1E4".
+            if (md >= 10) { md = 1; e += 1.0; }
+            m0 = SEG_DIGITS[md];
+            m1 = (e < 0.0) ? SEG_E_NEG : SEG_E;
+            // Only one column is left, so |exponent| >= 10 saturates at 9.
+            m2 = SEG_DIGITS[clamp(int(abs(e)), 0, 9)];
+        } else {
+            // Fixed point: d.dd, rounded to two decimals.
+            float scaled = floor(mag * 100.0 + 0.5);
+            if (scaled > 999.0) scaled = 999.0;   // 9.99 ceiling
+            m0 = SEG_DIGITS[decimal_digit(scaled, 2)];
+            m1 = SEG_DIGITS[decimal_digit(scaled, 1)];
+            m2 = SEG_DIGITS[decimal_digit(scaled, 0)];
+            point = true;
+        }
+    }
+
+    float d = 1e9;
+    d = min(d, sd_seven_seg(m0, p - vec2(-adv, 0.0)));
+    d = min(d, sd_seven_seg(m1, p));
+    d = min(d, sd_seven_seg(m2, p - vec2( adv, 0.0)));
+    if (point) {
+        d = min(d, sd_seg_point(p - vec2(-adv * 0.5, 0.0)));
+    }
+    return fill(d, px);
+}
+
 // Draw whatever items overlap this cell. Returns colour-with-coverage:
 // .rgb premultiplied tint, .a total coverage.
 vec4 draw_items(ivec4 c, vec2 p, int travel, float px) {
@@ -573,6 +687,20 @@ vec4 draw_items(ivec4 c, vec2 p, int travel, float px) {
         vec3 edge = (value > 0.0) ? COL_ITEM_POS : COL_ITEM_NEG;
         // Fill first, then the ring over it.
         vec3 col = mix(COL_ITEM_FILL, edge, cov.y);
+        // Then the number over both. Skipped entirely when zoomed out past
+        // legibility -- the ring still carries the sign there.
+        float text = text_opacity(px);
+        if (text > 0.0) {
+            // Into glyph space: centred on the disc, scaled so a glyph unit
+            // is ITEM_NUM_SIZE cells.
+            vec2 gp = (p - axis * (delta / BELT_UNIT)) / ITEM_NUM_SIZE;
+            // The antialias width converts with it. Scaling the glyph but
+            // not its edge softness is what double-antialiased the structure
+            // glyph at its interior boundary.
+            float gpx = px / ITEM_NUM_SIZE;
+            float num = item_number(value, gp, gpx) * text;
+            col = mix(col, COL_ITEM_NUM, num);
+        }
         // Whichever disc covers this pixel most wins, so overlapping discs
         // (possible when spacing < 2 * radius) do not flicker by index.
         if (cov.x > out_col.a) out_col = vec4(col, cov.x);
@@ -631,6 +759,15 @@ vec4 draw_waiting(ivec4 c, ivec2 ci, vec2 p, float px) {
         float value = gate_out_value(row, channel);
         vec3 edge = (value > 0.0) ? COL_ITEM_POS : COL_ITEM_NEG;
         vec3 col = mix(COL_ITEM_FILL, edge, ring);
+        // The number, in the *unsquished* frame: compressing the glyphs along
+        // with the disc would make them unreadable, and the squish is there
+        // to say "this is nowhere", not to deform the cargo.
+        float text = text_opacity(px);
+        if (text > 0.0) {
+            vec2 gp = (p - at) / ITEM_NUM_SIZE;
+            float num = item_number(value, gp, px / ITEM_NUM_SIZE) * text;
+            col = mix(col, COL_ITEM_NUM, num);
+        }
         if (body > out_col.a) out_col = vec4(col, body);
     }
     return out_col;

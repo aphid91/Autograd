@@ -414,3 +414,144 @@ def test_probe_reach_spans_the_longest_footprint():
     assert _reach >= _longest - 1, (
         f"PROBE_REACH {_reach} too small for a {_longest}-cell footprint")
     ok(f"PROBE_REACH {_reach} spans the longest footprint ({_longest})")
+
+
+# --- the seven-segment number on an item -----------------------------------
+# Three columns of calculator digits, formatted entirely in GLSL. There is no
+# Python counterpart to compare against -- the shader is the only
+# implementation -- so these pin the *rules* instead: the bar layout, the two
+# format branches, and the three rounding edge cases that a plausible-looking
+# render hides.
+#
+# Why here and not in the pixel tests: a formatter bug draws a perfectly
+# crisp wrong number. Mutation testing showed exactly that -- disabling the
+# scientific branch, dropping the decimal point, and removing both rounding
+# carries all left every framebuffer assertion passing, because each still
+# produced three well-formed glyphs on a disc.
+
+#: Masks the shader must use, derived from the bar numbering in its own
+#: comment: bit 0 top, 1 upper-right, 2 lower-right, 3 bottom, 4 lower-left,
+#: 5 upper-left, 6 middle.
+_SEG_EXPECTED = {
+    0: 0b0111111, 1: 0b0000110, 2: 0b1011011, 3: 0b1001111, 4: 0b1100110,
+    5: 0b1101101, 6: 0b1111101, 7: 0b0000111, 8: 0b1111111, 9: 0b1101111,
+}
+
+
+def test_seven_segment_digit_masks_are_right():
+    # A wrong mask draws a wrong digit crisply, which no pixel test here
+    # would call a failure -- it checks that digits differ, not what they
+    # say. The masks are the ground truth for the whole display.
+    _m = _re.search(r"SEG_DIGITS\[10\]\s*=\s*int\[10\]\((.*?)\)\s*;",
+                    _src, _re.S)
+    assert _m, "SEG_DIGITS table not found in the shader"
+    _vals = [int(v.strip(), 0) for v in
+             _re.findall(r"(0x[0-9A-Fa-f]+|\d+)\s*(?=,|$)",
+                         _re.sub(r"//[^\n]*", "", _m.group(1)))]
+    assert len(_vals) == 10, f"expected 10 digit masks, parsed {len(_vals)}"
+    for _d, _want in _SEG_EXPECTED.items():
+        assert _vals[_d] == _want, (
+            f"digit {_d} is mask 0x{_vals[_d]:02X}, expected "
+            f"0x{_want:02X} -- it would draw as a different digit")
+    # A "1" must be exactly two bars and an "8" all seven: the display's
+    # legibility rests on those being distinguishable.
+    assert bin(_vals[1]).count("1") == 2, "a 1 must light exactly two bars"
+    assert bin(_vals[8]).count("1") == 7, "an 8 must light all seven bars"
+    ok("all ten seven-segment digit masks match the bar numbering")
+
+
+def test_the_exponent_sign_uses_a_distinct_glyph():
+    # With only three columns there is no room for a separate sign, so the
+    # exponent's sign rides on the E. The two glyphs must be *different
+    # shapes*, or 5e7 and 5e-7 render identically -- a silent factor of
+    # 10^14.
+    # These are #defines, not consts, so _glsl_int (which looks for
+    # "= value") does not see them. One may be defined as another's name.
+    def _define(name, depth=0):
+        m = _re.search(rf"#define\s+{name}\s+(\S+)", _src)
+        assert m, f"#define {name} not found in shader source"
+        val = m.group(1)
+        if _re.fullmatch(r"0x[0-9A-Fa-f]+|\d+", val):
+            return int(val, 0)
+        assert depth < 4, f"#define {name} chains too deep"
+        return _define(val, depth + 1)
+
+    _e = _define("SEG_E")
+    _c = _define("SEG_E_NEG")
+    assert _e != _c, "SEG_E and SEG_E_NEG must differ, or the sign is lost"
+    assert _c != 0, "SEG_E_NEG must draw something"
+    # They must differ by *several* bars, not one. An "E" and a "C" differ by
+    # a single bar out of four and are nearly the same shape at the few
+    # pixels these are drawn at -- the whole-frame difference between 1e9 and
+    # 1e-9 was 16 pixels, which is not a legible distinction for a value
+    # eighteen orders of magnitude apart. A bare minus (one bar) against an E
+    # (four) is unmistakable.
+    _differing = bin(_e ^ _c).count("1")
+    assert _differing >= 3, (
+        f"SEG_E (0x{_e:02X}) and SEG_E_NEG (0x{_c:02X}) differ in only "
+        f"{_differing} bar(s) -- too alike to tell apart at item size")
+    ok(f"a negative exponent uses a clearly distinct glyph "
+       f"(0x{_e:02X} vs 0x{_c:02X}, {_differing} bars differ)")
+
+
+def test_item_number_has_both_format_branches():
+    _body = _re.search(r"float item_number\([^)]*\)\s*\{(.*?)\n\}",
+                       _src, _re.S).group(1)
+    # Scientific notation must actually be reachable. Disabling this branch
+    # leaves every pixel test passing, since a fixed-point fallback still
+    # draws three plausible glyphs for a huge value.
+    assert "NUM_FIXED_HI" in _body and "NUM_FIXED_LO" in _body, (
+        "the format must be chosen by comparing the exponent against both "
+        "NUM_FIXED_HI and NUM_FIXED_LO")
+    assert "SEG_E" in _body, "the scientific branch must draw an E"
+    # The decimal point belongs to the fixed branch only; a scientific
+    # render has no point, so "point" must be conditional.
+    assert "sd_seg_point" in _body, "fixed point must draw a decimal point"
+    assert _re.search(r"if\s*\(\s*point\s*\)", _body), (
+        "the decimal point must be conditional -- a scientific render has "
+        "none")
+    ok("item_number() has both format branches and a conditional point")
+
+
+def test_item_number_handles_both_rounding_carries():
+    _body = _re.search(r"float item_number\([^)]*\)\s*\{(.*?)\n\}",
+                       _src, _re.S).group(1)
+    # Carry 1: rounding a mantissa to one digit can reach 10, which is two
+    # digits. It must renormalise, not clamp -- clamping shows 9.6e3 as
+    # "0E3" or "9E3" rather than "1E4".
+    assert _re.search(r"md\s*>=\s*10", _body), (
+        "the mantissa must be checked for rounding up to 10")
+    assert _re.search(r"md\s*=\s*1\s*;.*?e\s*\+=\s*1", _body, _re.S), (
+        "a mantissa that rounds to 10 must become 1 with the exponent "
+        "incremented, not be clamped to 9")
+    # Carry 2: rounding to two decimals can cross the fixed-point ceiling.
+    # 9.996 -> 10.00 needs three integer columns, so it must promote to
+    # scientific rather than clamp to 9.99 and report a smaller value.
+    assert _re.search(r"1000\.0", _body), (
+        "a fixed-point value that rounds past 9.99 must be detected "
+        "(scaled >= 1000) and promoted to scientific")
+    assert "NUM_FIXED_HI" in _body
+    ok("item_number() renormalises both rounding carries")
+
+
+def test_the_glyph_columns_fit_inside_the_disc():
+    # The number is drawn on the face of the item, so the three columns must
+    # fit inside the ring -- otherwise digits spill over the rim and read as
+    # belt decoration. Checked here rather than by eye because the layout is
+    # arithmetic over four tunables that are each independently adjustable.
+    import math
+    _half_w = float(_re.search(r"#define SEG_HALF_W\s+([\d.]+)", _src).group(1))
+    _gap = float(_re.search(r"#define NUM_GAP\s+([\d.]+)", _src).group(1))
+    _size = float(_re.search(r"#define ITEM_NUM_SIZE\s+([\d.]+)", _src).group(1))
+    _radius = float(_re.search(r"#define ITEM_RADIUS\s+([\d.]+)", _src).group(1))
+    _ring = float(_re.search(r"#define ITEM_RING\s+([\d.]+)", _src).group(1))
+    _adv = _half_w * 2.0 + _gap
+    # Furthest lit corner: the outer edge of an outer column, full height.
+    _corner = math.hypot((_adv + _half_w) * _size, 1.0 * _size)
+    _inner = _radius - _ring
+    assert _corner <= _inner, (
+        f"the glyph columns reach {_corner:.4f} cells from the centre but "
+        f"the disc's inner radius is {_inner:.4f} -- digits would cross the "
+        f"ring. Reduce ITEM_NUM_SIZE or NUM_GAP.")
+    ok(f"three glyph columns fit inside the ring "
+       f"({_corner:.3f} <= {_inner:.3f} cells)")

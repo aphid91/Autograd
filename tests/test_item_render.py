@@ -459,6 +459,456 @@ def test_audits_stay_clean_while_rendering():
         engine.debug_feed = None
 
 
+# --- the number on an item -------------------------------------------------
+# Seven-segment digits drawn over the disc. There is nothing to read back and
+# no glyph geometry stored anywhere, so pixels are the only evidence that a
+# value reached the screen -- and the only way to catch digits that render but
+# say the wrong thing.
+
+def _disc_centre(img):
+    """Screen position of the strongest item-coloured pixel in the frame.
+
+    The glyphs are inside the disc, and the disc is wherever the simulation
+    put it, so the probes locate it by colour rather than by cell. Returns
+    None if no item colour is present at all.
+    """
+    f = img.astype(float)
+    cast = np.maximum(f[:, :, 1] - np.maximum(f[:, :, 0], f[:, :, 2]),
+                      f[:, :, 0] - np.maximum(f[:, :, 1], f[:, :, 2]))
+    iy, ix = np.unravel_index(int(np.argmax(cast)), cast.shape)
+    return (int(ix), int(iy)) if cast[iy, ix] > 25 else None
+
+
+def _glyph_pixels(img):
+    """Mask of glyph-coloured pixels over the whole frame.
+
+    Glyphs are near-white (COL_ITEM_NUM is (0.93, 0.95, 1.00)) and so are
+    both *bright* and *desaturated*. Thresholding the darkest channel is what
+    separates them from the ring, which is bright in one channel only, and
+    from the belt, which is mid-grey -- a luminance test passes both.
+
+    Frame-wide rather than windowed on the disc: the glyphs sit inside the
+    disc and nothing else on the board is this colour, so there is nothing to
+    exclude, and a window centred by colour cast lands on the *ring* and
+    clips the digits it is meant to measure.
+    """
+    f = img.astype(float)
+    lo = f.min(axis=2)
+    spread = f.max(axis=2) - lo
+    return (lo > 190) & (spread < 45)
+
+
+def _digit_mask(img, at=None, half=26):
+    """Glyph pixels, cropped to a window around them.
+
+    Returned as a fixed-size window centred on the glyphs' own bounding box
+    so two renders can be compared pixel by pixel. An empty result is a
+    1x1 False, so `.sum()` is 0 and comparisons still work.
+    """
+    m = _glyph_pixels(img)
+    if at is None:
+        ys, xs = np.nonzero(m)
+        if not len(ys):
+            return np.zeros((1, 1), dtype=bool)
+        at = ((int(xs.min()) + int(xs.max())) // 2,
+              (int(ys.min()) + int(ys.max())) // 2)
+    x, y = at
+    return m[max(0, y - half):y + half + 1,
+             max(0, x - half):x + half + 1]
+
+
+#: Zoom for the digit probes. PROBE_ZOOM puts a glyph at 5.4px, right at the
+#: fade threshold, so these need their own: at 160 a glyph is ~22px tall and
+#: individual bars are several pixels wide.
+TEXT_ZOOM = 160.0
+
+
+def _one_item_at(value):
+    """One item on a belt, with the view centred on wherever it ended up.
+
+    The item's position is a function of the tick, so where it lands is the
+    simulation's business, not the test's -- `_look_at` on the belt's start
+    cell would frame the wrong cell. The disc is found by its colour cast and
+    the view is left wide enough for the caller to probe around it.
+    """
+    engine.place_belt_path((10, 20), (16, 20))
+    engine.sync_segments()
+    engine.debug_feed = value
+    _at_whole_tick()
+    engine.clock.request_step()
+    engine.clock.advance(0.0)
+    # Frame the tail cell, where a single freshly-pushed item sits.
+    seg = next(iter(engine.segments.segments.values()))
+    pos = engine.belts.position_of(seg, seg.tail - 1, engine.clock.tick, 0.0)
+    cam.center[:] = (10.0 + pos / UNIT + 0.5, 20.5)
+    cam.zoom = TEXT_ZOOM
+
+
+def test_an_item_draws_digits_on_its_face():
+    """A disc must carry near-white glyph pixels, not just a ring."""
+    try:
+        _one_item_at(3.14159)
+        img = _render()
+        lit = _digit_mask(img).sum()
+        # "3.14" measures ~210 glyph pixels at TEXT_ZOOM; 100 is comfortably
+        # above anything stray and far below a real render.
+        assert lit > 100, f"expected glyph pixels on the disc, got {lit}"
+        ok(f"an item's value draws as digits ({lit} glyph pixels)")
+    finally:
+        engine.debug_feed = None
+
+
+def test_different_values_draw_different_digits():
+    """The glyphs must depend on the payload.
+
+    This is the assertion with teeth. A renderer that drew a fixed glyph, or
+    that ignored the value, still passes a "digits appear" check -- and that
+    is not hypothetical: the first version of this test passed while nothing
+    was drawn at all, because its mask was loose enough to count belt pixels
+    and it sampled a cell the item was not in.
+
+    Three values chosen to differ in *both* format branches: 1.00 and 8.88
+    are fixed point (an 8 lights all seven bars, a 1 lights two), and 5E7 is
+    scientific, so a formatter stuck on one branch fails here.
+    """
+    shapes = {}
+    try:
+        for value in (1.0, 8.88, 5e7):
+            harness.reset()
+            _one_item_at(value)
+            img = _render()
+            m = _digit_mask(img)
+            shapes[value] = m
+            assert m.sum() > 100, f"{value}: only {m.sum()} glyph pixels"
+
+        # An 8 lights all seven bars where a 1 lights two, so "8.88" draws
+        # measurably more than "1.00" -- 409 against 295 as rendered. The
+        # margin is deliberately loose: the point is that the value reaches
+        # the glyphs at all, not the exact bar areas.
+        assert shapes[8.88].sum() > shapes[1.0].sum() * 1.2, (
+            f"8.88 ({shapes[8.88].sum()}) should light more segments "
+            f"than 1.00 ({shapes[1.0].sum()})")
+        # And every pair must differ pixel by pixel, not merely in total --
+        # two different numbers can light the same bar area by coincidence.
+        # Windows are the same size by construction, but crop to the common
+        # shape rather than trusting that, since one clipped at a frame edge
+        # would otherwise raise instead of failing with a message.
+        vals = list(shapes)
+        for a, b in ((vals[0], vals[1]), (vals[1], vals[2]),
+                     (vals[0], vals[2])):
+            ma, mb = shapes[a], shapes[b]
+            h = min(ma.shape[0], mb.shape[0])
+            w = min(ma.shape[1], mb.shape[1])
+            diff = (ma[:h, :w] != mb[:h, :w]).sum()
+            assert diff > 20, (
+                f"{a} and {b} drew near-identical glyphs ({diff} px differ)")
+        ok("1.00, 8.88 and 5E7 each draw a distinct glyph pattern")
+    finally:
+        engine.debug_feed = None
+
+
+#: Glyph layout constants, mirroring the shader's. SEG_HALF_W and NUM_GAP are
+#: in glyph units; one glyph unit is ITEM_NUM_SIZE cells.
+SEG_HALF_W = 0.60
+NUM_GAP = 0.30
+ITEM_NUM_SIZE = 0.068
+
+
+def _columns(img):
+    """Lit area of each of the three glyph columns, left to right.
+
+    Sliced at the layout's own column boundaries rather than at blank gaps in
+    the render. Gap-finding does not work here: the decimal pip sits *in* the
+    gap between columns 0 and 1, leaving a one-pixel separation for "8.88"
+    that no threshold can tell from a bar's own antialiasing -- it read as two
+    columns, not three.
+
+    Returns (width, height, lit) per column, measuring only the glyph's own
+    pixels so the pip is excluded by falling outside every column's span.
+    """
+    m = _glyph_pixels(img)
+    ys, xs = np.nonzero(m)
+    if not len(xs):
+        return []
+    # The three columns are centred at -adv, 0, +adv in glyph units, each
+    # SEG_HALF_W wide, so the lit span runs from -(adv + SEG_HALF_W) to
+    # +(adv + SEG_HALF_W) -- map that onto the rendered bounding box.
+    adv = SEG_HALF_W * 2.0 + NUM_GAP
+    span = (adv + SEG_HALF_W) * 2.0          # total width, glyph units
+    x0, x1 = int(xs.min()), int(xs.max())
+    # Scale from the actual extent, so this does not depend on the zoom.
+    per_unit = (x1 - x0 + 1) / span
+    out = []
+    for centre in (-adv, 0.0, adv):
+        lo = x0 + (centre - SEG_HALF_W + span / 2.0) * per_unit
+        hi = x0 + (centre + SEG_HALF_W + span / 2.0) * per_unit
+        sub = m[:, int(round(lo)):int(round(hi)) + 1]
+        if not sub.any():
+            out.append((0, 0, 0))
+            continue
+        cx = np.nonzero(sub.any(axis=0))[0]
+        cy = np.nonzero(sub.any(axis=1))[0]
+        out.append((int(cx.max() - cx.min() + 1),
+                    int(cy.max() - cy.min() + 1),
+                    int(sub.sum())))
+    return out
+
+
+def test_the_glyphs_say_what_the_formatter_says():
+    """The digits drawn must be the digits the format rules call for.
+
+    The other tests show that *something* value-dependent is drawn. This one
+    pins *what*, which is the difference between a working display and a
+    plausible-looking one. Mutation testing is why it exists: disabling the
+    scientific branch entirely left the other two tests passing, because a
+    fallback to fixed point still differs from a 1.00 in some pixels.
+
+    Read back structurally rather than by exact pixels: a column's lit area
+    is a proxy for how many bars it lights, which is enough to tell an 8
+    (all seven) from a 1 (two) from a blank.
+    """
+    try:
+        # "1.11": the three columns are all 1s, so all three are narrow --
+        # a 1 lights only the two right-hand bars.
+        harness.reset()
+        _one_item_at(1.11)
+        ones = _columns(_render())
+        assert len(ones) == 3, f"expected 3 glyph columns for 1.11, got {len(ones)}"
+
+        # "8.88": same three columns, every bar lit.
+        harness.reset()
+        _one_item_at(8.88)
+        eights = _columns(_render())
+        assert len(eights) == 3, f"expected 3 columns for 8.88, got {len(eights)}"
+
+        # Density is the signal, not width: an 8 lights all seven bars where
+        # a 1 lights two, so each column's lit area roughly trebles. Width
+        # alone is unreliable -- column 0 of a fixed-point render also picks
+        # up the decimal pip, which widens a narrow 1 without filling it.
+        for i, (one, eight) in enumerate(zip(ones, eights)):
+            assert eight[2] > one[2] * 1.8, (
+                f"column {i}: an 8 ({eight[2]}px lit) must be far denser "
+                f"than a 1 ({one[2]}px) -- two bars against seven")
+
+        # Every glyph spans the full glyph height, so all three of the 8s
+        # must be the same height. (The 1s are not checked this way: a 1 is
+        # two vertical bars and its *lit* extent is the same two units, but
+        # antialiasing at the ends makes the measurement noisier.)
+        heights = [c[1] for c in eights]
+        assert max(heights) - min(heights) <= 2, (
+            f"the three 8s should be the same height, got {heights}")
+
+        # The middle bar must actually be drawn. An 8 without it is a 0 and a
+        # 2 without it is a 7, which a density check does not notice -- one
+        # bar in seven is inside the tolerance. Look for it directly: across
+        # the vertical centre of an 8, the glyph is solid, whereas a 0 is
+        # hollow there. Sample the middle row of the centre column and
+        # require it to be mostly lit.
+        m = _glyph_pixels(_render())
+        ys, xs = np.nonzero(m)
+        mid_row = (int(ys.min()) + int(ys.max())) // 2
+        adv = SEG_HALF_W * 2.0 + NUM_GAP
+        span = (adv + SEG_HALF_W) * 2.0
+        per_unit = (int(xs.max()) - int(xs.min()) + 1) / span
+        lo = int(xs.min()) + round((span / 2.0 - SEG_HALF_W) * per_unit)
+        hi = int(xs.min()) + round((span / 2.0 + SEG_HALF_W) * per_unit)
+        band = m[mid_row - 1:mid_row + 2, lo:hi + 1]
+        frac = band.any(axis=0).mean() if band.size else 0.0
+        assert frac > 0.5, (
+            f"an 8's middle bar is missing: only {frac:.0%} of its centre "
+            f"row is lit, so it would read as a 0")
+        ok("glyph columns read back as the formatter's digits "
+           f"(1.11 widths {[c[0] for c in ones]}, "
+           f"8.88 widths {[c[0] for c in eights]})")
+    finally:
+        engine.debug_feed = None
+
+
+def test_a_big_value_goes_scientific():
+    """A value past the fixed-point range must switch format, not clamp.
+
+    5e7 cannot be shown as d.dd at all, so the mantissa/E/exponent branch has
+    to engage. Checked by the *middle* column: an E is three bars plus a
+    spine where a fixed-point middle column is a digit, and crucially the
+    decimal pip is absent -- so the column count and the gap structure
+    differ from any fixed-point render.
+
+    Without this, disabling the scientific branch outright still passed the
+    whole file: a silent fallback to fixed point draws *something* for every
+    value, and every other assertion here is satisfied by "something".
+    """
+    try:
+        harness.reset()
+        _one_item_at(5e7)          # -> 5E7
+        sci = _glyph_pixels(_render())
+        sci_px = int(sci.sum())
+
+        harness.reset()
+        # Same leading digit in the fixed branch, so any difference between
+        # the two renders is the format and not the mantissa.
+        _one_item_at(5.0)          # -> 5.00
+        fixed = _glyph_pixels(_render())
+        fixed_px = int(fixed.sum())
+
+        assert sci_px != fixed_px, (
+            f"5e7 and 5.0 drew the same glyph area ({sci_px}px) -- is the "
+            f"scientific branch engaging at all?")
+        # The decimal pip makes the fixed render's lowest row extend further
+        # left-of-centre; more robustly, the two differ substantially.
+        h = min(sci.shape[0], fixed.shape[0])
+        w = min(sci.shape[1], fixed.shape[1])
+        diff = int((sci[:h, :w] != fixed[:h, :w]).sum())
+        assert diff > 50, (
+            f"5e7 and 5.0 rendered near-identically ({diff}px differ)")
+        ok(f"5e7 goes scientific: {sci_px}px against 5.0's {fixed_px}px, "
+           f"{diff}px differ")
+    finally:
+        engine.debug_feed = None
+
+
+def test_a_negative_exponent_reads_differently():
+    """1e-9 and 1e9 must not render identically.
+
+    With only three columns the exponent's sign has nowhere to go, so the
+    middle column carries it: "1-9" against "1E9". Get that wrong and two
+    values eighteen orders of magnitude apart draw the same three digits --
+    the worst failure this display can have, and invisible to every other
+    check here, since both render as three crisp well-formed glyphs.
+
+    An earlier version used a "C" (an E minus its middle bar) and this test
+    is why it is gone: the two differed by 16 pixels over the whole frame.
+    """
+    try:
+        harness.reset()
+        _one_item_at(1e9)
+        img_big = _render()
+        big, cols_big = _glyph_pixels(img_big), _columns(img_big)
+
+        harness.reset()
+        _one_item_at(1e-9)
+        img_small = _render()
+        small, cols_small = _glyph_pixels(img_small), _columns(img_small)
+
+        h = min(big.shape[0], small.shape[0])
+        w = min(big.shape[1], small.shape[1])
+        diff = int((big[:h, :w] != small[:h, :w]).sum())
+        assert diff > 20, (
+            f"1e9 and 1e-9 rendered near-identically ({diff}px differ) -- "
+            f"the exponent's sign is being dropped")
+        # Specifically the *middle* column, which is the E or the C. Both
+        # outer columns carry the same mantissa and exponent digit, so this
+        # localises the difference to the sign rather than accepting any
+        # difference anywhere.
+        mid_big, mid_small = cols_big[1][2], cols_small[1][2]
+        assert mid_big != mid_small, (
+            f"the E/C column is identical for 1e9 and 1e-9 "
+            f"({mid_big}px both) -- the sign is not reaching the glyph")
+        ok(f"1e9 and 1e-9 draw distinct glyphs ({diff}px differ; "
+           f"E column {mid_big}px vs minus column {mid_small}px)")
+    finally:
+        engine.debug_feed = None
+
+
+def test_a_blocked_gates_waiting_zone_shows_its_value():
+    """An occupied waiting zone must carry its number too.
+
+    A waiting zone is back pressure made visible: the gate produced something
+    the belt refused. Showing *what* it is holding is the point of drawing it
+    at all, so the number belongs there as much as on a belt -- and the zone
+    is drawn squished, which the digits must not inherit or they would be
+    illegible.
+
+    A separate test because the waiting zone is a second call site for the
+    glyph code, and deleting the number from it left every other assertion
+    here passing.
+    """
+    from core.entity import Shear
+
+    def _glyph_px_for(feed):
+        """Glyph pixels around a Shear, optionally holding results."""
+        harness.reset()
+        gate = engine.place_structure(Shear, 10, 20)
+        engine.sync_segments()
+        if feed:
+            gate.set_input(0, 3.0)
+            gate.set_input(1, 4.0)
+        _at_whole_tick()
+        engine.clock.request_step()
+        engine.clock.advance(0.0)
+        held = not gate.outputs_clear()
+        cam.center[:] = (11.0, 20.5)
+        cam.zoom = TEXT_ZOOM
+        return int(_glyph_pixels(_render()).sum()), held
+
+    # Measured against a starved gate, not against zero. A Shear's own glyph
+    # is COL_STRUCT_MARK, which is near-white and so lands in the same mask:
+    # the structure alone accounts for ~2100 pixels, enough that a plain
+    # "> 100" check passes with the waiting-zone number deleted entirely.
+    # Only the *difference* is the numbers.
+    starved, held_none = _glyph_px_for(False)
+    assert not held_none, "a starved Shear must hold nothing"
+
+    held, held_some = _glyph_px_for(True)
+    assert held_some, (
+        "the gate should be holding results with nothing downstream")
+
+    delta = held - starved
+    assert delta > 150, (
+        f"a held waiting zone added only {delta} glyph pixels over a starved "
+        f"gate's {starved} -- back pressure is visible but its value is not")
+    ok(f"a blocked gate's waiting zone shows its value "
+       f"(+{delta} glyph pixels over a starved gate)")
+
+
+def test_digits_vanish_when_zoomed_out():
+    """Below legibility the digits must go, leaving the disc readable.
+
+    A glyph a few pixels tall is noise over the fill, and worse, its
+    near-white pixels dilute the ring colour that carries the sign at every
+    zoom. The fade is the reason a puck still reads when its number cannot.
+    """
+    try:
+        _one_item_at(8.88)
+        img = _render()
+        assert _digit_mask(img).sum() > 40, "no digits at the text zoom"
+
+        # Well below NUM_MIN_PX: at zoom 20 a glyph is ~2.7px tall.
+        #
+        # Counting near-white pixels is useless here and that is the whole
+        # difficulty: a 3px glyph is so heavily antialiased that it never
+        # reaches the glyph colour even when fully drawn, so "no bright
+        # pixels" is true whether the fade works or not. Removing the fade
+        # entirely still passed a threshold-based check.
+        #
+        # So compare against a disc that is *known* to have no number on it:
+        # the same item rendered at the same zoom carrying a value whose
+        # glyphs would land in the same pixels. A faded disc must be flat --
+        # its interior the fill colour alone -- while an unfaded one has the
+        # grey wash of sub-pixel digits over it. Measure the interior's
+        # brightness spread rather than its peak.
+        cam.zoom = 20.0
+        img = _render()
+        at = _disc_centre(img)
+        assert at is not None, "the disc vanished along with the digits"
+        x, y = at
+        interior = img[y - 2:y + 3, x - 2:x + 3].astype(float)
+        assert interior.size, "sampled off the frame"
+        # COL_ITEM_FILL is (0.14, 0.15, 0.18) -> ~36..46. Digits, however
+        # dim, lift the darkest channel well above that.
+        darkest = float(interior.min(axis=2).max())
+        assert darkest < 110.0, (
+            f"the disc interior is too bright ({darkest:.0f}) for a disc "
+            f"with no number on it -- are the digits still being drawn?")
+
+        # The sign must still be legible from the ring alone.
+        x, y = at
+        assert _is_green(img[y, x].astype(float)), \
+            f"the disc lost its colour: {img[y, x].tolist()}"
+        ok("digits fade out when zoomed out; the ring colour survives")
+    finally:
+        engine.debug_feed = None
+
+
 # --- the copy-mode selection rectangle -------------------------------------
 # Screen furniture rather than board state: nothing is stored per cell for it,
 # so the only way to check it exists is to look at the pixels.
