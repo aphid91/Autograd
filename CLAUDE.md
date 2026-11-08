@@ -285,15 +285,16 @@ Two consequences:
   the Source class rather than in `Gameboard.spawn()`, the same seam
   Underground uses for its role and partner fields.
 - **Changing it flushes every item in flight** (`Engine.flush_material()`),
-  belts *and* gate channels. Clearing only the rings leaves a value already
-  pulled into a gate's input, or a result already in its waiting zone, to
-  re-enter the network next tick. The flush is board-wide because an item is
-  a payload and an entry tick with no record of which machine produced it —
-  tracing descendants of one Source is not expressible in the closed form.
-  Same bargain an edit to the belt network already makes. Setting the
-  *current* value is not a change and does not flush, because imgui reports a
-  change per keystroke and typing `-1` into a Source already at `-1` would
-  otherwise wipe the board mid-edit.
+  belts *and* gate channels — the same thing a belt-network edit does, and
+  the same thing the panel's Clear-items button does. `flush_material()` is
+  the single meaning of "start fresh"; `clear_items()` is the belts-only
+  half and is **not** what a caller usually wants, since material already
+  inside a gate re-enters the network next tick (see "An edit drops the
+  items…" under Belt segments, where exactly that was a live bug).
+
+  Setting the *current* value is not a change and does not flush, because
+  imgui reports a change per keystroke and typing `-1` into a Source already
+  at `-1` would otherwise wipe the board mid-edit.
 
 The value travels with copy/paste (`StampEntry.emit` → `Placement.emit` →
 `Engine._spawn_fields()`), or a configured Source would paste back at the
@@ -565,6 +566,30 @@ truth — delete every segment and they recompute from it. Membership is still
   means dividing a ring's live contents between two new rings, and every
   position is relative to its segment's anchor, so it is not expressible in
   the closed form. Dropping them is the price of O(1); edits are human-paced.
+
+  **And it must drop gate state too, which it did not.** A rebuild empties
+  every ring, but material that has already *left* a belt sits in an entity
+  row — a value in a gate's input channel, a result in its output waiting
+  zone — and segment code never touches those. The next tick pushed them
+  back onto the fresh runs, so items the player watched vanish reappeared a
+  tick later. `sync_segments()` now calls `Engine.flush_material()`, which
+  clears belts *and* gate channels.
+
+  Two things made this hide well. It is **bounded, not continuous** — about
+  one stray value per gate port that happened to be holding something — so
+  it reads exactly like a Source refilling. And a test asserted the old
+  behaviour by name (`gate_state_survives_a_segment_rebuild`), on the
+  reasonable-sounding grounds that gate state lives in rows and a rebuild is
+  derived-state churn. The lesson is that "derived state" is about where a
+  value is *stored*, not about whether it is live material.
+
+  The flush is deliberately **board-wide**. An item is a payload and an entry
+  tick with no record of which machine produced it, so "only the gates near
+  the edit" is not a question the closed form can answer. Pinned by
+  `test_an_edit_does_not_resurrect_items_onto_the_belts`, which changes the
+  Source's emitted value at the same time as the edit so any surviving old
+  value is identifiable — asserting merely that the belts emptied is not
+  enough, since they do empty and then refill from the gates.
 - **Ring capacity is a power of two.** Required, not tidy: slots are indexed
   `k % cap` on a monotonically growing counter, which only survives unsigned
   wraparound when `cap` is a power of two.
@@ -594,6 +619,13 @@ A moving ghost preview rewrites cells every frame, and since derivation skips
 ghosts those writes cannot change its answer; notifying anyway rebuilt the
 whole index once per frame for an identical result. Preview churn now causes
 **zero** rebuilds.
+
+That guard became load-bearing rather than merely an optimisation when
+`sync_segments()` started flushing material (above). A spurious rebuild used
+to cost a wasted whole-board scan; it now **empties the board**, so without
+this a ghost dragged across a running factory would wipe it once per frame.
+`test_preview_churn_does_not_destroy_items` asserts the consequence rather
+than the rebuild count — removing the guard takes a 19-item belt to 0.
 
 **Frustrated cells count as real.** This is the subtle one, and it was a live
 bug: frustration is an overlay that leaves `.x` untouched precisely so the
@@ -726,10 +758,10 @@ results in those zones.
 
 A machine with **no inputs** fires differently
 (`GateSim._fire_generator()`), and both differences exist to make a
-six-port `Source` usable:
+multi-port `Source` usable:
 
-- **It only fills channels with somewhere to go.** With six faces and one
-  belt, five waiting zones would fill once and block the machine for good.
+- **It only fills channels with somewhere to go.** With three faces and one
+  belt, two waiting zones would fill once and block the machine for good.
 - **It fills whichever free zones it finds**, rather than requiring *all* of
   them clear. `outputs_clear()` is all-or-nothing, so using it here would let
   one slow belt stall every other belt the same Source feeds — the opposite
@@ -795,12 +827,16 @@ The remaining cost is that a single tile's two faces share a slot, so feeding
 one corner from both sides gets one item per tick between them. Spread the
 belts across tiles.
 
-This matters for sizing: `MAX_CHANNELS` is 6, set by Source, so a row needs
-`8 + 4×6 = 32` slots and `ENTITY_STRIDE` is 32. Sink's four fit inside that,
-which is why widening the sink cost no stride at all — one channel per *face*
-would have needed 8 and widened every row in the game, including every belt's.
-Note the stride is baked into save files, so the persistence shape check
-rejects older ones.
+This matters for sizing: `MAX_CHANNELS` is 4, now set by **Sink**, so a row
+needs `8 + 4×4 = 24` slots and `ENTITY_STRIDE` is 24. One channel per *face*
+would have needed 8 and widened every row in the game, including every
+belt's.
+
+Source used to set it at 6, carrying all six perimeter faces; narrowing that
+machine to north-and-east is what let both constants come down (32 → 24, a
+25% narrower row for every entity on the board). Note the stride is baked
+into save files, so the persistence shape check rejects older ones — this
+change invalidates saves written before it.
 
 The renderer needs the same mapping — `output_channel_at()` is generated from
 Python, because "port index == channel" is false for Sink and indexing by
@@ -1193,7 +1229,7 @@ rotated; all are continuous rectangles.
 | `Swap` | 1×2 | x,y,z → x, (y,z if x>0 else z,y) |
 | `Shear` | 2×1 | x,y → x, x+y |
 | `Mac` | 2×1 | x,y,z → x, y, z + x·y |
-| `Source` | 2×1 | an output on each of its six perimeter faces |
+| `Source` | 2×1 | outputs on its north and east faces (3 ports) |
 | `Sink` | 2×2 | two inputs per cell, folded to one channel each |
 
 The three arithmetic machines share an idiom: a **pass-through channel**
@@ -1247,9 +1283,16 @@ stays correct even when the cell-to-face pairing is scrambled.
   `F_FLIPPED`). A neighbour probe must read the *neighbour's* flip bit
   (`is_flipped(n.z)`), not the calling cell's.
 - **Chirality is derived, not declared** (`Entity.is_chiral()`): it mirrors the
-  port layout and compares. `Swap`, `Shear` and `Mac` are chiral; `Source` and
-  `Sink` are symmetric about the authored X axis, so `F` is a deliberate no-op
-  for them rather than a special case in the toolbelt.
+  port layout and compares. `Swap`, `Shear`, `Mac` and `Source` are chiral;
+  only `Sink` is symmetric about the authored X axis, so `F` is a deliberate
+  no-op for it rather than a special case in the toolbelt.
+
+  **`Source` became chiral for free** when it dropped to north-and-east
+  ports — the six-face version was symmetric and `F` did nothing on it.
+  Nothing in the toolbelt or the input layer changed, which is the payoff for
+  deriving this from the ports instead of declaring it: narrowing a machine's
+  port set gave it a working mirror as a side effect. Mirroring sends the two
+  north faces south and leaves the east port on the far cell.
 - **Faces are derived, not stored** (`Entity.faces_for`). Every instance of a
   type has the same port layout, so storing it per-row would be duplication.
   If ports ever become per-instance configurable, that is where it changes.

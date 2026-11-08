@@ -561,7 +561,12 @@ class Orchestrator:
             engine.debug_feed = (None if requests.debug_feed is False
                                  else float(requests.debug_feed))
         if requests.clear_items:
-            engine.clear_items()
+            # flush_material(), not clear_items(): the button says "clear
+            # items" and the player means all of them, including the ones
+            # sitting in a gate's channels where clear_items() cannot see
+            # them. Leaving those behind had them reappear on the belts a
+            # tick later -- the same bug a network edit had.
+            engine.flush_material()
 
         # 7. simulation. After every player mutation, so a tick acts on the
         # board as just edited; before the device sync, so its effects are

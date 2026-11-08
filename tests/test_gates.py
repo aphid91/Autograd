@@ -191,23 +191,28 @@ def test_a_dangling_generator_stays_inert():
 
 
 def test_one_source_fills_two_belts():
-    """Six independent output channels, each feeding its own run.
+    """Independent output channels, each feeding its own run.
 
-    This is why generators skip unconnected channels at all: with six ports
-    and one belt, five waiting zones would fill once and block the machine
-    for good. It is also why the channels must not fold onto one slot the way
-    a Sink's inputs do -- a waiting zone is cleared by whoever drains it, so
+    This is why generators skip unconnected channels at all: with three ports
+    and one belt, two waiting zones would fill once and block the machine for
+    good. It is also why the channels must not fold onto one slot the way a
+    Sink's inputs do -- a waiting zone is cleared by whoever drains it, so
     two belts sharing a channel would split one item per tick between them
     instead of each getting a full run.
+
+    Uses the north and east faces. This test used to run north and south,
+    which was the natural pair when Source carried all six perimeter faces;
+    it is the only test whose *geometry* depended on the dropped ones.
     """
     src = engine.place_structure(Source, 10, 10)   # 2x1 over (10,10)-(11,10)
-    # North face of cell 0 feeds an eastward run; south face feeds another.
+    # North face of cell 0 feeds an eastward run along the top...
     for x in range(10, 16):
         engine.place_belt(x, 11, cell.DIR_PX)
     engine.place_structure(Sink, 16, 11)
-    for x in range(10, 16):
-        engine.place_belt(x, 9, cell.DIR_PX)
-    engine.place_structure(Sink, 16, 9)
+    # ...and the east face of cell 1 feeds another, straight out of the side.
+    for x in range(12, 18):
+        engine.place_belt(x, 10, cell.DIR_PX)
+    engine.place_structure(Sink, 18, 9)
     engine.sync_segments()
     assert engine.segments.count == 2, engine.segments.count
 
@@ -528,11 +533,26 @@ def test_erasing_a_gate_leaves_no_stale_state():
     ok("erasing the Sink left the segment dangling and the belt simply filled")
 
 
-def test_gate_state_survives_a_segment_rebuild():
-    """Editing belts must not disturb what a gate is holding.
+def test_a_segment_rebuild_flushes_gate_state_too():
+    """Editing belts clears what gates are holding, not just the runs.
 
-    Segments are derived and get rebuilt wholesale; gate state lives in
-    entity rows and must be untouched by that.
+    **This test used to assert the opposite**, on the reasoning that gate
+    state lives in entity rows and so should be untouched by a rebuild of
+    derived segment state. That is tidy and it was wrong: a rebuild drops
+    every item on every belt, but material that has already *left* a belt
+    sits in a gate's input channel or output waiting zone, and the next tick
+    pushes it back onto the fresh runs. Items the player watched vanish
+    reappeared a tick later.
+
+    The giveaway was that it is bounded rather than continuous -- about one
+    stray value per gate port that happened to be holding something -- which
+    reads exactly like a Source simply refilling, which is why it survived
+    both this test and ordinary play.
+
+    So `sync_segments()` now calls `flush_material()`, making it the single
+    meaning of "start fresh" alongside a Source's value change. Board-wide on
+    purpose: an item is a payload and an entry tick with no provenance, so
+    "only the gates near the edit" is not answerable.
     """
     gate = engine.place_structure(Shear, 10, 10)
     engine.sync_segments()
@@ -544,9 +564,54 @@ def test_gate_state_survives_a_segment_rebuild():
     engine.sync_segments()
     assert engine.segments.stats["rebuilds"] > 0
 
-    assert gate.in_held(0) and gate.in_value(0) == 7.0, gate.in_value(0)
-    assert gate.out_held(1) and gate.out_value(1) == 9.0, gate.out_value(1)
-    ok("a segment rebuild left the gate's held input and waiting zone intact")
+    assert not gate.in_held(0), (
+        f"the gate's input survived a rebuild holding {gate.in_value(0)}; it "
+        f"would re-enter the network on the next tick")
+    assert gate.outputs_clear(), (
+        f"the gate's waiting zone survived a rebuild holding "
+        f"{gate.out_value(1)}")
+    ok("a segment rebuild flushed the gate's input and waiting zone")
+
+
+def test_an_edit_does_not_resurrect_items_onto_the_belts():
+    """The reported bug, end to end: no stale value comes back after an edit.
+
+    Distinguishes old material from new by changing what the Source emits at
+    the same time as the edit, so anything carrying the old value can only
+    have come from state the edit failed to clear. Asserting "the belts
+    emptied" is not enough -- they do empty, and then refill a tick later
+    from the gates.
+    """
+    src = engine.place_structure(Source, 10, 20)
+    src.emit_value = 7.0
+    engine.place_belt_path((12, 20), (19, 20))
+    engine.place_structure(Shear, 20, 20)
+    engine.place_belt_path((22, 20), (33, 20))
+    engine.sync_segments()
+    _run(50)
+
+    # Saturated, with material inside the gates as well as on the belts.
+    held = [c for g in engine.gates.gates()
+            for c in range(g.input_count()) if g.in_held(c)]
+    assert held, "expected a gate to be holding something before the edit"
+
+    # Edit the network and change the emitted value in one go. 7.0 (and the
+    # Shear's 14.0) can now only come from un-flushed state.
+    src.emit_value = 2.0
+    engine.erase(26, 20)
+    engine.sync_segments()
+    _run(20)
+
+    seen = set()
+    for seg in engine.segments.segments.values():
+        for k in range(seg.head, seg.tail):
+            seen.add(engine.belts.payload_of(seg, k))
+    stale = {v for v in seen if v in (7.0, 14.0)}
+    assert not stale, (
+        f"stale payloads {sorted(stale)} reappeared after the edit; the "
+        f"belts carried {sorted(seen)}")
+    assert seen, "nothing flowed after the edit at all"
+    ok(f"after an edit the belts carried only fresh values: {sorted(seen)}")
 
 
 def test_long_chain_reaches_steady_throughput():

@@ -528,11 +528,37 @@ class Engine:
         Returns the number of segments if a rebuild happened, else None.
         Called once per frame before the tick, so the simulation always runs
         against segments matching the board the player just edited.
+
+        **A rebuild flushes gate state as well as the belts.** `rebuild()`
+        drops every item on every run -- positions are relative to a
+        segment's anchor and so cannot survive re-derivation -- but it only
+        touches segments, and material that has already *left* a belt is
+        sitting in an entity row: a value in a gate's input channel, or a
+        result in its output waiting zone. Those are untouched by a rebuild,
+        so the next tick pushes them back onto the fresh runs and they appear
+        as new items on belts the player just watched empty.
+
+        That was a real bug, and the giveaway is that it is bounded rather
+        than continuous: roughly one stray item per gate port that happened
+        to be holding something, so a one-gate chain resurrected two values
+        and a two-gate chain two more. Easy to dismiss as the Source simply
+        refilling.
+
+        Flushing the gates too makes `flush_material()` the single meaning of
+        "start fresh" -- the same thing a Source's value change does. It is
+        deliberately board-wide: an item is a payload and an entry tick with
+        no record of which machine produced it, so "only the gates near the
+        edit" is not a question the closed form can answer. Edits are
+        human-paced, and this is the bargain the belts already make.
         """
         if not self._segments_stale:
             return None
         self._segments_stale = False
         n = self.segments.rebuild()
+        # Order matters: rebuild() first, so flush_material() resets the
+        # anchors of the runs that now exist rather than the ones that just
+        # stopped existing.
+        self.flush_material()
         # A rebuild reassigns every ring's base and cap, so the device arena
         # has to be laid out again before the next upload.
         self.belt_device.invalidate_layout()

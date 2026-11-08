@@ -367,6 +367,39 @@ def test_preview_churn_does_not_rebuild():
     ok("18 frames hovering a blocked structure -> 0 rebuilds")
 
 
+def test_preview_churn_does_not_destroy_items():
+    """The stakes of the rebuild count above: a rebuild now flushes material.
+
+    This used to cost only a wasted whole-board scan. Since `sync_segments()`
+    started flushing gate state and belt items (to stop an edit resurrecting
+    items), a spurious rebuild would **wipe every item on the board** -- so
+    dragging a ghost across a running factory would empty it, once per frame.
+    The `_real_content()` guard in the invalidation hook is what prevents
+    that, and this asserts the consequence rather than the mechanism.
+    """
+    engine.place_structure(Source, 10, 20)
+    engine.place_belt_path((12, 20), (29, 20))
+    engine.sync_segments()
+    for _ in range(60):
+        engine.clock.request_step()
+        engine.clock.advance(0.0)
+    before = sum(s.count for s in engine.segments.segments.values())
+    assert before > 0, "needed items on the belt to have anything to lose"
+
+    # Wave a structure ghost over the running belt and beside it.
+    select_tool("Shear")
+    for (x, y) in [(15, 25), (16, 25), (17, 25), (18, 20), (19, 20), (20, 25)]:
+        put_cursor_at_cell(x, y)
+        step()
+
+    after = sum(s.count for s in engine.segments.segments.values())
+    assert after == before, (
+        f"preview churn destroyed items: {before} -> {after}. A ghost must "
+        f"not trigger a rebuild, because a rebuild now flushes material.")
+    _clean()
+    ok(f"a ghost dragged over a running belt left all {before} items alone")
+
+
 def test_idle_frames_do_not_rebuild():
     """With nothing changing, the index is left alone."""
     engine.place_belt_path((5, 5), (15, 5))

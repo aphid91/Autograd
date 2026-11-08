@@ -34,11 +34,14 @@ _COMMON_FIELDS = 8
 # vec4 are the easiest thing to index from a compute shader later.
 #
 # A gate needs, per channel: the value held at each input, the value waiting
-# at each output, and an occupancy flag for both. The widest is Source's six
-# independent output channels, so 8 common + 6*2 values + 6*2 flags = 32.
+# at each output, and an occupancy flag for both. The widest is Sink's four
+# input channels, so 8 common + 4*2 values + 4*2 flags = 24.
 # Rows are cheap and branching is not, so every type carries the full set
 # rather than packing per-type -- a belt row simply has unused slots.
-ENTITY_STRIDE = 32
+#
+# Was 32, set by a six-port Source. Narrowing that machine to three ports
+# left Sink's four as the widest, which is what let this drop.
+ENTITY_STRIDE = 24
 
 #: Most *channels* of one kind any machine has -- not port faces. Fixes the
 #: per-row gate layout, so a machine with more channels means bumping this
@@ -58,7 +61,7 @@ ENTITY_STRIDE = 32
 #: deliver one belt's worth. Per cell, each of the four tiles drains
 #: independently. See Sink.in_channel().
 #:
-#: **Source does not fold at all -- six faces, six channels.** Same
+#: **Source does not fold at all -- three faces, three channels.** Same
 #: arithmetic from the other side: a waiting zone is cleared by whoever
 #: drains it, so two belts sharing one channel would split one item per tick
 #: between them instead of each getting their own. Independent channels are
@@ -66,9 +69,10 @@ ENTITY_STRIDE = 32
 #: simply staying empty.
 #:
 #: Sizing the row by *faces* would mean 8 channels for every entity. Sizing
-#: by channels keeps it at 6, set by Source -- Sink's four fit inside that,
-#: which is why widening the sink cost no stride at all.
-MAX_CHANNELS = 6
+#: by channels keeps it at 4, now set by Sink -- Source used to set it at 6
+#: with all six perimeter faces, so narrowing that machine is what let both
+#: this and ENTITY_STRIDE come down.
+MAX_CHANNELS = 4
 
 
 class Entity:
@@ -806,21 +810,30 @@ class Mac(Structure):
 
 
 class Source(Structure):
-    """2x1 emitter with an output on every one of its six perimeter faces.
+    """2x1 emitter with outputs on its north and east faces only.
 
-    Each cell carries its own outward faces: both carry +Y and -Y, cell 0
-    carries -X and cell 1 carries +X. So material can be drawn off from any
-    side without aiming at a particular tile.
+    Three ports: `+Y` on each of the two cells, and `+X` on the eastern cell.
+    Authored at DIR_PX and rotated, so "north and east" means *relative to
+    the machine* -- a Source rotated 180 degrees draws off south and west.
 
-    **The six faces are six independent channels, not one folded channel**
-    -- the opposite of Sink. A waiting zone is cleared by whoever drains it,
-    so two belts sharing a channel would split one item per tick between
-    them; separate channels let one Source fill several belts at once. The
-    faces nobody connected simply stay empty rather than filling a zone and
-    blocking the machine, which is what makes a 6-port generator usable at
-    all (see GateSim._connected_channels()).
+    **The three faces are three independent channels, not one folded
+    channel** -- the opposite of Sink. A waiting zone is cleared by whoever
+    drains it, so two belts sharing a channel would split one item per tick
+    between them; separate channels let one Source fill several belts at
+    once. The faces nobody connected simply stay empty rather than filling a
+    zone and blocking the machine, which is what makes a multi-port generator
+    usable at all (see GateSim._connected_channels()).
 
-    This is what sets MAX_CHANNELS, and so ENTITY_STRIDE.
+    It used to carry all six perimeter faces, which is where MAX_CHANNELS's
+    value of 6 came from. Three is the deliberate smaller set: material comes
+    off the two sides you are most likely to build along, and the machine
+    reads less like a junction.
+
+    **Dropping the -X and -Y faces makes this type chiral**, where the
+    six-port version was symmetric about the authored X axis. Chirality is
+    derived from the port layout rather than declared (`is_chiral()`), so `F`
+    became a real mirror here with no change to the toolbelt -- the north
+    faces stay put and the east port moves to the west cell's `-X`.
 
     **The emitted value is per instance**, stored in the row (see `F_EMIT`),
     so two Sources on one board can emit different numbers. `EMIT_VALUE` is
@@ -828,8 +841,6 @@ class Source(Structure):
 
     Even on x and odd on y, so it is the type that exercises both halves of
     the centred-placement rule at once -- see origin_for_cursor().
-
-    Symmetric about the authored X axis, so it is achiral and F is a no-op.
     """
 
     TYPE_ID = cell.TYPE_SOURCE
@@ -839,8 +850,8 @@ class Source(Structure):
 
     INPUTS = ()
     OUTPUTS = (
-        (0, 0, cell.DIR_NX), (0, 0, cell.DIR_PY), (0, 0, cell.DIR_NY),
-        (1, 0, cell.DIR_PX), (1, 0, cell.DIR_PY), (1, 0, cell.DIR_NY),
+        (0, 0, cell.DIR_PY),
+        (1, 0, cell.DIR_PY), (1, 0, cell.DIR_PX),
     )
 
     #: Where this Source's own emit value lives in its row.
@@ -1236,31 +1247,38 @@ def _self_check():
     assert Mac.face_masks_at(1, 0) == (1 << cell.DIR_PY,
                                        (1 << cell.DIR_NY) | (1 << cell.DIR_PX))
 
-    # Source: a 2x1 emitting on all six perimeter faces, each its own
-    # channel. Each cell carries exactly the faces pointing out of the body.
+    # Source: a 2x1 emitting north and east only -- +Y on both cells, +X on
+    # the eastern one. Three ports, each its own channel.
     assert Source.FOOTPRINT == (2, 1)
-    assert not Source.INPUTS and len(Source.OUTPUTS) == 6
-    assert Source.out_channels() == 6, Source.out_channels()
-    for lx in (0, 1):
-        in_mask, out_mask = Source.face_masks_at(lx, 0)
-        assert in_mask == 0, lx
-        outward = {cell.DIR_PY, cell.DIR_NY,
-                   cell.DIR_NX if lx == 0 else cell.DIR_PX}
-        assert out_mask == sum(1 << d for d in outward), (
-            lx, bin(out_mask))
-    # Every perimeter face covered exactly once, and no interior face.
+    assert not Source.INPUTS and len(Source.OUTPUTS) == 3
+    assert Source.out_channels() == 3, Source.out_channels()
+    assert Source.face_masks_at(0, 0) == (0, 1 << cell.DIR_PY)
+    assert Source.face_masks_at(1, 0) == (
+        0, (1 << cell.DIR_PY) | (1 << cell.DIR_PX))
     _, souts = Source.faces_for(0, 0, cell.DIR_PX)
-    assert len(set(souts)) == 6, souts
+    assert len(set(souts)) == 3, souts
+    # The dropped faces really are gone, not merely unlisted somewhere.
+    for gone in (((0, 0), cell.DIR_NX), ((0, 0), cell.DIR_NY),
+                 ((1, 0), cell.DIR_NY)):
+        assert gone not in souts, f"{gone} should no longer be a port"
     assert ((0, 0), cell.DIR_PX) not in souts, "interior face is not a port"
     assert ((1, 0), cell.DIR_NX) not in souts, "interior face is not a port"
-    # Six independent channels, not one folded channel: a waiting zone is
+    # Three independent channels, not one folded channel: a waiting zone is
     # cleared by whoever drains it, so folding would make two belts split
     # one item per tick instead of each getting their own.
-    assert len({Source.out_channel(i) for i in range(6)}) == 6
+    assert len({Source.out_channel(i) for i in range(3)}) == 3
     # Firing produces one value per channel, all of them this instance's.
     _s = _view(Source)
     _s.initialise(0, 0, cell.DIR_PX)
-    assert _s.fire([]) == [Source.EMIT_VALUE] * 6
+    assert _s.fire([]) == [Source.EMIT_VALUE] * 3
+
+    # Asymmetric about the authored X axis now that -X and -Y are gone, so
+    # the mirror is a genuinely different machine and F does something. The
+    # six-port version was symmetric and F was a no-op on it; nothing in the
+    # toolbelt had to change, because chirality is derived from the ports.
+    assert Source.is_chiral(), (
+        "a north/east Source should be chiral -- if this fails, is_chiral() "
+        "is not seeing the dropped faces")
 
     # Sink: a 2x2 accepting on every perimeter face, and no outputs. Each
     # cell carries exactly the two faces that point out of the footprint.
@@ -1366,16 +1384,34 @@ def _self_check():
     assert Swap.PASS_THROUGH and Shear.PASS_THROUGH and Mac.PASS_THROUGH
     assert not Source.PASS_THROUGH and not Sink.PASS_THROUGH
 
-    # Chirality is derived from the ports, so it cannot drift from them.
-    # The arithmetic machines are chiral; Source and Sink are symmetric
-    # about the authored X axis and so have no second version.
+    # Chirality is derived from the ports, so it cannot drift from them. The
+    # arithmetic machines are chiral, and so is Source now that it emits
+    # north and east only -- dropping -X and -Y broke the symmetry the
+    # six-port version had. Sink's full perimeter is still symmetric.
     assert Swap.is_chiral() and Shear.is_chiral() and Mac.is_chiral()
-    assert not Source.is_chiral() and not Sink.is_chiral()
+    assert Source.is_chiral(), "a north/east Source is not symmetric"
+    assert not Sink.is_chiral()
+
     # An achiral type's flipped placement is identical to its plain one.
-    for c in (Source, Sink):
+    # Compares *both* port sets: checking only inputs passes vacuously for a
+    # type with none, which is exactly the case here.
+    for c in (Sink,):
         for d in range(4):
-            assert (sorted(c.faces_for(0, 0, d, False)[0])
-                    == sorted(c.faces_for(0, 0, d, True)[0])), c.__name__
+            plain, flipped = c.faces_for(0, 0, d, False), \
+                c.faces_for(0, 0, d, True)
+            assert sorted(plain[0]) == sorted(flipped[0]), c.__name__
+            assert sorted(plain[1]) == sorted(flipped[1]), c.__name__
+
+    # And a chiral type's mirror really differs somewhere, at every facing --
+    # otherwise is_chiral() would be claiming a distinction F cannot show.
+    for c in (Swap, Shear, Mac, Source):
+        for d in range(4):
+            plain, flipped = c.faces_for(0, 0, d, False), \
+                c.faces_for(0, 0, d, True)
+            assert (sorted(plain[0]) != sorted(flipped[0])
+                    or sorted(plain[1]) != sorted(flipped[1])), (
+                f"{c.__name__} claims chirality but mirrors to itself at "
+                f"{cell.DIR_NAMES[d]}")
 
     assert Belt.ROTATABLE is False
 
