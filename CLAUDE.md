@@ -8,9 +8,11 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 app renders a cell grid and its entities entirely from a fragment shader that
 reads game state out of a GPU texture, with an imgui control panel on top.
 
-Currently implemented: the gameboard, belts, belt-drawing UX (elbow/line
-planning with a ghost preview), erase, and camera pan/zoom. Belt *simulation*
-(items moving) is deliberately not implemented — see "Deferred" below.
+Currently implemented: the gameboard, belts and underground belts, the
+belt-drawing UX (elbow/line planning with a ghost preview), copy/paste/erase
+modes, camera pan/zoom, save/load — and the **simulation**: belts carry items
+in closed form, gates fire on a two-phase tick, and a saturated chain moves
+one item per tick. See "Deferred" for what is still missing.
 
 ## Commands
 
@@ -45,7 +47,7 @@ There is no pytest/linter configured.
 | [tests/test_segments.py](tests/test_segments.py) | belt-run derivation: tracing, cuts, undergrounds, merges, audit under churn |
 | [tests/test_belts.py](tests/test_belts.py) | the closed form against the naive oracle, on fixed and randomised configs |
 | [tests/test_item_render.py](tests/test_item_render.py) | reads the framebuffer back: do discs appear where the simulation says? |
-| [tests/test_gates.py](tests/test_gates.py) | firing rules, arithmetic, back pressure, and the bubble-free claim |
+| [tests/test_gates.py](tests/test_gates.py) | firing rules, arithmetic, back pressure, dangling-output discard, and the bubble-free claim |
 | [tests/test_stamp.py](tests/test_stamp.py) | what the stamp transforms preserve: wiring, topology, arithmetic |
 | [tests/test_clipboard.py](tests/test_clipboard.py) | the copy/paste/erase mode machine, driven through the fake mouse and keyboard |
 | [tests/test_inspect.py](tests/test_inspect.py) | the Status window, the per-Source emit value, the per-belt seed, the save filename box |
@@ -864,37 +866,78 @@ results in those zones.
 |---|---|
 | `Shear` | x,y → x, x+y |
 | `Mac` | x,y,z → x, y, z + x·y |
-| `Swap` | x,y,z → x, (z,y if x>0 else y,z) — x is the control |
+| `Reciprocal` | a → 1/a |
+| `Max` | a,b → max(a,b) on **both** outputs |
+| `Floor` | a → ⌊a⌋ |
+| `Route` | a,b → a down **one** of two outputs, on the sign of b |
+| `Merge` | a,b,c → whichever of a,b the control c selects |
 | `Source` | → a per-instance constant on every connected port |
-| `Sink` | destroys whatever arrives, up to 4 per tick |
+| `Swap` | x,y,z → x, (z,y if x>0 else y,z) — *hidden, see below* |
+| `Sink` | destroys whatever arrives, up to 4 per tick — *hidden* |
 
-**`Swap` swaps on a *positive* control.** The two branches were the other way
-round at first, which reads backwards — the machine sat exchanging its lanes
-whenever its control said not to. Zero counts as "do not swap", so the
-control reads as a plain condition. Pinned in `core/entity.py`'s self-check
-and in [tests/test_gates.py](tests/test_gates.py); note
-[tests/test_stamp.py](tests/test_stamp.py) also asserts the polarity, since
-its mirror-invariance check needs to know which branch is the pass-through.
+**A positive control is always the active case.** `Swap` swaps when x>0,
+`Route` sends right when b>0, `Merge` selects `a` when c>0. Zero counts as
+the inactive branch, so a control reads as a plain condition. Swap's two
+branches were the other way round at first, which reads backwards — the
+machine sat exchanging its lanes whenever its control said not to. Pinned in
+`core/entity.py`'s self-check and in [tests/test_gates.py](tests/test_gates.py);
+note [tests/test_stamp.py](tests/test_stamp.py) also asserts Swap's polarity,
+since its mirror-invariance check needs to know which branch is the
+pass-through.
 
-#### Generators are the one machine that skips its own outputs
+**`Swap` and `Sink` are hidden from the toolbelt but still defined.** They
+are absent from `STRUCTURES` and so have no tool, but keep their classes and
+their type ids, so an older saved board still loads, draws and simulates one.
+Hiding a machine is a toolbelt decision and nothing more — `ALL_STRUCTURES`
+is what the type-geometry checks iterate, and
+`test_a_hidden_machine_still_works_on_the_board` places both through the
+engine the way a load does. **Type ids are append-only** for the same reason:
+they are baked into every saved grid word, so renumbering would silently
+reinterpret old saves.
 
-A machine with **no inputs** fires differently
-(`GateSim._fire_generator()`), and both differences exist to make a
-multi-port `Source` usable:
+Sink is hidden because it is now redundant — a dangling output destroys what
+it is sent, so there is nothing left for it to do that leaving a port
+unconnected does not.
 
-- **It only fills channels with somewhere to go.** With three faces and one
-  belt, two waiting zones would fill once and block the machine for good.
-- **It fills whichever free zones it finds**, rather than requiring *all* of
-  them clear. `outputs_clear()` is all-or-nothing, so using it here would let
-  one slow belt stall every other belt the same Source feeds — the opposite
-  of what a multi-port generator is for.
+#### A dangling output is a sink
 
-A machine that *consumes* inputs must do neither: it writes every result and
-lets a full zone stop it, because discarding one would silently destroy
-material. So leaving a `Shear`'s pass-through dangling still stalls it after a
-single fire. Both halves are pinned against each other
-(`test_a_generator_skips_its_dangling_faces` vs
-`test_an_undrained_output_blocks_the_whole_gate`).
+A result sent to an output face with **nothing on the far side is destroyed
+at fire time**, rather than filling a waiting zone nobody will drain. So
+leaving a `Shear`'s pass-through unconnected no longer stalls the machine: it
+runs at full rate and the pass-through evaporates.
+
+This is a deliberate end to reversible computing here — a gate may now
+destroy information. When "backwards" mode arrives, these discard points are
+where a machine will have to remember a little of what it dropped.
+
+It **collapsed a special case rather than adding one**.
+`GateSim._connected_channels()` used to be consulted only by generators, on
+the grounds that a machine *consuming* inputs must write every result or
+silently lose material. Now that losing it is the specification, every gate
+consults the same connectivity, and it decides two things: which zones can
+block it (`outputs_clear(drains)`) and which results are discarded.
+
+**Generators keep exactly one difference**: `_fire_generator()` fills
+whichever free zones it finds rather than requiring *all* of them clear.
+`outputs_clear()` over the connected set is all-or-nothing, so using it there
+would let one slow belt stall every other belt the same Source feeds — the
+opposite of what a multi-port generator is for. Skipping dangling faces still
+matters *more* for a generator, though, and for the reason it always did: a
+generator creates material from nothing, so emitting into a dangling face
+would be a pure print-and-shred loop rather than a result being dropped. With
+**no** channel connected it stays inert.
+
+Pinned by `test_a_dangling_output_destroys_and_does_not_block`, which asserts
+the **rate** — one discard and one item per tick — rather than merely that
+the gate kept firing. A half-rate gate is exactly the symptom a mistake here
+would produce, and "it fired at least once" would not catch it. That test is
+the inverted descendant of `test_an_undrained_output_blocks_the_whole_gate`.
+
+A consequence for the tests: a bare gate on an empty board no longer fills
+its zones, so anything wanting to observe back pressure must attach a real
+consumer and let it back up (`_drain_every_output()`). Note a one-cell run
+holds **two** items at the default spacing, so those tests loop until blocked
+rather than assuming a fire count.
 
 **A face only counts as connected if its channel actually owns the run.** A
 2×1 Source has two `+Y` faces and a long run touches both, but a segment
@@ -909,11 +952,53 @@ because it reads belt *presence* (static for the whole phase) rather than belt
 *state*, whose read order would make firing nondeterministic.
 
 **Firing is declared, not special-cased.** `FIRE_RULE` is `FIRE_ALL`
-(every input needed — a Shear cannot compute x+y from x alone) or `FIRE_ANY`
+(every input needed — a Shear cannot compute x+y from x alone), `FIRE_ANY`
 (Sink's rule; waiting for all four channels would deadlock a sink fed from
-one side). A type with **no** inputs is vacuously ready under either rule, so
-`Source` fires whenever its output is clear with no special case anywhere —
-and its rate self-regulates to whatever the belt will take.
+one side), or `FIRE_SELECT` (Merge's). A type with **no** inputs is
+vacuously ready under any of them, so `Source` fires whenever its output is
+clear with no special case anywhere — and its rate self-regulates to
+whatever the belt will take.
+
+`inputs_ready()` is **overridable**, because an enum cannot express a rule
+that depends on the values held rather than on occupancy. `FIRE_SELECT`
+names that case and the base class deliberately does not resolve it — a type
+declaring it must override, and the self-check pins that it does. Falling
+through to the `FIRE_ALL` branch instead would make such a machine wait for
+a lane it is supposed to be able to ignore: silent, and exactly the bug the
+enum value exists to make visible. The enum survives because it is also the
+declared home for a future per-type rate limit.
+
+#### Two mechanisms the second gate vocabulary needed
+
+Both are general, and neither is special-cased anywhere in the tick:
+
+- **Emitting on one output and not the other.** `fire()` returning `None`
+  for a channel already meant "emit nothing"; it is now a load-bearing
+  decision. `Route` sends its item down one of two paths and the other stays
+  **silent** — not a copy that is then destroyed, which would look identical
+  on the taken path. `test_route_emits_nothing_on_the_path_not_taken` runs
+  15 ticks to tell those apart, since one fire cannot distinguish "nothing
+  was emitted" from "not arrived yet".
+
+- **Consuming only some inputs.** `structure_phase()` used to clear every
+  held channel, giving the machine no say. `Entity.consumed()` now reports
+  which channels a fire used up, defaulting to every fed one. `Merge` waits
+  for its control and takes only the lane that control names; the other
+  **stays loaded in the machine**, neither emitted nor destroyed, until a
+  later tick's control selects it. The default would have silently eaten it.
+
+  It is returned rather than mutated, so the structure phase stays the only
+  writer of gate state — the same discipline that keeps `fire()` a pure
+  function of its inputs.
+
+**Values are clamped, not allowed to go infinite.** `VALUE_LIMIT` is 2²⁴,
+the point past which float32 integers stop being contiguous. `1/0` clamps
+there (keeping the sign of the zero) rather than reaching a belt as an
+infinity nothing downstream can represent or render, and `Floor` clamps
+*before* flooring because `math.floor(inf)` raises rather than returning a
+value. **NaN passes through unchanged** — it is the one value meaning "this
+computation had no answer", and `Max` reports it rather than ordering it.
+A real decision about saturating vs. wrapping vs. an error item is deferred.
 
 **Each machine's arithmetic is one `fire()` method** taking channel values
 and returning channel values, indexed by declaration order. That indexing is
@@ -1343,31 +1428,57 @@ reports nothing for it.
 
 ### Structures
 
-The machine set lives in `core/entity.py` and is listed in `STRUCTURES`, which
-is what the toolbelt builds its tools from. All are authored at `DIR_PX` and
-rotated; all are continuous rectangles.
+The machine set lives in `core/entity.py`. **Three tuples, and the
+distinction matters**: `STRUCTURES` is what the toolbelt builds tools from,
+`HIDDEN_STRUCTURES` holds types that are defined but not placeable, and
+`ALL_STRUCTURES` is their union — what anything reasoning about *types*
+rather than about *tools* should iterate, including the geometry self-checks.
+All are authored at `DIR_PX` and rotated; all are continuous rectangles.
 
 | type | footprint | signature |
 |---|---|---|
-| `Swap` | 1×2 | x,y,z → x, (z,y if x>0 else y,z) |
 | `Shear` | 2×1 | x,y → x, x+y |
-| `Mac` | 2×1 | x,y,z → x, y, z + x·y |
 | `Source` | 2×1 | outputs on its north and east faces (3 ports) |
-| `Sink` | 2×2 | two inputs per cell, folded to one channel each |
+| `Route` | 2×1 | a,b → a down one of two outputs; b passes through |
+| `Merge` | 2×1 | a,b,c → the lane c selects; c passes through |
+| `Reciprocal` | 1×2 | a → 1/a |
+| `Max` | 2×1 | a,b → max(a,b) on both outputs |
+| `Mac` | 2×1 | x,y,z → x, y, z + x·y |
+| `Floor` | 2×1 | a → ⌊a⌋ |
+| `Swap` *(hidden)* | 1×2 | x,y,z → x, (z,y if x>0 else y,z) |
+| `Sink` *(hidden)* | 2×2 | two inputs per cell, folded to one channel each |
 
-The three arithmetic machines share an idiom: a **pass-through channel**
+The toolbelt order is belt and underground in slots 1–2, then this table's
+order from slot 3.
+
+The machines carrying a control share an idiom: a **pass-through channel**
 crosses the body on one axis unchanged, while the channel taking the *long
 way* across the footprint is the one that gets mutated. `Swap`'s x runs
 vertically through the whole 1×2 body (in at the top cell's north face, out at
 the bottom cell's south) while y and z cross their own cell horizontally.
 `Shear` passes x down through cell 0 only; `Mac` is `Shear` plus a second
-vertical control channel down cell 1.
+vertical control channel down cell 1. `Route` and `Merge` run their control
+horizontally across both cells instead, west face in and east face out.
+
+**A machine that mutates every channel it touches declares no
+`PASS_THROUGH`**, so no faint belt is drawn across it — `Reciprocal`, `Max`
+and `Floor`. That absence is the visual difference from `Shear`, where the
+overlay means "this signal survives unchanged".
 
 **Adding a machine is one Python class.** An `Entity` subclass declaring
 `FOOTPRINT`, `INPUTS`, `OUTPUTS`, `PASS_THROUGH`, `COLOUR` and `GLYPH`, plus
-an entry in `STRUCTURES` and `cell.TYPE_NAMES`. **No GLSL changes at all** —
-see "Generated GLSL tables" below. The builders, the toolbelt, the stub
-logic and the port arrows are all generic.
+an entry in `STRUCTURES` and `cell.TYPE_NAMES`. **No GLSL changes at all**
+unless it wants a new glyph — see "Generated GLSL tables" below. The
+builders, the toolbelt, the stub logic and the port arrows are all generic.
+Five machines were added at once this way and needed no change to any of
+them.
+
+A new *glyph* is the one thing still hand-written: a `sd_*` function in
+[world.frag](shaders/world.frag), a `GLYPH_*` constant in
+[common.glsl](shaders/common.glsl), and an entry in `glsl_types.GLYPHS`.
+They are abstract marks rather than text — a divide sign for `Reciprocal`,
+stacked chevrons for `Max` — because "1/x" and "MX" are multi-character
+strings and a bitmap font is its own project.
 
 - **Ports are per-cell, not per-type.** A port belongs to one cell of a
   footprint — `Shear`'s y-input is on cell 0 only, `Source` has one port on a
@@ -1406,9 +1517,22 @@ stays correct even when the cell-to-face pairing is scrambled.
   `F_FLIPPED`). A neighbour probe must read the *neighbour's* flip bit
   (`is_flipped(n.z)`), not the calling cell's.
 - **Chirality is derived, not declared** (`Entity.is_chiral()`): it mirrors the
-  port layout and compares. `Swap`, `Shear`, `Mac` and `Source` are chiral;
-  only `Sink` is symmetric about the authored X axis, so `F` is a deliberate
-  no-op for it rather than a special case in the toolbelt.
+  port layout and compares. **Only `Sink` is achiral**, its ports covering
+  the whole perimeter so a mirror permutes them onto each other; `F` is a
+  deliberate no-op for it rather than a special case in the toolbelt. Every
+  other machine is chiral.
+
+  **Ports on a body's centre line do not make it achiral**, which is easy to
+  get backwards: the mirror is about the authored **X** axis, so it exchanges
+  north and south. A `Reciprocal`'s north input lands where its south output
+  was, meaning a flipped one takes its input at the bottom — `F` reverses
+  which way material flows through it, a genuinely useful second orientation.
+
+  The self-check asserts this per type **against `is_chiral()` itself**
+  rather than against a hardcoded list of machine names, in both directions
+  (a chiral type's mirror must differ at every facing; an achiral type's must
+  not). That is what caught the wrong assumption above, and it means a new
+  machine is covered automatically whichever it turns out to be.
 
   **`Source` became chiral for free** when it dropped to north-and-east
   ports — the six-face version was symmetric and `F` did nothing on it.
@@ -1563,8 +1687,11 @@ if you want to change it.
 ### Structures
 
 Each machine draws a glyph centred on its whole footprint — `Shear` a Plus,
-`Mac` an X, `Swap` a Z, `Source`/`Sink` a dot — chosen by `body_glyph()` and
-drawn by `sd_glyph()`, with the colour from `body_colour()`.
+`Mac` an X, `Swap` a Z, `Source`/`Sink` a dot, `Reciprocal` a divide sign,
+`Max` stacked chevrons, `Floor` a down arrow, `Merge` a Y and `Route` the
+same Y inverted — chosen by `body_glyph()` and drawn by `sd_glyph()`, with
+the colour from `body_colour()`. The marks are abstract rather than
+lettered; see "Adding a machine" above.
 Both carry short port arrows — blue pointing inward at inputs, red pointing
 outward at outputs — plus **connection stubs**: a short belt-coloured bar from
 the body edge out to the cell boundary, drawn only on a port face that
@@ -1660,8 +1787,16 @@ saturated chain moves one item per tick. What is still missing:
 
 **Cooldown ticks** (every gate fires every tick it can; a per-type rate limit
 is the obvious next knob, and `FIRE_RULE` is where it would go);
+**backwards mode** (gates may now destroy information — a dangling output is
+a sink — so running a machine in reverse will need each discard point to
+remember a little of what it dropped. `GateSim.structure_phase()`'s discard
+branch is the single place that would record it);
+**a numeric policy** (`VALUE_LIMIT` clamps `1/0` and `floor(±inf)` to 2²⁴ as
+a placeholder; saturating vs. wrapping vs. a distinct error item is
+undecided, and NaN currently propagates while infinities do not);
 **a Sink's record** (it destroys what it eats; a stack per input channel is
-the stated next step);
+the stated next step — though Sink is now off the toolbelt, since a dangling
+output does the same job);
 **item-to-gate transit** (items pop in and out of existence at the ends of a
 run rather than being seen to enter or leave a machine — deliberate for now);
 **numbers on items** (a disc shows only the sign of its value, via colour);
@@ -1692,6 +1827,26 @@ stamp history is in-session only).
 The empty hand's gesture is now **inspect** rather than the
 structure-selection tool originally planned for it — that slot is taken, so a
 selection tool would need a different home.
+
+**The machine abstraction held up under a vocabulary change.** Five machines
+arrived at once and the builders, toolbelt, placement, stubs, port arrows and
+GLSL tables all needed no change — the evidence that generating per-type data
+from the classes was the right call. What *did* need changing was the
+**firing protocol**, in three places, and the pattern is worth noting: each
+was a case of the engine holding a decision the machine should have owned.
+Readiness was an enum the type could not override; consumption was implicit
+in the tick; "which outputs may be skipped" was a generator-only special
+case. Each became a method on `Entity` with a sensible default.
+
+If a future machine does not fit, that is the shape to look for first — a
+question the tick currently answers on every machine's behalf. The remaining
+candidates are rate (every gate fires as fast as it can) and whether a gate
+may hold state between fires (only `Merge` does, and only by leaving an input
+loaded).
+
+The toolbelt is now **full**: ten slots for belt, underground and eight
+machines. A further machine needs either a slot-switching mechanism or a
+second page, which is the next piece of UI the vocabulary will demand.
 
 Per-machine configuration now has two worked examples and still no general
 mechanism, and the pair shows why one is wanted. `Source.F_EMIT` reuses an
