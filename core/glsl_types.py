@@ -35,6 +35,15 @@ GLYPHS = {
     "cross": "GLYPH_CROSS",
     "zed": "GLYPH_ZED",
     "dot": "GLYPH_DOT",
+    # Abstract marks rather than text. "1/x" and "MX" are multi-character
+    # strings, and glyph rendering here is a hand-drawn SDF per mark -- a
+    # bitmap font is its own project (see the Deferred notes). A divide sign
+    # and a pair of chevrons read at a 2x1's size, where lettering would not.
+    "divide": "GLYPH_DIVIDE",
+    "chevrons": "GLYPH_CHEVRONS",
+    "arrow_down": "GLYPH_ARROW_DOWN",
+    "wye": "GLYPH_WYE",
+    "wye_down": "GLYPH_WYE_DOWN",
 }
 
 #: Expanded to the type id constants. Must appear before anything that

@@ -231,12 +231,14 @@ def test_toolbelt_selection():
         assert orch.toolbelt.active.name == name, orch.toolbelt.active.name
         return orch.toolbelt.active
 
-    for _name in ("Swap", "Shear", "Sink", "Underground"):
+    for _name in ("Route", "Shear", "Max", "Underground"):
         select_tool(_name)
         ok(f"number key selected {_name}")
-    press_key(glfw.KEY_0)
-    assert orch.toolbelt.selected == 9 and orch.toolbelt.active is None
-    ok("key 0 selected empty slot 10")
+    # Slot 10 is the last tool rather than empty now that the machine set
+    # fills the bar, so select it by name and assert the index instead.
+    select_tool("Floor")
+    assert orch.toolbelt.selected == 9, orch.toolbelt.selected
+    ok("key 0 selected slot 10")
     select_tool("Belt")
     assert orch.toolbelt.active.name == "Belt"
     ok("key 1 back to Belt")
@@ -318,11 +320,18 @@ def test_f_flips_a_chiral_structure_shift_f_frames_the_board():
     assert not _tool.flipped, "F twice should return to the original"
     ok("F is an involution")
 
-    # An achiral structure ignores F entirely.
-    select_tool("Sink")
-    _sink_tool = orch.toolbelt.active
-    assert _sink_tool.name == "Sink" and not _sink_tool.entity_cls.is_chiral()
-    press_key(glfw.KEY_F)
+    # An achiral structure ignores F entirely. Every machine the toolbelt
+    # currently offers is chiral, so this goes through a builder made
+    # directly: Sink is still a defined type (an old save can contain one),
+    # it is simply not on the bar. Driving it through the toolbelt would mean
+    # adding a slot purely to test a no-op.
+    from core.builders import StructureBuilder
+    from core.entity import Sink
+    assert not Sink.is_chiral(), (
+        "Sink is this check's achiral subject -- if it became chiral, pick "
+        "another type rather than deleting the assertion")
+    _sink_tool = StructureBuilder(Sink)
+    _sink_tool.flip()
     assert not _sink_tool.flipped, "F must be a no-op for an achiral type"
     ok("F does nothing to an achiral Sink")
 
@@ -722,29 +731,46 @@ def test_a_tool_must_not_collide_with_its_own_preview():
     # more heavily than a 1D one and so is the real test of clear-then-plan.
     # Everything here derives from FOOTPRINT, so changing a machine's shape does
     # not invalidate the test.
+    # No *placeable* machine is 2D any more -- every one on the bar is 1x2 or
+    # 2x1 -- so this drops a Sink builder into a slot directly rather than
+    # weakening the check to a 1D footprint. Sink is still a defined type
+    # that an old save can put on the board, so it is a real subject; it is
+    # only absent from the toolbelt.
     engine.clear_board(); step()
-    select_tool("Sink")
+    from core.builders import StructureBuilder
+    _slot = len(orch.toolbelt.slots) - 1
+    _saved_slot = orch.toolbelt.slots[_slot]
+    orch.toolbelt.slots[_slot] = StructureBuilder(Sink)
+    orch.toolbelt.select(_slot)
     _sw, _sh2 = Sink.FOOTPRINT
     assert _sw > 1 and _sh2 > 1, "this section wants a 2D footprint"
-    for x in range(8, 18):
-        put_cursor_at_cell(x, 24); step()
-        assert orch.last_plan is not None and orch.last_plan.ok, (
-            f"Sink self-frustrated at x={x}: {orch.last_plan.frustrated_cells}")
-    click()
-    assert board.live_count == 1, "a Sink is one entity"
-    _ox, _oy = Sink.origin_for_cursor(17, 24, cell.DIR_PX)
-    _sink_id = cell.cell_id(board.cell_word(_ox, _oy))
-    for _dx in range(_sw):
-        for _dy in range(_sh2):
-            assert cell.cell_id(
-                board.cell_word(_ox + _dx, _oy + _dy)) == _sink_id, (_dx, _dy)
-            assert cell.unpack_local(
-                int(board.grid[_oy + _dy, _ox + _dx, cell.CH_Y])) == (_dx, _dy)
-    # The cursor cell is covered, and sits at the footprint's centre offset.
-    assert (17, 24) in Sink.cells_for(_ox, _oy, cell.DIR_PX)
-    assert cell.unpack_local(int(board.grid[24, 17, cell.CH_Y])) == \
-        Sink.centre_offset(cell.DIR_PX)
-    ok(f"{_sw}x{_sh2} Sink centres on the cursor, one entity, correct offsets")
+    # Restore the borrowed slot even if an assertion fires, or every later
+    # scenario inherits a Sink tool where its real one should be -- the same
+    # discipline the imgui and clock-phase cleanups follow.
+    try:
+        for x in range(8, 18):
+            put_cursor_at_cell(x, 24); step()
+            assert orch.last_plan is not None and orch.last_plan.ok, (
+                f"Sink self-frustrated at x={x}: "
+                f"{orch.last_plan.frustrated_cells}")
+        click()
+        assert board.live_count == 1, "a Sink is one entity"
+        _ox, _oy = Sink.origin_for_cursor(17, 24, cell.DIR_PX)
+        _sink_id = cell.cell_id(board.cell_word(_ox, _oy))
+        for _dx in range(_sw):
+            for _dy in range(_sh2):
+                assert cell.cell_id(
+                    board.cell_word(_ox + _dx, _oy + _dy)) == _sink_id, (_dx, _dy)
+                assert cell.unpack_local(
+                    int(board.grid[_oy + _dy, _ox + _dx, cell.CH_Y])) == (_dx, _dy)
+        # The cursor cell is covered, and sits at the footprint's centre offset.
+        assert (17, 24) in Sink.cells_for(_ox, _oy, cell.DIR_PX)
+        assert cell.unpack_local(int(board.grid[24, 17, cell.CH_Y])) == \
+            Sink.centre_offset(cell.DIR_PX)
+        ok(f"{_sw}x{_sh2} Sink centres on the cursor, one entity, "
+           f"correct offsets")
+    finally:
+        orch.toolbelt.slots[_slot] = _saved_slot
 
     engine.clear_board(); step()
     select_tool("Belt")

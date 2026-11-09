@@ -813,8 +813,44 @@ class Structure(Entity):
 # cell of the footprint, not on all of them.
 
 
+#: Largest magnitude a value may take. Beyond this a float32 is still exact
+#: but the *integers* are not contiguous, so arithmetic stops behaving like
+#: the numbers the player sees: 2^24 + 1 is not representable.
+#:
+#: Items are float32 (the entity array is destined for an SSBO), so this is
+#: the honest ceiling rather than an arbitrary one. Division can produce
+#: infinity and `floor(inf)` has no answer at all, so both clamp here instead
+#: of propagating a value nothing downstream can use. A real decision about
+#: saturating vs. wrapping vs. an error item is deferred -- see the Deferred
+#: notes -- and this is the placeholder that keeps the board finite meanwhile.
+VALUE_LIMIT = float(2 ** 24)
+
+
+def clamp_value(v):
+    """Bring a result into the representable-integer range.
+
+    Infinities clamp to +/- VALUE_LIMIT. **NaN passes through unchanged**,
+    deliberately: it is the one value that means "this computation had no
+    answer", and collapsing it to a number would hide that. Max of a NaN
+    reports NaN for exactly this reason.
+    """
+    if v != v:                       # NaN: no ordering, so no clamping
+        return v
+    if v > VALUE_LIMIT:
+        return VALUE_LIMIT
+    if v < -VALUE_LIMIT:
+        return -VALUE_LIMIT
+    return v
+
+
 class Swap(Structure):
     """Conditional swap: x,y,z -> x, (z,y if x>0 else y,z).
+
+    **Hidden from the toolbelt** -- it is absent from `STRUCTURES`, so no
+    tool places it. The class stays registered and keeps TYPE_SWAP, so an
+    older saved board still loads and draws one correctly. That split is the
+    point: hiding a machine is a toolbelt decision, not a reason to
+    invalidate saves.
 
     Authored at DIR_PX as a 1x2 (tall) body. The x channel runs vertically
     through the *whole* body -- in at the north face of the top cell, out at
@@ -920,6 +956,266 @@ class Mac(Structure):
         """x,y,z -> x, y, z + x*y. Declared order is (x out, y out, z' out)."""
         x, y, z = values
         return [x, y, z + x * y]
+
+
+class Reciprocal(Structure):
+    """a -> 1/a. Authored as a 1x2 (tall) body, in at the top, out at the
+    bottom.
+
+    **No pass-through.** The single channel is mutated, so there is no
+    control signal to draw -- `PASS_THROUGH` stays empty and no faint belt
+    crosses the body. That is the visual distinction from Shear, where the
+    overlay means "this signal survives unchanged".
+
+    **Flipping reverses the flow.** The mirror is about the authored X axis,
+    which exchanges north and south, so a flipped Reciprocal takes its input
+    at the bottom and emits at the top. That makes `F` a genuinely useful
+    second orientation here rather than a no-op -- and it is derived from the
+    ports by `is_chiral()`, not declared.
+    """
+
+    TYPE_ID = cell.TYPE_RECIP
+    FOOTPRINT = (1, 2)
+    COLOUR = (0.66, 0.30, 0.30)   # red
+    GLYPH = "divide"
+
+    INPUTS = ((0, 1, cell.DIR_PY),)
+    OUTPUTS = ((0, 0, cell.DIR_NY),)
+
+    def fire(self, values):
+        """a -> 1/a, with 1/0 clamped rather than infinite.
+
+        Division by zero is the one input with no answer. It clamps to
+        VALUE_LIMIT carrying the sign of the zero's reciprocal -- so +0 gives
+        +limit and -0 gives -limit, which at least keeps the sign meaningful.
+        """
+        a, = values
+        if a == 0.0:
+            # math.copysign reads the sign *bit*, so -0.0 is distinguished
+            # from +0.0 and the result keeps the direction the limit is
+            # approached from.
+            return [math.copysign(VALUE_LIMIT, a)]
+        return [clamp_value(1.0 / a)]
+
+
+class Max(Structure):
+    """a,b -> max(a,b) on both outputs. Authored as a 2x1 (wide) body.
+
+    Two inputs on the north faces of the two cells, two outputs on the south
+    faces of the same two cells -- so it reads as two lanes in, two lanes
+    out, both carrying the larger value.
+
+    Both outputs carry the same number, which is what makes it a *fan-out*
+    as well as a comparison: one lane can feed the next stage while the other
+    is left dangling and destroyed. That needs no special case -- a dangling
+    output is discarded for every gate now.
+
+    **No pass-through**: neither lane survives unchanged (both become the
+    max), so no control overlay is drawn.
+    """
+
+    TYPE_ID = cell.TYPE_MAX
+    FOOTPRINT = (2, 1)
+    COLOUR = (0.78, 0.50, 0.22)   # orange
+    GLYPH = "chevrons"
+
+    INPUTS = (
+        (0, 0, cell.DIR_PY),   # a in
+        (1, 0, cell.DIR_PY),   # b in
+    )
+    OUTPUTS = (
+        (0, 0, cell.DIR_NY),   # max out, left
+        (1, 0, cell.DIR_NY),   # max out, right
+    )
+
+    def fire(self, values):
+        """a,b -> max,max. **NaN propagates** rather than being ordered.
+
+        `max()` on a NaN is unspecified in the "which operand wins" sense --
+        Python's builtin returns whichever it compared first -- so this tests
+        explicitly. A NaN input means the comparison has no answer, and
+        reporting NaN is more honest than silently preferring the other lane.
+        """
+        a, b = values
+        if a != a or b != b:
+            return [float("nan")] * 2
+        m = clamp_value(a if a > b else b)
+        return [m, m]
+
+
+class Floor(Structure):
+    """a -> floor(a). Authored as a 2x1 (wide) body.
+
+    In at the north face of the left cell, out at the east face of the right
+    cell -- so the value takes the long way across the footprint, which is
+    the idiom for a channel that gets mutated. **No pass-through**, since the
+    one channel is the one being changed.
+
+    The right cell carries no input, only the output: the width is there to
+    give the value somewhere to travel and the glyph somewhere to sit.
+    """
+
+    TYPE_ID = cell.TYPE_FLOOR
+    FOOTPRINT = (2, 1)
+    COLOUR = (0.78, 0.72, 0.26)   # yellow
+    GLYPH = "arrow_down"
+
+    INPUTS = ((0, 0, cell.DIR_PY),)
+    OUTPUTS = ((1, 0, cell.DIR_PX),)
+
+    def fire(self, values):
+        """a -> floor(a), clamped into the exact-integer range.
+
+        `floor(inf)` has no value at all, and `math.floor` raises on it
+        rather than returning one -- so the clamp has to happen *before* the
+        floor, not after. NaN is passed through untouched for the same reason
+        Max propagates it: it means the computation had no answer.
+        """
+        a, = values
+        if a != a:
+            return [a]
+        return [float(math.floor(clamp_value(a)))]
+
+
+class Route(Structure):
+    """a,b -> a down one of two outputs, chosen by the control b.
+
+    Authored as a 2x1 (wide) body. The control enters the west face of the
+    left cell and leaves the east face of the right cell **unchanged**, so it
+    crosses the whole footprint and is the declared `PASS_THROUGH` axis --
+    the faint belt overlay marks it, exactly as Swap's control does. The
+    routed value enters the north face of the left cell and leaves by one of
+    the two south faces.
+
+    **b > 0 sends a to the right-hand output, otherwise to the left.** Zero
+    counts as "left", so the control reads as a plain condition -- the same
+    polarity convention Swap uses, where a positive control is the active
+    case.
+
+    This is the machine the `fire()`-returns-None contract exists for: it
+    emits on exactly one of its two data channels per fire, and the other
+    stays empty. Nothing in the tick special-cases it.
+    """
+
+    TYPE_ID = cell.TYPE_ROUTE
+    FOOTPRINT = (2, 1)
+    COLOUR = (0.38, 0.68, 0.86)   # sky blue
+    GLYPH = "wye_down"
+
+    INPUTS = (
+        (0, 0, cell.DIR_PY),   # a in, the value being routed
+        (0, 0, cell.DIR_NX),   # b in, the control
+    )
+    OUTPUTS = (
+        (0, 0, cell.DIR_NY),   # a out, left  -- taken when b <= 0
+        (1, 0, cell.DIR_NY),   # a out, right -- taken when b > 0
+        (1, 0, cell.DIR_PX),   # b out, the control passing through
+    )
+
+    #: The control survives; `a` is merely redirected. Declared because
+    #: geometry cannot tell a pass-through from a mutated channel.
+    PASS_THROUGH = (cell.DIR_PX,)
+
+    def fire(self, values):
+        """a,b -> (a, None, b) or (None, a, b), on the sign of b.
+
+        The declined channel returns None, which the structure phase skips --
+        so one item goes one way and *nothing* goes the other, rather than a
+        copy going both ways and one being destroyed.
+
+        Note the control is a normal output and so takes part in back
+        pressure: if its own path backs up, the whole gate stalls. That is
+        correct -- the control is real material, not a discardable copy.
+        """
+        a, b = values
+        if b > 0.0:
+            return [None, a, b]
+        return [a, None, b]
+
+
+class Merge(Structure):
+    """a,b,c -> whichever of a,b the control c selects, on one output.
+
+    Authored as a 2x1 (wide) body, with Route's topology: the control enters
+    the west face of the left cell and leaves the east face of the right cell
+    unchanged (the declared `PASS_THROUGH`), `a` enters the north face of the
+    left cell and `b` the north face of the right, and the merged value
+    leaves the south face of the right cell.
+
+    **c > 0 selects a, otherwise b** -- the same polarity as Route and Swap,
+    where a positive control is the active case.
+
+    Two things make this the most unusual machine here, and both are why the
+    firing protocol grew:
+
+    * **It does not wait for both data lanes.** Readiness depends on the
+      control's *value*: with c held it needs only the lane c names. Neither
+      FIRE_ALL (which would deadlock whenever the unused lane is empty) nor
+      FIRE_ANY (which would fire with no control at all) expresses that, so
+      it declares FIRE_SELECT and overrides `inputs_ready()`.
+    * **The unused lane stays loaded.** `consumed()` reports only the control
+      and the selected lane, so an item waiting on the other lane is neither
+      destroyed nor emitted -- it sits in the machine until a later tick's
+      control selects it. The default "consume every fed channel" would have
+      silently eaten it.
+    """
+
+    TYPE_ID = cell.TYPE_MERGE
+    FOOTPRINT = (2, 1)
+    COLOUR = (0.24, 0.34, 0.66)   # dark blue
+    GLYPH = "wye"
+    FIRE_RULE = Structure.FIRE_SELECT
+
+    INPUTS = (
+        (0, 0, cell.DIR_PY),   # a in
+        (1, 0, cell.DIR_PY),   # b in
+        (0, 0, cell.DIR_NX),   # c in, the control
+    )
+    OUTPUTS = (
+        (1, 0, cell.DIR_NY),   # the selected value
+        (1, 0, cell.DIR_PX),   # c out, the control passing through
+    )
+
+    #: Channel indices, named because three of this machine's methods index
+    #: them and an off-by-one would be a silent mis-wiring.
+    CH_A, CH_B, CH_CONTROL = 0, 1, 2
+
+    PASS_THROUGH = (cell.DIR_PX,)
+
+    def _selected(self, control):
+        """Which data channel the control names. c > 0 selects a."""
+        return self.CH_A if control > 0.0 else self.CH_B
+
+    def inputs_ready(self):
+        """The control, plus the one lane it selects. Nothing else.
+
+        Value-dependent, which is what FIRE_SELECT means and why the base
+        class cannot answer this. Waiting for both lanes would deadlock the
+        normal use -- two producers feeding one consumer, only one of which
+        has anything at a given moment.
+        """
+        if not self.in_held(self.CH_CONTROL):
+            return False
+        return self.in_held(self._selected(self.in_value(self.CH_CONTROL)))
+
+    def consumed(self, values):
+        """The control and the selected lane. The other lane stays loaded.
+
+        Returning the default (every fed channel) would destroy an item
+        waiting on the lane this fire did not select -- material the player
+        can see sitting in the machine.
+        """
+        control = values[self.CH_CONTROL]
+        return [self.CH_CONTROL, self._selected(control)]
+
+    def fire(self, values):
+        """a,b,c -> (selected, c).
+
+        Reads only the selected lane, which `inputs_ready()` guarantees is
+        fed. The other may be None and is simply not looked at.
+        """
+        control = values[self.CH_CONTROL]
+        return [values[self._selected(control)], control]
 
 
 class Source(Structure):
@@ -1105,8 +1401,28 @@ class Sink(Structure):
         return port_index // 2
 
 
-#: Every placeable structure, in the order the toolbelt offers them.
-STRUCTURES = (Swap, Shear, Mac, Source, Sink)
+#: Every placeable structure, in the order the toolbelt offers them. Belt and
+#: underground belt take slots 1 and 2, so this list starts at slot 3.
+#:
+#: **Hidden machines stay defined.** `Swap` and `Sink` are deliberately absent
+#: -- Swap pending a rethink, Sink because a dangling output now destroys what
+#: it is sent and so does the same job without occupying a slot. Both classes
+#: remain registered with their type ids, so a saved board containing one
+#: still loads, draws and simulates correctly; only the *tool* is gone.
+#:
+#: That is the whole cost of hiding a machine, which is the point: placement,
+#: the GLSL tables and the type registry all derive from the classes, while
+#: the toolbelt derives from this tuple.
+STRUCTURES = (Shear, Source, Route, Merge, Reciprocal, Max, Mac, Floor)
+
+#: Machines defined but not offered by the toolbelt. Named so the self-check
+#: and the GLSL tests can still cover their geometry -- a hidden machine that
+#: an old save can resurrect must stay as correct as a placeable one.
+HIDDEN_STRUCTURES = (Swap, Sink)
+
+#: Every machine, placeable or not. What anything reasoning about *types*
+#: rather than about *tools* should iterate.
+ALL_STRUCTURES = STRUCTURES + HIDDEN_STRUCTURES
 
 
 def _self_check():
@@ -1117,7 +1433,7 @@ def _self_check():
         f"gate fields need {Entity._GATE_FIELDS_END} slots, stride is "
         f"{ENTITY_STRIDE}")
     assert ENTITY_STRIDE % 4 == 0, "rows must land on vec4 boundaries"
-    for c in STRUCTURES:
+    for c in ALL_STRUCTURES:
         # Channels, not faces: Sink has 8 faces on 1 channel.
         assert c.in_channels() <= MAX_CHANNELS, (c.__name__, c.in_channels())
         assert c.out_channels() <= MAX_CHANNELS, (c.__name__, c.out_channels())
@@ -1263,22 +1579,134 @@ def _self_check():
     assert len({next(iter(c)) for c in by_channel.values()}) == 4, (
         "two channels on the same cell")
 
-    # Every machine returns exactly one value per output channel.
+    # Every machine returns exactly one value per output channel. Covers the
+    # hidden machines too: an old save can still put one on the board.
     for c, args in ((Swap, [1.0, 2.0, 3.0]), (Shear, [1.0, 2.0]),
                     (Mac, [1.0, 2.0, 3.0]), (Source, []),
-                    (Sink, [1.0] * Sink.in_channels())):
+                    (Sink, [1.0] * Sink.in_channels()),
+                    (Reciprocal, [2.0]), (Max, [1.0, 2.0]),
+                    (Floor, [1.5]), (Route, [5.0, 1.0]),
+                    (Merge, [5.0, 6.0, 1.0])):
         got = _view(c).fire(args)
         assert len(got) == c.out_channels(), (
             f"{c.__name__}.fire() returned {len(got)} values for "
             f"{c.out_channels()} output channels")
+
+    # --- the new arithmetic -----------------------------------------------
+    # Reciprocal: 1/a, with the zero case clamped rather than infinite.
+    rc = _view(Reciprocal)
+    assert rc.fire([2.0]) == [0.5]
+    assert rc.fire([-4.0]) == [-0.25]
+    assert rc.fire([0.0]) == [VALUE_LIMIT], "1/0 must clamp, not be inf"
+    assert rc.fire([-0.0]) == [-VALUE_LIMIT], "1/-0 keeps the sign"
+    assert math.isfinite(rc.fire([1e-30])[0]), "a tiny divisor must not be inf"
+    assert not Reciprocal.PASS_THROUGH, "a mutated channel is not a control"
+
+    # Max: both outputs carry the larger value, and NaN propagates.
+    mx = _view(Max)
+    assert mx.fire([3.0, 7.0]) == [7.0, 7.0]
+    assert mx.fire([7.0, 3.0]) == [7.0, 7.0]
+    assert mx.fire([-5.0, -2.0]) == [-2.0, -2.0]
+    assert mx.fire([4.0, 4.0]) == [4.0, 4.0]
+    _nan = float("nan")
+    for args in ([_nan, 1.0], [1.0, _nan]):
+        got = mx.fire(args)
+        assert all(v != v for v in got), (
+            f"Max of a NaN must report NaN, got {got}")
+    assert not Max.PASS_THROUGH
+
+    # Floor: rounds toward -inf, and infinities clamp *before* the floor --
+    # math.floor(inf) raises rather than returning a value.
+    fl = _view(Floor)
+    assert fl.fire([1.7]) == [1.0]
+    assert fl.fire([-1.2]) == [-2.0], "floor goes toward -inf, not toward 0"
+    assert fl.fire([3.0]) == [3.0]
+    assert fl.fire([float("inf")]) == [VALUE_LIMIT]
+    assert fl.fire([float("-inf")]) == [-VALUE_LIMIT]
+    assert fl.fire([_nan])[0] != fl.fire([_nan])[0], "NaN must pass through"
+
+    # Route: one item down one path, *nothing* down the other, plus the
+    # control passing through. The None is the whole mechanism.
+    rt = _view(Route)
+    assert rt.fire([5.0, 1.0]) == [None, 5.0, 1.0], "c>0 routes right"
+    assert rt.fire([5.0, 0.0]) == [5.0, None, 0.0], "c==0 routes left"
+    assert rt.fire([5.0, -1.0]) == [5.0, None, -1.0], "c<0 routes left"
+    for ctrl in (1.0, 0.0, -1.0):
+        got = rt.fire([5.0, ctrl])
+        assert sum(1 for v in got[:2] if v is not None) == 1, (
+            f"exactly one data output must fire, got {got}")
+    assert Route.PASS_THROUGH == (cell.DIR_PX,), "the control survives"
+
+    # Merge: the control selects a lane, and the *other lane is not touched*.
+    mg = _view(Merge)
+    assert mg.fire([5.0, 6.0, 1.0]) == [5.0, 1.0], "c>0 selects a"
+    assert mg.fire([5.0, 6.0, 0.0]) == [6.0, 0.0], "c<=0 selects b"
+    assert mg.fire([5.0, 6.0, -2.0]) == [6.0, -2.0]
+    # It must not read the unselected lane at all, which is what lets it fire
+    # with that lane empty.
+    assert mg.fire([5.0, None, 1.0]) == [5.0, 1.0], (
+        "selecting a must not require b")
+    assert mg.fire([None, 6.0, 0.0]) == [6.0, 0.0], (
+        "selecting b must not require a")
+    assert Merge.PASS_THROUGH == (cell.DIR_PX,)
 
     # --- readiness --------------------------------------------------------
     # FIRE_ALL waits for every input; FIRE_ANY needs one. A type with no
     # inputs is vacuously ready under either, which is what makes Source
     # fire with no special case anywhere.
     assert Sink.FIRE_RULE == Entity.FIRE_ANY, "a sink fires on any input"
-    for c in (Swap, Shear, Mac, Source):
+    for c in (Swap, Shear, Mac, Source, Reciprocal, Max, Floor, Route):
         assert c.FIRE_RULE == Entity.FIRE_ALL, c.__name__
+    assert Merge.FIRE_RULE == Entity.FIRE_SELECT
+
+    # A type declaring FIRE_SELECT **must** override inputs_ready(): the base
+    # class cannot resolve a value-dependent rule, and would fall through to
+    # the FIRE_ALL branch -- making the machine wait for a lane it is
+    # supposed to be able to ignore. Silent, and exactly the bug the enum
+    # value exists to make visible.
+    for c in ALL_STRUCTURES:
+        if c.FIRE_RULE == Entity.FIRE_SELECT:
+            assert c.inputs_ready is not Entity.inputs_ready, c.__name__
+            assert "inputs_ready" in vars(c), (
+                f"{c.__name__} declares FIRE_SELECT without overriding "
+                f"inputs_ready()")
+
+    # Merge's readiness: the control plus the selected lane, nothing more.
+    mg = _view(Merge)
+    assert not mg.inputs_ready(), "nothing fed"
+    mg.set_input(Merge.CH_A, 5.0)
+    assert not mg.inputs_ready(), "a alone is not enough -- no control"
+    mg.set_input(Merge.CH_CONTROL, 1.0)
+    assert mg.inputs_ready(), "control selecting a, and a is held"
+    # Flip the control to select the *empty* lane and it must stall again.
+    mg.set_input(Merge.CH_CONTROL, -1.0)
+    assert not mg.inputs_ready(), (
+        "the control selects b, which is empty -- it must wait")
+    mg.set_input(Merge.CH_B, 6.0)
+    assert mg.inputs_ready()
+
+    # And consumption leaves the unselected lane alone. This is the claim
+    # that `consumed()` exists for: the default would eat both.
+    mg = _view(Merge)
+    mg.set_input(Merge.CH_A, 5.0)
+    mg.set_input(Merge.CH_B, 6.0)
+    mg.set_input(Merge.CH_CONTROL, 1.0)          # selects a
+    vals = [mg.in_value(i) if mg.in_held(i) else None for i in range(3)]
+    taken = sorted(mg.consumed(vals))
+    assert taken == sorted([Merge.CH_A, Merge.CH_CONTROL]), taken
+    assert Merge.CH_B not in taken, (
+        "the unselected lane must stay loaded, not be destroyed")
+
+    # Every other machine consumes every fed channel, which is the default.
+    sh_c = _view(Shear)
+    sh_c.set_input(0, 1.0)
+    sh_c.set_input(1, 2.0)
+    assert sorted(sh_c.consumed([1.0, 2.0])) == [0, 1]
+    # ...and an unfed channel is not reported, so FIRE_ANY does not clear
+    # slots that never arrived.
+    sk_c = _view(Sink)
+    sk_c.set_input(2, 9.0)
+    assert sk_c.consumed([None, None, 9.0, None]) == [2]
 
     v = _view(Shear)
     assert not v.inputs_ready(), "nothing fed yet"
@@ -1333,7 +1761,7 @@ def _self_check():
         assert c.TYPE_ID in cell.TYPE_NAMES, c.__name__
 
     # --- properties every structure must have, whatever its shape ---------
-    for c in STRUCTURES:
+    for c in ALL_STRUCTURES:
         w, h = c.FOOTPRINT
         authored = {(lx, ly) for lx in range(w) for ly in range(h)}
         assert c.ROTATABLE, c.__name__
@@ -1456,7 +1884,7 @@ def _self_check():
     # unplace_local() inverts it, at every orientation. This is what the
     # renderer relies on to turn a .y offset back into an authored one; when
     # it was missing, a rotated Sink put its ports on interior edges.
-    for c in STRUCTURES:
+    for c in ALL_STRUCTURES:
         w, h = c.FOOTPRINT
         for d in range(4):
             for fl in (False, True):
@@ -1481,7 +1909,7 @@ def _self_check():
                 assert len(outs) == len(c.OUTPUTS)
 
     # A flip is an involution, and never changes which cells are covered.
-    for c in STRUCTURES:
+    for c in ALL_STRUCTURES:
         for d in range(4):
             for lx in range(c.FOOTPRINT[0]):
                 for ly in range(c.FOOTPRINT[1]):
@@ -1495,7 +1923,7 @@ def _self_check():
     # rotation would swing the body around the pointer instead of turning
     # about it.
     _fracs = [i / 8 for i in range(9)]
-    for c in STRUCTURES:
+    for c in ALL_STRUCTURES:
         for d in range(4):
             w, h = c.footprint_for(d)
             for fx in _fracs:
@@ -1530,41 +1958,53 @@ def _self_check():
 
     # A declared pass-through axis must have an output face pointing that
     # way, or the overlay would draw a channel the machine cannot carry.
-    for c in STRUCTURES:
+    for c in ALL_STRUCTURES:
         out_faces = {f for _c, f in c.faces_for(0, 0, cell.DIR_PX)[1]}
         for f in c.PASS_THROUGH:
             assert f in out_faces, (c.__name__, cell.DIR_NAMES[f])
-    assert Swap.PASS_THROUGH and Shear.PASS_THROUGH and Mac.PASS_THROUGH
-    assert not Source.PASS_THROUGH and not Sink.PASS_THROUGH
+    # The machines carrying a control signal declare it; the ones that mutate
+    # every channel they touch must not, or the overlay would promise a
+    # pass-through the arithmetic does not honour.
+    for c in (Swap, Shear, Mac, Route, Merge):
+        assert c.PASS_THROUGH, c.__name__
+    for c in (Source, Sink, Reciprocal, Max, Floor):
+        assert not c.PASS_THROUGH, c.__name__
 
-    # Chirality is derived from the ports, so it cannot drift from them. The
-    # arithmetic machines are chiral, and so is Source now that it emits
-    # north and east only -- dropping -X and -Y broke the symmetry the
-    # six-port version had. Sink's full perimeter is still symmetric.
-    assert Swap.is_chiral() and Shear.is_chiral() and Mac.is_chiral()
-    assert Source.is_chiral(), "a north/east Source is not symmetric"
-    assert not Sink.is_chiral()
+    # Chirality is derived from the ports, so it cannot drift from them.
+    # Asserted against `is_chiral()` per type rather than against a hardcoded
+    # list, so adding or hiding a machine cannot leave a stale expectation --
+    # the two loops below are what actually pin the derivation, and this is
+    # only the inventory.
+    # Only Sink is achiral: its ports cover the whole perimeter, so mirroring
+    # permutes them onto each other. Every other machine is chiral, including
+    # the ones whose ports sit on the body's centre line -- the flip mirrors
+    # about the authored *X* axis, which exchanges north and south, so a
+    # Reciprocal's north input lands where its south output was. Flipping one
+    # therefore reverses which way material flows through it, which is a
+    # genuinely useful second orientation rather than a no-op.
+    assert not Sink.is_chiral(), "a full perimeter is symmetric"
+    for c in (Swap, Shear, Mac, Source, Reciprocal, Max, Floor, Route, Merge):
+        assert c.is_chiral(), c.__name__
 
-    # An achiral type's flipped placement is identical to its plain one.
+    # An achiral type's flipped placement is identical to its plain one, and a
+    # chiral type's really differs -- at every facing. Derived from
+    # is_chiral() so a new machine is covered automatically, whichever it is.
     # Compares *both* port sets: checking only inputs passes vacuously for a
-    # type with none, which is exactly the case here.
-    for c in (Sink,):
+    # type with none, which is exactly Source's case.
+    for c in ALL_STRUCTURES:
         for d in range(4):
             plain, flipped = c.faces_for(0, 0, d, False), \
                 c.faces_for(0, 0, d, True)
-            assert sorted(plain[0]) == sorted(flipped[0]), c.__name__
-            assert sorted(plain[1]) == sorted(flipped[1]), c.__name__
-
-    # And a chiral type's mirror really differs somewhere, at every facing --
-    # otherwise is_chiral() would be claiming a distinction F cannot show.
-    for c in (Swap, Shear, Mac, Source):
-        for d in range(4):
-            plain, flipped = c.faces_for(0, 0, d, False), \
-                c.faces_for(0, 0, d, True)
-            assert (sorted(plain[0]) != sorted(flipped[0])
-                    or sorted(plain[1]) != sorted(flipped[1])), (
-                f"{c.__name__} claims chirality but mirrors to itself at "
-                f"{cell.DIR_NAMES[d]}")
+            same = (sorted(plain[0]) == sorted(flipped[0])
+                    and sorted(plain[1]) == sorted(flipped[1]))
+            if c.is_chiral():
+                assert not same, (
+                    f"{c.__name__} claims chirality but mirrors to itself at "
+                    f"{cell.DIR_NAMES[d]}")
+            else:
+                assert same, (
+                    f"{c.__name__} claims to be achiral but its mirror "
+                    f"differs at {cell.DIR_NAMES[d]}")
 
     assert Belt.ROTATABLE is False
 

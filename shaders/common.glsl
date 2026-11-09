@@ -194,6 +194,11 @@ const int GLYPH_PLUS  = 1;
 const int GLYPH_CROSS = 2;   // X
 const int GLYPH_ZED   = 3;   // Z
 const int GLYPH_DOT   = 4;
+const int GLYPH_DIVIDE = 5;  // obelus, for Reciprocal (1/x)
+const int GLYPH_CHEVRONS = 6; // stacked >>, for Max
+const int GLYPH_ARROW_DOWN = 7; // for Floor
+const int GLYPH_WYE = 8;     // Y, for Merge (two in, one out)
+const int GLYPH_WYE_DOWN = 9; // upside-down Y, for Route (one in, two out)
 
 // Footprints, per-cell port masks, control axes, colours and glyphs --
 // all emitted from the Entity subclasses. See core/glsl_types.py.

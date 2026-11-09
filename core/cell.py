@@ -128,7 +128,17 @@ TYPE_MAC = 4     # x,y,z -> x, y, z + x*y
 TYPE_SOURCE = 5  # emits from one tip
 TYPE_SINK = 6    # consumes on all four sides
 TYPE_UNDER = 7   # underground belt end (entrance or exit -- see .y bit)
-# 8..127 reserved for future structures.
+TYPE_RECIP = 8   # a -> 1/a
+TYPE_MAX = 9     # a,b -> max, max
+TYPE_FLOOR = 10  # a -> floor(a)
+TYPE_ROUTE = 11  # a,b -> a down one of two paths, chosen by b
+TYPE_MERGE = 12  # a,b,c -> whichever of a,b the control c selects
+# 13..127 reserved for future structures.
+#
+# **Ids are permanent.** They are baked into every saved board's grid words,
+# so a type that is hidden from the toolbelt keeps its id and its class (see
+# Swap, which is no longer placeable but still loads). Renumbering would
+# silently reinterpret old saves.
 
 TYPE_NAMES = {
     TYPE_EMPTY: "empty",
@@ -138,6 +148,11 @@ TYPE_NAMES = {
     TYPE_MAC: "mac",
     TYPE_SOURCE: "source",
     TYPE_SINK: "sink",
+    TYPE_RECIP: "recip",
+    TYPE_MAX: "max",
+    TYPE_FLOOR: "floor",
+    TYPE_ROUTE: "route",
+    TYPE_MERGE: "merge",
     # Keep these short and identifier-safe: glsl_types.py upper-cases them
     # into the GLSL type constants (TYPE_UNDER, TYPE_SHEAR, ...), so a name
     # with a space or a hyphen would not compile.

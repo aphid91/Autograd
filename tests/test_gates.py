@@ -14,7 +14,8 @@ one-tick stall recovery.
 """
 from core import cell
 from core.belts import UNIT
-from core.entity import Mac, Shear, Sink, Source, Swap
+from core.entity import (VALUE_LIMIT, Floor, Mac, Max, Merge, Reciprocal,
+                         Route, Shear, Sink, Source, Swap)
 
 from tests import harness
 from tests.harness import board, engine, ok, step
@@ -169,14 +170,17 @@ def test_shear_computes_on_the_board():
     ok("Shear fired on the board: (3,4) -> (3,7), both onto belts")
 
 
-def _fire_once_and_read(gate, inputs):
+def _fire_once_and_read(gate, inputs, expect_empty=False):
     """Feed `inputs`, run one tick, and read each output channel's value.
 
-    Outputs are read from the waiting zones, which requires them *not* to be
-    drained -- so this deliberately leaves them dangling and reads the zones
-    before the discard would matter... except a dangling result is now
-    destroyed at fire time. So it wires a one-cell run per output and reads
-    the value off that run instead. Returns {channel: payload}.
+    Wires a one-cell run to every output and reads the value off that run.
+    Reading the waiting zones directly would be simpler but is not available:
+    a connected zone is drained within the same tick, and a *dangling* one is
+    destroyed at fire time, so neither leaves anything to inspect.
+
+    Returns {channel: payload}. With `expect_empty`, a channel whose run
+    received nothing maps to None instead of failing -- which is what Route
+    needs, since it deliberately emits on only one of its two data channels.
     """
     _drain_every_output(gate)
     engine.sync_segments()
@@ -188,6 +192,9 @@ def _fire_once_and_read(gate, inputs):
         step_v = cell.DIR_STEPS[face]
         seg = engine.segments.at(xy[0] + step_v[0], xy[1] + step_v[1])
         assert seg is not None, f"channel {ch} lost its run"
+        if expect_empty and seg.count == 0:
+            got[ch] = None
+            continue
         assert seg.count == 1, f"channel {ch} delivered {seg.count} items"
         got[ch] = engine.belts.payload_of(seg, seg.head)
     return got
@@ -851,3 +858,276 @@ def test_audits_clean_through_a_running_chain():
         assert not problems, (engine.clock.tick, problems[:4])
     ok("40 ticks of two chains: segmentation, transport and device audits "
        "all clean")
+
+
+# ======================================================================
+# The machines added with the second gate vocabulary
+# ======================================================================
+#
+# core/entity.py already self-checks each `fire()` against its signature with
+# no board. These are the ones that need the whole stack: that the gate is
+# reachable through its declared ports, that items arrive and leave on the
+# faces the class says, and -- for Route and Merge -- that the two new firing
+# mechanisms behave on a real board rather than only in a view.
+
+
+def test_reciprocal_and_floor_compute_on_the_board():
+    """Two single-input machines, wired through their real ports."""
+    rc = engine.place_structure(Reciprocal, 10, 10)
+    got = _fire_once_and_read(rc, [4.0])
+    assert got[0] == 0.25, got
+    ok("Reciprocal fired on the board: 4 -> 0.25")
+
+    # 1/0 clamps rather than reaching the belt as an infinity, which nothing
+    # downstream could represent or render.
+    harness.reset()
+    rc = engine.place_structure(Reciprocal, 10, 10)
+    got = _fire_once_and_read(rc, [0.0])
+    assert got[0] == VALUE_LIMIT, got
+    ok(f"Reciprocal clamped 1/0 to {VALUE_LIMIT:g} instead of emitting inf")
+
+    harness.reset()
+    fl = engine.place_structure(Floor, 10, 10)
+    got = _fire_once_and_read(fl, [2.7])
+    assert got[0] == 2.0, got
+    ok("Floor fired on the board: 2.7 -> 2")
+
+    # Toward -inf, which is the half of floor() a truncation would get wrong
+    # while still passing on positive inputs.
+    harness.reset()
+    fl = engine.place_structure(Floor, 10, 10)
+    got = _fire_once_and_read(fl, [-2.7])
+    assert got[0] == -3.0, f"floor(-2.7) must be -3, got {got[0]}"
+    ok("Floor rounded -2.7 toward -inf, to -3")
+
+
+def test_max_puts_the_same_value_on_both_outputs():
+    """Both lanes carry the larger value: Max fans out as well as compares."""
+    mx = engine.place_structure(Max, 10, 10)
+    got = _fire_once_and_read(mx, [3.0, 9.0])
+    assert got[0] == 9.0 and got[1] == 9.0, got
+    ok("Max fired on the board: (3,9) -> 9 on both outputs")
+
+
+def test_max_with_one_output_dangling_runs_at_full_rate():
+    """The second lane may simply be left unconnected.
+
+    The spec's "do not create an item there at all" case. It needs no special
+    handling -- a dangling output is destroyed for every gate now -- but it is
+    the configuration a player will actually build, so it is worth pinning
+    that it does not throttle the machine.
+    """
+    mx = engine.place_structure(Max, 10, 10)
+    # Drain the left-hand output only; leave the right one dangling.
+    faces = sorted(engine.gates._output_faces(mx), key=lambda f: f[0][0])
+    (xy, face, drained_ch) = faces[0]
+    step_v = cell.DIR_STEPS[face]
+    start = (xy[0] + step_v[0], xy[1] + step_v[1])
+    end = (start[0], start[1] - 5)
+    engine.place_belt_path(start, end)
+    # The Sink must actually be *under* the run's last cell, or the belt has
+    # no consumer, fills, and back-pressures the gate -- which would make this
+    # test measure a blocked belt rather than a dangling output. A 2x2's
+    # origin is its lower-left corner, so it goes one further down and one
+    # left of the end cell for its top-right tile to sit in the run's path.
+    engine.place_structure(Sink, end[0] - 1, end[1] - 2)
+    engine.sync_segments()
+
+    drain_seg = engine.segments.at(*start)
+    assert drain_seg is not None and drain_seg.dst is not None, (
+        "the drained lane needs a real consumer, or this test measures back "
+        "pressure instead of the dangling output")
+
+    connected = engine.gates._connected_channels(mx)
+    assert drained_ch in connected, "the drained lane should be connected"
+    assert len(connected) == 1, (
+        f"only one lane is wired, got {sorted(connected)}")
+
+    before = engine.gates.stats["destroyed"]
+    before_blocked = engine.gates.stats["blocked"]
+    for _ in range(20):
+        mx.set_input(0, 3.0)
+        mx.set_input(1, 9.0)
+        _run(1)
+    destroyed = engine.gates.stats["destroyed"] - before
+    assert destroyed == 20, (
+        f"the dangling lane should discard one value per tick, got {destroyed}")
+    assert engine.gates.stats["blocked"] == before_blocked, (
+        f"a dangling lane must not block: {engine.gates.stats}")
+    ok(f"Max with one lane dangling fired 20/20 ticks, discarding "
+       f"{destroyed} values")
+
+
+def test_route_sends_an_item_one_way_only():
+    """The either/or output: one path gets the item, the other gets nothing.
+
+    This is what `fire()` returning None buys. Asserting the *silent* path is
+    the point -- a copy going both ways with one destroyed would look
+    identical on the taken path.
+    """
+    for control, want_right in ((1.0, True), (0.0, False), (-3.0, False)):
+        harness.reset()
+        rt = engine.place_structure(Route, 10, 10)
+        got = _fire_once_and_read(rt, [5.0, control], expect_empty=True)
+
+        # Channels 0 and 1 are the two data outputs, left and right.
+        live = {ch: v for ch, v in got.items()
+                if ch in (0, 1) and v is not None}
+        assert len(live) == 1, (
+            f"control {control} put items on {sorted(live)}; exactly one "
+            f"data output must fire")
+        ch = next(iter(live))
+        assert ch == (1 if want_right else 0), (
+            f"control {control} routed to channel {ch}")
+        assert live[ch] == 5.0, live
+        # The control itself passes through unchanged on channel 2.
+        assert got[2] == control, f"the control should survive: {got[2]}"
+    ok("Route sent the item down exactly one path for c>0, c==0 and c<0, "
+       "passing the control through")
+
+
+def test_route_emits_nothing_on_the_path_not_taken():
+    """The untaken path's run must stay genuinely empty, tick after tick.
+
+    Separate from the above because one fire cannot distinguish "nothing was
+    emitted" from "an item was emitted and has not arrived yet".
+    """
+    rt = engine.place_structure(Route, 10, 10)
+    _drain_every_output(rt)
+    engine.sync_segments()
+
+    # Channel 1 is the right-hand data output, taken only when c > 0.
+    by_ch = {ch: (xy, face) for (xy, face, ch)
+             in engine.gates._output_faces(rt)}
+    (xy, face) = by_ch[1]
+    step_v = cell.DIR_STEPS[face]
+    right = engine.segments.at(xy[0] + step_v[0], xy[1] + step_v[1])
+    assert right is not None, "the right-hand output lost its run"
+
+    for _ in range(15):
+        rt.set_input(0, 5.0)
+        rt.set_input(1, -1.0)       # always route left
+        _run(1)
+    assert right.count == 0, (
+        f"the untaken path carried {right.count} items -- Route is emitting "
+        f"on both outputs and relying on the discard")
+    ok("15 ticks routing left: the right-hand run never received an item")
+
+
+def test_merge_fires_without_waiting_for_both_lanes():
+    """The control plus the selected lane is enough -- the other may be empty.
+
+    FIRE_ALL would deadlock here, which is the whole reason FIRE_SELECT and
+    the overridable `inputs_ready()` exist.
+    """
+    mg = engine.place_structure(Merge, 10, 10)
+    _drain_every_output(mg)
+    engine.sync_segments()
+
+    before = engine.gates.stats["fired"]
+    mg.set_input(Merge.CH_A, 5.0)
+    mg.set_input(Merge.CH_CONTROL, 1.0)
+    assert not mg.in_held(Merge.CH_B), "b must start empty for this test"
+    _run(1)
+    assert not mg.in_held(Merge.CH_A), "a should have been consumed"
+    assert engine.gates.stats["fired"] > before, (
+        f"Merge did not fire with b empty: {engine.gates.stats}")
+    ok("Merge fired on control+a alone, with b empty")
+
+
+def test_merge_waits_when_the_control_selects_an_empty_lane():
+    """Readiness follows the control's *value*, not merely its presence.
+
+    The other half of FIRE_SELECT: holding the control and the *wrong* lane
+    is not enough. A rule keyed on occupancy alone (FIRE_ANY) would fire here
+    and emit whichever lane happened to be loaded.
+    """
+    mg = engine.place_structure(Merge, 10, 10)
+    _drain_every_output(mg)
+    engine.sync_segments()
+
+    before = engine.gates.stats["fired"]
+    mg.set_input(Merge.CH_B, 6.0)
+    mg.set_input(Merge.CH_CONTROL, 1.0)      # selects a, which is empty
+    _run(5)
+    assert engine.gates.stats["fired"] == before, (
+        f"Merge fired while its selected lane was empty: {engine.gates.stats}")
+    assert mg.in_held(Merge.CH_B), "b must still be waiting"
+    assert mg.in_held(Merge.CH_CONTROL), "the control must still be waiting"
+
+    # Feed the selected lane and it goes immediately.
+    mg.set_input(Merge.CH_A, 5.0)
+    _run(1)
+    assert engine.gates.stats["fired"] > before, "it should fire now"
+    ok("Merge waited 5 ticks for the lane its control named, then fired")
+
+
+def test_merge_leaves_the_unselected_lane_loaded():
+    """The lane the control did not pick is neither emitted nor destroyed.
+
+    `consumed()` exists for exactly this. The default -- clear every fed
+    channel -- would silently eat an item the player can see in the machine.
+    """
+    mg = engine.place_structure(Merge, 10, 10)
+    _drain_every_output(mg)
+    engine.sync_segments()
+
+    mg.set_input(Merge.CH_A, 5.0)
+    mg.set_input(Merge.CH_B, 6.0)
+    mg.set_input(Merge.CH_CONTROL, 1.0)      # selects a
+    before_destroyed = engine.gates.stats["destroyed"]
+    _run(1)
+
+    assert not mg.in_held(Merge.CH_A), "the selected lane is consumed"
+    assert mg.in_held(Merge.CH_B), (
+        "the unselected lane must stay loaded, not be consumed")
+    assert mg.in_value(Merge.CH_B) == 6.0, (
+        f"b's value changed to {mg.in_value(Merge.CH_B)}")
+    assert engine.gates.stats["destroyed"] == before_destroyed, (
+        "nothing should have been destroyed -- b was held, not discarded")
+
+    # And the held lane is usable later: flip the control and it comes out.
+    by_ch = {ch: (xy, face) for (xy, face, ch)
+             in engine.gates._output_faces(mg)}
+    (xy, face) = by_ch[0]
+    step_v = cell.DIR_STEPS[face]
+    out = engine.segments.at(xy[0] + step_v[0], xy[1] + step_v[1])
+
+    mg.set_input(Merge.CH_CONTROL, -1.0)     # now selects b
+    _run(1)
+    assert not mg.in_held(Merge.CH_B), "b should now be consumed"
+    vals = [engine.belts.payload_of(out, k)
+            for k in range(out.head, out.tail)]
+    assert 6.0 in vals, f"b's value 6.0 never arrived: {vals}"
+    ok("Merge held b through a fire selecting a, then emitted it when the "
+       "control flipped")
+
+
+def test_a_hidden_machine_still_works_on_the_board():
+    """Swap and Sink are off the toolbelt but must still simulate.
+
+    An older saved board can contain either, so hiding a machine must be a
+    toolbelt decision and nothing more. This places them the way a load does
+    -- straight through the engine, with no tool involved.
+    """
+    from core.entity import ALL_STRUCTURES, HIDDEN_STRUCTURES, STRUCTURES
+    assert Swap in HIDDEN_STRUCTURES and Sink in HIDDEN_STRUCTURES
+    assert Swap not in STRUCTURES and Sink not in STRUCTURES
+    assert set(ALL_STRUCTURES) == set(STRUCTURES) | set(HIDDEN_STRUCTURES)
+
+    # A hidden Swap still computes, through its real ports.
+    sw = engine.place_structure(Swap, 10, 10)
+    got = _fire_once_and_read(sw, [1.0, 7.0, 9.0])
+    assert [got[i] for i in range(3)] == [1.0, 9.0, 7.0], got
+    ok("a hidden Swap placed by the engine still fired: (1,7,9) -> (1,9,7)")
+
+    # And a hidden Sink still consumes a saturated belt.
+    harness.reset()
+    engine.place_structure(Source, 7, 10)
+    engine.place_belt_path((9, 10), (14, 10))
+    engine.place_structure(Sink, 15, 10)
+    engine.sync_segments()
+    _run(20)
+    assert engine.gates.stats["consumed"] > 10, engine.gates.stats
+    ok(f"a hidden Sink still consumed "
+       f"{engine.gates.stats['consumed']} items in 20 ticks")

@@ -425,6 +425,52 @@ float sd_dot(vec2 p, float r, float t) {
     return length(p) - max(t * 2.0, r * 0.35);
 }
 
+// An obelus: a bar with a dot above and below. Stands in for "1/x" --
+// lettering is a separate project, and this reads at a 1x2's size.
+float sd_divide(vec2 p, float r, float t) {
+    float d = sd_box(p, vec2(r, t));                    // the bar
+    float gap = r * 0.55;
+    d = min(d, length(p - vec2(0.0,  gap)) - t * 1.5);  // upper dot
+    d = min(d, length(p - vec2(0.0, -gap)) - t * 1.5);  // lower dot
+    return d;
+}
+
+// One ">" chevron, apex at +X, centred on the origin.
+float sd_chevron(vec2 p, float r, float t) {
+    vec2 a = vec2(-r,  r);
+    vec2 b = vec2( r,  0.0);
+    vec2 c = vec2(-r, -r);
+    return min(sd_segment(p, a, b), sd_segment(p, b, c)) - t;
+}
+
+// Stacked ">>", for Max: "the larger one comes through". Two chevrons side
+// by side along the long axis of a 2x1.
+float sd_chevrons(vec2 p, float r, float t) {
+    float s = r * 0.55;
+    float d =      sd_chevron(p - vec2(-s * 0.9, 0.0), s, t);
+    return min(d, sd_chevron(p - vec2( s * 0.9, 0.0), s, t));
+}
+
+// A downward arrow, for Floor: a stem with a two-stroke head at the bottom.
+float sd_arrow_down(vec2 p, float r, float t) {
+    float d = sd_segment(p, vec2(0.0, r), vec2(0.0, -r));
+    d = min(d, sd_segment(p, vec2(0.0, -r), vec2( r * 0.6, -r * 0.4)));
+    d = min(d, sd_segment(p, vec2(0.0, -r), vec2(-r * 0.6, -r * 0.4)));
+    return d - t;
+}
+
+// A "Y": two arms converging from the top into a single stem going down.
+// Merge's mark -- two inputs, one output. `flip` mirrors it vertically for
+// Route, which is the same topology the other way up.
+float sd_wye(vec2 p, float r, float t, bool flip) {
+    if (flip) p.y = -p.y;
+    vec2 mid = vec2(0.0, 0.0);
+    float d = sd_segment(p, vec2(-r, r), mid);      // upper-left arm
+    d = min(d, sd_segment(p, vec2( r, r), mid));    // upper-right arm
+    d = min(d, sd_segment(p, mid, vec2(0.0, -r)));  // the stem
+    return d - t;
+}
+
 // Dispatch on the glyph id from type_glyph(). `r` is the arm reach and `t`
 // the stroke half-thickness, both already scaled to the footprint.
 float sd_glyph(int glyph, vec2 p, float r, float t) {
@@ -432,6 +478,11 @@ float sd_glyph(int glyph, vec2 p, float r, float t) {
     if (glyph == GLYPH_CROSS) return sd_cross(p, r, t);
     if (glyph == GLYPH_ZED)   return sd_zed(p, r, t);
     if (glyph == GLYPH_DOT)   return sd_dot(p, r, t);
+    if (glyph == GLYPH_DIVIDE) return sd_divide(p, r, t);
+    if (glyph == GLYPH_CHEVRONS) return sd_chevrons(p, r, t);
+    if (glyph == GLYPH_ARROW_DOWN) return sd_arrow_down(p, r, t);
+    if (glyph == GLYPH_WYE) return sd_wye(p, r, t, false);
+    if (glyph == GLYPH_WYE_DOWN) return sd_wye(p, r, t, true);
     return 1e9;
 }
 
