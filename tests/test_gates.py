@@ -41,6 +41,26 @@ def _feeding_channel(gate, seg):
     return channel
 
 
+def _drain_every_output(gate):
+    """Put one belt cell on each of `gate`'s output faces, facing away.
+
+    A **dangling output no longer blocks** -- its result is destroyed at fire
+    time -- so a test that wants to observe a full waiting zone has to give
+    every output somewhere to go, and then let that somewhere back up. Before
+    that change a bare gate on an empty board filled its zones and jammed,
+    which is what several of these tests used to rely on.
+
+    One cell with nothing beyond it is exactly the shape wanted: connected,
+    so the channel counts as drainable and can block, but saturating after a
+    single item so back pressure arrives immediately.
+
+    Call before `sync_segments()`.
+    """
+    for (xy, face, _ch) in engine.gates._output_faces(gate):
+        step_v = cell.DIR_STEPS[face]
+        engine.place_belt(xy[0] + step_v[0], xy[1] + step_v[1], face)
+
+
 def _chain(gate_cls, gate_at, direction=cell.DIR_PX):
     """Source -> belt -> gate -> belt -> Sink, returning the pieces.
 
@@ -111,8 +131,20 @@ def test_well_fed_gate_fires_every_tick():
 
 
 def test_shear_computes_on_the_board():
-    """x,y -> x, x+y, with the inputs delivered by belts."""
+    """x,y -> x, x+y, with the inputs delivered by belts.
+
+    Reads the results off the **belts** rather than out of the waiting zones.
+    Each output gets a one-cell run, and the belt phase drains a connected
+    zone in the same tick the structure phase filled it -- so by end of tick
+    the zones are empty and the values are on the belt, which is the normal
+    flowing case. Asserting `out_held` here would really be asserting that
+    nothing downstream took the result, i.e. back pressure, which
+    test_back_pressure_stalls_a_blocked_gate covers deliberately.
+    """
     gate = engine.place_structure(Shear, 10, 10)
+    # Both outputs need a consumer, or their results are destroyed rather
+    # than being delivered anywhere this test can read.
+    _drain_every_output(gate)
     engine.sync_segments()
     # Feed both channels directly: belt-feeding two separate channels needs
     # two Sources and is covered by the wiring tests below.
@@ -120,47 +152,72 @@ def test_shear_computes_on_the_board():
     gate.set_input(1, 4.0)
 
     _run(1)
-    assert gate.out_held(0) and gate.out_held(1), "both outputs should fill"
-    assert gate.out_value(0) == 3.0, gate.out_value(0)
-    assert gate.out_value(1) == 7.0, gate.out_value(1)
     assert not gate.in_held(0) and not gate.in_held(1), "inputs consumed"
-    ok("Shear fired on the board: (3,4) -> (3,7)")
+
+    # Channel 0 is the pass-through (x, south), channel 1 the mutated one
+    # (x+y, east). Find each by the face its port sits on.
+    got = {}
+    for (xy, face, ch) in engine.gates._output_faces(gate):
+        step_v = cell.DIR_STEPS[face]
+        seg = engine.segments.at(xy[0] + step_v[0], xy[1] + step_v[1])
+        assert seg is not None, f"channel {ch} lost its run"
+        assert seg.count == 1, f"channel {ch} delivered {seg.count} items"
+        got[ch] = engine.belts.payload_of(seg, seg.head)
+
+    assert got[0] == 3.0, f"the pass-through should carry x=3, got {got[0]}"
+    assert got[1] == 7.0, f"the mutated channel should carry 7, got {got[1]}"
+    ok("Shear fired on the board: (3,4) -> (3,7), both onto belts")
+
+
+def _fire_once_and_read(gate, inputs):
+    """Feed `inputs`, run one tick, and read each output channel's value.
+
+    Outputs are read from the waiting zones, which requires them *not* to be
+    drained -- so this deliberately leaves them dangling and reads the zones
+    before the discard would matter... except a dangling result is now
+    destroyed at fire time. So it wires a one-cell run per output and reads
+    the value off that run instead. Returns {channel: payload}.
+    """
+    _drain_every_output(gate)
+    engine.sync_segments()
+    for i, v in enumerate(inputs):
+        gate.set_input(i, v)
+    _run(1)
+    got = {}
+    for (xy, face, ch) in engine.gates._output_faces(gate):
+        step_v = cell.DIR_STEPS[face]
+        seg = engine.segments.at(xy[0] + step_v[0], xy[1] + step_v[1])
+        assert seg is not None, f"channel {ch} lost its run"
+        assert seg.count == 1, f"channel {ch} delivered {seg.count} items"
+        got[ch] = engine.belts.payload_of(seg, seg.head)
+    return got
 
 
 def test_mac_and_swap_compute_on_the_board():
-    """Mac accumulates a product; Swap exchanges a pair on a condition."""
+    """Mac accumulates a product; Swap exchanges a pair on a condition.
+
+    Each output is given a one-cell run, since a dangling output is destroyed
+    rather than held -- see _drain_every_output().
+    """
     mac = engine.place_structure(Mac, 10, 10)
-    engine.sync_segments()
-    mac.set_input(0, 2.0)      # x
-    mac.set_input(1, 5.0)      # y
-    mac.set_input(2, 1.0)      # z
-    _run(1)
-    assert [mac.out_value(i) for i in range(3)] == [2.0, 5.0, 11.0], (
-        [mac.out_value(i) for i in range(3)])
+    got = _fire_once_and_read(mac, [2.0, 5.0, 1.0])   # x, y, z
+    assert [got[i] for i in range(3)] == [2.0, 5.0, 11.0], got
     ok("Mac fired: (2,5,1) -> (2,5,11)")
 
-    harness.reset()
-    swap = engine.place_structure(Swap, 20, 20)
-    engine.sync_segments()
     # x > 0: swap. The control reads as "swap when true", so a positive x is
     # the exchanging case and zero-or-negative is the pass-through.
-    swap.set_input(0, 1.0)
-    swap.set_input(1, 7.0)
-    swap.set_input(2, 9.0)
-    _run(1)
-    assert [swap.out_value(i) for i in range(3)] == [1.0, 9.0, 7.0], (
-        [swap.out_value(i) for i in range(3)])
+    harness.reset()
+    swap = engine.place_structure(Swap, 20, 20)
+    got = _fire_once_and_read(swap, [1.0, 7.0, 9.0])
+    assert [got[i] for i in range(3)] == [1.0, 9.0, 7.0], got
     ok("Swap with x>0 exchanged y and z")
 
-    # x <= 0: no swap. Drain the waiting zones first, or it cannot fire.
-    for i in range(3):
-        swap.clear_output(i)
-    swap.set_input(0, -1.0)
-    swap.set_input(1, 7.0)
-    swap.set_input(2, 9.0)
-    _run(1)
-    assert [swap.out_value(i) for i in range(3)] == [-1.0, 7.0, 9.0], (
-        [swap.out_value(i) for i in range(3)])
+    # x <= 0: no swap. A fresh board rather than draining by hand, since the
+    # one-cell runs from the previous fire are now full.
+    harness.reset()
+    swap = engine.place_structure(Swap, 20, 20)
+    got = _fire_once_and_read(swap, [-1.0, 7.0, 9.0])
+    assert [got[i] for i in range(3)] == [-1.0, 7.0, 9.0], got
     ok("Swap with x<=0 passed y,z through unchanged")
 
 
@@ -384,28 +441,47 @@ def test_back_pressure_stalls_a_blocked_gate():
     its own output zone, which the belt phase empties when it can.
     """
     gate = engine.place_structure(Shear, 10, 10)
+    # Connected but tiny: a one-cell run per output, so each takes exactly one
+    # item and then backs up. A *dangling* output would not block at all --
+    # its result is destroyed -- so back pressure needs a real consumer that
+    # has stopped consuming.
+    _drain_every_output(gate)
     engine.sync_segments()
-    gate.set_input(0, 1.0)
-    gate.set_input(1, 1.0)
-    _run(1)
-    assert not gate.outputs_clear(), "should be holding results"
 
-    # Nothing downstream, so the zones stay full and it cannot fire again.
+    # Fill the runs first. A one-cell run holds **two** items at the default
+    # spacing (capacity is a power of two), so it takes more than one fire to
+    # saturate -- feeding until the zones stay occupied rather than assuming a
+    # count keeps this independent of UNIT, d and v.
+    for _ in range(8):
+        gate.set_input(0, 1.0)
+        gate.set_input(1, 1.0)
+        _run(1)
+        if not gate.outputs_clear():
+            break
+    assert not gate.outputs_clear(), (
+        "the one-cell runs never backed up, so nothing is blocked")
+
+    # Now it is genuinely blocked: a fresh pair of inputs cannot be taken.
     gate.set_input(0, 5.0)
     gate.set_input(1, 5.0)
+    _run(1)
+    held_value = gate.out_value(1)
+
     before = engine.gates.stats["blocked"]
     _run(5)
     assert engine.gates.stats["blocked"] >= before + 5, engine.gates.stats
-    assert gate.out_value(1) == 2.0, (
-        f"the blocked gate overwrote its waiting zone: {gate.out_value(1)}")
+    assert gate.out_value(1) == held_value, (
+        f"the blocked gate overwrote its waiting zone: {gate.out_value(1)} "
+        f"was {held_value}")
     assert gate.in_held(0) and gate.in_held(1), "inputs must be held"
     ok("a blocked Shear held its result and its inputs for 5 ticks")
 
-    # Drain by hand; it fires on the next tick.
+    # Drain by hand; it fires on the next tick, taking the inputs it held.
     for i in range(2):
         gate.clear_output(i)
     _run(1)
-    assert gate.out_value(1) == 10.0, gate.out_value(1)
+    assert gate.out_value(1) == 10.0, (
+        f"draining should have let it compute 5+5, got {gate.out_value(1)}")
     ok("draining the waiting zone let it fire again immediately")
 
 
@@ -701,12 +777,19 @@ def test_a_fully_wired_shear_computes_through_belts():
        f"x={south_vals[0]} south, {stats['consumed']} items consumed")
 
 
-def test_an_undrained_output_blocks_the_whole_gate():
-    """Every output must have somewhere to go, not just the interesting one.
+def test_a_dangling_output_destroys_and_does_not_block():
+    """A dangling output is a sink: the gate runs on and the result vanishes.
 
-    Easy to get wrong when building: a Shear's pass-through output is easy to
-    forget, and forgetting it stalls the machine completely rather than
-    degrading it.
+    The inverse of what this file used to assert. Leaving a Shear's
+    pass-through unconnected once stalled the machine completely after a
+    single fire, on the principle that a gate must never silently destroy
+    material. Destroying it is now the specified behaviour -- it is what
+    makes an explicit Sink unnecessary for outputs you do not want -- so the
+    machine must instead run at full rate with the pass-through evaporating.
+
+    Asserting the *rate* rather than merely "it kept firing" is the point: a
+    gate that fired occasionally would also pass a non-zero check, and a
+    half-rate gate is exactly the symptom a mistake here would produce.
     """
     gate = engine.place_structure(Shear, 20, 20)
     engine.place_structure(Source, 20, 27, cell.DIR_NY)
@@ -721,16 +804,30 @@ def test_an_undrained_output_blocks_the_whole_gate():
     engine.place_structure(Sink, 27, 20)
     engine.sync_segments()
 
-    _run(30)
-    assert gate.out_held(0), (
-        "the undrained pass-through output should still be holding")
-    assert engine.gates.stats["blocked"] > 10, engine.gates.stats
-    # It fired exactly once, then jammed.
+    # Let the two feed runs fill, then measure steady state.
+    _run(20)
+    before_destroyed = engine.gates.stats["destroyed"]
+    before_blocked = engine.gates.stats["blocked"]
     east = engine.segments.at(26, 20)
-    assert east.tail <= 1, (
-        f"the gate should have emitted at most once, got {east.tail}")
-    ok(f"leaving one output undrained stalled the gate after a single fire "
-       f"({engine.gates.stats['blocked']} blocked ticks)")
+    before_items = east.tail
+    _run(20)
+
+    assert not gate.out_held(0), (
+        "the dangling pass-through must hold nothing -- its result is "
+        "destroyed at fire time, not parked in a waiting zone")
+    assert engine.gates.stats["blocked"] == before_blocked, (
+        f"a dangling output must never block: {engine.gates.stats}")
+
+    # One fire per tick, so one discard per tick and one item east per tick.
+    destroyed = engine.gates.stats["destroyed"] - before_destroyed
+    emitted = east.tail - before_items
+    assert destroyed == 20, (
+        f"expected one discard per tick over 20 ticks, got {destroyed}")
+    assert emitted == 20, (
+        f"the gate should emit one item east per tick, got {emitted} -- a "
+        f"shortfall means the dangling channel is still throttling it")
+    ok(f"a dangling pass-through destroyed {destroyed} values over 20 ticks "
+       f"while the gate ran at full rate ({emitted} items east)")
 
 
 def test_audits_clean_through_a_running_chain():

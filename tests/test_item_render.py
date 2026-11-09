@@ -825,13 +825,31 @@ def test_a_blocked_gates_waiting_zone_shows_its_value():
     from core.entity import Shear
 
     def _glyph_px_for(feed):
-        """Glyph pixels around a Shear, optionally holding results."""
+        """Glyph pixels around a Shear, optionally holding results.
+
+        Every output gets a one-cell run. A **dangling** output no longer
+        fills a waiting zone at all -- its result is destroyed at fire time --
+        so a connected run that saturates after one item is now what produces
+        a visibly blocked zone.
+        """
         harness.reset()
         gate = engine.place_structure(Shear, 10, 20)
+        for (xy, face, _ch) in engine.gates._output_faces(gate):
+            step_v = cell.DIR_STEPS[face]
+            engine.place_belt(xy[0] + step_v[0], xy[1] + step_v[1], face)
         engine.sync_segments()
         if feed:
-            gate.set_input(0, 3.0)
-            gate.set_input(1, 4.0)
+            # Fire until the runs back up and the zones stay occupied. A
+            # one-cell run holds two items at the default spacing, so the
+            # count is not one -- loop until blocked rather than assume it.
+            for _ in range(8):
+                gate.set_input(0, 3.0)
+                gate.set_input(1, 4.0)
+                _at_whole_tick()
+                engine.clock.request_step()
+                engine.clock.advance(0.0)
+                if not gate.outputs_clear():
+                    break
         _at_whole_tick()
         engine.clock.request_step()
         engine.clock.advance(0.0)

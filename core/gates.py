@@ -46,26 +46,37 @@ shared state").
 Back pressure
 -------------
 
-A gate is blocked when any output waiting zone is still occupied. The belt
-phase empties them; if a belt is full the zone stays occupied and the gate
-does not fire next tick. That is the whole mechanism -- no explicit "is the
-belt full" query anywhere, which matters because a gate must not read belt
-state during the structure phase.
+A gate is blocked when an output waiting zone **that has a consumer** is
+still occupied. The belt phase empties them; if a belt is full the zone stays
+occupied and the gate does not fire next tick. That is the whole mechanism --
+no explicit "is the belt full" query anywhere, which matters because a gate
+must not read belt state during the structure phase.
 
 A consequence worth knowing: **an occupied waiting zone at the end of a tick
 is a renderable state.** It means "this gate produced something the belt
 would not take", and the renderer draws it squished between the gate and the
 belt. While things flow it is always empty by end of tick, so nothing shows.
 
-**Generators are the one exception**, and it is about material rather than
-about Source. A machine with no inputs can fire for free and repeatedly, so
-it skips output channels with nothing on the far side instead of filling a
-waiting zone nobody will drain; with *no* channel connected it stays inert.
-A machine that consumes inputs must never do this -- discarding a result it
-has no room for would destroy material, so the value goes to the zone and the
-block that follows is the back pressure. See `_connected_channels()`,
-including why reading the grid there does not break the phase's
-order-independence the way reading belt state would.
+**A dangling output is a sink.** A result sent to an output face with nothing
+on the far side is destroyed at fire time rather than filling a zone nobody
+will drain. So leaving a Shear's pass-through unconnected no longer stalls
+the machine -- it runs at full rate and the pass-through evaporates, which is
+what makes an explicit Sink unnecessary for tidying up outputs you do not
+want.
+
+This is a deliberate end to reversible computing here: a gate may now destroy
+information. When "backwards" mode arrives, these discard points are where a
+machine will have to remember a little of what it dropped.
+
+It also collapses what used to be a special case. `_connected_channels()` was
+consulted only by generators, on the grounds that a machine *consuming*
+inputs must write every result or silently lose material -- the losing being
+the thing to avoid. Now that losing it is the specified behaviour, every gate
+consults the same connectivity, and generators keep exactly one difference:
+they fill whichever free zones they find rather than requiring all of them
+clear (see `_fire_generator`). Reading the grid is still safe for the reason
+`_connected_channels()` documents: connectivity is belt *presence*, frozen
+for the whole phase, not belt *state*.
 
 
 Direct gate-to-gate connections
@@ -100,7 +111,7 @@ class GateSim:
         self.belts = belts
         self.stats = {"fired": 0, "blocked": 0, "starved": 0,
                       "drained": 0, "loaded": 0, "consumed": 0, "direct": 0,
-                      "unconnected": 0}
+                      "unconnected": 0, "destroyed": 0}
 
     # --- gate discovery ---------------------------------------------------
     def gates(self):
@@ -142,7 +153,12 @@ class GateSim:
                     fired += 1
                 continue
 
-            if not gate.outputs_clear():
+            # Only the channels with somewhere to send a result can block.
+            # A dangling output is a sink in its own right (see
+            # _discard_dangling), so waiting on one would stall the machine
+            # on a zone nothing will ever drain.
+            drains = self._connected_channels(gate)
+            if not gate.outputs_clear(drains):
                 # Something is still waiting to leave. This is back pressure
                 # arriving: the belt downstream did not take the last result.
                 self.stats["blocked"] += 1
@@ -152,16 +168,31 @@ class GateSim:
                       for i in range(n_in)]
             results = gate.fire(values)
 
-            # Consume the inputs. Under FIRE_ANY only the fed channels are
-            # cleared, which for a Sink means the one that arrived.
-            for i in range(n_in):
+            # Consume the inputs the machine says it used. The default is
+            # every fed channel -- under FIRE_ANY that is whichever arrived,
+            # which for a Sink means the one face that was loaded. Merge
+            # overrides it to leave its unused data lane loaded.
+            for i in gate.consumed(values):
                 if gate.in_held(i):
                     gate.clear_input(i)
                     self.stats["consumed"] += 1
 
             for i, value in enumerate(results):
-                if value is not None:
-                    gate.set_output(i, value)
+                if value is None:
+                    # The machine declined this channel -- Route sending an
+                    # item down one path and not the other. Not a discard:
+                    # nothing was produced to begin with.
+                    continue
+                if i not in drains:
+                    # A dangling output destroys what it is sent. This is the
+                    # deliberate end of reversible computing here: a gate may
+                    # drop a result it has nowhere to put, rather than filling
+                    # a zone forever and jamming. When "backwards" mode
+                    # arrives, this is the point that has to remember a little
+                    # of what it destroyed.
+                    self.stats["destroyed"] += 1
+                    continue
+                gate.set_output(i, value)
             fired += 1
 
         self.stats["fired"] += fired
@@ -323,23 +354,21 @@ class GateSim:
     def _fire_generator(self, gate):
         """Fire a machine with no inputs. True if it produced anything.
 
-        A generator's output channels are **independent**, which is what
-        separates this from the arithmetic path:
+        A generator's output channels are **independent**, which is the one
+        thing still separating this from the arithmetic path: it fills
+        whichever free zones it finds instead of demanding that *all* of them
+        be clear. `outputs_clear()` over the connected set is all-or-nothing,
+        so using it here would let one slow belt stall every other belt the
+        same Source feeds -- the exact opposite of "fill both of them".
 
-        * It only fills channels with somewhere to go. A dangling face is
-          pure waste rather than something to hold material in, and firing a
-          generator is free and repeatable, so skipping costs nothing. A
-          6-port Source would otherwise block permanently the first time it
-          fired, with five zones nobody will ever drain.
-        * It fills whichever free zones it finds instead of demanding that
-          *all* of them be clear. `outputs_clear()` is all-or-nothing, so
-          using it here would let one slow belt stall every other belt the
-          same Source feeds -- the exact opposite of "fill both of them".
-
-        A machine that consumes inputs must do neither: it has to write every
-        result and let a full zone stop it, because dropping one would
-        silently destroy material. That is why leaving a Shear's pass-through
-        dangling still stalls it after a single fire.
+        Skipping dangling faces is no longer a difference -- every gate does
+        that now (see the module docstring). But it still matters *more*
+        here, and for the reason it always did: a generator creates material
+        from nothing, so emitting into a dangling face would be a pure
+        item-printing-and-shredding loop rather than a result being dropped.
+        With **no** channel connected it stays inert, which is why a Source
+        alone on the board does nothing at all rather than running flat out
+        and discarding everything.
         """
         drains = self._connected_channels(gate)
         if not drains:
@@ -382,8 +411,12 @@ class GateSim:
         them drains the channel. For every machine but Sink the two are the
         same thing, since channel == port index.
 
-        Only generators consult this -- see structure_phase() for why a
-        machine that consumes inputs must write its results regardless.
+        **Every gate consults this**, which it did not always. It used to be
+        a generator-only check, because a machine consuming inputs had to
+        write every result or lose material. Destroying a result with nowhere
+        to go is now the specified behaviour, so the same connectivity decides
+        two things for every gate: which zones can block it
+        (`outputs_clear(drains)`) and which results are discarded.
 
         **This reads the grid, which the structure phase otherwise must not
         do -- and it is safe for a specific reason.** The prohibition exists

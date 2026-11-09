@@ -132,8 +132,18 @@ class Entity:
     #: A type with no inputs at all (Source) is vacuously ready under either,
     #: so it fires whenever its output is clear -- which is what we want, and
     #: falls out rather than being special-cased. _self_check() pins that.
+    #: FIRE_SELECT -- readiness depends on the *values* held, not merely on
+    #:              which channels are fed. Declared by a type that overrides
+    #:              `inputs_ready()`; the base class never resolves it, so a
+    #:              type naming it without overriding is a bug the self-check
+    #:              catches rather than a silently-never-firing machine.
+    #:
+    #: The enum survives the move to an overridable `inputs_ready()` because
+    #: it is also the declared place for a future per-type rate limit, and
+    #: because it keeps the common two cases readable at the class level.
     FIRE_ALL = 0
     FIRE_ANY = 1
+    FIRE_SELECT = 2
     FIRE_RULE = FIRE_ALL
 
     #: Value a Source emits. Only meaningful for types with no inputs; one
@@ -246,9 +256,14 @@ class Entity:
         """Transform fed input channel values into output channel values.
 
         `values` is a list of length input_count(); entries for unfed
-        channels are None (only reachable under FIRE_ANY). Returns a list of
-        length output_count(), where None means "emit nothing on this
-        channel".
+        channels are None (only reachable under FIRE_ANY or FIRE_SELECT).
+        Returns a list of length output_count(), where None means "emit
+        nothing on this channel".
+
+        **A None result is a real decision, not a gap.** Route uses it to
+        send one item down one of two paths, which is what makes "either/or"
+        routing expressible without a special case in the tick: the channel
+        it declines simply never fills.
 
         Overridden per machine. The base implementation emits nothing, which
         is correct for a type with no outputs and a safe default for a type
@@ -263,12 +278,40 @@ class Entity:
         """
         return [None] * self.output_count()
 
+    def consumed(self, values):
+        """Which input channels firing with `values` uses up.
+
+        A sequence of channel indices. The default is **every fed channel**,
+        which is what every machine but Merge wants: an arithmetic gate reads
+        all its inputs, and a Sink under FIRE_ANY eats whatever arrived.
+
+        Merge is why this is a method at all. It waits for its control and
+        then takes *one* of its two data lanes, and the lane it did not take
+        has to **stay loaded** -- destroying it would lose material the
+        player can see sitting in the machine, and emitting it would defeat
+        the point of the gate. Consumption used to be implicit in
+        `GateSim.structure_phase()`, which cleared every held channel and
+        gave the machine no say.
+
+        Returned rather than mutated here so the structure phase stays the
+        only writer of gate state, exactly as `fire()` is a pure function of
+        its inputs.
+        """
+        return [i for i in range(self.input_count()) if self.in_held(i)]
+
     def inputs_ready(self):
         """Does this gate's firing rule consider it fed?
 
-        Reads FIRE_RULE rather than branching on type. A machine with no
-        inputs is vacuously ready under either rule, which is what makes
-        Source fire without a special case.
+        Reads FIRE_RULE rather than branching on type, and is **overridable**
+        for the cases the enum cannot express. A machine with no inputs is
+        vacuously ready under either rule, which is what makes Source fire
+        without a special case.
+
+        FIRE_SELECT is deliberately not resolved here: a type declaring it
+        must override this method, because readiness then depends on the
+        values held rather than on occupancy alone. Returning False would
+        make such a type silently never fire, so the self-check pins that
+        every FIRE_SELECT type really does override.
         """
         n = self.input_count()
         if n == 0:
@@ -277,15 +320,28 @@ class Entity:
             return any(self.in_held(i) for i in range(n))
         return all(self.in_held(i) for i in range(n))
 
-    def outputs_clear(self):
-        """Is every output's waiting zone free?
+    def outputs_clear(self, channels=None):
+        """Is every output waiting zone free?
 
         A gate cannot fire with anything still waiting -- that is the
         back-pressure signal, and it is why a backed-up belt eventually
         stalls the machine feeding it rather than losing items.
+
+        `channels` narrows the question to a subset, which is how a
+        **dangling output no longer blocks**: the caller passes the channels
+        that actually have a consumer, and a channel with nothing on the far
+        side is neither waited on nor filled. See
+        `GateSim._connected_channels()`, which is now consulted for every
+        gate rather than only for generators.
+
+        A dangling channel's zone must therefore never be filled in the
+        first place -- the structure phase discards those results. Were one
+        to fill anyway, excluding it here would mean a gate blocked forever
+        on a zone nothing drains and nothing checks.
         """
-        return not any(self.out_held(i)
-                       for i in range(self.output_count()))
+        if channels is None:
+            channels = range(self.output_count())
+        return not any(self.out_held(i) for i in channels)
 
     #: True if mirroring this type produces a genuinely different machine.
     #: A type whose port layout is symmetric about the authored X axis is
