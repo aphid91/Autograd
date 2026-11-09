@@ -159,6 +159,19 @@ uniform int   select_on;      // 0 when no selection is in progress
 #define WAIT_SQUISH       0.46   // scale along the travel axis
 #define WAIT_OFFSET       0.44   // distance from the gate cell's centre
 
+// --- seeded belts ---
+// A belt the player marked as a seed injects an item onto its run every time
+// segments are re-derived. The cell is tinted by the *sign* of that value --
+// green above zero, red at or below, the same split the item discs use -- so
+// a glance across the board says where the seeds are and roughly what they
+// carry. Drawn over the belt body and under the items, which is the layer
+// "this cell is configured" belongs in: it is a property of the cell, unlike
+// an item (cargo on top) or frustration (a transient overlay).
+#define COL_SEED_POS      vec3(0.30, 0.74, 0.36)
+#define COL_SEED_NEG      vec3(0.82, 0.30, 0.28)
+#define SEED_ALPHA        0.50
+#define SEED_INSET        0.30   // half-extent of the tinted patch, in cells
+
 // --- segment debug overlay ---
 // Tints each belt cell by a hash of its segment id, so a run's extent and
 // where it is cut are visible at a glance. Compiled out entirely unless
@@ -863,6 +876,15 @@ void main() {
             BeltDraw b = draw_belt(p, ci, c, px, world);
             col = mix(col, COL_BELT, b.body * alpha_scale);
             col = mix(col, COL_CHEVRON, b.chevron * alpha_scale);
+            // A seeded cell, tinted by the sign of what it seeds. Over the
+            // spine so it reads as marking this belt, and clipped to a patch
+            // rather than the whole cell so the run's shape stays legible
+            // through it.
+            if (is_seeded(c.z)) {
+                vec3 sc = is_seed_positive(c.z) ? COL_SEED_POS : COL_SEED_NEG;
+                float a = fill(sd_box(p, vec2(SEED_INSET)), px);
+                col = mix(col, sc, a * SEED_ALPHA * alpha_scale);
+            }
         } else if (type == TYPE_UNDER) {
             // A funnel, mouth on the surface side. An entrance's mouth faces
             // back the way material came; an exit's faces the way it goes.

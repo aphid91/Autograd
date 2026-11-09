@@ -142,24 +142,26 @@ def test_mac_and_swap_compute_on_the_board():
     harness.reset()
     swap = engine.place_structure(Swap, 20, 20)
     engine.sync_segments()
-    # x > 0: no swap.
+    # x > 0: swap. The control reads as "swap when true", so a positive x is
+    # the exchanging case and zero-or-negative is the pass-through.
     swap.set_input(0, 1.0)
     swap.set_input(1, 7.0)
     swap.set_input(2, 9.0)
     _run(1)
-    assert [swap.out_value(i) for i in range(3)] == [1.0, 7.0, 9.0]
-    ok("Swap with x>0 passed y,z through unchanged")
+    assert [swap.out_value(i) for i in range(3)] == [1.0, 9.0, 7.0], (
+        [swap.out_value(i) for i in range(3)])
+    ok("Swap with x>0 exchanged y and z")
 
-    # x <= 0: swap. Drain the waiting zones first, or it cannot fire.
+    # x <= 0: no swap. Drain the waiting zones first, or it cannot fire.
     for i in range(3):
         swap.clear_output(i)
     swap.set_input(0, -1.0)
     swap.set_input(1, 7.0)
     swap.set_input(2, 9.0)
     _run(1)
-    assert [swap.out_value(i) for i in range(3)] == [-1.0, 9.0, 7.0], (
+    assert [swap.out_value(i) for i in range(3)] == [-1.0, 7.0, 9.0], (
         [swap.out_value(i) for i in range(3)])
-    ok("Swap with x<=0 exchanged y and z")
+    ok("Swap with x<=0 passed y,z through unchanged")
 
 
 def test_a_dangling_generator_stays_inert():

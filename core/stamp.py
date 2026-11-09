@@ -69,10 +69,10 @@ class StampEntry:
     """One captured entity: a type, an offset in the stamp, an orientation."""
 
     __slots__ = ("entity_cls", "dx", "dy", "direction", "flipped",
-                 "is_exit", "partner", "emit")
+                 "is_exit", "partner", "emit", "seed")
 
     def __init__(self, entity_cls, dx, dy, direction, flipped=False,
-                 is_exit=False, partner=None, emit=None):
+                 is_exit=False, partner=None, emit=None, seed=None):
         self.entity_cls = entity_cls
         self.dx = dx
         self.dy = dy
@@ -93,11 +93,16 @@ class StampEntry:
         # Orientation-independent, so rotate() and mirror() carry it through
         # untouched.
         self.emit = emit
+        # Belt-only: `(on, value)` for a seeded cell, or None for "not
+        # seeded". Carried for the same reason as `emit` -- a seed is per
+        # instance and a paste that dropped it would look identical while
+        # behaving differently. Also orientation-independent.
+        self.seed = seed
 
     def copy(self):
         return StampEntry(self.entity_cls, self.dx, self.dy, self.direction,
                           self.flipped, self.is_exit, self.partner,
-                          self.emit)
+                          self.emit, self.seed)
 
     def cells(self, ox=0, oy=0):
         """Cells this entry covers, offset by a paste origin."""

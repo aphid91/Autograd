@@ -1,23 +1,43 @@
-"""Copy and paste modes: an override on whatever the hand already holds.
+"""Copy, paste and erase modes: an override on whatever the hand already holds.
 
-Copy and paste are **not toolbelt slots**. They temporarily take over from the
-held tool and hand it back when they finish, so ctrl+C in the middle of
-drawing a belt run does not lose the belt tool. `Clipboard` owns that
-stashing, the mode flag, and the stamp history; the orchestrator drives it and
-`core/stamp.py` does the geometry.
+These are **not toolbelt slots**. They temporarily take over from the held
+tool and hand it back when they finish, so ctrl+C in the middle of drawing a
+belt run does not lose the belt tool. `Clipboard` owns that stashing, the mode
+flag, and the stamp history; the orchestrator drives it and `core/stamp.py`
+does the geometry.
 
     MODE_OFF     normal play, the toolbelt is in charge
-    MODE_COPY    left-drag draws a selection rectangle
+    MODE_COPY    left-drag draws a selection rectangle, then paste it
     MODE_PASTE   the active stamp previews under the cursor
+    MODE_ERASE   left-drag draws a rectangle, then deletes what it touched
 
-Entering either mode stashes the current slot. Leaving restores it -- except
-on `Q`, which is the universal "empty the hand" and therefore drops the stash
-rather than returning to it. That asymmetry is deliberate: every other exit is
-"I am done with this mode", while Q is "I want to be holding nothing".
+Entering any of them stashes the current slot. Leaving restores it -- with two
+exceptions, and both are deliberate:
 
-Copy mode has no camera pan, because a left-drag is the selection gesture. In
-paste mode left-drag still pans, since the stamp follows the cursor and needs
-no drag of its own.
+- `Q` is the universal "empty the hand", so it drops the stash rather than
+  returning to it. Every other exit means "I am done with this mode"; Q means
+  "I want to be holding nothing".
+- **Choosing a toolbelt slot also drops it.** Picking a tool is a new choice
+  rather than an interruption ending, so restoring the stash on top of it
+  would override what the player just asked for. The orchestrator does that
+  (`_select_slot()`); it uses `exit_to_empty()` for exactly this reason.
+
+**Copy and erase have no camera pan**, because a left-drag is their selection
+gesture. In paste mode left-drag still pans, since the stamp follows the
+cursor and needs no drag of its own.
+
+Erase mode is copy mode's gesture with a different consequence, which is why
+it reuses the whole selection machine rather than growing one of its own. Two
+differences:
+
+- **A release erases and stays in the mode.** Copy mode's release ends the
+  mode (you go to paste with what you caught); erasing is a repeated action,
+  so the rectangle is a stroke rather than a commitment.
+- **`ctrl+X` is a cut**: the same rectangle, captured as a stamp *before* the
+  entities are deleted, then straight to paste mode holding it. That makes
+  cut-then-place one continuous chain exactly as ctrl+C -> ctrl+V is, stash
+  included -- `_stash()` refusing to overwrite is what keeps the player's
+  real tool through the whole chain.
 """
 
 from core.stamp import Stamp, StampEntry, StampHistory
@@ -25,8 +45,10 @@ from core.stamp import Stamp, StampEntry, StampHistory
 MODE_OFF = 0
 MODE_COPY = 1
 MODE_PASTE = 2
+MODE_ERASE = 3
 
-MODE_NAMES = {MODE_OFF: "Off", MODE_COPY: "Copy", MODE_PASTE: "Paste"}
+MODE_NAMES = {MODE_OFF: "Off", MODE_COPY: "Copy", MODE_PASTE: "Paste",
+              MODE_ERASE: "Erase"}
 
 
 class Clipboard:
@@ -40,6 +62,11 @@ class Clipboard:
         #: such rather than collapsing to slot 0.
         self._stashed_slot = None
         self._has_stash = False
+        #: True in erase mode when the rectangle should be *cut* -- captured
+        #: as a stamp and then deleted -- rather than simply deleted. Set by
+        #: ctrl+X and cleared when the mode ends, so a later bare-X stroke
+        #: cannot inherit it.
+        self.cutting = False
 
     # --- queries ---------------------------------------------------------
     @property
@@ -55,6 +82,20 @@ class Clipboard:
         return self.mode == MODE_PASTE
 
     @property
+    def erasing(self):
+        return self.mode == MODE_ERASE
+
+    @property
+    def selecting(self):
+        """True in the modes whose left-drag draws a rectangle.
+
+        Copy and erase share one gesture, so the input layer and the camera
+        ask this rather than naming both modes -- adding a third
+        rectangle-dragging mode then needs no change at either call site.
+        """
+        return self.mode in (MODE_COPY, MODE_ERASE)
+
+    @property
     def stamp(self):
         """The stamp paste mode would place, or None."""
         return self.history.active
@@ -62,6 +103,9 @@ class Clipboard:
     def status(self):
         if self.mode == MODE_COPY:
             return "Copy: drag to select"
+        if self.mode == MODE_ERASE:
+            return ("Cut: drag to take and delete" if self.cutting
+                    else "Erase: drag to delete")
         if self.mode == MODE_PASTE:
             s = self.stamp
             if s is None:
@@ -88,6 +132,18 @@ class Clipboard:
         self.mode = MODE_PASTE
         return True
 
+    def enter_erase(self, current_slot, cut=False):
+        """X (or ctrl+X for a cut). Stash the held tool and start selecting.
+
+        `cut` is remembered on the mode rather than read per release, because
+        the status line and the panel both need to say which of the two the
+        next drag will do.
+        """
+        self._stash(current_slot)
+        self.mode = MODE_ERASE
+        self.cutting = bool(cut)
+        return True
+
     def _stash(self, current_slot):
         """Remember the held slot, unless a mode is already holding a stash.
 
@@ -109,13 +165,20 @@ class Clipboard:
         self.mode = MODE_OFF
         self._stashed_slot = None
         self._has_stash = False
+        self.cutting = False
         return slot, had
 
     def exit_to_empty(self):
-        """Q: leave the mode and drop the stash -- the hand becomes empty."""
+        """Leave the mode and drop the stash -- the hand becomes empty.
+
+        Q's behaviour, and also what selecting a toolbelt slot uses: both
+        mean "the stash is not what I want next", for different reasons (see
+        the module docstring).
+        """
         self.mode = MODE_OFF
         self._stashed_slot = None
         self._has_stash = False
+        self.cutting = False
 
     # --- the stamp history -----------------------------------------------
     def adopt(self, stamp):
@@ -124,9 +187,14 @@ class Clipboard:
         Called with a non-empty stamp only; an empty selection returns the
         player to their tool instead (the orchestrator decides, since only it
         can restore a slot).
+
+        Reached from a cut as well as a copy, hence clearing `cutting`: the
+        mode we are entering has no use for it, and leaving it set would have
+        a later bare-X stroke silently cut.
         """
         self.history.push(stamp)
         self.mode = MODE_PASTE
+        self.cutting = False
         return stamp
 
     def cycle_stamp(self, delta):
@@ -204,6 +272,12 @@ def capture(board, x0, y0, x1, y1, include_ghosts=False):
             # travel with the copy or pasting a configured Source would
             # silently hand back one emitting the type default.
             emit=getattr(view, "emit_value", None),
+            # A seeded belt keeps its seed, same reasoning as emit: per
+            # instance, invisible in the paste, and silently lost without
+            # this. Only a *seeded* cell carries one, so an ordinary belt's
+            # entry stays None and pastes at the type default.
+            seed=((True, float(view.seed_value))
+                  if getattr(view, "seed_on", False) else None),
         )
         row_to_index[view.row] = len(entries)
         entries.append(entry)

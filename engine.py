@@ -288,6 +288,10 @@ class Engine:
             extra["is_exit"] = placement.is_exit
         if placement.emit is not None:
             extra["emit"] = placement.emit
+        if placement.seed is not None:
+            on, value = placement.seed
+            extra["seed_on"] = on
+            extra["seed_value"] = value
         return extra
 
     def build_plan(self, plan):
@@ -559,10 +563,75 @@ class Engine:
         # anchors of the runs that now exist rather than the ones that just
         # stopped existing.
         self.flush_material()
+        # ...and the seeds go on *after* the flush, for the same reason in
+        # reverse: a flush empties every ring, so seeding before it would
+        # wipe exactly what was just placed.
+        self.seed_segments()
         # A rebuild reassigns every ring's base and cap, so the device arena
         # has to be laid out again before the next upload.
         self.belt_device.invalidate_layout()
         return n
+
+    def seed_segments(self):
+        """Put one item on each run holding a seeded belt cell. Returns the count.
+
+        A seeded belt is a standing instruction: whenever this cell's run is
+        (re)derived -- a board clear, a load, or any edit that triggers the
+        segment sweep -- it starts with an item of the player's chosen value
+        on it. That makes a run testable without wiring a Source to it.
+
+        **Items enter at the tail, as ordinary pushes.** The closed form can
+        only accept an item at a run's entrance (`pos` is measured from the
+        tail and `enter_tick` is stamped once), so there is no way to
+        materialise one at the seeded cell's own offset -- it rides from the
+        start like anything else.
+
+        **Several seeds on one run arrive as a clump, which needs staggered
+        entry ticks.** Every seed enters on the same tick, so pushing them
+        all at `clock.tick` puts the first at position 0 and then has
+        `has_room()` refuse every one after it -- four seeded cells produced
+        a single item. Dating each successive seed one `d/v` further into the
+        past puts it exactly one spacing ahead instead, which is the state a
+        producer feeding the run at full rate would have reached. The `min`
+        in the closed form then treats them as the compressed clump they are,
+        and `push()`'s room check still refuses anything that genuinely will
+        not fit -- so a run shorter than its seed count takes as many as fit
+        and drops the rest, as asked.
+
+        Seeds are deliberately pushed directly rather than offered through
+        the producer callback: a seed is not a producer, and routing it
+        through `offer()` would have it compete with the gate actually
+        feeding that run.
+        """
+        seeded = 0
+        for seg in self.segments.segments.values():
+            values = [v.seed_value for v in self._seeded_cells(seg)]
+            if not values:
+                continue
+            # Ticks per item of separation, so a clump of seeds is spaced by
+            # the same `d` the transport enforces.
+            per = max(1, self.belts.spacing // self.belts.speed)
+            # Oldest first: an item's position grows with its age, and the
+            # ring requires positions to *decrease* in k, so the first push
+            # has to be the most backdated one. Enumerating the seeds up
+            # front is what makes that expressible -- the stagger is counted
+            # down from the total rather than up from zero.
+            n = len(values)
+            for i, value in enumerate(values):
+                when = self.clock.tick - (n - 1 - i) * per
+                if self.belts.push(seg, value, when):
+                    seeded += 1
+        return seeded
+
+    def _seeded_cells(self, seg):
+        """Live, real, seeded belt views along a segment, tail first."""
+        for (x, y) in seg.cells:
+            view = self.board.entity_at(x, y)
+            if view is None or view.type_id != cell.TYPE_BELT:
+                continue
+            if view.is_ghost or not view.seed_on:
+                continue
+            yield view
 
     def clear_items(self):
         """Take every item off every belt, leaving the segmentation alone.

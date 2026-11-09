@@ -68,7 +68,7 @@ STATE_PLANNING = 1
 STATE_ERASING = 2
 STATE_ARMED = 3      # left button down, not yet known to be click or drag
 STATE_PANNING = 4
-STATE_SELECTING = 5  # copy mode: left-drag is drawing a selection rectangle
+STATE_SELECTING = 5  # copy/erase: left-drag is drawing a selection rectangle
 
 STATE_NAMES = {
     STATE_IDLE: "Idle",
@@ -91,6 +91,12 @@ DRAG_THRESHOLD_PX = 6.0
 _MODE_OFF = 0
 _MODE_COPY = 1
 _MODE_PASTE = 2
+_MODE_ERASE = 3
+
+#: Modes whose left-drag draws a rectangle rather than panning the camera.
+#: Mirrors Clipboard.selecting -- the gesture machine below is shared, and
+#: only what happens on *release* differs between them.
+_MODE_SELECTS = (_MODE_COPY, _MODE_ERASE)
 
 # Keys that are edge-triggered (act once per press) rather than held.
 _SLOT_KEYS = {
@@ -100,6 +106,7 @@ _SLOT_KEYS = {
 _EDGE_KEYS = (
     glfw.KEY_R, glfw.KEY_ESCAPE, glfw.KEY_F, glfw.KEY_F5, glfw.KEY_DELETE,
     glfw.KEY_SPACE, glfw.KEY_PERIOD, glfw.KEY_Q, glfw.KEY_C, glfw.KEY_V,
+    glfw.KEY_X,
 ) + tuple(_SLOT_KEYS)
 
 
@@ -115,6 +122,7 @@ class Intents:
         "drag_pan_px", "toggle_pause", "step_tick", "pipette",
         "copy_mode", "paste_mode", "exit_mode", "shift_held",
         "select_rect", "commit_select", "stamp_steps",
+        "erase_mode", "cut_mode", "commit_erase",
     )
 
     def __init__(self):
@@ -164,6 +172,14 @@ class Intents:
         self.select_rect = None
         #: True on the frame a selection drag is released.
         self.commit_select = False
+        # X / ctrl+X: erase mode, and its cut variant. Separate intents
+        # rather than one with a flag, so the orchestrator's two calls read
+        # as the two different requests they are.
+        self.erase_mode = False
+        self.cut_mode = False
+        #: True on the frame an erase-mode rectangle is released. Distinct
+        #: from `commit_select`: that one ends its mode, this one does not.
+        self.commit_erase = False
         #: shift+scroll notches in paste mode: walk the stamp history.
         self.stamp_steps = 0.0
 
@@ -263,8 +279,9 @@ class InputManager:
         cursor and places on a single click.
 
         `mode` is the clipboard mode (see core/clipboard.py). It changes what
-        a left-drag means -- in copy mode it draws a selection rectangle
-        instead of panning the camera -- so the gesture machine has to know.
+        a left-drag means -- in copy and erase modes it draws a selection
+        rectangle instead of panning the camera -- so the gesture machine has
+        to know.
         """
         io = imgui.get_io()
         want_kb = io.want_capture_keyboard
@@ -298,6 +315,14 @@ class InputManager:
         v_key = self._edge(glfw.KEY_V, not want_kb)
         it.copy_mode = c_key and ctrl
         it.paste_mode = v_key and ctrl
+
+        # X / ctrl+X: erase mode and its cut variant. Unlike C and V the bare
+        # key is bound here -- erasing is frequent enough to deserve it, the
+        # way F took the bare key from frame-the-board -- so the two are a
+        # modifier apart on the same key rather than two separate bindings.
+        x_key = self._edge(glfw.KEY_X, not want_kb)
+        it.erase_mode = x_key and not ctrl
+        it.cut_mode = x_key and ctrl
 
         # --- simulation clock ---
         # Space pauses; '.' runs exactly one tick, which works whether or not
@@ -363,11 +388,17 @@ class InputManager:
         if want_mouse:
             left_press = right_press = False
 
-        # --- copy mode: its own small gesture machine ---
+        # --- copy and erase: one selection gesture machine ---
         # Left-drag is the selection rectangle, which means there is no camera
-        # pan in copy mode -- the gesture is spoken for. A plain click or any
+        # pan in either mode -- the gesture is spoken for. A plain click or any
         # right-press leaves the mode.
-        if mode == _MODE_COPY:
+        #
+        # The two modes differ only in what a *release* means, and that
+        # difference is the one branch below: copy hands its rectangle over
+        # and ends, erase deletes and stays. Everything else -- arming,
+        # promotion past the threshold, the live rectangle, the aborts -- is
+        # identical, which is why this is one block rather than two.
+        if mode in _MODE_SELECTS:
             if escape:
                 it.exit_mode = True
                 self.state = STATE_IDLE
@@ -379,9 +410,14 @@ class InputManager:
                 if a is not None:
                     it.select_rect = (a[0], a[1], cx, cy)
                 if left_release:
-                    # Release always ends copy mode; the orchestrator decides
-                    # whether anything was caught.
-                    it.commit_select = True
+                    # Copy's release ends the mode; the orchestrator decides
+                    # whether anything was caught. Erase's release deletes and
+                    # leaves the mode running, because erasing is a repeated
+                    # stroke rather than a one-shot commitment.
+                    if mode == _MODE_ERASE:
+                        it.commit_erase = True
+                    else:
+                        it.commit_select = True
                     self.state = STATE_IDLE
                     self._select_anchor = None
             elif self.state == STATE_ARMED:
@@ -394,11 +430,15 @@ class InputManager:
                                       cx, cy)
                 elif left_release:
                     # A click that never became a drag: cancel the mode.
+                    # Erase mode deliberately does nothing on a bare click --
+                    # a single-cell delete on a stray click is too easy to do
+                    # by accident, and right-drag already covers cell-by-cell
+                    # erasing outside the mode entirely.
                     it.exit_mode = True
                     self.state = STATE_IDLE
             else:
                 if right_press:
-                    # Right-press leaves copy mode even mid-drag.
+                    # Right-press leaves the mode even mid-drag.
                     it.exit_mode = True
                     self.state = STATE_IDLE
                     self._select_anchor = None

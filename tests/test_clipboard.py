@@ -16,8 +16,8 @@ early version of the all-or-nothing test pass for entirely the wrong reason.
 import glfw
 
 from core import cell
-from core.clipboard import (MODE_COPY, MODE_OFF, MODE_PASTE, Clipboard,
-                            capture)
+from core.clipboard import (MODE_COPY, MODE_ERASE, MODE_OFF, MODE_PASTE,
+                            Clipboard, capture)
 from core.entity import Sink, Source, Underground
 from core.stamp import Stamp
 
@@ -44,6 +44,14 @@ def test_input_mode_constants_match_the_clipboard():
     assert im._MODE_OFF == MODE_OFF
     assert im._MODE_COPY == MODE_COPY
     assert im._MODE_PASTE == MODE_PASTE
+    assert im._MODE_ERASE == MODE_ERASE
+    # The input layer's "this mode drags a rectangle" set must agree with the
+    # clipboard's own answer, or a mode would get copy's gesture in one layer
+    # and not the other.
+    cb = Clipboard()
+    for mode in (MODE_OFF, MODE_COPY, MODE_PASTE, MODE_ERASE):
+        cb.mode = mode
+        assert cb.selecting == (mode in im._MODE_SELECTS), mode
     ok("input_manager's mode constants match core/clipboard.py")
 
 
@@ -492,3 +500,281 @@ def test_an_empty_hand_is_stashed_as_empty():
         f"an empty hand must be restored as empty, got slot "
         f"{orch.toolbelt.selected}")
     ok("an empty hand was stashed and restored as empty")
+
+
+# --- erase mode ------------------------------------------------------------
+# Erase reuses copy's whole selection gesture and differs only in what the
+# release does, so these tests concentrate on that difference: what gets
+# deleted, and that the mode survives to be used again.
+
+
+def _row_survivors(y, xs):
+    """Cells in a row still holding a *real* entity.
+
+    `real_cells_at()` rather than `is_empty()`: a selected tool previews a
+    ghost under the cursor, ghosts occupy real cells, and `is_empty()` counts
+    them as taken. Same trap this module's docstring warns about -- and the
+    reason these tests count cells rather than `board.live_count`, which
+    includes the preview's row.
+    """
+    return real_cells_at(y, xs)
+
+
+def test_x_enters_erase_mode_and_stashes_the_tool():
+    """Bare X is erase mode; like copy, it gives the held tool back."""
+    select_tool("Shear")
+    assert orch.clipboard.mode == MODE_OFF
+    press_key(glfw.KEY_X)
+    assert orch.clipboard.mode == MODE_ERASE, orch.clipboard.mode
+    assert not orch.clipboard.cutting, "bare X is not a cut"
+    assert orch.clipboard._has_stash
+    ok("X entered erase mode with the Shear stashed")
+
+    # A plain click does nothing to the board and leaves the mode. Erasing on
+    # a stray click is too easy to do by accident to be worth the shortcut.
+    engine.place_belt(40, 40)
+    engine.sync_segments()
+    put_cursor_at_cell(40, 40)
+    step()
+    click()
+    assert not board.is_empty(40, 40), "a bare click must not erase"
+    assert orch.clipboard.mode == MODE_OFF
+    assert orch.toolbelt.active.name == "Shear", orch.toolbelt.active.name
+    ok("a plain click erased nothing and restored the Shear")
+
+
+def test_an_erase_drag_deletes_what_the_rectangle_touched():
+    """The rectangle's cells go, and nothing outside it does."""
+    select_tool("Belt")
+    engine.place_belt_path((10, 10), (16, 10))
+    engine.place_belt_path((10, 14), (16, 14))
+    engine.sync_segments()
+    assert len(_row_survivors(10, range(10, 17))) == 7
+
+    press_key(glfw.KEY_X)
+    drag_cells((11, 9), (13, 11))
+
+    # The rectangle spans x=11..13, y=9..11, so the three cells of row 10
+    # inside it go and the rest of the run stays.
+    assert _row_survivors(10, range(10, 17)) == [10, 14, 15, 16], (
+        _row_survivors(10, range(10, 17)))
+    # The untouched row is the control: a rectangle erase must not be a
+    # whole-board operation.
+    assert len(_row_survivors(14, range(10, 17))) == 7
+    ok("the rectangle's cells were erased and the next row left alone")
+
+
+def test_erasing_a_rectangle_stays_in_erase_mode():
+    """Erasing is a repeated stroke, not a one-shot that ends the mode.
+
+    This is the one real difference from copy mode, whose release hands its
+    rectangle over and leaves. Pinned because sharing the gesture machine
+    makes it cheap to accidentally share the exit too.
+    """
+    select_tool("Belt")
+    engine.place_belt_path((10, 10), (16, 10))
+    engine.sync_segments()
+    press_key(glfw.KEY_X)
+
+    drag_cells((11, 9), (12, 11))
+    assert orch.clipboard.mode == MODE_ERASE, (
+        "the first stroke must not end the mode")
+    # A second stroke with no re-entry, which is the point.
+    drag_cells((14, 9), (16, 11))
+    assert orch.clipboard.mode == MODE_ERASE
+    # Two rectangles: x=11..12 then x=14..16. The cells between and outside
+    # them survive, which is also what says the second stroke really erased
+    # rather than the first one having taken the whole row.
+    assert _row_survivors(10, range(10, 17)) == [10, 13], (
+        _row_survivors(10, range(10, 17)))
+    assert orch.select_rect is None, "the rectangle should clear on release"
+    ok("two strokes erased in one visit to the mode")
+
+
+def test_erase_mode_leaves_no_stamp_behind():
+    """A plain erase is a deletion, not a cut: nothing reaches the history."""
+    engine.place_belt_path((10, 10), (14, 10))
+    engine.sync_segments()
+    press_key(glfw.KEY_X)
+    drag_cells((9, 9), (15, 11))
+    assert _row_survivors(10, range(9, 16)) == [], (
+        _row_survivors(10, range(9, 16)))
+    assert not orch.clipboard.history, "a plain erase must not copy"
+    assert orch.clipboard.mode == MODE_ERASE
+    ok("a plain erase deleted without pushing a stamp")
+
+
+def test_escape_and_right_press_leave_erase_mode():
+    """Both of copy mode's aborts work here too, since the machine is shared."""
+    select_tool("Belt")
+    press_key(glfw.KEY_X)
+    press_key(glfw.KEY_ESCAPE)
+    assert orch.clipboard.mode == MODE_OFF, orch.clipboard.mode
+    assert orch.toolbelt.active.name == "Belt"
+
+    press_key(glfw.KEY_X)
+    assert orch.clipboard.mode == MODE_ERASE
+    fake["right"] = True
+    step()
+    fake["right"] = False
+    step()
+    assert orch.clipboard.mode == MODE_OFF, orch.clipboard.mode
+    ok("Esc and a right-press both left erase mode")
+
+
+def test_erase_mode_takes_a_whole_structure_from_any_cell():
+    """Touching, not containing -- the rule capture() uses.
+
+    `Engine.erase()` removes a multi-cell entity from any one of its cells,
+    so a rectangle clipping one corner of a Sink takes the whole machine.
+    """
+    sink_cells = [(20, 20), (21, 20), (20, 21), (21, 21)]
+    engine.place_structure(Sink, 20, 20)       # 2x2, cells (20,20)..(21,21)
+    engine.sync_segments()
+    assert all(not board.is_empty(*c) for c in sink_cells), "setup"
+
+    press_key(glfw.KEY_X)
+    # A rectangle covering only the top-right cell of the four. It has to be
+    # a real drag: a same-cell "drag" never passes DRAG_THRESHOLD_PX and so
+    # is a click, which deliberately erases nothing.
+    drag_cells((21, 21), (23, 23))
+    assert all(board.is_empty(*c) for c in sink_cells), (
+        "one cell of a Sink should have taken all of it: "
+        f"{[c for c in sink_cells if not board.is_empty(*c)]} left")
+    ok("a rectangle clipping one cell erased the whole Sink")
+
+
+def test_ctrl_x_cuts_into_paste_mode():
+    """A cut captures before deleting, then hands you the stamp."""
+    engine.place_belt_path((20, 20), (23, 20))
+    engine.sync_segments()
+    assert len(_row_survivors(20, range(20, 24))) == 4
+
+    ctrl_key(glfw.KEY_X)
+    assert orch.clipboard.mode == MODE_ERASE, orch.clipboard.mode
+    assert orch.clipboard.cutting, "ctrl+X must arm the cut"
+
+    drag_cells((19, 19), (24, 21))
+    assert _row_survivors(20, range(20, 24)) == [], (
+        "the cut must delete what it took")
+    assert orch.clipboard.mode == MODE_PASTE, orch.clipboard.mode
+    s = orch.clipboard.stamp
+    assert s is not None and len(s) == 4, s
+    ok("ctrl+X captured four belts, deleted them, and went to paste mode")
+
+    # And it pastes back, which is the whole point of a cut.
+    put_cursor_at_cell(21, 20)
+    step()
+    click()
+    assert _row_survivors(20, range(20, 24)) == [20, 21, 22, 23], (
+        _row_survivors(20, range(20, 24)))
+    ok("the cut stamp pasted back onto the board")
+
+
+def test_a_cut_is_one_continuous_mode_chain():
+    """The tool held before a cut survives cut -> paste -> exit.
+
+    Same property as ctrl+C -> ctrl+V, and it holds for the same reason:
+    `Clipboard._stash()` refuses to overwrite an existing stash, so the
+    intermediate mode switch cannot replace the player's real tool with
+    erase mode's own empty hand.
+    """
+    select_tool("Shear")
+    engine.place_belt_path((20, 20), (22, 20))
+    engine.sync_segments()
+    ctrl_key(glfw.KEY_X)
+    drag_cells((19, 19), (23, 21))
+    assert orch.clipboard.mode == MODE_PASTE
+    press_key(glfw.KEY_ESCAPE)
+    assert orch.clipboard.mode == MODE_OFF
+    assert orch.toolbelt.active.name == "Shear", orch.toolbelt.active.name
+    ok("the Shear came back after cut -> paste -> Esc")
+
+
+def test_the_cut_flag_does_not_outlive_its_mode():
+    """A later bare-X stroke must not silently cut.
+
+    `cutting` lives on the mode, so every exit clears it. Without that a
+    player who cut once would find their next plain erase quietly copying --
+    invisible until the history filled with things they meant to delete.
+    """
+    select_tool("Belt")
+    ctrl_key(glfw.KEY_X)
+    assert orch.clipboard.cutting
+    press_key(glfw.KEY_ESCAPE)
+    assert not orch.clipboard.cutting, "Esc must disarm the cut"
+
+    press_key(glfw.KEY_X)
+    assert not orch.clipboard.cutting, "bare X after a cut must not cut"
+    engine.place_belt_path((10, 10), (12, 10))
+    engine.sync_segments()
+    drag_cells((9, 9), (13, 11))
+    assert _row_survivors(10, range(9, 14)) == []
+    assert not orch.clipboard.history, "the stale cut flag copied anyway"
+    ok("the cut flag did not survive its mode")
+
+
+def test_an_empty_cut_does_not_strand_you_in_paste_mode():
+    """Cutting bare board catches nothing, so there is nothing to paste."""
+    select_tool("Belt")
+    ctrl_key(glfw.KEY_X)
+    drag_cells((40, 40), (44, 44))
+    assert not orch.clipboard.history, "nothing should have been pushed"
+    assert orch.clipboard.mode == MODE_ERASE, (
+        "an empty cut should leave you erasing, not in an empty paste mode")
+    ok("an empty cut left the player in erase mode")
+
+
+# --- selecting a tool overrides the stash ----------------------------------
+def test_selecting_a_tool_leaves_any_mode_holding_that_tool():
+    """A slot pick is a new choice, so it beats the stashed tool.
+
+    Every other exit restores the stash, because the mode interrupted the
+    player and handing the tool back is the courtesy. Choosing a slot is not
+    an interruption ending -- restoring afterwards would override what was
+    just asked for, which is why `_select_slot()` drops the stash instead.
+    """
+    for enter, name in ((lambda: ctrl_key(glfw.KEY_C), "copy"),
+                        (lambda: press_key(glfw.KEY_X), "erase"),
+                        (lambda: ctrl_key(glfw.KEY_X), "cut")):
+        harness.reset()
+        select_tool("Shear")
+        enter()
+        assert orch.clipboard.active, f"setup: {name} mode should be on"
+        select_tool("Belt")
+        assert orch.clipboard.mode == MODE_OFF, (
+            f"selecting a tool should have left {name} mode")
+        assert orch.toolbelt.active.name == "Belt", (
+            f"{name}: landed on {orch.toolbelt.active.name}, not the picked "
+            f"tool -- the stash overrode the choice")
+    ok("a slot pick left copy, erase and cut modes holding the picked tool")
+
+
+def test_selecting_a_tool_leaves_paste_mode_too():
+    """Including paste, whose tool override has to be dropped with it."""
+    _copy_a_run()
+    assert orch.clipboard.mode == MODE_PASTE
+    select_tool("Mac")
+    assert orch.clipboard.mode == MODE_OFF
+    assert orch.toolbelt.active.name == "Mac", orch.toolbelt.active.name
+    assert orch.paste_tool is None, "the paste tool must go with the mode"
+    # The stamp itself survives -- leaving paste mode is not losing the copy.
+    assert orch.clipboard.history, "the history should outlive the mode"
+    ok("a slot pick left paste mode and dropped the paste tool")
+
+
+def test_the_panels_slot_buttons_leave_a_mode_too():
+    """Clicking a slot in the bar must behave exactly as its digit does.
+
+    The two go through one path (`Orchestrator._select_slot`), so this pins
+    the wiring rather than a second implementation.
+    """
+    select_tool("Shear")
+    ctrl_key(glfw.KEY_C)
+    assert orch.clipboard.mode == MODE_COPY
+    belt_slot = next(i for i, s in enumerate(orch.toolbelt.slots)
+                     if s is not None and s.name == "Belt")
+    orch._select_slot(belt_slot)
+    assert orch.clipboard.mode == MODE_OFF
+    assert orch.toolbelt.active.name == "Belt"
+    ok("the panel's slot path left the mode on the picked tool")

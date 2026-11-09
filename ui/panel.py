@@ -4,7 +4,7 @@ from imgui_bundle import imgui
 
 from core import cell, persistence
 from core.belts import UNIT
-from core.entity import Source
+from core.entity import Belt, Source
 from ui.input_manager import STATE_NAMES
 from core.toolbelt import SLOT_COUNT, SPLIT_AFTER
 
@@ -18,7 +18,7 @@ class UIRequests:
                  "toggle_pause", "step_tick", "tick_rate",
                  "segment_debug", "rebuild_segments", "audit_segments",
                  "debug_feed", "clear_items", "close_status",
-                 "set_emit")
+                 "set_emit", "set_seed")
 
     def __init__(self):
         self.reload_shader = False
@@ -51,6 +51,11 @@ class UIRequests:
         #: the row rather than a view, matching Orchestrator.inspect_row --
         #: a view must not cross a frame boundary.
         self.set_emit = None
+        #: (row, on, value) to set a belt cell's seed, or None. A row for the
+        #: same reason as set_emit; both halves together because the checkbox
+        #: and the value box are one setting and either one changing has to
+        #: carry the other's current state.
+        self.set_seed = None
 
 
 class UI:
@@ -321,16 +326,20 @@ class UI:
                  | imgui.WindowFlags_.no_nav)
         imgui.set_next_window_bg_alpha(0.85)
 
-        # Copy and paste tint the whole bar, so a mode that overrides the
-        # toolbelt is never mistaken for a slot selection. Blue for copy,
-        # a warmer shade for paste -- the bar is the one piece of UI always
+        # A mode tints the whole bar, so one that overrides the toolbelt is
+        # never mistaken for a slot selection. Blue for copy, a warmer shade
+        # for paste, red for erase -- the bar is the one piece of UI always
         # on screen, which makes it the right place to say what mode you are
-        # in.
+        # in, and erase is the one worth noticing you are still in.
         cb = orch.clipboard
         tinted = cb.active
         if tinted:
-            tint = (imgui.ImVec4(0.14, 0.26, 0.40, 0.92) if cb.copying
-                    else imgui.ImVec4(0.30, 0.24, 0.12, 0.92))
+            if cb.copying:
+                tint = imgui.ImVec4(0.14, 0.26, 0.40, 0.92)
+            elif cb.erasing:
+                tint = imgui.ImVec4(0.38, 0.14, 0.14, 0.92)
+            else:
+                tint = imgui.ImVec4(0.30, 0.24, 0.12, 0.92)
             imgui.push_style_color(imgui.Col_.window_bg, tint)
 
         if imgui.begin("##toolbelt", None, flags):
@@ -439,8 +448,29 @@ class UI:
         imgui.text(f"{entity.footprint_w}x{entity.footprint_h}"
                    f"   row {entity.row}")
 
-        # Per-type affordances. Only Source has one so far; everything else
-        # shows its channels and nothing more.
+        # Per-type affordances. Source and Belt have one each; everything
+        # else shows its channels and nothing more.
+        if isinstance(entity, Belt):
+            imgui.separator()
+            imgui.text_unformatted("Seed")
+            changed_on, on = imgui.checkbox("##seed_on", entity.seed_on)
+            imgui.same_line()
+            imgui.set_next_item_width(140)
+            # A float entry like Source's, for the same reason: the seeded
+            # value is the point of the control and should not be clamped to
+            # a slider's range.
+            changed_val, value = imgui.input_float(
+                "##seed_value", float(entity.seed_value))
+            if changed_on or changed_val:
+                # Both halves travel together -- whichever widget moved, the
+                # other's current value has to come along or the setter would
+                # see a half-update and treat it as a change.
+                req.set_seed = (entity.row, on, value)
+            imgui.text_disabled(
+                "puts an item of this value on this belt's run\n"
+                "every time the run is rebuilt (an edit, a clear, a load)")
+            imgui.text_disabled("changing it clears every item in flight")
+
         if isinstance(entity, Source):
             imgui.separator()
             imgui.text_unformatted("Emits")
@@ -628,6 +658,7 @@ class UI:
         imgui.text("ctrl+C: copy (drag a box)   ctrl+V: paste")
         imgui.text("  paste: click places, shift+click places what fits")
         imgui.text("  shift+scroll: older/newer copy")
+        imgui.text("X: erase mode (drag a box)   ctrl+X: cut")
         imgui.text("Left-click: build with the active tool")
         imgui.text("R / shift+R: per-tool (belt shape, structure rotation)")
         imgui.text("Right-click: cancel plan / drag to erase")

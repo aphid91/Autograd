@@ -15,6 +15,8 @@ const int GHOST_SHIFT = 0, GHOST_MASK = 0x3;
 const int FLIP_SHIFT = 2;   // .z bit 2: mirrored about the authored X axis
 const int UNDER_EXIT_SHIFT   = 3;   // .z bit 3: this end surfaces
 const int UNDER_PAIRED_SHIFT = 4;   // .z bit 4: this end has a partner
+const int SEED_SHIFT     = 5;   // .z bit 5: belt cell seeds its run
+const int SEED_POS_SHIFT = 6;   // .z bit 6: that seed's value is positive
 const int LOCAL_SHIFT = 16, LOCAL_MASK = 0xFFFF;
 // .w: belt segment membership. Derived state, stamped by core/segments.py.
 const int SEG_OFF_SHIFT = 0,  SEG_OFF_MASK = 0xFFFF;
@@ -50,6 +52,11 @@ int ghost_state(int w) { return (w >> GHOST_SHIFT) & GHOST_MASK; }
 bool is_flipped (int w) { return ((w >> FLIP_SHIFT) & 1) != 0; }
 bool is_under_exit  (int w) { return ((w >> UNDER_EXIT_SHIFT)   & 1) != 0; }
 bool is_under_paired(int w) { return ((w >> UNDER_PAIRED_SHIFT) & 1) != 0; }
+// A seeded belt cell, and the sign of what it seeds. The value itself is not
+// in the cell -- only the sign, which is all a tint can convey and matches
+// what the item discs themselves report.
+bool is_seeded     (int w) { return ((w >> SEED_SHIFT)     & 1) != 0; }
+bool is_seed_positive(int w) { return ((w >> SEED_POS_SHIFT) & 1) != 0; }
 
 ivec2 cell_local(int w) {
     return ivec2((w >> LOCAL_SHIFT) & LOCAL_MASK, w & LOCAL_MASK);

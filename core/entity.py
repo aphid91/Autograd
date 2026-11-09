@@ -35,13 +35,27 @@ _COMMON_FIELDS = 8
 #
 # A gate needs, per channel: the value held at each input, the value waiting
 # at each output, and an occupancy flag for both. The widest is Sink's four
-# input channels, so 8 common + 4*2 values + 4*2 flags = 24.
-# Rows are cheap and branching is not, so every type carries the full set
-# rather than packing per-type -- a belt row simply has unused slots.
+# input channels, so 8 common + 4*2 values + 4*2 flags = 24 slots of gate
+# state. Rows are cheap and branching is not, so every type carries the full
+# set rather than packing per-type -- a belt row simply has unused slots.
+#
+# The last four carry a **belt's seed** (see `Belt.F_SEED_ON`). Unlike
+# Source's emit value, which squats on an input slot a generator can never
+# read, a belt has no dead slot to reuse: every one of the 24 belongs to the
+# gate block, and a belt is not a gate so none of them *is* read -- but
+# aliasing onto them would make a belt's seed and a machine's channel the
+# same storage, which is exactly the kind of coincidence that breaks the
+# first time a belt gains any channel at all. So the row grew by one vec4,
+# the smallest honest increment. That widens every row in the game, which is
+# the price; at 512x512 with a few thousand entities it is a few tens of KB.
 #
 # Was 32, set by a six-port Source. Narrowing that machine to three ports
-# left Sink's four as the widest, which is what let this drop.
-ENTITY_STRIDE = 24
+# left Sink's four as the widest, which dropped it to 24; the belt seed takes
+# it to 28.
+#
+# **The stride is baked into save files**, so changing it invalidates older
+# ones -- persistence checks the shape and refuses them.
+ENTITY_STRIDE = 28
 
 #: Most *channels* of one kind any machine has -- not port faces. Fixes the
 #: per-row gate layout, so a machine with more channels means bumping this
@@ -585,20 +599,62 @@ class Entity:
 
 
 class Belt(Entity):
-    """A single-cell conveyor. Direction is which way items travel."""
+    """A single-cell conveyor. Direction is which way items travel.
+
+    Items in flight belong to the *segment* a belt is part of, not to the
+    cell -- see core/segments.py -- so a belt row holds no item state. The
+    **seed** is the one exception, and it is not item state: it is a standing
+    instruction to put one item on this cell's run whenever that run is
+    (re)derived, which is a property of the cell the player clicked and
+    therefore has to live with the cell.
+
+    That distinction is what decides where it goes. A segment is rebuilt from
+    the grid and gets a fresh id every time, so storing the seed on the
+    segment would lose it on the next edit -- which is precisely the moment
+    it is supposed to fire.
+    """
 
     TYPE_ID = cell.TYPE_BELT
     FOOTPRINT = (1, 1)
 
-    # No belt-specific row fields. Items belong to the *segment* a belt is
-    # part of, not to the cell -- see core/segments.py -- so per-cell item
-    # state would be a second home for something that already has one.
+    #: Seed state, in the row's trailing vec4 (see ENTITY_STRIDE).
+    #:
+    #: `F_SEED_ON` is a flag rather than "a value of zero means off", because
+    #: zero is a perfectly good thing to seed -- the same reason a Source's
+    #: emit value needed `initialise()` to seed its default.
+    F_SEED_ON = Entity._GATE_FIELDS_END + 0
+    F_SEED_VALUE = Entity._GATE_FIELDS_END + 1
 
-    def initialise(self, x, y, direction, is_ghost=False, flipped=False):
+    #: What a freshly ticked seed box starts at, so switching the checkbox on
+    #: produces a visible item rather than an invisible zero.
+    SEED_VALUE = 1.0
+
+    def initialise(self, x, y, direction, is_ghost=False, flipped=False,
+                   seed_on=False, seed_value=None):
         # A belt is 1x1 with no ports, so `flipped` is meaningless for it --
         # accepted and passed through only so every entity type takes the
         # same orientation arguments and callers need no special case.
         super().initialise(x, y, direction, is_ghost=is_ghost, flipped=flipped)
+        self._set(self.F_SEED_ON, 1.0 if seed_on else 0.0)
+        self._set(self.F_SEED_VALUE,
+                  float(self.SEED_VALUE if seed_value is None else seed_value))
+
+    @property
+    def seed_on(self):
+        """Does this cell put an item on its run at every rebuild?"""
+        return bool(self._get(self.F_SEED_ON))
+
+    @seed_on.setter
+    def seed_on(self, value):
+        self._set(self.F_SEED_ON, 1.0 if value else 0.0)
+
+    @property
+    def seed_value(self):
+        return float(self._get(self.F_SEED_VALUE))
+
+    @seed_value.setter
+    def seed_value(self, v):
+        self._set(self.F_SEED_VALUE, float(v))
 
 
 class Underground(Entity):
@@ -702,7 +758,7 @@ class Structure(Entity):
 
 
 class Swap(Structure):
-    """Conditional swap: x,y,z -> x, (y,z if x>0 else z,y).
+    """Conditional swap: x,y,z -> x, (z,y if x>0 else y,z).
 
     Authored at DIR_PX as a 1x2 (tall) body. The x channel runs vertically
     through the *whole* body -- in at the north face of the top cell, out at
@@ -731,16 +787,17 @@ class Swap(Structure):
     PASS_THROUGH = (cell.DIR_NY,)
 
     def fire(self, values):
-        """x,y,z -> x, (y,z if x>0 else z,y).
+        """x,y,z -> x, (z,y if x>0 else y,z).
 
         x is the control: it passes through unchanged (it is the declared
         PASS_THROUGH axis) and its sign decides whether y and z swap.
-        x == 0 means no swap.
+        A **positive** x swaps; zero or negative passes the pair straight
+        through, so x reads as "swap when true" rather than the reverse.
         """
         x, y, z = values
         if x > 0.0:
-            return [x, y, z]
-        return [x, z, y]
+            return [x, z, y]
+        return [x, y, z]
 
 
 class Shear(Structure):
@@ -1034,10 +1091,13 @@ def _self_check():
         return v
 
     # Swap: x is the control and passes through; y and z exchange iff x > 0.
+    # A positive control swaps -- "swap when the condition holds". The two
+    # branches were the other way round at first, which reads backwards:
+    # the machine sat swapping whenever its control said not to.
     sw = _view(Swap)
-    assert sw.fire([1.0, 7.0, 9.0]) == [1.0, 7.0, 9.0], "x>0 must not swap"
-    assert sw.fire([-1.0, 7.0, 9.0]) == [-1.0, 9.0, 7.0], "x<=0 must swap"
-    assert sw.fire([0.0, 7.0, 9.0]) == [0.0, 9.0, 7.0], "x==0 means swap"
+    assert sw.fire([1.0, 7.0, 9.0]) == [1.0, 9.0, 7.0], "x>0 must swap"
+    assert sw.fire([-1.0, 7.0, 9.0]) == [-1.0, 7.0, 9.0], "x<0 must not swap"
+    assert sw.fire([0.0, 7.0, 9.0]) == [0.0, 7.0, 9.0], "x==0 means no swap"
 
     # Shear: x passes through, y becomes x+y.
     sh = _view(Shear)
@@ -1074,6 +1134,43 @@ def _self_check():
     # The occupancy flag stays clear, so nothing reads the emit value as a
     # held input even by mistake.
     assert not src.in_held(0)
+
+    # --- a belt's seed ----------------------------------------------------
+    # The seed lives *past* the gate block rather than aliasing onto it. A
+    # belt reads none of those 24 slots today, so reuse would work -- and
+    # would make a belt's seed and a machine's channel one piece of storage,
+    # which stops being harmless the moment a belt gains a channel.
+    assert Belt.F_SEED_ON >= Entity._GATE_FIELDS_END, (
+        "a belt's seed must not alias the gate block")
+    assert Belt.F_SEED_VALUE < ENTITY_STRIDE, (
+        f"seed value at {Belt.F_SEED_VALUE} is past the {ENTITY_STRIDE}-slot "
+        f"row")
+
+    blt = _view(Belt)
+    # A zeroed row reads as "not seeded", which is the right default: a belt
+    # the player has not touched must not inject anything.
+    assert not blt.seed_on and blt.seed_value == 0.0
+
+    # initialise() seeds the *value* default but leaves the flag off, so a
+    # belt drawn by the ordinary path never injects until it is asked to.
+    blt.initialise(1, 2, cell.DIR_PX)
+    assert not blt.seed_on, "a freshly placed belt must not be seeded"
+    assert blt.seed_value == Belt.SEED_VALUE, blt.seed_value
+
+    # Zero is a legal seed value, not a sentinel -- which is the whole reason
+    # the flag exists separately from the value.
+    blt.seed_on = True
+    blt.seed_value = 0.0
+    assert blt.seed_on and blt.seed_value == 0.0, (
+        "zero must be a seedable value, distinct from 'not seeded'")
+    blt.seed_value = -2.5
+    assert blt.seed_value == -2.5
+
+    # And the explicit spawn path carries both halves, which is what a paste
+    # and a load need.
+    seeded_belt = _view(Belt)
+    seeded_belt.initialise(0, 0, cell.DIR_PY, seed_on=True, seed_value=3.5)
+    assert seeded_belt.seed_on and seeded_belt.seed_value == 3.5
 
     # initialise() seeds the class default, which is how a placed Source
     # starts at EMIT_VALUE rather than at 0.0.

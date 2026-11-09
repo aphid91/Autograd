@@ -280,11 +280,20 @@ class Gameboard:
         # An underground end publishes its role and pairing into .z, so the
         # renderer can draw the funnel and the dotted span from the grid
         # alone. Re-stamp a pair after pairing them (see Engine.pair_under).
+        #
+        # A seeded belt publishes the same way, and for the same reason: the
+        # shader tints the cell from the grid texture with no entity-row
+        # lookup. It carries the *sign* rather than the value, which is all a
+        # tint can show -- see cell.SEED_BIT. Changing either through the row
+        # alone leaves the grid stale, hence restamp().
+        seeded = bool(getattr(view, "seed_on", False))
         word_z = cell.pack_flags(
             cell.GHOST_PENDING if view.is_ghost else cell.GHOST_NONE,
             flipped=view.flipped,
             under_exit=getattr(view, "is_exit", False),
             under_paired=getattr(view, "paired", False),
+            seeded=seeded,
+            seed_positive=seeded and getattr(view, "seed_value", 0.0) > 0.0,
         )
         word_x = cell.pack_cell(view.type_id, view.direction, view.row)
         ox, oy = view.origin

@@ -28,7 +28,7 @@ import glfw
 from core import config, persistence
 from core.builders import PasteBuilder, default_builders
 from core.clipboard import Clipboard, MODE_COPY, MODE_PASTE, capture
-from core.entity import Source
+from core.entity import Belt, Source
 from render.camera import Camera
 from engine import Engine
 from ui.input_manager import InputManager, STATE_PLANNING
@@ -112,6 +112,60 @@ class Orchestrator:
         self._refresh_paste_tool()
         return True
 
+    def _enter_erase(self, cut=False):
+        """X / ctrl+X: stash the held tool and start a rectangle erase.
+
+        Entered the same way as copy mode and sharing its gesture, since the
+        only difference is what the release does -- see core/clipboard.py.
+        """
+        self.clipboard.enter_erase(self._stashable_slot(), cut=cut)
+        self._on_tool_changed()
+        self.select_rect = None
+
+    def _erase_selection(self, rect):
+        """Delete everything a released erase rectangle touched.
+
+        Touching, not contained -- the same rule `capture()` uses, so a
+        sloppy drag over a machine takes the whole machine. `Engine.erase()`
+        already removes a multi-cell entity from any one of its cells and
+        releases an underground's partner, so erasing per cell is both
+        correct and idempotent here.
+
+        **The mode survives**, which is the point of erase mode: the
+        rectangle is a stroke you repeat, not a commitment that ends it.
+
+        Under `cutting` the rectangle is captured *before* anything is
+        deleted and we go to paste mode holding it -- a cut. An empty cut
+        catches nothing, so it leaves the player erasing rather than
+        stranding them in a paste mode with no stamp.
+        """
+        self.select_rect = None
+        if rect is None:
+            return 0
+
+        stamp = None
+        if self.clipboard.cutting:
+            stamp = capture(self.engine.board, *rect)
+
+        x0, y0, x1, y1 = rect
+        lo_x, hi_x = (x0, x1) if x0 <= x1 else (x1, x0)
+        lo_y, hi_y = (y0, y1) if y0 <= y1 else (y1, y0)
+        erased = 0
+        for y in range(lo_y, hi_y + 1):
+            for x in range(lo_x, hi_x + 1):
+                if self.engine.board.in_bounds(x, y):
+                    erased += int(self.engine.erase(x, y))
+
+        if stamp:
+            # A cut becomes the active stamp and takes us to paste mode, so
+            # cut-then-place is one chain like copy-then-place. The stash
+            # survives it: Clipboard._stash() refuses to overwrite, so the
+            # tool the player held before the cut still comes back.
+            self.clipboard.adopt(stamp)
+            self._on_tool_changed()
+            self._refresh_paste_tool()
+        return erased
+
     def _stashable_slot(self):
         """The slot to return to, or None for an empty hand.
 
@@ -124,11 +178,13 @@ class Orchestrator:
         return self.toolbelt.selected
 
     def _end_mode(self, to_empty=False):
-        """Leave copy or paste mode.
+        """Leave copy, paste or erase mode.
 
         `to_empty` is Q's behaviour -- drop the stash and hold nothing. Every
         other exit (right-press, a plain click, Esc) restores the tool the
         player was using, so a mode entered mid-gesture gives the belt back.
+        Selecting a toolbelt slot is the third case and does not come through
+        here at all -- see `_select_slot()`.
         """
         if not self.clipboard.active:
             return
@@ -145,6 +201,31 @@ class Orchestrator:
         self.paste_tool = None
         self.select_rect = None
         self._on_tool_changed()
+
+    def _select_slot(self, slot):
+        """Pick a toolbelt slot, leaving any clipboard mode on the way.
+
+        **Picking a tool wins over the stash.** Every other way out of a mode
+        restores what the player was holding when they entered it, because
+        the mode interrupted them and handing the tool back is the courtesy.
+        Choosing a slot is not an interruption ending -- it is a new choice,
+        and restoring the stash afterwards would override it with whatever
+        was held several actions ago.
+
+        So the stash is *discarded* rather than applied. Without that the
+        order of these two operations would decide the outcome, which is
+        exactly the kind of coupling the single accessor exists to avoid.
+        """
+        if self.clipboard.active:
+            # exit_to_empty() drops the stash without touching the toolbelt,
+            # which is what lets the select() below be the final word.
+            self.clipboard.exit_to_empty()
+            self.paste_tool = None
+            self.select_rect = None
+        if self.toolbelt.select(slot):
+            self._on_tool_changed()
+            return True
+        return False
 
     def _capture_selection(self, rect):
         """Turn a released selection rectangle into a stamp.
@@ -255,6 +336,42 @@ class Orchestrator:
             return
         view.emit_value = value
         self.engine.flush_material()
+
+    def _set_seed(self, row, on, value):
+        """Change a belt cell's seed, and re-derive so it takes effect.
+
+        A seed fires when segments are derived, so changing one has to
+        invalidate the index -- otherwise the player ticks the box and
+        nothing happens until their next unrelated edit. `invalidate_segments()`
+        is the whole mechanism: the frame's `sync_segments()` then rebuilds,
+        flushes, and re-seeds, exactly as a belt placement would.
+
+        That also means **changing a seed clears the board's items**, since a
+        rebuild does. Consistent with every other edit to the belt network,
+        and with a Source's emit value -- there is one meaning of "start
+        fresh" (see `Engine.flush_material()`).
+
+        Guarded on the row still being a live belt for the same reason
+        `_set_emit` is: a request is built from the previous frame's state and
+        the entity could have been erased in between.
+        """
+        board = self.engine.board
+        if not board.is_row_alive(row):
+            return
+        view = board.view(row)
+        if not isinstance(view, Belt):
+            return
+        if view.seed_on == bool(on) and view.seed_value == value:
+            # Nothing changed. Checked for the same reason `_set_emit` checks:
+            # imgui reports a change per keystroke, and re-deriving on every
+            # one would wipe the board mid-edit.
+            return
+        view.seed_on = bool(on)
+        view.seed_value = float(value)
+        # The sign lives in the cell for the tint, so the row alone is not
+        # enough -- see Gameboard._stamp_footprint().
+        board.restamp(view)
+        self.engine.invalidate_segments()
 
     def inspected(self):
         """A fresh view of the inspected entity, or None.
@@ -384,8 +501,7 @@ class Orchestrator:
         # 3. toolbelt selection. Changing tools drops any in-flight preview --
         # a half-drawn belt run means nothing to the structure tool.
         if intents.select_slot is not None:
-            if self.toolbelt.select(intents.select_slot):
-                self._on_tool_changed()
+            self._select_slot(intents.select_slot)
 
         # Q: pick up or put down. In copy or paste mode it means neither --
         # it leaves the mode with an *empty* hand, dropping the stashed tool
@@ -396,11 +512,16 @@ class Orchestrator:
             else:
                 self._pipette(intents.cursor_cell, intents.cursor_in_world)
 
-        # ctrl+C / ctrl+V, and the ways back out.
+        # ctrl+C / ctrl+V / X / ctrl+X, and the ways back out. Mutually
+        # exclusive: one key press cannot mean two modes.
         if intents.copy_mode:
             self._enter_copy()
         elif intents.paste_mode:
             self._enter_paste()
+        elif intents.cut_mode:
+            self._enter_erase(cut=True)
+        elif intents.erase_mode:
+            self._enter_erase(cut=False)
         if intents.exit_mode:
             self._end_mode(to_empty=False)
 
@@ -410,10 +531,14 @@ class Orchestrator:
             if self.clipboard.cycle_stamp(step):
                 self._refresh_paste_tool()
 
-        # A completed selection drag becomes a stamp.
+        # A completed selection drag becomes a stamp, or a deletion. The two
+        # share the gesture and differ only here: a copy ends its mode, an
+        # erase stroke keeps going.
         self.select_rect = intents.select_rect
         if intents.commit_select:
             self._capture_selection(intents.select_rect)
+        elif intents.commit_erase:
+            self._erase_selection(intents.select_rect)
 
         tool = self._active_tool()
 
@@ -506,8 +631,9 @@ class Orchestrator:
         if requests.clear_board:
             engine.clear_board()
         if requests.select_slot is not None:
-            if self.toolbelt.select(requests.select_slot):
-                self._on_tool_changed()
+            # Same path as the number keys, so clicking a slot in the bar
+            # leaves a clipboard mode exactly as pressing its digit does.
+            self._select_slot(requests.select_slot)
         # The panel's R / F buttons go through the same path as the keys, so
         # they transform the stamp in paste mode rather than reaching past it
         # into the toolbelt.
@@ -539,6 +665,8 @@ class Orchestrator:
             self.inspect_row = None
         if requests.set_emit is not None:
             self._set_emit(*requests.set_emit)
+        if requests.set_seed is not None:
+            self._set_seed(*requests.set_seed)
         if requests.toggle_pause:
             engine.clock.toggle_pause()
         if requests.step_tick:

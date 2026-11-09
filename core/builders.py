@@ -73,7 +73,7 @@ class Placement:
     """One entity a plan would create, and whether it can actually happen."""
 
     __slots__ = ("entity_cls", "x", "y", "direction", "blocked_cells",
-                 "flipped", "is_exit", "under_partner", "emit")
+                 "flipped", "is_exit", "under_partner", "emit", "seed")
 
     def __init__(self, entity_cls, x, y, direction, blocked_cells=(),
                  flipped=False):
@@ -94,6 +94,11 @@ class Placement:
         # toolbelt should start at the default, not inherit whatever the last
         # copied one happened to emit.
         self.emit = None
+        # Belt-only: `(on, value)` for a seeded cell, or None for the type
+        # default. Only a paste sets it, for exactly the same reason -- a
+        # freshly drawn belt run must not inherit a copied seed, or every
+        # later run would quietly inject items.
+        self.seed = None
 
     @property
     def frustrated(self):
@@ -534,8 +539,10 @@ class PasteBuilder(EntityBuilder):
             p = Placement(entry.entity_cls, x, y, entry.direction, blocked,
                           flipped=entry.flipped)
             p.is_exit = entry.is_exit
-            # A captured Source keeps the value it was emitting.
+            # A captured Source keeps the value it was emitting, and a
+            # captured belt keeps its seed.
             p.emit = entry.emit
+            p.seed = entry.seed
             placements.append(p)
 
         # Intra-stamp underground pairing travels with the plan, so a copied

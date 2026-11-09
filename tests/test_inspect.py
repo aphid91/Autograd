@@ -20,12 +20,13 @@ import glfw
 
 from core import cell, config
 from core.builders import quadrant_dir
-from core.entity import Shear, Sink, Source
+from core.entity import Belt, Shear, Sink, Source
 from ui.panel import UIRequests
 
 from tests import harness
 from tests.harness import (board, click, ctrl_key, drag_cells, engine, fake,
-                           ok, orch, put_cursor_at_cell, select_tool, step)
+                           ok, orch, press_key, put_cursor_at_cell,
+                           select_tool, step)
 
 
 # --- clicking with an empty hand -------------------------------------------
@@ -385,6 +386,286 @@ def test_the_emit_value_survives_a_save_round_trip():
         if os.path.exists(path):
             os.remove(path)
     ok("a Source's emit value survived a save/load round trip")
+
+
+# --- a belt's seed ---------------------------------------------------------
+# A seeded belt cell puts an item on its run every time segments are derived.
+# Like the Source's emit value it is per-instance configuration living in the
+# entity row, so these tests cover the same ownership questions -- plus one
+# the Source does not have: the seed has to *fire*, and firing is a side
+# effect of the segment sweep rather than of the setter.
+
+
+def _seeded_run(cells, value=1.0, a=(10, 10), b=(15, 10)):
+    """A belt run with `cells` seeded at `value`. Returns its segment."""
+    select_tool("Belt")
+    engine.place_belt_path(a, b)
+    engine.sync_segments()
+    for xy in cells:
+        view = board.entity_at(*xy)
+        orch._set_seed(view.row, True, value)
+    engine.sync_segments()
+    return engine.segments.at(*a)
+
+
+def test_a_placed_belt_is_not_seeded():
+    """The default has to be off: an untouched belt must inject nothing."""
+    engine.place_belt(10, 10)
+    engine.sync_segments()
+    view = board.entity_at(10, 10)
+    assert not view.seed_on, "a freshly drawn belt must not be seeded"
+    assert engine.segments.at(10, 10).count == 0
+    # The value still has its default, so ticking the box produces a visible
+    # item rather than an invisible zero.
+    assert view.seed_value == Belt.SEED_VALUE, view.seed_value
+    ok("a placed belt starts unseeded, with the default value ready")
+
+
+def test_a_seeded_belt_puts_its_value_on_the_run():
+    seg = _seeded_run([(12, 10)], value=2.5)
+    assert seg.count == 1, seg.count
+    assert engine.belts.payload_of(seg, seg.head) == 2.5
+    ok("a seeded cell put one item of its value on the run")
+
+
+def test_zero_is_a_seedable_value():
+    """Which is why the flag is separate from the value.
+
+    Nothing distinguishes "seeds zero" from "not seeded" if the value alone
+    carries the state -- the same trap Source.initialise() exists to avoid.
+    """
+    seg = _seeded_run([(12, 10)], value=0.0)
+    assert seg.count == 1, "zero must still seed"
+    assert engine.belts.payload_of(seg, seg.head) == 0.0
+    ok("a seed of zero produced an item, not an absence")
+
+
+def test_the_seed_fires_again_on_every_rebuild():
+    """The point of the feature: it survives the sweep that empties the run.
+
+    An edit anywhere drops every item on every belt (positions are relative
+    to a segment's anchor, so they cannot survive re-derivation). A seed is
+    the standing instruction that refills afterwards, which is what makes it
+    different from simply pushing an item once.
+    """
+    seg = _seeded_run([(12, 10)])
+    assert seg.count == 1
+
+    # An edit on the far side of the board: enough to invalidate, unrelated
+    # to this run.
+    engine.place_belt(40, 40)
+    engine.sync_segments()
+    seg = engine.segments.at(10, 10)
+    assert seg.count == 1, (
+        f"the seed should have re-fired after the rebuild, got {seg.count}")
+    assert engine.belts.payload_of(seg, seg.head) == 1.0
+    ok("the seed re-fired after an unrelated edit rebuilt the segments")
+
+
+def test_several_seeds_on_one_run_give_several_items():
+    """One item per seeded cell, nose to tail.
+
+    They all enter on the same tick, so this needs the staggered entry ticks
+    in `Engine.seed_segments()`: pushed at the same tick, the first lands at
+    position 0 and `has_room()` then refuses every one after it -- four
+    seeded cells produced a single item.
+    """
+    seg = _seeded_run([(10, 10), (11, 10), (12, 10), (13, 10)])
+    assert seg.count == 4, f"expected one item per seeded cell, got {seg.count}"
+
+    # Spaced by exactly the transport's spacing, and in order -- the state a
+    # producer running at full rate would have reached.
+    tick = engine.clock.tick
+    pos = engine.belts.positions(seg, tick)
+    assert pos == sorted(pos, reverse=True), pos
+    gaps = [pos[i - 1] - pos[i] for i in range(1, len(pos))]
+    assert all(g == engine.belts.spacing for g in gaps), gaps
+
+    # And the simulation's own invariants hold, which is the real check: the
+    # audit tests ordering, spacing and the anchor independently of this.
+    assert not engine.belts.audit(tick), engine.belts.audit(tick)
+    assert not engine.segments.audit(), engine.segments.audit()
+    ok("four seeded cells gave four correctly spaced items")
+
+
+def test_a_run_shorter_than_its_seeds_takes_what_fits():
+    """Seeds go through the same room check as any other push.
+
+    So a run with more seeded cells than it can physically hold takes as many
+    as fit and drops the rest, rather than overfilling the ring.
+    """
+    select_tool("Belt")
+    engine.place_belt_path((30, 30), (31, 30))
+    engine.sync_segments()
+    for x in (30, 31):
+        orch._set_seed(board.entity_at(x, 30).row, True, 1.0)
+    engine.sync_segments()
+    seg = engine.segments.at(30, 30)
+    cap = engine.belts.capacity_of(seg)
+    assert 0 < seg.count <= cap, (seg.count, cap)
+    assert not engine.belts.audit(engine.clock.tick), (
+        engine.belts.audit(engine.clock.tick))
+    ok(f"a 2-cell run with 2 seeds holds {seg.count}, within capacity {cap}")
+
+
+def test_the_seeded_cell_is_tinted_by_its_sign():
+    """The flags the renderer reads, mirrored into .z.
+
+    The cell carries the *sign* rather than the value, which is all a tint
+    can convey. Changing either half through the row alone would leave the
+    grid stale, so this is really a test that `_set_seed` restamps.
+    """
+    engine.place_belt(10, 10)
+    engine.sync_segments()
+    row = board.entity_at(10, 10).row
+
+    z = int(board.grid[10, 10, cell.CH_Z])
+    assert not cell.is_seeded(z), "an unseeded cell must not claim a seed"
+
+    orch._set_seed(row, True, 3.0)
+    z = int(board.grid[10, 10, cell.CH_Z])
+    assert cell.is_seeded(z) and cell.is_seed_positive(z)
+
+    orch._set_seed(row, True, -3.0)
+    z = int(board.grid[10, 10, cell.CH_Z])
+    assert cell.is_seeded(z) and not cell.is_seed_positive(z), (
+        "a negative seed must clear the sign bit")
+
+    # Zero reads as negative, matching the item discs' own split.
+    orch._set_seed(row, True, 0.0)
+    z = int(board.grid[10, 10, cell.CH_Z])
+    assert cell.is_seeded(z) and not cell.is_seed_positive(z)
+
+    orch._set_seed(row, False, 3.0)
+    z = int(board.grid[10, 10, cell.CH_Z])
+    assert not cell.is_seeded(z), "unticking the box must clear the flag"
+    ok("the cell's seed flags tracked the setting and its sign")
+
+
+def test_turning_a_seed_off_stops_it_firing():
+    seg = _seeded_run([(12, 10)])
+    assert seg.count == 1
+    orch._set_seed(board.entity_at(12, 10).row, False, 1.0)
+    engine.sync_segments()
+    seg = engine.segments.at(10, 10)
+    assert seg.count == 0, f"an unticked seed still fired: {seg.count} items"
+    ok("unticking the seed stopped it injecting")
+
+
+def test_setting_the_same_seed_is_not_a_rebuild():
+    """imgui reports a change per keystroke, so no-ops must stay no-ops.
+
+    Same guard as the emit value's, and it matters more here: a rebuild
+    empties every belt on the board, so re-applying the current value mid-edit
+    would wipe the factory.
+    """
+    _seeded_run([(12, 10)])
+    row = board.entity_at(12, 10).row
+    before = engine.segments.stats["rebuilds"]
+    orch._set_seed(row, True, 1.0)          # exactly what is already set
+    engine.sync_segments()
+    assert engine.segments.stats["rebuilds"] == before, (
+        "re-setting the same seed forced a rebuild")
+    ok("re-setting the same seed changed nothing")
+
+
+def test_set_seed_tolerates_a_dead_or_wrong_row():
+    """A request is built from the previous frame's state."""
+    belt = engine.place_belt(10, 10)
+    row = belt.row
+    engine.erase(10, 10)
+    orch._set_seed(row, True, 1.0)           # must not raise
+    src = engine.place_structure(Source, 20, 20)
+    orch._set_seed(src.row, True, 1.0)       # not a belt; must be ignored
+    assert not hasattr(src, "seed_on") or not getattr(src, "seed_on", False)
+    ok("_set_seed ignored a freed row and a non-belt")
+
+
+def test_a_copied_belt_keeps_its_seed():
+    """Per-instance configuration has to travel with a copy.
+
+    Same reasoning as the Source's emit value: the paste looks identical, so
+    a dropped seed would be invisible until the run failed to fill.
+    """
+    seg = _seeded_run([(12, 10)], value=4.0)
+    assert seg.count == 1
+    ctrl_key(glfw.KEY_C)
+    drag_cells((9, 9), (16, 11))
+    stamp = orch.clipboard.stamp
+    assert stamp is not None and len(stamp) == 6, stamp
+    seeds = [e.seed for e in stamp.entries if e.seed is not None]
+    assert seeds == [(True, 4.0)], seeds
+
+    # Paste it elsewhere and the seeded cell seeds there too.
+    put_cursor_at_cell(12, 20)
+    step()
+    click()
+    engine.sync_segments()
+    pasted = [board.entity_at(x, 20) for x in range(10, 16)]
+    on = [v for v in pasted if v is not None and v.seed_on]
+    assert len(on) == 1, [v.seed_on for v in pasted if v is not None]
+    assert on[0].seed_value == 4.0, on[0].seed_value
+    assert engine.segments.at(10, 20).count == 1, "the pasted seed did not fire"
+    ok("a copied belt pasted with its seed intact and firing")
+
+
+def test_a_freshly_drawn_belt_does_not_inherit_a_copied_seed():
+    """`Placement.seed` defaults to None for exactly this.
+
+    Otherwise copying a seeded belt would make every later run the Belt tool
+    drew inject items -- quietly, since the cells look the same.
+    """
+    _seeded_run([(12, 10)], value=4.0)
+    ctrl_key(glfw.KEY_C)
+    drag_cells((9, 9), (16, 11))
+    assert orch.clipboard.stamp is not None, "setup: nothing was copied"
+    press_key(glfw.KEY_ESCAPE)
+
+    select_tool("Belt")
+    engine.place_belt_path((10, 30), (13, 30))
+    engine.sync_segments()
+    for x in range(10, 14):
+        view = board.entity_at(x, 30)
+        assert not view.seed_on, f"({x},30) inherited a copied seed"
+    assert engine.segments.at(10, 30).count == 0
+    ok("the Belt tool still draws unseeded belts after copying a seeded one")
+
+
+def test_the_seed_survives_a_save_round_trip():
+    """It lives in the entity row, so persistence carries it wholesale."""
+    path = os.path.join(tempfile.gettempdir(), "gates_seed_roundtrip.npz")
+    _seeded_run([(12, 10)], value=5.5)
+    try:
+        engine.save_board(path)
+        engine.clear_board()
+        step()
+        engine.load_board(path)
+        engine.sync_segments()
+        back = engine.entity_at(12, 10)
+        assert isinstance(back, Belt), back
+        assert back.seed_on and back.seed_value == 5.5, (
+            back.seed_on, back.seed_value)
+        # And it fires on the loaded board, which is a rebuild like any other.
+        assert engine.segments.at(10, 10).count == 1
+    finally:
+        if os.path.exists(path):
+            os.remove(path)
+    ok("a belt's seed survived a save/load round trip and fired on load")
+
+
+def test_the_panel_only_requests_a_seed_change():
+    """The window never mutates the board; it returns a (row, on, value)."""
+    req = UIRequests()
+    assert req.set_seed is None
+    # The orchestrator is what applies it, and it carries a row rather than a
+    # view for the same reason inspect_row does.
+    belt = engine.place_belt(10, 10)
+    engine.sync_segments()
+    req.set_seed = (belt.row, True, 2.0)
+    assert isinstance(req.set_seed[0], int), "a row, not a view"
+    orch._set_seed(*req.set_seed)
+    assert board.entity_at(10, 10).seed_on
+    ok("the panel's seed request is a (row, on, value) the orchestrator applies")
 
 
 # --- the save filename box -------------------------------------------------

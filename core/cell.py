@@ -12,7 +12,9 @@ duplicated in GLSL at the top of world.frag -- KEEP THE TWO IN SYNC.
         bit  2       flipped: entity mirrored about its authored X axis
         bit  3       underground end is an exit (not an entrance)
         bit  4       underground end is paired with a partner
-        bits 5-31   reserved
+        bit  5       belt cell is seeded (injects an item on every rebuild)
+        bit  6       that seed's value is positive (for the cell's tint)
+        bits 7-31   reserved
     .w  bits 0-15    offset along the belt segment, from its tail
         bits 16-30   segment id (0 = not on a segment)
         bit  31      unused -- deliberately clear, as in .x
@@ -120,7 +122,7 @@ def rotate_offset(lx, ly, direction):
 # --- entity types -------------------------------------------------------
 TYPE_EMPTY = 0
 TYPE_BELT = 1
-TYPE_SWAP = 2    # conditional swap: x,y,z -> x, (y,z if x>0 else z,y)
+TYPE_SWAP = 2    # conditional swap: x,y,z -> x, (z,y if x>0 else y,z)
 TYPE_SHEAR = 3   # x,y -> x, x+y
 TYPE_MAC = 4     # x,y,z -> x, y, z + x*y
 TYPE_SOURCE = 5  # emits from one tip
@@ -174,6 +176,20 @@ UNDER_EXIT_SHIFT = 3
 UNDER_EXIT_BIT = 1 << UNDER_EXIT_SHIFT
 UNDER_PAIRED_SHIFT = 4
 UNDER_PAIRED_BIT = 1 << UNDER_PAIRED_SHIFT
+
+# .z bit 5: this belt cell is seeded -- it injects an item onto its run
+# whenever segments are re-derived (see Belt.F_SEED_ON). Bit 6: the *sign* of
+# that seed's value, so the renderer can tint the cell green or red and the
+# player can see at a glance where the seeds are and roughly what they carry.
+#
+# The sign rather than the value, because a cell flag has no room for a float
+# and sign is what the item discs themselves already report. Positive is
+# green, zero-or-below red -- the same split as COL_ITEM_POS / COL_ITEM_NEG,
+# so a seeded cell and the item it produces agree on colour.
+SEED_SHIFT = 5
+SEED_BIT = 1 << SEED_SHIFT
+SEED_POS_SHIFT = 6
+SEED_POS_BIT = 1 << SEED_POS_SHIFT
 
 GHOST_NONE = 0
 GHOST_PENDING = 1      # a ghost entity of our own, in a free cell
@@ -311,13 +327,15 @@ def segment_id_arr(words):
 
 # --- .z: ghost state ----------------------------------------------------
 def pack_flags(ghost_state=GHOST_NONE, flipped=False, under_exit=False,
-               under_paired=False):
+               under_paired=False, seeded=False, seed_positive=False):
     if not 0 <= ghost_state <= GHOST_MASK:
         raise ValueError(f"bad ghost state {ghost_state}")
     return ((ghost_state << GHOST_SHIFT)
             | (FLIP_BIT if flipped else 0)
             | (UNDER_EXIT_BIT if under_exit else 0)
-            | (UNDER_PAIRED_BIT if under_paired else 0))
+            | (UNDER_PAIRED_BIT if under_paired else 0)
+            | (SEED_BIT if seeded else 0)
+            | (SEED_POS_BIT if seed_positive else 0))
 
 
 def is_flipped(word):
@@ -330,6 +348,14 @@ def is_under_exit(word):
 
 def is_under_paired(word):
     return bool(int(word) & UNDER_PAIRED_BIT)
+
+
+def is_seeded(word):
+    return bool(int(word) & SEED_BIT)
+
+
+def is_seed_positive(word):
+    return bool(int(word) & SEED_POS_BIT)
 
 
 def ghost_state(word):
@@ -392,20 +418,31 @@ def _self_check():
 
     # Every .z flag is independent of the others and of the ghost field --
     # with_ghost_state() in particular must not disturb any of them.
+    import itertools
     for s in (GHOST_NONE, GHOST_PENDING, GHOST_FRUSTRATED):
-        for fl in (False, True):
-            for ex in (False, True):
-                for pr in (False, True):
-                    w = pack_flags(s, fl, ex, pr)
-                    assert ghost_state(w) == s, (s, fl, ex, pr)
-                    assert is_flipped(w) == fl, (s, fl, ex, pr)
-                    assert is_under_exit(w) == ex, (s, fl, ex, pr)
-                    assert is_under_paired(w) == pr, (s, fl, ex, pr)
-                    # Rewriting the ghost field preserves the rest.
-                    w2 = with_ghost_state(w, GHOST_FRUSTRATED)
-                    assert is_flipped(w2) == fl
-                    assert is_under_exit(w2) == ex
-                    assert is_under_paired(w2) == pr
+        for (fl, ex, pr, sd, sp) in itertools.product((False, True),
+                                                      repeat=5):
+            args = (s, fl, ex, pr, sd, sp)
+            w = pack_flags(*args)
+            assert ghost_state(w) == s, args
+            assert is_flipped(w) == fl, args
+            assert is_under_exit(w) == ex, args
+            assert is_under_paired(w) == pr, args
+            assert is_seeded(w) == sd, args
+            assert is_seed_positive(w) == sp, args
+            # Rewriting the ghost field preserves the rest.
+            w2 = with_ghost_state(w, GHOST_FRUSTRATED)
+            assert is_flipped(w2) == fl
+            assert is_under_exit(w2) == ex
+            assert is_under_paired(w2) == pr
+            assert is_seeded(w2) == sd
+            assert is_seed_positive(w2) == sp
+
+    # The seed flags occupy their own bits, so neither can be mistaken for
+    # an underground's -- these two pairs share .z and nothing else.
+    assert SEED_BIT != UNDER_PAIRED_BIT and SEED_BIT != UNDER_EXIT_BIT
+    assert not is_under_paired(pack_flags(seeded=True))
+    assert not is_seeded(pack_flags(under_paired=True))
 
     assert step_to_dir(1, 0) == DIR_PX and step_to_dir(0, -1) == DIR_NY
 

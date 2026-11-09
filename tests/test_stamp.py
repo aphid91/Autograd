@@ -74,13 +74,15 @@ def test_mirroring_preserves_what_each_machine_computes():
         return v
 
     # Swap exchanges its two lanes; exchanging them first changes nothing.
+    # The pass-through case is x <= 0, so that is the one where exchanging
+    # the inputs simply comes back exchanged.
     sw = view(Swap)
-    assert sw.fire([1.0, 7.0, 9.0]) == [1.0, 7.0, 9.0]
-    assert sw.fire([1.0, 9.0, 7.0]) == [1.0, 9.0, 7.0]
-    # With x <= 0 it swaps, and swapping a swapped pair is the same operation
+    assert sw.fire([-1.0, 7.0, 9.0]) == [-1.0, 7.0, 9.0]
+    assert sw.fire([-1.0, 9.0, 7.0]) == [-1.0, 9.0, 7.0]
+    # With x > 0 it swaps, and swapping a swapped pair is the same operation
     # viewed from the other side -- which is exactly what a mirror does.
-    a = sw.fire([-1.0, 7.0, 9.0])
-    b = sw.fire([-1.0, 9.0, 7.0])
+    a = sw.fire([1.0, 7.0, 9.0])
+    b = sw.fire([1.0, 9.0, 7.0])
     assert a[1:] == list(reversed(b[1:])), (a, b)
     ok("Swap's operation is invariant under exchanging its y/z lanes")
 

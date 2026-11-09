@@ -170,6 +170,41 @@ class BeltSim:
     def payload_of(self, seg, k):
         return float(seg.payload[k % seg.cap])
 
+    # --- entry ------------------------------------------------------------
+    def has_room(self, seg, tick):
+        """Can an item enter at the tail right now?
+
+        Room exists once the last item has moved a full `spacing` clear of
+        the entrance -- an empty run always has room. Shared by the tick's
+        produce step and by `push()` so the two cannot disagree about when a
+        belt is full.
+        """
+        if seg.head == seg.tail:
+            return True
+        return self.position_of(seg, seg.tail - 1, tick) >= self.spacing
+
+    def _push(self, seg, payload, tick):
+        """Place an item at the tail. Assumes `has_room()` already said yes."""
+        slot = seg.tail % seg.cap
+        seg.enter_tick[slot] = tick
+        seg.payload[slot] = payload
+        seg.tail += 1
+        self.stats["pushed"] += 1
+
+    def push(self, seg, payload, tick):
+        """Put an item on a run's tail if it fits. Returns whether it did.
+
+        For producers that are not part of the tick's offer/accept protocol --
+        currently a seeded belt cell (see `Engine.seed_segments()`), which is
+        a standing instruction rather than a machine with a waiting zone to
+        drain. It goes through the same room check as the tick's own push, so
+        a seed cannot overfill a run or land on top of another item.
+        """
+        if not self.has_room(seg, tick):
+            return False
+        self._push(seg, payload, tick)
+        return True
+
     # --- the tick --------------------------------------------------------
     def tick_segment(self, seg, tick, offer=None, accept=None, took=None):
         """Advance one segment by one tick. O(1), no loops over items.
@@ -217,15 +252,10 @@ class BeltSim:
         #    spacing clear of the entrance.
         pushed = False
         if offer is not None:
-            room = (seg.head == seg.tail
-                    or self.position_of(seg, seg.tail - 1, tick) >= self.spacing)
-            if room:
+            if self.has_room(seg, tick):
                 payload = offer(seg)
                 if payload is not None:
-                    slot = seg.tail % seg.cap
-                    seg.enter_tick[slot] = tick
-                    seg.payload[slot] = payload
-                    seg.tail += 1
+                    self._push(seg, payload, tick)
                     pushed = True
                     # Only now has the producer actually parted with it.
                     if took is not None:
@@ -233,8 +263,9 @@ class BeltSim:
 
         if popped:
             self.stats["popped"] += 1
-        if pushed:
-            self.stats["pushed"] += 1
+        # `pushed` is counted by _push(), the single place an item enters a
+        # ring -- counting again here would double every tick's push and also
+        # miss a seed, which does not come through this path at all.
         return popped, pushed
 
     def tick(self, tick, offer=None, accept=None, took=None):

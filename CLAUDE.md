@@ -47,8 +47,8 @@ There is no pytest/linter configured.
 | [tests/test_item_render.py](tests/test_item_render.py) | reads the framebuffer back: do discs appear where the simulation says? |
 | [tests/test_gates.py](tests/test_gates.py) | firing rules, arithmetic, back pressure, and the bubble-free claim |
 | [tests/test_stamp.py](tests/test_stamp.py) | what the stamp transforms preserve: wiring, topology, arithmetic |
-| [tests/test_clipboard.py](tests/test_clipboard.py) | the copy/paste mode machine, driven through the fake mouse and keyboard |
-| [tests/test_inspect.py](tests/test_inspect.py) | the Status window, the per-Source emit value, the save filename box |
+| [tests/test_clipboard.py](tests/test_clipboard.py) | the copy/paste/erase mode machine, driven through the fake mouse and keyboard |
+| [tests/test_inspect.py](tests/test_inspect.py) | the Status window, the per-Source emit value, the per-belt seed, the save filename box |
 
 **Scenarios are independent.** `harness.reset()` clears the board, camera,
 input state and toolbelt before each one, so a failure names the scenario
@@ -100,6 +100,8 @@ surfaced as one shuffle seed in twelve failing a pixel test.
 | `1`-`9`, `0` | select a toolbelt slot |
 | `ctrl+C` | copy mode — left-drag a selection box |
 | `ctrl+V` | paste mode, if anything has been copied |
+| `X` | erase mode — left-drag a box to delete what it touched |
+| `ctrl+X` | cut: the same box, captured as a stamp, then straight to paste |
 | shift+scroll | **paste mode**: walk the copy history (older / newer) |
 | Left-click | build with the active tool (fires on **release**); with an **empty hand**, inspect what is there |
 | `R` / `shift+R` | **per-tool**: belt path shape, or structure rotation |
@@ -156,26 +158,70 @@ Every tool names the type it places (`EntityBuilder.entity_cls`), so
 `Toolbelt.select_tool_for()` is a generic lookup rather than a per-type
 branch. A type with no builder fails softly and leaves the hand empty.
 
-### Copy and paste are modes, not tools
+### Copy, paste and erase are modes, not tools
 
 [core/clipboard.py](core/clipboard.py) owns a mode flag, a stashed toolbelt
-slot, and the stamp history. Copy and paste **override** whatever the hand
-holds and give it back when they finish, so `ctrl+C` mid-belt-run does not
-lose the belt tool. `Orchestrator._active_tool()` is the single accessor that
-resolves the override, which is why nothing downstream — gesture style,
-preview, commit — needs a mode branch.
+slot, and the stamp history. These modes **override** whatever the hand holds
+and give it back when they finish, so `ctrl+C` mid-belt-run does not lose the
+belt tool. `Orchestrator._active_tool()` is the single accessor that resolves
+the override, which is why nothing downstream — gesture style, preview,
+commit — needs a mode branch.
 
-**Every exit restores the stashed tool except `Q`,** which drops the stash and
-leaves the hand empty. That asymmetry is the point: right-press, a plain
-click, and `Esc` all mean "done with this mode", while `Q` means "I want to be
-holding nothing". A stash of `None` is a real value — an empty hand must be
-restored as empty, not collapsed to slot 0.
+**Every exit restores the stashed tool except two,** and both exceptions say
+something different:
 
-**Copy mode has no camera pan.** Left-drag is the selection gesture, so the
-camera cannot also have it. Paste mode keeps left-drag for panning, since the
-stamp follows the cursor and needs no drag of its own. An empty selection
-returns you to your tool rather than stranding you in a paste mode with
-nothing to paste.
+- **`Q`** drops the stash and leaves the hand empty. Right-press, a plain
+  click and `Esc` all mean "done with this mode"; `Q` means "I want to be
+  holding nothing".
+- **Selecting a toolbelt slot** also drops it, and lands on the picked tool.
+  A slot pick is a *new choice* rather than an interruption ending, so
+  restoring the stash on top of it would override what the player just asked
+  for. `Orchestrator._select_slot()` is the single path for this — both the
+  number keys and the panel's slot buttons go through it — and it uses
+  `exit_to_empty()` precisely so the `select()` after it is the final word.
+  Without that the outcome would depend on the order of those two
+  operations.
+
+A stash of `None` is a real value — an empty hand must be restored as empty,
+not collapsed to slot 0.
+
+**Copy and erase have no camera pan.** Left-drag is their selection gesture,
+so the camera cannot also have it. Paste mode keeps left-drag for panning,
+since the stamp follows the cursor and needs no drag of its own. An empty
+selection returns you to your tool rather than stranding you in a paste mode
+with nothing to paste.
+
+#### Erase mode is copy's gesture with a different consequence
+
+`X` enters it and it reuses the whole selection machine — arming, the
+threshold promotion, the live rectangle, the aborts — because only the
+*release* differs. Two differences, both load-bearing:
+
+- **A release erases and the mode survives.** Copy's release hands its
+  rectangle over and leaves; erasing is a stroke you repeat, so the rectangle
+  is not a commitment that ends the mode. Sharing the gesture machine makes
+  it cheap to accidentally share the exit too, hence a test for exactly this.
+- **`ctrl+X` is a cut**: the same rectangle, captured *before* the entities
+  are deleted, then straight to paste mode holding it. The stash survives the
+  whole chain (`_stash()` refuses to overwrite), so cut → paste → `Esc` gives
+  back the tool you held before the cut — same property as `ctrl+C` →
+  `ctrl+V`. An empty cut leaves you erasing rather than in a paste mode with
+  no stamp.
+
+`cutting` lives on the mode and every exit clears it. Otherwise a player who
+cut once would find their next plain erase quietly copying — invisible until
+the history filled with things they meant to delete.
+
+**A bare click in erase mode does nothing but leave the mode.** Deleting the
+cell under a stray click is too easy to do by accident, and right-drag
+already covers cell-by-cell erasing outside the mode entirely. Note a
+same-cell "drag" never passes `DRAG_THRESHOLD_PX` and so *is* a click — a
+test asserting a one-cell rectangle has to drag far enough to promote.
+
+Erasing is per cell and **touching, not containing**: `Engine.erase()` takes
+a multi-cell entity from any one of its cells and releases an underground's
+partner, so a rectangle clipping one corner of a Sink takes the whole
+machine.
 
 The stash survives the copy→paste switch (`Clipboard._stash()` refuses to
 overwrite an existing stash), or capturing would replace the player's real
@@ -253,14 +299,18 @@ skips them: a ghost is about to be despawned. An empty hand has no preview of
 its own, so this is reachable only on the frame a tool was just put down —
 which is exactly when it happens.
 
-The panel only **requests**: `close_status` and `set_emit` come back in
-`UIRequests` and the orchestrator applies them, so the window never mutates
-board state. `set_emit` carries a `(row, value)` pair for the same reason
-`inspect_row` is a row.
+The panel only **requests**: `close_status`, `set_emit` and `set_seed` come
+back in `UIRequests` and the orchestrator applies them, so the window never
+mutates board state. `set_emit` carries a `(row, value)` pair and `set_seed`
+a `(row, on, value)` triple, for the same reason `inspect_row` is a row.
+`set_seed` carries both halves of the setting because the checkbox and the
+value box are one thing — whichever widget moved, the other's current value
+has to come along or the setter would read a half-update as a change.
 
-Most machines have no affordance yet and the window just reports type,
-orientation, footprint, and channel contents — an occupied output zone shows
-as `(waiting)`, which is back pressure made visible.
+Two types have an affordance so far: a **Source**'s emitted value and a
+**belt**'s seed, both below. Everything else just reports type, orientation,
+footprint, and channel contents — an occupied output zone shows as
+`(waiting)`, which is back pressure made visible.
 
 #### A Source's emitted value is per instance
 
@@ -301,6 +351,65 @@ The value travels with copy/paste (`StampEntry.emit` → `Placement.emit` →
 default — invisibly, since the paste looks identical. `Placement.emit`
 defaults to `None` so the *toolbelt* still places the type default rather than
 inheriting whatever was last copied.
+
+#### A belt cell can seed its run
+
+The Status window's other affordance. Ticking **Seed** on a belt makes that
+cell put one item of a chosen value onto its run every time segments are
+derived — an edit, a board clear, a load. That gives a run something to carry
+without wiring a Source to it.
+
+**The seed is attached to the cell, not to the segment.** A segment is
+rebuilt from the grid and gets a fresh id each time, so storing it there
+would lose it at exactly the moment it is supposed to fire. It lives in the
+belt's entity row (`Belt.F_SEED_ON` / `F_SEED_VALUE`), and the flag is
+separate from the value because **zero is a legal thing to seed** — the same
+trap `Source.initialise()` exists to avoid.
+
+Unlike `F_EMIT`, this could *not* squat on an existing slot. All 24
+post-prefix slots belong to the gate block, and while a belt reads none of
+them, aliasing would make a belt's seed and a machine's channel one piece of
+storage — a coincidence that breaks the first time a belt gains a channel. So
+`ENTITY_STRIDE` grew 24 → 28, one vec4, widening every row in the game.
+**That invalidates save files written before it**, which the persistence shape
+check rejects.
+
+Three consequences:
+
+- **Items enter at the tail, as ordinary pushes.** The closed form only
+  accepts an item at a run's entrance, so a seed cannot materialise at its
+  own cell's offset — it rides from the start like anything else.
+- **Several seeds on one run need staggered entry ticks.** They all enter on
+  the same tick, so pushing them all at `clock.tick` puts the first at
+  position 0 and has `has_room()` refuse every one after it: four seeded
+  cells produced a single item. `Engine.seed_segments()` backdates each
+  successive seed by one `d/v`, which is the state a producer running at full
+  rate would have reached, so the `min` treats them as the compressed clump
+  they are. The oldest must go on *first* — position grows with age and the
+  ring requires positions to decrease in `k` — which is why the seeds are
+  enumerated up front and the stagger counts down from the total.
+- **Changing a seed clears the board's items**, because it invalidates the
+  segment index and a rebuild drops everything. Consistent with every other
+  edit to the belt network. Setting the value it already has is not a change
+  and does not rebuild, for the same reason the emit value checks: imgui
+  reports a change per keystroke, and re-deriving on each one would wipe the
+  factory mid-edit.
+
+Seeding happens in `sync_segments()` **after** `flush_material()` — a flush
+empties every ring, so seeding before it would wipe exactly what was placed.
+
+A seeded cell is **tinted by the sign** of its value, green above zero and
+red at or below, matching the item discs' own split so a cell and the item it
+produces agree on colour. The sign is mirrored into `.z` (bits 5 and 6)
+because the shader reads it from the grid texture with no entity-row lookup —
+so changing a seed through the row alone leaves the grid stale, and
+`_set_seed()` restamps. The cell carries the sign rather than the value since
+that is all a tint can convey.
+
+The seed travels with copy/paste (`StampEntry.seed` → `Placement.seed`) and
+through a save, for the same reasons the emit value does; `Placement.seed`
+defaults to `None` so a freshly drawn run does not inherit a copied seed —
+which would otherwise have every later belt quietly injecting items.
 
 ### Persistent UI preferences
 
@@ -408,7 +517,12 @@ bit  31     unused — deliberately clear
 offset from the origin — the **placed** offset, after flip and rotation, not
 the authored one (see "Orientation" under Structures). `.z` bits 0-1 hold the
 ghost state (`0` real / `1` ghost / `2` frustrated — see "Frustrated cells"
-below) and bit 2 the flip flag.
+below), bit 2 the flip flag, bits 3-4 an underground end's role and pairing,
+and bits 5-6 a belt's seed and that seed's sign. Everything in `.z` past the
+ghost state is there for one reason: the renderer resolves it per-cell
+straight from the grid texture, with no entity-row lookup — so each is
+mirrored from the row and a change that skips `restamp()` leaves the grid
+stale.
 
 `.w` carries belt-segment membership: bits 0-15 the offset along the segment
 from its tail, bits 16-30 the segment id (`0` = not on a segment), bit 31
@@ -750,9 +864,17 @@ results in those zones.
 |---|---|
 | `Shear` | x,y → x, x+y |
 | `Mac` | x,y,z → x, y, z + x·y |
-| `Swap` | x,y,z → x, (y,z if x>0 else z,y) — x is the control |
+| `Swap` | x,y,z → x, (z,y if x>0 else y,z) — x is the control |
 | `Source` | → a per-instance constant on every connected port |
 | `Sink` | destroys whatever arrives, up to 4 per tick |
+
+**`Swap` swaps on a *positive* control.** The two branches were the other way
+round at first, which reads backwards — the machine sat exchanging its lanes
+whenever its control said not to. Zero counts as "do not swap", so the
+control reads as a plain condition. Pinned in `core/entity.py`'s self-check
+and in [tests/test_gates.py](tests/test_gates.py); note
+[tests/test_stamp.py](tests/test_stamp.py) also asserts the polarity, since
+its mirror-invariance check needs to know which branch is the pass-through.
 
 #### Generators are the one machine that skips its own outputs
 
@@ -827,16 +949,17 @@ The remaining cost is that a single tile's two faces share a slot, so feeding
 one corner from both sides gets one item per tick between them. Spread the
 belts across tiles.
 
-This matters for sizing: `MAX_CHANNELS` is 4, now set by **Sink**, so a row
-needs `8 + 4×4 = 24` slots and `ENTITY_STRIDE` is 24. One channel per *face*
-would have needed 8 and widened every row in the game, including every
-belt's.
+This matters for sizing: `MAX_CHANNELS` is 4, now set by **Sink**, so the
+gate block needs `8 + 4×4 = 24` slots. One channel per *face* would have
+needed 8 and widened every row in the game, including every belt's.
 
 Source used to set it at 6, carrying all six perimeter faces; narrowing that
-machine to north-and-east is what let both constants come down (32 → 24, a
-25% narrower row for every entity on the board). Note the stride is baked
-into save files, so the persistence shape check rejects older ones — this
-change invalidates saves written before it.
+machine to north-and-east is what let both constants come down (stride 32 →
+24, a 25% narrower row for every entity on the board). `ENTITY_STRIDE` is now
+**28**: the belt seed added one vec4 past the gate block (see "A belt cell can
+seed its run"). Note the stride is baked into save files, so the persistence
+shape check rejects older ones — each of these changes invalidates saves
+written before it.
 
 The renderer needs the same mapping — `output_channel_at()` is generated from
 Python, because "port index == channel" is false for Sink and indexing by
@@ -1226,7 +1349,7 @@ rotated; all are continuous rectangles.
 
 | type | footprint | signature |
 |---|---|---|
-| `Swap` | 1×2 | x,y,z → x, (y,z if x>0 else z,y) |
+| `Swap` | 1×2 | x,y,z → x, (z,y if x>0 else y,z) |
 | `Shear` | 2×1 | x,y → x, x+y |
 | `Mac` | 2×1 | x,y,z → x, y, z + x·y |
 | `Source` | 2×1 | outputs on its north and east faces (3 ports) |
@@ -1570,8 +1693,16 @@ The empty hand's gesture is now **inspect** rather than the
 structure-selection tool originally planned for it — that slot is taken, so a
 selection tool would need a different home.
 
-Per-machine configuration has one worked example (a Source's emit value) and
-no general mechanism. The next type to need a setting will want one: `F_EMIT`
-reuses an input slot that happens to be dead on a generator, which is exact
-but not a pattern — a machine with both inputs and a setting has no such slot
-and would need `ENTITY_STRIDE` to grow.
+Per-machine configuration now has two worked examples and still no general
+mechanism, and the pair shows why one is wanted. `Source.F_EMIT` reuses an
+input slot that happens to be dead on a generator — exact, but not a pattern.
+`Belt.F_SEED_ON`/`F_SEED_VALUE` is the case with no such slot available, and
+it did what the note predicted: grew `ENTITY_STRIDE` (24 → 28) and widened
+every row in the game to carry two values one type uses. A third setting
+should probably arrive with a real mechanism rather than a third ad-hoc
+answer — a side table keyed by row, say, which costs nothing for the types
+that have no settings.
+
+The tests for both also want folding together: `_set_emit` and `_set_seed`
+are the same shape (guard the row is alive and the right type, ignore a
+no-op, apply, invalidate) and only differ in what they invalidate.
