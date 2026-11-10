@@ -124,8 +124,10 @@ def load(board, path):
     # The table may have grown since the save; keep the larger of the two so
     # capacity never shrinks under live rows.
     rows = entities.shape[0]
-    if rows > board.entities.shape[0]:
-        board.entities = np.zeros((rows, ENTITY_STRIDE), dtype=np.float32)
+    # Through resize_entities(), not by assigning a fresh array: the SSBO is
+    # reserved at the old capacity and would then be too small for the next
+    # to_device(), which moderngl reports as "out of range offset".
+    board.resize_entities(rows, keep=False)
     board.entities[:] = 0.0
     board.entities[:rows] = entities.astype(np.float32, copy=False)
 

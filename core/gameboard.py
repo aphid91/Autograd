@@ -244,12 +244,26 @@ class Gameboard:
 
     def _grow(self):
         """Double the entity table. Invalidates nothing: ids are row indices."""
+        self.resize_entities(self.capacity * 2)
+
+    def resize_entities(self, new, keep=True):
+        """Grow the entity table to `new` rows, rebuilding the SSBO to match.
+
+        The single path for changing the table's size, because the array and
+        the SSBO must never disagree: an array larger than its buffer makes
+        the next to_device() write past the end, which moderngl reports as
+        "out of range offset". _grow() and persistence.load() both come here.
+
+        `keep=False` discards the existing rows (a load overwrites them all).
+        """
         old = self.capacity
-        new = old * 2
+        if new <= old:
+            return
         if new - 1 > cell.MAX_ENTITY_ID:
             raise RuntimeError("entity capacity would exceed the 22-bit cell id")
         grown = np.zeros((new, ENTITY_STRIDE), dtype=np.float32)
-        grown[:old] = self.entities
+        if keep:
+            grown[:old] = self.entities
         self.entities = grown
 
         # The SSBO is now the wrong size. Rebuild it here rather than leaving

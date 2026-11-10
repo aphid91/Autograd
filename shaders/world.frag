@@ -192,7 +192,7 @@ uniform int   select_on;      // 0 when no selection is in progress
 #define MAJOR_EVERY       8
 #define GRID_FADE_LO      3.0    // zoom (px/cell) where grid lines vanish
 #define GRID_FADE_HI      9.0    // ...and where they reach full strength
-#define GRID_ALPHA        0.9
+#define GRID_ALPHA        0.09
 
 // ======================================================================
 
