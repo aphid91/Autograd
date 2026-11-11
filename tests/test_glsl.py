@@ -13,7 +13,7 @@ GLSL consuming those tables does the authored/placed conversion correctly.
 """
 import re as _re
 
-from core import belt_device, belts, cell, entity, glsl_types
+from core import belt_device, belts, cell, entity, font, glsl_types
 from core.entity import STRUCTURES, Sink, Underground
 from render import camera, shader_loader
 
@@ -33,8 +33,19 @@ _tables = glsl_types.generate()
 
 
 def _glsl_int(name):
-    """An integer constant parsed back out of the shader source."""
-    m = _re.search(rf"\b{name}\s*=\s*(0x[0-9A-Fa-f]+|\d+)", _src)
+    """An integer constant parsed back out of the shader source.
+
+    Handles both forms the shader uses: a `const int` (which has an `=`) and
+    a `#define` (which does not). The tunables block is all `#define`s, so a
+    check against one of those would otherwise silently not find it -- and
+    the assert below would read as "the shader is missing this" rather than
+    "this helper cannot see that form".
+    """
+    m = _re.search(rf"\b{name}\s*=\s*(-?0x[0-9A-Fa-f]+|-?\d+)", _src)
+    if not m:
+        m = _re.search(rf"^[ \t]*#define[ \t]+{name}[ \t]+"
+                       rf"(-?0x[0-9A-Fa-f]+|-?\d+)[ \t]*(?://.*)?$",
+                       _src, _re.M)
     assert m, f"{name} not found in shader source"
     return int(m.group(1), 0)
 
@@ -416,142 +427,370 @@ def test_probe_reach_spans_the_longest_footprint():
     ok(f"PROBE_REACH {_reach} spans the longest footprint ({_longest})")
 
 
-# --- the seven-segment number on an item -----------------------------------
-# Three columns of calculator digits, formatted entirely in GLSL. There is no
-# Python counterpart to compare against -- the shader is the only
-# implementation -- so these pin the *rules* instead: the bar layout, the two
-# format branches, and the three rounding edge cases that a plausible-looking
-# render hides.
+# --- the bitfield font and the number formatter ----------------------------
+# Text is drawn from a 6x8 bitfield generated out of core/font.py, and numbers
+# are formatted in GLSL from a policy that core/font.py also implements in
+# Python. That Python implementation is an **oracle**, in the same sense as
+# belts.naive_tick(): the shader ships, and the reference exists to disagree
+# with it.
 #
-# Why here and not in the pixel tests: a formatter bug draws a perfectly
-# crisp wrong number. Mutation testing showed exactly that -- disabling the
-# scientific branch, dropping the decimal point, and removing both rounding
-# carries all left every framebuffer assertion passing, because each still
-# produced three well-formed glyphs on a disc.
+# That is a real change in what these tests can do. The seven-segment display
+# they replaced had no Python counterpart, so it could only be pinned by
+# regexes over the shader source -- which can assert a branch *exists* but
+# never that it computes the right thing. A formatter bug draws a perfectly
+# crisp wrong number, and the pixel tests can only tell that something
+# value-dependent appeared, not what it said.
 
-#: Masks the shader must use, derived from the bar numbering in its own
-#: comment: bit 0 top, 1 upper-right, 2 lower-right, 3 bottom, 4 lower-left,
-#: 5 upper-left, 6 middle.
-_SEG_EXPECTED = {
-    0: 0b0111111, 1: 0b0000110, 2: 0b1011011, 3: 0b1001111, 4: 0b1100110,
-    5: 0b1101101, 6: 0b1111101, 7: 0b0000111, 8: 0b1111111, 9: 0b1101111,
+
+def test_the_font_table_reaches_the_shader_intact():
+    # The table is generated, so the risk is not divergence but a generator
+    # that emits something the shader cannot index: a count that disagrees
+    # with the array length, or a value with bit 31 set (which the shader
+    # decodes with >>, and a sign-filled shift lights cells that are clear).
+    _count = _glsl_int("FONT_COUNT")
+    assert _count == len(font.CHARS), (
+        f"FONT_COUNT is {_count} but CHARS has {len(font.CHARS)}")
+    assert _glsl_int("FONT_W") == font.FONT_W
+    assert _glsl_int("FONT_H") == font.FONT_H
+
+    for _name, _half in (("FONT_LO", 0), ("FONT_HI", 1)):
+        _m = _re.search(rf"const int {_name}\[(\d+)\]\s*=\s*int\[\d+\]\((.*?)\)\s*;",
+                        _src, _re.S)
+        assert _m, f"{_name} table not found in the generated source"
+        assert int(_m.group(1)) == _count, (
+            f"{_name} is declared [{_m.group(1)}] but FONT_COUNT is {_count}")
+        _vals = [int(v.strip(), 0)
+                 for v in _m.group(2).split(",") if v.strip()]
+        assert len(_vals) == _count, (
+            f"{_name} holds {len(_vals)} entries, expected {_count}")
+        for _i, _v in enumerate(_vals):
+            assert _v == font.FONT[_i][_half], (
+                f"{_name}[{_i}] ({font.CHARS[_i]!r}) is 0x{_v:X}, Python "
+                f"says 0x{font.FONT[_i][_half]:X}")
+            # Bit 31 clear, for the same reason grid words keep it clear.
+            assert 0 <= _v < (1 << 24), (
+                f"{_name}[{_i}] = 0x{_v:X} exceeds 24 bits")
+    ok(f"the {_count}-glyph font table reaches the shader intact")
+
+
+def test_the_named_codes_agree_with_the_character_table():
+    # The formatter names a handful of glyphs by constant. If one of these
+    # drifts from CHARS the shader draws the wrong character with no other
+    # symptom -- a minus becoming a comma turns "-1" into ",1".
+    for _name, _want in [("CODE_DIGIT_0", font.CODE_DIGIT_0),
+                         ("CODE_MINUS", font.CODE_MINUS),
+                         ("CODE_POINT", font.CODE_POINT),
+                         ("CODE_SPACE", font.CODE_SPACE),
+                         ("CODE_E", font.CODE_E)]:
+        _got = _glsl_int(_name)
+        assert _got == _want, f"{_name} is {_got} in GLSL, {_want} in Python"
+        # And the code really indexes the character it is named for.
+        _ch = {"CODE_DIGIT_0": "0", "CODE_MINUS": "-", "CODE_POINT": ".",
+               "CODE_SPACE": " ", "CODE_E": "E"}[_name]
+        assert font.CHARS[_want] == _ch, (
+            f"{_name} = {_want} indexes {font.CHARS[_want]!r}, not {_ch!r}")
+    for _name, _codes in (("NAN", font.CODES_NAN), ("INF", font.CODES_INF)):
+        for _i, _code in enumerate(_codes):
+            assert _glsl_int(f"CODE_{_name}_{_i}") == _code
+    # The digits must be contiguous from CODE_DIGIT_0, because the formatter
+    # emits a digit as CODE_DIGIT_0 + value. Reordering CHARS would break
+    # every number on the board.
+    for _d in range(10):
+        assert font.CHARS[font.CODE_DIGIT_0 + _d] == str(_d), (
+            "the ten digits must be contiguous in CHARS from CODE_DIGIT_0 -- "
+            "the formatter emits CODE_DIGIT_0 + value")
+    ok("the formatter's named glyph codes index the characters they name")
+
+
+#: Structural facts about each digit's shape, independent of the bitfield
+#: itself: (lit cells, number of enclosed holes, symmetric top-to-bottom).
+#:
+#: These exist because every other check in this file compares the font
+#: against *itself*. The table is generated from core/font.py and the pixel
+#: tests identify a rendered glyph by matching it back to that same table, so
+#: swapping two glyphs' shapes is self-consistent and passes everything --
+#: mutation-tested, and it did. A "2" drawn where a "5" belongs is the worst
+#: failure a number display can have, and nothing caught it.
+#:
+#: Holes are the discriminating property and are cheap to count: 0 has one,
+#: 8 has two, 2 and 5 have none. Described here rather than derived so this
+#: is a genuinely separate statement of what each digit looks like.
+#: Note the 0 has *two* holes, not one: it is a slashed zero, and the
+#: diagonal divides its bowl. That is deliberate -- an unslashed 0 and a
+#: capital O are the same shape at this resolution, and both are in the font.
+_DIGIT_SHAPE = {
+    "0": (2, False), "1": (0, False), "2": (0, False), "3": (0, False),
+    "4": (1, False), "5": (0, False), "6": (1, False), "7": (0, False),
+    "8": (2, True),  "9": (1, False),
 }
 
 
-def test_seven_segment_digit_masks_are_right():
-    # A wrong mask draws a wrong digit crisply, which no pixel test here
-    # would call a failure -- it checks that digits differ, not what they
-    # say. The masks are the ground truth for the whole display.
-    _m = _re.search(r"SEG_DIGITS\[10\]\s*=\s*int\[10\]\((.*?)\)\s*;",
+def _holes(ch):
+    """Enclosed background regions in `ch`'s glyph.
+
+    Flood-fills the clear cells from the border; whatever clear cells are
+    left unreached are enclosed, and each connected group is one hole.
+    """
+    lo, hi = font.FONT[font.CHARS.index(ch)]
+
+    def lit(x, y):
+        i = y * font.FONT_W + x
+        return bool((lo >> i) & 1) if i < 24 else bool((hi >> (i - 24)) & 1)
+
+    w, h = font.FONT_W, font.FONT_H
+    seen = set()
+    stack = [(x, y) for x in range(w) for y in (0, h - 1) if not lit(x, y)]
+    stack += [(x, y) for y in range(h) for x in (0, w - 1) if not lit(x, y)]
+    while stack:
+        x, y = stack.pop()
+        if (x, y) in seen or not (0 <= x < w and 0 <= y < h) or lit(x, y):
+            continue
+        seen.add((x, y))
+        stack += [(x + 1, y), (x - 1, y), (x, y + 1), (x, y - 1)]
+    # Whatever clear cells the border fill did not reach are enclosed.
+    inner = {(x, y) for x in range(w) for y in range(h)
+             if not lit(x, y) and (x, y) not in seen}
+    holes = 0
+    while inner:
+        holes += 1
+        stack = [inner.pop()]
+        while stack:
+            x, y = stack.pop()
+            for n in ((x + 1, y), (x - 1, y), (x, y + 1), (x, y - 1)):
+                if n in inner:
+                    inner.discard(n)
+                    stack.append(n)
+    return holes
+
+
+def _row_has_enclosed_cell(rows, y):
+    """Does row `y` of an authored shape contain an enclosed clear cell?
+
+    Enclosed meaning unreachable from the glyph's border -- the same notion
+    `_holes` counts, restricted to one row so a bowl can be located
+    vertically.
+    """
+    h, w = len(rows), len(rows[0])
+    lit = lambda x, yy: rows[yy][x] == "#"
+    seen = set()
+    stack = [(x, yy) for x in range(w) for yy in (0, h - 1) if not lit(x, yy)]
+    stack += [(x, yy) for yy in range(h) for x in (0, w - 1) if not lit(x, yy)]
+    while stack:
+        x, yy = stack.pop()
+        if (x, yy) in seen or not (0 <= x < w and 0 <= yy < h) or lit(x, yy):
+            continue
+        seen.add((x, yy))
+        stack += [(x + 1, yy), (x - 1, yy), (x, yy + 1), (x, yy - 1)]
+    return any(not lit(x, y) and (x, y) not in seen for x in range(w))
+
+
+def test_each_digit_has_the_shape_its_name_implies():
+    # The independent check: every other font test compares the table to
+    # itself, so this describes the digits from outside it.
+    for _ch, (_want_holes, _want_sym) in _DIGIT_SHAPE.items():
+        _got = _holes(_ch)
+        assert _got == _want_holes, (
+            f"the glyph for {_ch!r} encloses {_got} hole(s), expected "
+            f"{_want_holes} -- is it actually the shape of a {_ch}?")
+
+        # Vertical symmetry separates 8 from everything else with holes, and
+        # catches a 6/9 swap, which hole-counting alone cannot.
+        _rows = font._SHAPES[_ch]
+        _sym = list(_rows[:7]) == list(reversed(_rows[:7]))
+        assert _sym == _want_sym, (
+            f"{_ch!r} is {'' if _sym else 'not '}symmetric top-to-bottom, "
+            f"expected {'' if _want_sym else 'not '}symmetric")
+
+    # 6 and 9 are each other's vertical mirror, which is what makes them the
+    # easiest pair to swap and the hardest to notice.
+    _six = list(font._SHAPES["6"][:7])
+    _nine = list(font._SHAPES["9"][:7])
+    assert _six != _nine, "6 and 9 must be different glyphs"
+    # And the 6's bowl is at the bottom, the 9's at the top. Located by
+    # where the *enclosed hole* sits, which is what the bowl actually is --
+    # a "widest row" proxy was tried first and is not reliable, since the
+    # crossbar of a 9 is as wide as its bowl.
+    for _ch, _want_low in (("6", True), ("9", False)):
+        _rows = font._SHAPES[_ch]          # authored top-down
+        _ink = [y for y, r in enumerate(_rows) if "#" in r]
+        _mid = (min(_ink) + max(_ink)) / 2.0
+        _enclosed = [y for y, r in enumerate(_rows)
+                     if _row_has_enclosed_cell(_rows, y)]
+        assert _enclosed, f"{_ch!r} has no enclosed bowl at all"
+        _centre = sum(_enclosed) / len(_enclosed)
+        # Rows are top-down here, so a *larger* index is lower on the glyph.
+        assert (_centre > _mid) == _want_low, (
+            f"{_ch!r}'s bowl sits at row {_centre:.1f} against a midline of "
+            f"{_mid:.1f} -- 6 closes at the bottom and 9 at the top")
+    # 2 and 5 are the other dangerous pair: both have no holes and neither is
+    # symmetric, so the checks above cannot separate them. They are vertical
+    # mirrors of each other in this font -- a 5 has its full bar on top and
+    # closes bottom-right, a 2 has its full bar on the bottom and opens
+    # top-left -- which is exactly why swapping them is easy and invisible.
+    # Mutation-tested: the swap passed everything until this.
+    for _ch, _want_top in (("2", False), ("5", True)):
+        _rows = font._SHAPES[_ch][:7]
+        _full = [y for y, r in enumerate(_rows)
+                 if r.count("#") >= font.FONT_W - 1]
+        assert _full, f"{_ch!r} has no full-width bar"
+        # Rows are authored top-down, so a small index is the top.
+        _on_top = min(_full) < len(_rows) / 2.0
+        assert _on_top == _want_top, (
+            f"{_ch!r}'s full-width bar is on the "
+            f"{'top' if _on_top else 'bottom'} -- a 5 bars across the top "
+            f"and a 2 across the bottom, so this glyph is the other digit")
+
+    # 0 and O are the pair this font has to keep apart, since both are in it
+    # and at 6x8 an unslashed zero is identical to the letter. The slash is
+    # what separates them, and the hole count is how that shows up.
+    assert _holes("0") == 2 and _holes("O") == 1, (
+        f"0 encloses {_holes('0')} holes and O encloses {_holes('O')} -- "
+        f"the zero's slash is what tells them apart")
+    assert font.glyph_bits("0") != font.glyph_bits("O")
+    ok("each digit's glyph has the holes, symmetry and bar placement its "
+       "name implies; 0/O and 2/5 are distinguishable")
+
+
+def test_the_formatter_policy_matches_the_python_reference():
+    # The fixed/scientific boundary is the one piece of policy that must be
+    # identical on both sides: the Python reference is only an oracle if it
+    # switches format where the shader does.
+    assert _glsl_int("NUM_FIXED_HI_E") == font.FIXED_HI_E, (
+        "NUM_FIXED_HI_E and font.FIXED_HI_E must agree")
+    assert _glsl_int("NUM_FIXED_LO_E") == font.FIXED_LO_E, (
+        "NUM_FIXED_LO_E and font.FIXED_LO_E must agree")
+    ok(f"the formatter switches to scientific outside "
+       f"[1e{font.FIXED_LO_E}, 1e{font.FIXED_HI_E}) on both sides")
+
+
+def test_every_string_the_formatter_can_produce_is_drawable():
+    # A character with no glyph is silently skipped by the shader, which
+    # would turn "-1" into "1" -- a sign error with no visual artefact. Sweep
+    # the formatter over the value classes that reach it and check each
+    # character resolves to a code.
+    _values = [0.0, -0.0, 1.0, -1.0, 2.5, -2.5, 3.14159, 9.999, 0.999,
+               -0.5, 100.0, 1234567.0, 5e7, -5e7, 1e-9, -1e-9, 9.96e9,
+               float("nan"), float("inf"), float("-inf")]
+    # Include the values that *maximise* length, not just representative
+    # ones: a negative at the top of the fixed range with every decimal kept
+    # is the longest string the formatter can emit, and it is the case that
+    # would overflow the shader's fixed buffer. The first version of this
+    # test sampled only tidy values and missed it -- NUM_MAX_CODES was 10
+    # against a true worst case of 13, so a big untrimmed value would have
+    # been silently truncated.
+    _values = _values + [-1234567.0, 9999999.0, -9999999.0, -9.96e9]
+    _bound = _glsl_int("NUM_MAX_CODES")
+    _seen = set()
+    _worst = (0, "")
+    for _v in _values:
+        for _sig in (0, 1, 2, 3, 4):
+            for _trim in (True, False):
+                _text = font.format_number(_v, _sig, _trim)
+                _codes = font.codes_for(_text)       # raises if undrawable
+                assert len(_codes) <= _bound, (
+                    f"{_text!r} is {len(_codes)} codes but NUM_MAX_CODES is "
+                    f"{_bound} -- the shader would silently truncate it")
+                if len(_text) > _worst[0]:
+                    _worst = (len(_text), _text)
+                _seen.update(_text)
+    # The bound must also match the arithmetic the shader's comment states,
+    # so a change to the fixed range or the digit cap is caught here rather
+    # than by whichever value happens to be sampled.
+    _longest = 1 + font.FIXED_HI_E + 1 + 4      # sign, ints, point, decimals
+    assert _bound >= _longest, (
+        f"NUM_MAX_CODES is {_bound} but the policy allows {_longest} "
+        f"characters (sign + {font.FIXED_HI_E} integer digits + point + 4 "
+        f"decimals)")
+    ok(f"every formatter output is drawable and fits NUM_MAX_CODES={_bound} "
+       f"(longest {_worst[1]!r}, {_worst[0]} chars; {len(_seen)} distinct "
+       f"characters)")
+
+
+def test_a_trimmed_number_drops_its_trailing_zeros():
+    # The headline behaviour: -1.00 must read as -1. Pinned here as well as
+    # in font.py's own self-check because this is the property the whole
+    # change was for, and a regression would be a silent cosmetic one.
+    for _value, _want in [(-1.0, "-1"), (1.0, "1"), (2.5, "2.5"),
+                          (-2.5, "-2.5"), (0.0, "0"), (12.0, "12")]:
+        _got = font.format_number(_value, sig=2, trim=True)
+        assert _got == _want, f"{_value} formats as {_got!r}, want {_want!r}"
+    # And the flag is what does it, rather than the rounding happening to.
+    assert font.format_number(-1.0, sig=2, trim=False) == "-1.00"
+    # A minus is now a column of its own, which is what trimming paid for.
+    assert font.format_number(-1.0).startswith("-")
+    ok("trimming turns -1.00 into -1 and the sign gets its own column")
+
+
+def test_the_item_label_is_allowed_to_spill_but_is_still_found():
+    # The number may reach past the disc rim, which means two things the old
+    # layout did not need and which are easy to get wrong together:
+    #
+    #  - the per-pixel scan's `reach` must cover the text, not just the disc,
+    #    or an item whose digits touch this cell is never considered;
+    #  - the coverage written out must be the *union* of disc and text, or
+    #    the overhang is clipped back to the circle it was allowed to leave.
+    #
+    # Both are shader-source properties with no Python counterpart, so they
+    # are pinned structurally. A pixel test covers the visible consequence.
+    _body = _re.search(r"vec4 draw_items\([^)]*\)\s*\{(.*?)\n\}",
+                       _src, _re.S).group(1)
+    assert "text_half" in _body, (
+        "draw_items() must widen its reach to cover a spilling number")
+    assert _re.search(r"reach\s*=.*max\s*\(\s*ITEM_RADIUS\s*,\s*text_half",
+                      _body), (
+        "reach must be the wider of the disc radius and the text half-width")
+    # No early-out on an uncovered pixel: that is exactly where the overhang
+    # lives. Mutation-testing this restores the old `if (cov.x <= 0.0)`.
+    assert not _re.search(r"if\s*\(\s*cov\.x\s*<=\s*0\.0\s*\)\s*continue",
+                          _body), (
+        "draw_items() must not skip pixels the disc misses -- the number is "
+        "allowed to spill past the rim and would be clipped")
+    assert _re.search(r"max\s*\(\s*cov\.x\s*,\s*ink\s*\)", _body), (
+        "coverage must be the union of the disc and the number's ink")
+    ok("a spilling item label widens the scan reach and the coverage union")
+
+
+def test_a_source_draws_its_emitted_value_from_the_row():
+    # The Source's number comes straight out of the entity SSBO, which is
+    # what makes it free: no new upload, no per-instance state anywhere else.
+    # The offset must be generated from Source.F_EMIT rather than spelled as
+    # F_IN_VALUE in the shader -- the two are equal only because a generator
+    # has no input channels, and a hand-written alias would silently read a
+    # channel if F_EMIT ever moves.
+    from core.entity import Source
+    _got = _glsl_int("F_EMIT")
+    assert _got == Source.F_EMIT, (
+        f"F_EMIT is {_got} in GLSL, {Source.F_EMIT} in Python")
+    assert not _re.search(r"ent_field\(\s*id\s*,\s*F_IN_VALUE\s*\)", _src), (
+        "the Source's emit value must be read via F_EMIT, not by spelling "
+        "out F_IN_VALUE -- they coincide only while Source has no inputs")
+    _body = _re.search(r"ent_field\(\s*id\s*,\s*F_EMIT\s*\)", _src)
+    assert _body, "the renderer must read F_EMIT out of the entity row"
+    # Source has no input channels, which is the precondition for F_EMIT
+    # squatting on that slot and so for this read being safe at all.
+    assert Source.in_channels() == 0, (
+        "Source gained an input channel -- F_EMIT now aliases it and the "
+        "renderer would draw a channel value as the emit value")
+    ok("a Source's emitted value is read from its row via generated F_EMIT")
+
+
+def test_the_source_number_does_not_rotate_with_the_facing():
+    # Text has a reading orientation a glyph does not, so a south-facing
+    # Source must still read left-to-right. `pf` is footprint-centred and
+    # axis-aligned to the world, so the fix is to *not* rotate it -- which
+    # means the test is that no rotation is applied, and that is only
+    # meaningful if the surrounding code is the kind that would.
+    _m = _re.search(r"bool show_emit\s*=(.*?)\n            \} else \{",
                     _src, _re.S)
-    assert _m, "SEG_DIGITS table not found in the shader"
-    _vals = [int(v.strip(), 0) for v in
-             _re.findall(r"(0x[0-9A-Fa-f]+|\d+)\s*(?=,|$)",
-                         _re.sub(r"//[^\n]*", "", _m.group(1)))]
-    assert len(_vals) == 10, f"expected 10 digit masks, parsed {len(_vals)}"
-    for _d, _want in _SEG_EXPECTED.items():
-        assert _vals[_d] == _want, (
-            f"digit {_d} is mask 0x{_vals[_d]:02X}, expected "
-            f"0x{_want:02X} -- it would draw as a different digit")
-    # A "1" must be exactly two bars and an "8" all seven: the display's
-    # legibility rests on those being distinguishable.
-    assert bin(_vals[1]).count("1") == 2, "a 1 must light exactly two bars"
-    assert bin(_vals[8]).count("1") == 7, "an 8 must light all seven bars"
-    ok("all ten seven-segment digit masks match the bar numbering")
-
-
-def test_the_exponent_sign_uses_a_distinct_glyph():
-    # With only three columns there is no room for a separate sign, so the
-    # exponent's sign rides on the E. The two glyphs must be *different
-    # shapes*, or 5e7 and 5e-7 render identically -- a silent factor of
-    # 10^14.
-    # These are #defines, not consts, so _glsl_int (which looks for
-    # "= value") does not see them. One may be defined as another's name.
-    def _define(name, depth=0):
-        m = _re.search(rf"#define\s+{name}\s+(\S+)", _src)
-        assert m, f"#define {name} not found in shader source"
-        val = m.group(1)
-        if _re.fullmatch(r"0x[0-9A-Fa-f]+|\d+", val):
-            return int(val, 0)
-        assert depth < 4, f"#define {name} chains too deep"
-        return _define(val, depth + 1)
-
-    _e = _define("SEG_E")
-    _c = _define("SEG_E_NEG")
-    assert _e != _c, "SEG_E and SEG_E_NEG must differ, or the sign is lost"
-    assert _c != 0, "SEG_E_NEG must draw something"
-    # They must differ by *several* bars, not one. An "E" and a "C" differ by
-    # a single bar out of four and are nearly the same shape at the few
-    # pixels these are drawn at -- the whole-frame difference between 1e9 and
-    # 1e-9 was 16 pixels, which is not a legible distinction for a value
-    # eighteen orders of magnitude apart. A bare minus (one bar) against an E
-    # (four) is unmistakable.
-    _differing = bin(_e ^ _c).count("1")
-    assert _differing >= 3, (
-        f"SEG_E (0x{_e:02X}) and SEG_E_NEG (0x{_c:02X}) differ in only "
-        f"{_differing} bar(s) -- too alike to tell apart at item size")
-    ok(f"a negative exponent uses a clearly distinct glyph "
-       f"(0x{_e:02X} vs 0x{_c:02X}, {_differing} bars differ)")
-
-
-def test_item_number_has_both_format_branches():
-    _body = _re.search(r"float item_number\([^)]*\)\s*\{(.*?)\n\}",
-                       _src, _re.S).group(1)
-    # Scientific notation must actually be reachable. Disabling this branch
-    # leaves every pixel test passing, since a fixed-point fallback still
-    # draws three plausible glyphs for a huge value.
-    assert "NUM_FIXED_HI" in _body and "NUM_FIXED_LO" in _body, (
-        "the format must be chosen by comparing the exponent against both "
-        "NUM_FIXED_HI and NUM_FIXED_LO")
-    assert "SEG_E" in _body, "the scientific branch must draw an E"
-    # The decimal point belongs to the fixed branch only; a scientific
-    # render has no point, so "point" must be conditional.
-    assert "sd_seg_point" in _body, "fixed point must draw a decimal point"
-    assert _re.search(r"if\s*\(\s*point\s*\)", _body), (
-        "the decimal point must be conditional -- a scientific render has "
-        "none")
-    ok("item_number() has both format branches and a conditional point")
-
-
-def test_item_number_handles_both_rounding_carries():
-    _body = _re.search(r"float item_number\([^)]*\)\s*\{(.*?)\n\}",
-                       _src, _re.S).group(1)
-    # Carry 1: rounding a mantissa to one digit can reach 10, which is two
-    # digits. It must renormalise, not clamp -- clamping shows 9.6e3 as
-    # "0E3" or "9E3" rather than "1E4".
-    assert _re.search(r"md\s*>=\s*10", _body), (
-        "the mantissa must be checked for rounding up to 10")
-    assert _re.search(r"md\s*=\s*1\s*;.*?e\s*\+=\s*1", _body, _re.S), (
-        "a mantissa that rounds to 10 must become 1 with the exponent "
-        "incremented, not be clamped to 9")
-    # Carry 2: rounding to two decimals can cross the fixed-point ceiling.
-    # 9.996 -> 10.00 needs three integer columns, so it must promote to
-    # scientific rather than clamp to 9.99 and report a smaller value.
-    assert _re.search(r"1000\.0", _body), (
-        "a fixed-point value that rounds past 9.99 must be detected "
-        "(scaled >= 1000) and promoted to scientific")
-    assert "NUM_FIXED_HI" in _body
-    ok("item_number() renormalises both rounding carries")
-
-
-def test_the_glyph_columns_fit_inside_the_disc():
-    # The number is drawn on the face of the item, so the three columns must
-    # fit inside the ring -- otherwise digits spill over the rim and read as
-    # belt decoration. Checked here rather than by eye because the layout is
-    # arithmetic over four tunables that are each independently adjustable.
-    import math
-    _half_w = float(_re.search(r"#define SEG_HALF_W\s+([\d.]+)", _src).group(1))
-    _gap = float(_re.search(r"#define NUM_GAP\s+([\d.]+)", _src).group(1))
-    _size = float(_re.search(r"#define ITEM_NUM_SIZE\s+([\d.]+)", _src).group(1))
-    _radius = float(_re.search(r"#define ITEM_RADIUS\s+([\d.]+)", _src).group(1))
-    _ring = float(_re.search(r"#define ITEM_RING\s+([\d.]+)", _src).group(1))
-    _adv = _half_w * 2.0 + _gap
-    # Furthest lit corner: the outer edge of an outer column, full height.
-    _corner = math.hypot((_adv + _half_w) * _size, 1.0 * _size)
-    _inner = _radius - _ring
-    assert _corner <= _inner, (
-        f"the glyph columns reach {_corner:.4f} cells from the centre but "
-        f"the disc's inner radius is {_inner:.4f} -- digits would cross the "
-        f"ring. Reduce ITEM_NUM_SIZE or NUM_GAP.")
-    ok(f"three glyph columns fit inside the ring "
-       f"({_corner:.3f} <= {_inner:.3f} cells)")
+    assert _m, "the Source emit-value branch was not found"
+    _branch = _m.group(1)
+    assert "sd_number" in _branch, "the branch must draw a formatted number"
+    assert "rotate_to_dir" not in _branch and "unrotate" not in _branch, (
+        "the Source's number must not be rotated into its facing -- text "
+        "has a reading orientation and pf is already world-aligned")
+    # A fallback glyph at small sizes, so a zoomed-out Source still reads as
+    # a generator rather than as an empty box.
+    assert "sd_glyph" in _branch, (
+        "below the legibility cutoff the Source must fall back to its glyph")
+    ok("the Source's number reads left-to-right at every facing, with a "
+       "glyph fallback when small")

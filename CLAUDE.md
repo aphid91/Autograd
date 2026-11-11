@@ -46,7 +46,7 @@ There is no pytest/linter configured.
 | [tests/test_tick.py](tests/test_tick.py) | the clock as wired into the frame loop: rate, `alpha`, keys, phase order |
 | [tests/test_segments.py](tests/test_segments.py) | belt-run derivation: tracing, cuts, undergrounds, merges, audit under churn |
 | [tests/test_belts.py](tests/test_belts.py) | the closed form against the naive oracle, on fixed and randomised configs |
-| [tests/test_item_render.py](tests/test_item_render.py) | reads the framebuffer back: do discs appear where the simulation says? |
+| [tests/test_item_render.py](tests/test_item_render.py) | reads the framebuffer back: do discs appear where the simulation says, and do the labels say what the formatter says? |
 | [tests/test_gates.py](tests/test_gates.py) | firing rules, arithmetic, back pressure, dangling-output discard, and the bubble-free claim |
 | [tests/test_stamp.py](tests/test_stamp.py) | what the stamp transforms preserve: wiring, topology, arithmetic |
 | [tests/test_clipboard.py](tests/test_clipboard.py) | the copy/paste/erase mode machine, driven through the fake mouse and keyboard |
@@ -482,6 +482,7 @@ everything else is grouped by layer.
 | [core/stamp.py](core/stamp.py) | copy-stamps: entries, the rotate/mirror algebra, the history ring |
 | [core/clipboard.py](core/clipboard.py) | copy/paste mode state, the stashed tool, and `capture()` |
 | [core/glsl_types.py](core/glsl_types.py) | emits the per-type GLSL tables from the entity classes |
+| [core/font.py](core/font.py) | the 6×8 bitfield font, and the reference number formatter |
 | [core/persistence.py](core/persistence.py) | save/load the board to a single `.npz` (`.w` zeroed — derived) |
 | [core/config.py](core/config.py) | persistent panel preferences (the quicksave filename), loaded only by `app.py` |
 | [core/toolbelt.py](core/toolbelt.py) | ten slots, one active tool |
@@ -1109,12 +1110,113 @@ A port face has exactly one neighbour, so each (gate, channel) pair has one
 upstream source and the writes are disjoint — no contention even though many
 gates write inputs in the same pass.
 
+### Text rendering
+
+[core/font.py](core/font.py) holds a **6×8 on/off bitfield per character**,
+two 24-bit ints, generated into `common.glsl` at the ids marker exactly as
+the per-type tables are. A pixel finds which glyph cell it lands in, tests
+one bit, and takes a box distance against that cell — so a character costs
+an integer op and one `sd_box` whichever character it is. No texture, no
+sampler binding, no asset on disk, and no 36-way branch over glyph shapes.
+
+This replaced a seven-segment display that could draw ten digits and a
+handful of fakeable letters. The alternatives and why not:
+
+- **A bitmap or SDF atlas** is cheapest per pixel but is a *resource* — a
+  texture to generate or ship, a binding, and for SDF either a committed
+  binary asset or a startup generation pass. Both cut against "nothing is
+  written to disk, `F5` needs no build step".
+- **Per-glyph stroke SDFs**, which is what `sd_glyph` does for the nine
+  machine marks, are prettiest and scale perfectly — but 10 digits plus the
+  alphabet is 36+ hand-authored functions behind a branch chain evaluated
+  per pixel per column. Fine at nine, poor at thirty-six.
+
+The visible trade is that glyphs are **blocky** — a dot-matrix readout
+rather than smooth type. Deliberate for a factory game's machine displays,
+and it antialiases through the usual `fill()` because each lit cell is a
+real box in world space, not a magnified texel.
+
+**6×8 rather than the classic 5×7**: 5×7 fits in one int but compromises
+`4`, `M`, `W` and `X` and rules out lowercase. 48 bits needs two ints
+either way and two ints cover 8×8, so the wider cell is free.
+
+#### The formatter has a Python oracle
+
+`format_number()` exists twice: in GLSL, which ships, and in
+`core/font.py`, which exists to disagree with it — the same relationship
+`belts.naive_tick()` has to the closed form.
+
+That is worth the duplication because **a formatter bug draws a perfectly
+crisp wrong number**. There is no visual artefact, and the pixel tests can
+only see that something value-dependent appeared. The seven-segment
+formatter had no Python counterpart and so was pinned by regexes over the
+shader source, which can assert that a branch exists but never that it
+computes the right thing.
+
+Policy is a few knobs rather than a rewrite: `sig` digits after the point,
+`trim` to drop trailing zeros (which is what turns `-1.00` into `-1`), and
+`NUM_FIXED_HI_E`/`LO_E` for the fixed↔scientific boundary — mirrored by
+`font.FIXED_HI_E`/`LO_E`, since the reference is only an oracle if it
+switches format where the shader does.
+
+**A minus costs a column, and trimming paid for it.** The seven-segment
+version spent all three columns on digits and left the sign to the ring
+alone; `-1` is two glyphs where `1.00` was three.
+
+**`NUM_MAX_CODES` bounds every buffer** (GLSL has no dynamic arrays).
+Overflowing it does not crash — `num_push()` drops the excess — it
+*silently truncates a number*, so `tests/test_glsl.py` sweeps the formatter
+and asserts nothing reaches the bound. It was 10 against a true worst case
+of 13 (`-1234567.0000`) until that sweep included the length-maximising
+values rather than tidy representative ones.
+
+#### Reading the pixels back
+
+[tests/test_item_render.py](tests/test_item_render.py) identifies each
+rendered glyph by downsampling it onto the 6×8 grid and matching against the
+font table, so a pixel test can assert **what the number said** rather than
+that something was drawn. Three things this needs:
+
+- **Slice at the layout's advances, not at blank columns.** A `1` has a
+  blank column inside it, so gap-finding segmented `1.11` into nine
+  fragments. The expected string reconstructs the pen positions instead.
+- **The decimal point's narrow advance has to be followed on both counts** —
+  it advances `NUM_POINT_ADV` rather than `FONT_W` *and* is drawn shifted
+  left within it. Missing either reads the next digit one cell late.
+- **Aspect ratio breaks ties between solid rectangles.** A `-` is 4×1 cells
+  and a `.` is 2×2; cropped to their own ink both are filled boxes that
+  match each other perfectly, and `2.5` read as `2-5` until the score
+  accounted for shape.
+
+#### What the font tests cannot see
+
+Every other font check compares the table **against itself** — the GLSL is
+generated from it, and the pixel tests identify glyphs by matching back to
+it. So swapping two glyphs' shapes is self-consistent and passes
+everything. Mutation-tested, and it did: exchanging `2` and `5` was
+invisible to the entire suite.
+
+`test_each_digit_has_the_shape_its_name_implies` is the independent
+statement — enclosed holes, vertical symmetry, and where each digit's
+full-width bar sits — and it names the two dangerous pairs explicitly:
+`0`/`O` (identical at 6×8 without the zero's slash, which is why the slash
+is there and why `0` has *two* holes) and `2`/`5` (vertical mirrors with no
+holes and no symmetry, so only bar placement separates them).
+
 ### Item rendering
 
 Items draw as discs with a coloured ring — **green above zero, red at or
 below** — sized by `ITEM_RADIUS` in [world.frag](shaders/world.frag)'s
-tunables. No text: glyph rendering is a project of its own, and sign is what
-is worth reading at a glance.
+tunables, and carry their value as text (see "Text rendering" below).
+
+**The ring and the number say the same thing at different zooms.** The
+number is exact and the ring is only a sign, but the ring survives all the
+way down the zoom range while the text fades out below legibility
+(`NUM_MIN_PX` / `NUM_GOOD_PX`, in *glyph pixel height* rather than zoom,
+because that is the quantity legibility actually depends on). So zooming out
+degrades gracefully rather than going blank. That redundancy is why dropping
+the sign glyph would have been defensible and why adding it was still worth
+it — the ring cannot tell you a value, only which side of zero it is on.
 
 **The shader recomputes positions; it never reads them.** Materialising
 O(items) of state per frame is exactly the cost the closed form avoids, so
@@ -1699,6 +1801,38 @@ actually has something on the other side, so a structure and its neighbours
 read as physically joined. Stubs are drawn *under* the body so the body edge
 caps their inner end.
 
+#### A Source shows its emitted value instead of a glyph
+
+The dot a `Source` used to draw said only "this is a generator", which the
+colour and the port arrows already say. The emitted value is the one thing
+that differs between two Sources, and it was reachable only by clicking.
+
+**Nothing new is uploaded for this.** The entity SSBO is already bound and
+the cell already carries the row id, so the renderer reads `F_EMIT` straight
+out of the row. The offset is *generated* from `Source.F_EMIT` rather than
+spelled as `F_IN_VALUE` in the shader: the two are equal only because a
+generator has no input channels, and a hand-written alias would silently
+read a channel if `F_EMIT` ever moved (see "A Source's emitted value is per
+instance").
+
+Two things the glyph did not need:
+
+- **The label does not rotate with the facing.** Text has a reading
+  orientation a mark does not, so a south-facing Source must still read
+  left-to-right. `pf` is footprint-centred and already world-aligned, so the
+  fix is simply not to rotate it.
+- **Below the legibility cutoff the type glyph comes back.** A number too
+  small to read is noise, but a blank body is worse than the dot — a Source
+  would stop being identifiable at a glance. This differs from the item
+  labels, which just fade, because a disc still has its ring to carry the
+  sign and a machine body has nothing.
+
+Sizing these labels is a real tension and both ends were hit while tuning
+it: too small and a glyph lands inside the fade band at ordinary build zoom,
+so a `137` renders as fragments and reads as `37` — which looks exactly like
+a formatter bug and is not one. Too large and a saturated belt becomes
+wall-to-wall text with the discs and their rings lost underneath.
+
 ### Control-signal overlay
 
 A machine draws a faint belt straight through itself on each axis it passes
@@ -1799,9 +1933,13 @@ the stated next step — though Sink is now off the toolbelt, since a dangling
 output does the same job);
 **item-to-gate transit** (items pop in and out of existence at the ends of a
 run rather than being seen to enter or leave a machine — deliberate for now);
-**numbers on items** (a disc shows only the sign of its value, via colour);
 **int and bool item types** (the storage is float32 throughout, as designed;
-nothing yet reinterprets it);
+nothing yet reinterprets it — though the formatter would need a policy per
+type, since `trim` and `sig` mean nothing for a bool);
+**lowercase and a general text layer** (the font is uppercase-only, and the
+only callers are the item labels and a Source's value — a machine wanting a
+*name* on its body, or a tooltip, would want a string-drawing entry point
+rather than the number-shaped one `sd_number()` provides);
 **incremental segment rebuild** (currently whole-board on any real edit;
 the inspector reports rebuild counts so there is a number to point at before
 anyone optimises it);

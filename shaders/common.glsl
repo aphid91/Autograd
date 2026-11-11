@@ -375,92 +375,269 @@ float sd_chevron(vec2 p, float half_len, float half_span, float thick) {
     return d - thick;
 }
 
-// --- seven-segment digits ----------------------------------------------
+// --- the bitfield font -------------------------------------------------
 //
-// Numbers on items, drawn as a calculator display: seven bars per cell, lit
-// by a bitmask. No texture and no atlas, so there is no asset to ship, no
-// sampler binding, and no resolution to outgrow -- a digit is an SDF like
-// everything else here and stays crisp at any zoom.
+// Text is drawn from a 6x8 on/off bitfield per character, two ints wide,
+// generated from core/font.py into the FONT_LO / FONT_HI tables above. A
+// pixel finds which glyph cell it lands in, tests that one bit, and takes a
+// box distance against the cell -- so a character costs an integer op and one
+// sd_box whichever character it is. No texture, no sampler, no 36-way branch
+// over glyph shapes.
 //
-// Bar order, one bit each:
+// This replaced a seven-segment display, which could draw ten digits and a
+// handful of fakeable letters. See core/font.py for why a bitfield rather
+// than an atlas or per-glyph stroke SDFs.
 //
-//        --- 0 ---
-//       |         |
-//       5         1
-//       |         |
-//        --- 6 ---
-//       |         |
-//       4         2
-//       |         |
-//        --- 3 ---
-//
-// Glyph space is x in [-SEG_HALF_W, SEG_HALF_W], y in [-1, 1], so a digit is
-// two units tall and centred on the origin. Callers scale it.
-#define SEG_HALF_W   0.60   // glyph half-width, in glyph units
-#define SEG_THICK    0.16   // bar half-thickness
-#define SEG_INSET    0.14   // how far bar ends stop short of the corner
+// Glyph space is one unit per glyph *cell*: a character occupies
+// x in [0, FONT_W], y in [0, FONT_H], origin at its bottom-left. Callers
+// scale and place it. That is a different convention from sd_glyph's
+// centred-on-origin space, deliberately -- text is laid out by advancing an
+// origin, not by centring each mark.
 
-// Masks, indexed by digit. Bit i lights bar i above.
-const int SEG_DIGITS[10] = int[10](
-    0x3F,  // 0: 0,1,2,3,4,5
-    0x06,  // 1: 1,2
-    0x5B,  // 2: 0,1,6,4,3
-    0x4F,  // 3: 0,1,2,3,6
-    0x66,  // 4: 5,6,1,2
-    0x6D,  // 5: 0,5,6,2,3
-    0x7D,  // 6: 0,5,4,3,2,6
-    0x07,  // 7: 0,1,2
-    0x7F,  // 8: all
-    0x6F   // 9: 0,1,2,3,5,6
-);
+// Is cell (x, y) of glyph `code` lit? Out-of-range cells and codes read
+// clear, so a caller need not clamp before asking.
+bool font_bit(int code, int x, int y) {
+    if (code < 0 || code >= FONT_COUNT) return false;
+    if (x < 0 || x >= FONT_W || y < 0 || y >= FONT_H) return false;
+    int bit = y * FONT_W + x;
+    // Two 24-bit halves, so neither can touch the sign bit -- see
+    // core/font.py glyph_bits().
+    int word = (bit < 24) ? FONT_LO[code] : FONT_HI[code];
+    int shift = (bit < 24) ? bit : bit - 24;
+    return ((word >> shift) & 1) != 0;
+}
 
-// Non-digit glyphs, same encoding.
-#define SEG_MINUS   0x40    // bar 6 alone
-#define SEG_E       0x79    // 0,5,4,3,6
-// A negative exponent needs a sign and there is no column to spare, so the
-// middle column *becomes* the sign: "1-9" for 1e-9 against "1E9" for 1e9.
+// Distance to glyph `code`, with `p` in glyph space (see above).
 //
-// The obvious alternative -- an "E" with its middle bar dropped, giving a
-// "C" -- was tried first and is wrong. E (0x79) and C (0x39) differ by
-// exactly one bar out of four, so at the handful of pixels these are drawn
-// at the two are nearly the same shape: a whole-frame pixel diff between
-// 1e9 and 1e-9 came to 16 pixels. A bare minus is one bar against four and
-// cannot be misread, which matters more than notational tidiness when the
-// failure is an eighteen-order-of-magnitude misreading.
-#define SEG_E_NEG   SEG_MINUS
-
-// A seven-segment glyph from its bitmask, in glyph space (see above).
-// Bars are inset from the corners so neighbours meet at a notch instead of
-// fusing into a blob where three of them coincide.
-float sd_seven_seg(int mask, vec2 p) {
+// Only the cell the point falls in is tested, plus nothing else: the lit
+// cells of a glyph form a union of unit boxes, and for a point inside the
+// glyph's bounding box the nearest lit cell is overwhelmingly the one it is
+// in or an immediate neighbour. Testing the 3x3 neighbourhood gives a
+// distance that is correct wherever it matters for antialiasing -- within a
+// pixel of an edge -- and is a conservative over-estimate further away,
+// where only the sign is read.
+//
+// Returning a real distance rather than a boolean is what lets text
+// antialias through the usual fill(d, px) and stay crisp at any zoom, which
+// is the whole reason a bitfield here is not simply a bitmap.
+float sd_font_glyph(int code, vec2 p) {
+    if (code < 0 || code >= FONT_COUNT) return 1e9;
+    ivec2 c = ivec2(floor(p));
     float d = 1e9;
-    float top = 1.0 - SEG_THICK, bot = -(1.0 - SEG_THICK);
-    float mid_y = 0.0;
-    float side = SEG_HALF_W - SEG_THICK;
-    // Vertical bars span half the glyph height, centred between the
-    // horizontal bar they sit between.
-    float vhalf = (top - mid_y) * 0.5 - SEG_INSET * 0.5;
-    vec2 vext = vec2(SEG_THICK, max(vhalf, 0.02));
-    vec2 hext = vec2(SEG_HALF_W - SEG_THICK - SEG_INSET * 0.5, SEG_THICK);
-
-    if ((mask & 0x01) != 0) d = min(d, sd_box(p - vec2(0.0, top), hext));
-    if ((mask & 0x02) != 0) d = min(d, sd_box(p - vec2( side, (top + mid_y) * 0.5), vext));
-    if ((mask & 0x04) != 0) d = min(d, sd_box(p - vec2( side, (bot + mid_y) * 0.5), vext));
-    if ((mask & 0x08) != 0) d = min(d, sd_box(p - vec2(0.0, bot), hext));
-    if ((mask & 0x10) != 0) d = min(d, sd_box(p - vec2(-side, (bot + mid_y) * 0.5), vext));
-    if ((mask & 0x20) != 0) d = min(d, sd_box(p - vec2(-side, (top + mid_y) * 0.5), vext));
-    if ((mask & 0x40) != 0) d = min(d, sd_box(p - vec2(0.0, mid_y), hext));
+    for (int dy = -1; dy <= 1; ++dy) {
+        for (int dx = -1; dx <= 1; ++dx) {
+            ivec2 q = c + ivec2(dx, dy);
+            if (!font_bit(code, q.x, q.y)) continue;
+            // Unit box centred on the cell.
+            vec2 centre = vec2(q) + 0.5;
+            d = min(d, sd_box(p - centre, vec2(0.5)));
+        }
+    }
     return d;
 }
 
-// The decimal point: a square pip on the baseline. Centred on the origin in
-// glyph space, so the caller positions it between two columns.
-float sd_seg_point(vec2 p) {
-    return sd_box(p - vec2(0.0, -(1.0 - SEG_THICK)), vec2(SEG_THICK));
+// --- number formatting -------------------------------------------------
+//
+// A value becomes a short string of glyph codes, which the caller then draws.
+// Formatting happens in the shader rather than CPU-side because the payload
+// is already here: pre-formatting would mean per-item state in the SSBO,
+// which is exactly the O(items) upload the closed form exists to avoid.
+//
+// The policy is a handful of knobs, so "how many digits" is a tunable rather
+// than a rewrite:
+//
+//   sig      significant figures to keep after the decimal point
+//   trim     drop trailing zeros, so -1.00 reads as -1 and 2.50 as 2.5
+//
+// Output is written into `codes` with the count returned. NUM_MAX_CODES
+// bounds every buffer: GLSL has no dynamic arrays, so the caller declares a
+// fixed one and this never writes past it.
+//
+// 16 is the worst case with headroom. The longest output is a fully
+// untrimmed negative fixed-point value at the top of the fixed range:
+// sign + NUM_FIXED_HI_E integer digits + point + sig decimals, which at
+// sig=4 is 1 + 7 + 1 + 4 = 13. Overflowing this does not crash -- num_push()
+// drops the excess -- but it silently truncates a number, which is exactly
+// the failure a display must not have, so test_glsl.py sweeps the formatter
+// and asserts nothing reaches the bound.
+#define NUM_MAX_CODES 16
+
+// The exponent range that stays in fixed-point notation. Outside it a value
+// goes scientific, which is the only way to fit a huge or tiny magnitude in
+// a few columns.
+#define NUM_FIXED_HI_E   7     // < 1e7 stays fixed
+#define NUM_FIXED_LO_E  -4     // >= 1e-4 stays fixed
+
+// Append one code, if there is room. Every write goes through this so the
+// bound is checked in one place rather than at each of the dozen call sites
+// below -- a missed check there would be an out-of-bounds write, which on
+// some drivers is silent corruption rather than an error.
+void num_push(inout int codes[NUM_MAX_CODES], inout int n, int code) {
+    if (n < NUM_MAX_CODES) { codes[n] = code; n = n + 1; }
 }
 
-// Digit `i` of `v` counting from the most significant, for a value already
-// known to be in [0, 10^digits). Returns 0..9.
-int decimal_digit(float v, int place) {
-    return int(mod(floor(v / pow(10.0, float(place))), 10.0));
+// Format `value` into `codes`, returning how many were written.
+//
+// `sig` is digits after the point; `trim` drops trailing zeros (and then a
+// bare trailing point), which is what turns -1.00 into -1.
+int format_number(float value, int sig, bool trim,
+                  out int codes[NUM_MAX_CODES]) {
+    int n = 0;
+    for (int i = 0; i < NUM_MAX_CODES; ++i) codes[i] = CODE_SPACE;
+
+    // NaN first: it is the one value meaning "this computation had no
+    // answer" (see the gate numeric policy) and every comparison below is
+    // false for it, so without this it would format as "0".
+    if (isnan(value)) {
+        num_push(codes, n, CODE_NAN_0);
+        num_push(codes, n, CODE_NAN_1);
+        num_push(codes, n, CODE_NAN_2);
+        return n;
+    }
+
+    bool neg = value < 0.0;
+    float mag = abs(value);
+
+    if (isinf(mag)) {
+        if (neg) num_push(codes, n, CODE_MINUS);
+        num_push(codes, n, CODE_INF_0);
+        num_push(codes, n, CODE_INF_1);
+        num_push(codes, n, CODE_INF_2);
+        return n;
+    }
+
+    // A minus is a column of its own now. The seven-segment display could
+    // not afford one -- three columns were three digits and the sign lived
+    // only in the ring colour -- but a 6-wide glyph cell and a tolerance for
+    // spilling past the disc rim buys it, and "-1" is worth far more than
+    // the third significant figure it costs.
+    if (neg) num_push(codes, n, CODE_MINUS);
+
+    if (mag == 0.0) {
+        num_push(codes, n, CODE_DIGIT_0);
+        return n;
+    }
+
+    float e = floor(log(mag) / log(10.0));
+
+    if (e >= float(NUM_FIXED_HI_E) || e < float(NUM_FIXED_LO_E)) {
+        // Scientific: one digit, the point and up to `sig` decimals if they
+        // are not all zero, then E and the signed exponent.
+        float mant = mag / pow(10.0, e);
+        // Rounding the mantissa can carry it to 10, which needs
+        // renormalising rather than clamping -- 9.96e3 is 1E4, not 9.9E3.
+        float scale = pow(10.0, float(sig));
+        float r = floor(mant * scale + 0.5);
+        if (r >= 10.0 * scale) { r = r / 10.0; e += 1.0; }
+
+        int whole = int(floor(r / scale));
+        num_push(codes, n, CODE_DIGIT_0 + whole);
+
+        int frac = int(r - float(whole) * scale);
+        int fdigits = sig;
+        if (trim) {
+            while (fdigits > 0 && (frac % 10) == 0) { frac /= 10; fdigits -= 1; }
+        }
+        if (fdigits > 0) {
+            num_push(codes, n, CODE_POINT);
+            for (int i = fdigits - 1; i >= 0; --i) {
+                int dv = int(mod(floor(float(frac) / pow(10.0, float(i))), 10.0));
+                num_push(codes, n, CODE_DIGIT_0 + dv);
+            }
+        }
+
+        num_push(codes, n, CODE_E);
+        if (e < 0.0) num_push(codes, n, CODE_MINUS);
+        int ae = int(abs(e));
+        if (ae >= 10) num_push(codes, n, CODE_DIGIT_0 + (ae / 10) % 10);
+        num_push(codes, n, CODE_DIGIT_0 + ae % 10);
+        return n;
+    }
+
+    // Fixed point. Round once at the requested precision, then split -- not
+    // the other way round, or a value like 9.999 would print its integer
+    // part as 9 and its rounded fraction as 00.
+    float scale = pow(10.0, float(sig));
+    float r = floor(mag * scale + 0.5);
+    float whole = floor(r / scale);
+    int frac = int(r - whole * scale);
+
+    int fdigits = sig;
+    if (trim) {
+        while (fdigits > 0 && (frac % 10) == 0) { frac /= 10; fdigits -= 1; }
+    }
+
+    // Integer part, most significant digit first. A loop down from a fixed
+    // ceiling rather than a digit count: NUM_FIXED_HI_E bounds it at 7
+    // digits, and leading zeros are skipped.
+    bool started = false;
+    for (int place = 7; place >= 0; --place) {
+        float pw = pow(10.0, float(place));
+        int dv = int(mod(floor(whole / pw), 10.0));
+        if (dv != 0) started = true;
+        if (!started && place > 0) continue;
+        num_push(codes, n, CODE_DIGIT_0 + dv);
+    }
+
+    if (fdigits > 0) {
+        num_push(codes, n, CODE_POINT);
+        for (int i = fdigits - 1; i >= 0; --i) {
+            int dv = int(mod(floor(float(frac) / pow(10.0, float(i))), 10.0));
+            num_push(codes, n, CODE_DIGIT_0 + dv);
+        }
+    }
+    return n;
+}
+
+// --- drawing a run of codes --------------------------------------------
+//
+// Lay `count` glyphs out left to right and return coverage at `p`.
+//
+// `p` is in *glyph cell* units with the origin at the text's centre, so the
+// caller scales by whatever it wants a cell to measure and does not have to
+// know the string's width. Centring here rather than at the call site is
+// what makes a variable-width number -- which is the point of trimming --
+// stay put instead of drifting as digits come and go.
+//
+// The point advance is narrower than a full cell: a decimal point carries
+// only a 2-wide pip, so giving it the same 6 cells as a digit leaves a
+// visible hole in the middle of a number.
+#define NUM_POINT_ADV  3.0
+
+// Total width of a code run, in glyph cells.
+float text_width(int codes[NUM_MAX_CODES], int count) {
+    float w = 0.0;
+    for (int i = 0; i < count; ++i) {
+        w += (codes[i] == CODE_POINT) ? NUM_POINT_ADV : float(FONT_W);
+    }
+    return w;
+}
+
+// Distance to the nearest lit cell of the run, with `p` centred as above.
+float sd_text(int codes[NUM_MAX_CODES], int count, vec2 p) {
+    float w = text_width(codes, count);
+    // Walk the pen from the left edge. Glyphs sit on rows 1..7 of an 8-row
+    // cell, so the ink's vertical centre is at FONT_H*0.5 -- using the cell
+    // centre keeps the baseline consistent across a mixed run.
+    vec2 q = p + vec2(w * 0.5, float(FONT_H) * 0.5);
+    float d = 1e9;
+    float pen = 0.0;
+    for (int i = 0; i < count; ++i) {
+        float adv = (codes[i] == CODE_POINT) ? NUM_POINT_ADV : float(FONT_W);
+        // Centre the narrow point glyph in its narrow advance.
+        float off = (codes[i] == CODE_POINT)
+                  ? pen - (float(FONT_W) - NUM_POINT_ADV) * 0.5
+                  : pen;
+        d = min(d, sd_font_glyph(codes[i], q - vec2(off, 0.0)));
+        pen += adv;
+    }
+    return d;
+}
+
+// Format and draw in one step, which is what every caller actually wants.
+// Returns the distance field; the caller applies fill() with its own px.
+float sd_number(float value, int sig, bool trim, vec2 p) {
+    int codes[NUM_MAX_CODES];
+    int n = format_number(value, sig, trim, codes);
+    return sd_text(codes, n, p);
 }

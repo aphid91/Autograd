@@ -26,7 +26,7 @@ surrounding grey washes the hue below any sensible threshold.
 """
 import numpy as np
 
-from core import cell
+from core import cell, font
 from core.belts import UNIT
 
 from tests import harness
@@ -607,119 +607,393 @@ def test_different_values_draw_different_digits():
         engine.debug_feed = None
 
 
-#: Glyph layout constants, mirroring the shader's. SEG_HALF_W and NUM_GAP are
-#: in glyph units; one glyph unit is ITEM_NUM_SIZE cells.
-SEG_HALF_W = 0.60
-NUM_GAP = 0.30
-ITEM_NUM_SIZE = 0.068
+#: Mirrors of the shader's text-layout tunables, needed to predict where a
+#: glyph lands on screen. NUM_POINT_ADV is common.glsl's; the rest are
+#: world.frag's.
+#:
+#: Parsed out of the shader rather than hardcoded. These are *tunables* --
+#: the block they live in exists to be fiddled with, and ITEM_NUM_SIZE was
+#: retuned twice while getting the labels legible. A hardcoded mirror turns
+#: every such tweak into a test failure that names the wrong thing: the
+#: render is fine and the test's arithmetic is stale.
+def _shader_float(name, default):
+    import re
+    from render import shader_loader
+    m = re.search(rf"^[ \t]*#define[ \t]+{name}[ \t]+([\d.]+)",
+                  shader_loader.load("world.frag"), re.M)
+    return float(m.group(1)) if m else default
 
 
-def _columns(img):
-    """Lit area of each of the three glyph columns, left to right.
+NUM_POINT_ADV = _shader_float("NUM_POINT_ADV", 3.0)
+ITEM_NUM_SIZE = _shader_float("ITEM_NUM_SIZE", 0.042)
+ITEM_RADIUS = _shader_float("ITEM_RADIUS", 0.22)
 
-    Sliced at the layout's own column boundaries rather than at blank gaps in
-    the render. Gap-finding does not work here: the decimal pip sits *in* the
-    gap between columns 0 and 1, leaving a one-pixel separation for "8.88"
-    that no threshold can tell from a bar's own antialiasing -- it read as two
-    columns, not three.
 
-    Returns (width, height, lit) per column, measuring only the glyph's own
-    pixels so the pip is excluded by falling outside every column's span.
+def _read_glyphs(img, text):
+    """Slice the rendered text into per-glyph masks, left to right.
+
+    Sliced at the *layout's* advances rather than at blank columns in the
+    render. Gap-finding does not work and the failure is instructive: a "1"
+    has a blank column inside it, between the serif flag and the stem, so
+    "1.11" segmented into nine fragments instead of four. Any font with an
+    interior gap in any glyph defeats that approach, which is most fonts.
+
+    So the expected string is passed in and used to reconstruct the pen
+    positions, exactly as sd_text() does -- including the narrow advance for
+    a decimal point. That makes this a check of *what each cell contains*
+    given the layout, with the glyph count asserted separately by the
+    caller; it cannot silently pass by finding a different number of glyphs
+    than it looked for.
+
+    Returns a list of (x0, x1, mask), the mask cropped to its own ink.
     """
     m = _glyph_pixels(img)
     ys, xs = np.nonzero(m)
     if not len(xs):
         return []
-    # The three columns are centred at -adv, 0, +adv in glyph units, each
-    # SEG_HALF_W wide, so the lit span runs from -(adv + SEG_HALF_W) to
-    # +(adv + SEG_HALF_W) -- map that onto the rendered bounding box.
-    adv = SEG_HALF_W * 2.0 + NUM_GAP
-    span = (adv + SEG_HALF_W) * 2.0          # total width, glyph units
+    # Advances in glyph cells, mirroring NUM_POINT_ADV in the shader.
+    advs = [NUM_POINT_ADV if ch == "." else float(font.FONT_W) for ch in text]
+    total = sum(advs)
+    # The render's ink spans the text's *ink*, not its advance box: the first
+    # glyph's left bearing and the last one's spacing column are blank. Map
+    # from the ink extent by trimming those, which the font makes knowable --
+    # the spacing column is always the rightmost of a cell.
     x0, x1 = int(xs.min()), int(xs.max())
-    # Scale from the actual extent, so this does not depend on the zoom.
-    per_unit = (x1 - x0 + 1) / span
+    # Leading blank columns of the first glyph, trailing of the last.
+    lead = _ink_bounds(text[0])[0]
+    trail = float(font.FONT_W) - 1.0 - _ink_bounds(text[-1])[1]
+    span = total - lead - trail
+    per_cell = (x1 - x0 + 1) / span
     out = []
-    for centre in (-adv, 0.0, adv):
-        lo = x0 + (centre - SEG_HALF_W + span / 2.0) * per_unit
-        hi = x0 + (centre + SEG_HALF_W + span / 2.0) * per_unit
-        sub = m[:, int(round(lo)):int(round(hi)) + 1]
+    pen = 0.0
+    for ch, adv in zip(text, advs):
+        # Slice at the *advance* boundaries, not at a fixed FONT_W window.
+        # A point advances only NUM_POINT_ADV cells, so a FONT_W-wide slice
+        # centred on it runs past into the next glyph and swallows it --
+        # which read as a "[" and a "/" where "1" and "." belonged.
+        #
+        # The pen runs in cell units from the text box's left edge, while x0
+        # is where the *ink* starts -- which is `lead` cells further in. So
+        # the conversion subtracts lead rather than starting the pen
+        # negative: doing both double-counts it and shifts every slice left
+        # by one cell, which is enough to clip a digit and pick up its
+        # neighbour.
+        #
+        # A point is also *drawn* shifted left within its narrow advance, so
+        # the 2-wide pip is centred in it -- sd_text() offsets it by
+        # -(FONT_W - NUM_POINT_ADV)/2. The slice has to follow, or the pip
+        # falls outside its own window and the next digit's slice is read
+        # one cell late.
+        draw = pen - ((float(font.FONT_W) - NUM_POINT_ADV) * 0.5
+                      if ch == "." else 0.0)
+        # Window the glyph's *own* ink columns rather than its whole cell, so
+        # a narrow glyph in a narrow advance cannot reach into its
+        # neighbour's window. The slack is a third of a cell each side:
+        # enough for antialiasing, and tight enough to exclude a neighbour.
+        # At half a cell the window following a "0" picked up the decimal
+        # pip, and the extra ink on the right made the zero match a "C".
+        g0, g1 = _ink_bounds(ch)
+        lo = x0 + (draw + g0 - 0.34 - lead) * per_cell
+        hi = x0 + (draw + g1 + 1.34 - lead) * per_cell
+        sub = m[:, max(0, int(round(lo))):int(round(hi)) + 1]
         if not sub.any():
-            out.append((0, 0, 0))
-            continue
-        cx = np.nonzero(sub.any(axis=0))[0]
-        cy = np.nonzero(sub.any(axis=1))[0]
-        out.append((int(cx.max() - cx.min() + 1),
-                    int(cy.max() - cy.min() + 1),
-                    int(sub.sum())))
+            out.append((int(round(lo)), int(round(hi)),
+                        np.zeros((1, 1), dtype=bool)))
+        else:
+            rows = np.nonzero(sub.any(axis=1))[0]
+            cols = np.nonzero(sub.any(axis=0))[0]
+            out.append((int(round(lo)) + int(cols.min()),
+                        int(round(lo)) + int(cols.max()),
+                        sub[rows.min():rows.max() + 1,
+                            cols.min():cols.max() + 1]))
+        pen += adv
     return out
 
 
+def _ink_bounds(ch):
+    """(first, last) lit column of `ch`, in glyph cells."""
+    lo, hi = font.glyph_bits(ch)
+    cols = [x for y in range(font.FONT_H) for x in range(font.FONT_W)
+            if _bit(lo, hi, y * font.FONT_W + x)]
+    return (min(cols), max(cols)) if cols else (0, font.FONT_W - 1)
+
+
+def _bit(lo, hi, i):
+    """Bit `i` of a glyph's two 24-bit halves."""
+    return bool((lo >> i) & 1) if i < 24 else bool((hi >> (i - 24)) & 1)
+
+
+def _identify(mask):
+    """Which character's bitfield best matches a rendered glyph.
+
+    This is the piece that makes the pixel tests able to say *what* was
+    drawn rather than merely that something was. The font is Python-known, so
+    a rendered glyph can be downsampled onto the 6x8 grid and compared
+    against every entry in the table -- no reference images, no committed
+    asset, and a new character is covered the moment it is added.
+
+    Returns (char, score) for the best match, score being the fraction of
+    the 48 cells that agree.
+    """
+    h, w = mask.shape
+    best, best_score = None, -1.0
+    for ch in font.CHARS:
+        if ch == " ":
+            continue
+        lo, hi = font.glyph_bits(ch)
+        # The glyph's own ink columns, so a narrow character like "1" is
+        # compared on its own extent rather than against a 6-wide box it
+        # does not fill. Mirrors what the render's gap-finding produced.
+        lit = [(x, y) for y in range(font.FONT_H) for x in range(font.FONT_W)
+               if (lo >> (y * font.FONT_W + x) & 1
+                   if y * font.FONT_W + x < 24
+                   else hi >> (y * font.FONT_W + x - 24) & 1)]
+        if not lit:
+            continue
+        xs = [p[0] for p in lit]
+        ys = [p[1] for p in lit]
+        gx0, gx1 = min(xs), max(xs)
+        gy0, gy1 = min(ys), max(ys)
+        gw, gh = gx1 - gx0 + 1, gy1 - gy0 + 1
+        agree = 0
+        for cy in range(gh):
+            for cx in range(gw):
+                # Sample the render at this cell's centre. Rows are top-down
+                # in the image and bottom-up in the font, hence the flip.
+                px = int((cx + 0.5) / gw * w)
+                py = int((gh - 1 - cy + 0.5) / gh * h)
+                got = bool(mask[min(py, h - 1), min(px, w - 1)])
+                want = (gx0 + cx, gy0 + cy) in lit
+                if got == want:
+                    agree += 1
+        score = agree / (gw * gh)
+        # Shape agreement alone cannot separate two solid rectangles: a "-"
+        # is 4x1 cells and a "." is 2x2, and cropping each to its own ink
+        # makes both a filled box that matches the other perfectly. The
+        # rendered pip is square and the minus is wide, so the *aspect* is
+        # what tells them apart -- and without this a "2.5" read as "2-5".
+        #
+        # Folded into the score rather than applied as a filter so it breaks
+        # ties without overriding a clear structural match: a glyph with real
+        # interior detail wins on `agree` by a margin this cannot close.
+        want_aspect = gw / gh
+        got_aspect = w / h
+        penalty = abs(want_aspect - got_aspect) / max(want_aspect, got_aspect)
+        score -= 0.25 * penalty
+        if score > best_score:
+            best, best_score = ch, score
+    return best, best_score
+
+
+def _read_number(img, text):
+    """The render identified glyph by glyph, given the layout `text` implies.
+
+    Returns a string of the same length as `text`, so comparing the two says
+    whether each cell drew the character the formatter asked for. It cannot
+    detect an *extra* glyph beyond the expected count -- `_ink_span` is what
+    bounds that, by checking the total ink extent against the layout's width.
+    """
+    return "".join(_identify(g[2])[0] for g in _read_glyphs(img, text))
+
+
+def _ink_span(img):
+    """(x0, x1) of all glyph ink in the frame, or None if there is none."""
+    m = _glyph_pixels(img)
+    ys, xs = np.nonzero(m)
+    if not len(xs):
+        return None
+    return int(xs.min()), int(xs.max())
+
+
+def _expected_ink_px(text, zoom, size):
+    """How wide `text`'s ink should be on screen, in pixels.
+
+    Derived from the font and the layout rather than measured, so it can be
+    compared against the render to catch a glyph the expected string does not
+    account for -- the one thing per-cell identification cannot see.
+    """
+    advs = [NUM_POINT_ADV if ch == "." else float(font.FONT_W) for ch in text]
+    lead = _ink_bounds(text[0])[0]
+    trail = float(font.FONT_W) - 1.0 - _ink_bounds(text[-1])[1]
+    return (sum(advs) - lead - trail) * size * zoom
+
+
 def test_the_glyphs_say_what_the_formatter_says():
-    """The digits drawn must be the digits the format rules call for.
+    """The characters drawn must be the characters the formatter calls for.
 
     The other tests show that *something* value-dependent is drawn. This one
-    pins *what*, which is the difference between a working display and a
-    plausible-looking one. Mutation testing is why it exists: disabling the
-    scientific branch entirely left the other two tests passing, because a
-    fallback to fixed point still differs from a 1.00 in some pixels.
+    pins *what*, by identifying each rendered glyph against the font table
+    and comparing against core/font.py's reference formatter.
 
-    Read back structurally rather than by exact pixels: a column's lit area
-    is a proxy for how many bars it lights, which is enough to tell an 8
-    (all seven) from a 1 (two) from a blank.
+    That comparison is only possible because the font and the format policy
+    both have Python counterparts now. The seven-segment display could only
+    be probed statistically -- lit area per column as a proxy for how many
+    bars a digit lights -- which could tell an 8 from a 1 but never catch a
+    2 drawn where a 5 belonged.
+
+    Two assertions per value, because neither alone is enough: the per-cell
+    identification says each position holds the right character, and the ink
+    span says there is no *extra* glyph the expected string does not account
+    for (a stray minus, or a padded "1.00" where "1" was asked for).
     """
     try:
-        # "1.11": the three columns are all 1s, so all three are narrow --
-        # a 1 lights only the two right-hand bars.
+        for value in (1.11, 8.88, -1.0, 2.5, 0.0, -0.5, -2.75):
+            harness.reset()
+            _one_item_at(value)
+            want = font.format_number(value, sig=2, trim=True)
+            img = _render()
+
+            got = _read_number(img, want)
+            assert got == want, (
+                f"item carrying {value} rendered as {got!r}, but the "
+                f"formatter says {want!r}")
+
+            x0, x1 = _ink_span(img)
+            measured = x1 - x0 + 1
+            expect = _expected_ink_px(want, TEXT_ZOOM, ITEM_NUM_SIZE)
+            # Antialiasing adds a pixel or so each side; a wrong glyph count
+            # is off by a whole 6-cell advance, which at this zoom is ~29px.
+            assert abs(measured - expect) <= 6, (
+                f"{value} drew {measured}px of ink but {want!r} should span "
+                f"{expect:.0f}px -- the render has a glyph the formatter "
+                f"did not ask for, or is missing one")
+        ok("rendered glyphs read back as the formatter's own output, at the "
+           "expected width (1.11, 8.88, -1, 2.5, 0, -0.5, -2.75)")
+    finally:
+        engine.debug_feed = None
+
+
+def test_a_negative_value_draws_its_minus_sign():
+    """-1 must render with a leading minus, not as a bare 1.
+
+    This is the behaviour the font change was for. The seven-segment display
+    spent all three columns on digits and left the sign to the ring colour
+    alone; trimming trailing zeros paid for a sign column, so "-1" is two
+    glyphs where "1.00" was three.
+
+    Worth its own test rather than leaning on the string comparison above:
+    a dropped minus is a *sign error*, the most consequential thing a number
+    display can get wrong, and it leaves a perfectly plausible render.
+    """
+    try:
         harness.reset()
-        _one_item_at(1.11)
-        ones = _columns(_render())
-        assert len(ones) == 3, f"expected 3 glyph columns for 1.11, got {len(ones)}"
+        _one_item_at(-1.0)
+        img = _render()
+        neg = _read_glyphs(img, "-1")
 
-        # "8.88": same three columns, every bar lit.
+        # The leading glyph is a minus.
+        first, score = _identify(neg[0][2])
+        assert first == "-", (
+            f"the leading glyph of -1 identifies as {first!r} "
+            f"(score {score:.2f}), not a minus")
+        # A minus is wide and short. The one shape it could be confused with
+        # is a 1 -- tall and narrow -- so check the aspect directly as well:
+        # best-match identification could in principle win on a degenerate
+        # render, and this cannot.
+        h, w = neg[0][2].shape
+        assert w > h, (
+            f"the minus rendered {w}x{h}; it must be wider than it is tall")
+
+        # And "-1" really is wider than "1": the minus occupies a column of
+        # its own rather than being drawn over the digit.
+        neg_span = _ink_span(img)
         harness.reset()
-        _one_item_at(8.88)
-        eights = _columns(_render())
-        assert len(eights) == 3, f"expected 3 columns for 8.88, got {len(eights)}"
+        _one_item_at(1.0)
+        pos_span = _ink_span(_render())
+        assert (neg_span[1] - neg_span[0]) > (pos_span[1] - pos_span[0]), (
+            "-1 must span more pixels than 1 -- the minus needs its own "
+            "column, not an overlay on the digit")
 
-        # Density is the signal, not width: an 8 lights all seven bars where
-        # a 1 lights two, so each column's lit area roughly trebles. Width
-        # alone is unreliable -- column 0 of a fixed-point render also picks
-        # up the decimal pip, which widens a narrow 1 without filling it.
-        for i, (one, eight) in enumerate(zip(ones, eights)):
-            assert eight[2] > one[2] * 1.8, (
-                f"column {i}: an 8 ({eight[2]}px lit) must be far denser "
-                f"than a 1 ({one[2]}px) -- two bars against seven")
+        # The ring still carries the sign, as it did before. The point was to
+        # add the glyph, not to replace the colour cue, which works at every
+        # zoom including below where a glyph resolves at all.
+        #
+        # Sampled at the *camera centre*, which is where _one_item_at frames
+        # the item -- and offset by half a cell because _peak_cast takes a
+        # cell index and looks at its centre. The ring is a thin annulus at
+        # the rim, so the patch has to be wide enough to reach it: at this
+        # zoom the disc is ~35px across, well past the default half of 8.
+        harness.reset()
+        _one_item_at(-1.0)
+        cast = _peak_cast(_render(), cam.center[0] - 0.5, cam.center[1] - 0.5,
+                          half=int(ITEM_RADIUS * TEXT_ZOOM) + 2)
+        assert _is_red(cast), (
+            "a negative item must still draw a red ring as well as a minus")
+        ok(f"-1 draws a leading minus ({w}x{h}px), wider than 1, and keeps "
+           f"its red ring")
+    finally:
+        engine.debug_feed = None
 
-        # Every glyph spans the full glyph height, so all three of the 8s
-        # must be the same height. (The 1s are not checked this way: a 1 is
-        # two vertical bars and its *lit* extent is the same two units, but
-        # antialiasing at the ends makes the measurement noisier.)
-        heights = [c[1] for c in eights]
-        assert max(heights) - min(heights) <= 2, (
-            f"the three 8s should be the same height, got {heights}")
 
-        # The middle bar must actually be drawn. An 8 without it is a 0 and a
-        # 2 without it is a 7, which a density check does not notice -- one
-        # bar in seven is inside the tolerance. Look for it directly: across
-        # the vertical centre of an 8, the glyph is solid, whereas a 0 is
-        # hollow there. Sample the middle row of the centre column and
-        # require it to be mostly lit.
-        m = _glyph_pixels(_render())
-        ys, xs = np.nonzero(m)
-        mid_row = (int(ys.min()) + int(ys.max())) // 2
-        adv = SEG_HALF_W * 2.0 + NUM_GAP
-        span = (adv + SEG_HALF_W) * 2.0
-        per_unit = (int(xs.max()) - int(xs.min()) + 1) / span
-        lo = int(xs.min()) + round((span / 2.0 - SEG_HALF_W) * per_unit)
-        hi = int(xs.min()) + round((span / 2.0 + SEG_HALF_W) * per_unit)
-        band = m[mid_row - 1:mid_row + 2, lo:hi + 1]
-        frac = band.any(axis=0).mean() if band.size else 0.0
-        assert frac > 0.5, (
-            f"an 8's middle bar is missing: only {frac:.0%} of its centre "
-            f"row is lit, so it would read as a 0")
-        ok("glyph columns read back as the formatter's digits "
-           f"(1.11 widths {[c[0] for c in ones]}, "
-           f"8.88 widths {[c[0] for c in eights]})")
+def test_a_trimmed_value_drops_its_trailing_zeros_on_screen():
+    """-1.00 must draw as "-1" on screen: narrower, not padded.
+
+    The formatter's trimming is unit-tested in core/font.py, but that cannot
+    tell whether the *renderer* honours the shortened string -- a layout
+    always drawing NUM_MAX_CODES columns would pass every formatter test
+    while showing "1.00" where "1" was asked for. The ink extent is what
+    distinguishes them, and it is why `sd_text` centres on the *used* width.
+    """
+    try:
+        harness.reset()
+        _one_item_at(1.0)
+        one = _ink_span(_render())
+        harness.reset()
+        _one_item_at(1.25)
+        full = _ink_span(_render())
+
+        one_px = one[1] - one[0] + 1
+        full_px = full[1] - full[0] + 1
+        # "1" is one glyph; "1.25" is four with a narrow point. The trimmed
+        # render must be substantially narrower, not merely different.
+        assert full_px > one_px * 2.0, (
+            f"1 drew {one_px}px of ink and 1.25 drew {full_px}px -- trimming "
+            f"should make 1 far narrower, so is the renderer padding to a "
+            f"fixed column count?")
+        assert one_px <= _expected_ink_px("1", TEXT_ZOOM, ITEM_NUM_SIZE) + 6, (
+            f"1 drew {one_px}px, wider than a single glyph should be")
+        ok(f"a trimmed value draws narrower ({one_px}px for 1 against "
+           f"{full_px}px for 1.25)")
+    finally:
+        engine.debug_feed = None
+
+
+def test_the_label_may_spill_past_the_disc_rim():
+    """A wide number must not be clipped to the disc it sits on.
+
+    The spill is deliberate -- sizing every number to fit the worst case
+    inside a 0.165-cell inner radius would make the common short cases
+    unreadably small -- but it needs two things in the draw path: the
+    coverage written out must be the union of the text's and the disc's, and
+    the per-pixel scan's reach must cover the text rather than just the disc.
+
+    Both fail the same way, and it does not look like a bug: the overhang
+    simply is not there, which reads as "the number is small". So this
+    measures the text against the disc's own diameter.
+    """
+    try:
+        harness.reset()
+        # Five glyphs: comfortably wider than the disc.
+        _one_item_at(-2.75)
+        img = _render()
+        x0, x1 = _ink_span(img)
+        text_px = x1 - x0 + 1
+
+        disc_px = 2.0 * ITEM_RADIUS * TEXT_ZOOM
+        assert text_px > disc_px, (
+            f"the number spans {text_px}px but the disc is {disc_px:.0f}px "
+            f"across -- the overhang is being clipped to the rim")
+
+        # Specifically: there is ink *outside* the disc on both sides, which
+        # is the thing that gets clipped. Measured from the frame centre,
+        # where _one_item_at puts the item.
+        cx = W / 2.0
+        assert (cx - x0) > disc_px / 2.0 and (x1 - cx) > disc_px / 2.0, (
+            f"ink runs from {x0} to {x1} around a centre at {cx:.0f} with a "
+            f"disc radius of {disc_px / 2.0:.0f}px -- the spill is clipped "
+            f"on one side")
+        ok(f"a wide label spills past the rim on both sides ({text_px}px of "
+           f"text over a {disc_px:.0f}px disc)")
     finally:
         engine.debug_feed = None
 
@@ -769,42 +1043,43 @@ def test_a_big_value_goes_scientific():
 def test_a_negative_exponent_reads_differently():
     """1e-9 and 1e9 must not render identically.
 
-    With only three columns the exponent's sign has nowhere to go, so the
-    middle column carries it: "1-9" against "1E9". Get that wrong and two
-    values eighteen orders of magnitude apart draw the same three digits --
-    the worst failure this display can have, and invisible to every other
-    check here, since both render as three crisp well-formed glyphs.
+    Two values eighteen orders of magnitude apart drawing the same glyphs is
+    the worst failure this display can have, and it is invisible to a check
+    that only asks whether *something* was drawn -- both render as crisp
+    well-formed glyphs either way.
 
-    An earlier version used a "C" (an E minus its middle bar) and this test
-    is why it is gone: the two differed by 16 pixels over the whole frame.
+    The seven-segment display had no column to spare for the exponent's
+    sign, so the middle column carried it: "1-9" against "1E9". An earlier
+    version used a "C" there (an E minus its middle bar) and the two differed
+    by 16 pixels over the whole frame, which is not a legible distinction.
+    The bitfield font has room for a real minus, so this now asserts the
+    strings themselves rather than probing column densities.
     """
     try:
         harness.reset()
         _one_item_at(1e9)
+        big_want = font.format_number(1e9, sig=2, trim=True)
         img_big = _render()
-        big, cols_big = _glyph_pixels(img_big), _columns(img_big)
+        assert _read_number(img_big, big_want) == big_want, big_want
 
         harness.reset()
         _one_item_at(1e-9)
+        small_want = font.format_number(1e-9, sig=2, trim=True)
         img_small = _render()
-        small, cols_small = _glyph_pixels(img_small), _columns(img_small)
+        assert _read_number(img_small, small_want) == small_want, small_want
 
-        h = min(big.shape[0], small.shape[0])
-        w = min(big.shape[1], small.shape[1])
-        diff = int((big[:h, :w] != small[:h, :w]).sum())
-        assert diff > 20, (
-            f"1e9 and 1e-9 rendered near-identically ({diff}px differ) -- "
-            f"the exponent's sign is being dropped")
-        # Specifically the *middle* column, which is the E or the C. Both
-        # outer columns carry the same mantissa and exponent digit, so this
-        # localises the difference to the sign rather than accepting any
-        # difference anywhere.
-        mid_big, mid_small = cols_big[1][2], cols_small[1][2]
-        assert mid_big != mid_small, (
-            f"the E/C column is identical for 1e9 and 1e-9 "
-            f"({mid_big}px both) -- the sign is not reaching the glyph")
-        ok(f"1e9 and 1e-9 draw distinct glyphs ({diff}px differ; "
-           f"E column {mid_big}px vs minus column {mid_small}px)")
+        # The two strings differ by the sign, which is the whole point.
+        assert big_want == "1E9" and small_want == "1E-9", (
+            f"expected 1E9 and 1E-9, got {big_want!r} and {small_want!r}")
+        # And they are visibly different renders, not merely different
+        # expectations: the negative is one glyph wider.
+        bw = _ink_span(img_big)
+        sw = _ink_span(img_small)
+        assert (sw[1] - sw[0]) > (bw[1] - bw[0]), (
+            f"1E-9 spans {sw[1] - sw[0]}px and 1E9 spans {bw[1] - bw[0]}px "
+            f"-- the exponent's minus is not being drawn")
+        ok(f"1e9 draws {big_want!r} and 1e-9 draws {small_want!r}, the "
+           f"latter one glyph wider")
     finally:
         engine.debug_feed = None
 
@@ -876,6 +1151,126 @@ def test_a_blocked_gates_waiting_zone_shows_its_value():
         f"gate's {starved} -- back pressure is visible but its value is not")
     ok(f"a blocked gate's waiting zone shows its value "
        f"(+{delta} glyph pixels over a starved gate)")
+
+
+#: Mirrors of the shader's Source-label tunables, so these tests format the
+#: expected string with the same policy the renderer uses. Parsed from the
+#: shader for the same reason the item ones are.
+EMIT_NUM_SIZE = _shader_float("EMIT_NUM_SIZE", 0.052)
+EMIT_NUM_SIG = int(_shader_float("EMIT_NUM_SIG", 2))
+
+
+def _source_at(value, zoom=TEXT_ZOOM, facing=cell.DIR_PX):
+    """A Source carrying `value`, framed on its footprint."""
+    from core.entity import Source
+
+    harness.reset()
+    src = engine.place_structure(Source, 10, 20, direction=facing)
+    src.emit_value = value
+    engine.sync_segments()
+    # A Source is 2x1 authored, so its footprint centre is half a cell off
+    # the origin along whichever axis the facing put the long side on.
+    w, h = Source.footprint_for(facing)
+    cam.center[:] = (10.0 + w * 0.5, 20.0 + h * 0.5)
+    cam.zoom = zoom
+    return src
+
+
+def test_a_source_shows_its_emitted_value():
+    """A Source must draw the number it emits, read back as that number.
+
+    The whole point of the change: what a generator produces was reachable
+    only by clicking it. The value comes straight out of the entity row
+    (Source.F_EMIT), so this also exercises the renderer reading gate state
+    out of the SSBO rather than from anything uploaded for the purpose.
+    """
+    for value in (7.0, -3.0, 2.5, 0.0, -1.0):
+        _source_at(value)
+        want = font.format_number(value, sig=EMIT_NUM_SIG, trim=True)
+        img = _render()
+        got = _read_number(img, want)
+        assert got == want, (
+            f"a Source emitting {value} rendered as {got!r}, expected "
+            f"{want!r}")
+    ok("a Source draws its emitted value (7, -3, 2.5, 0, -1)")
+
+
+def test_two_sources_show_their_own_values():
+    """The value is per instance, so two Sources must differ on screen.
+
+    This is the assertion with teeth. A renderer that drew `Source.EMIT_VALUE`
+    -- the class default -- rather than the row's own field would pass the
+    test above for whichever value happened to match, and would show every
+    Source on the board the same number. That is exactly the bug F_EMIT
+    living in the row exists to prevent.
+    """
+    from core.entity import Source
+
+    harness.reset()
+    a = engine.place_structure(Source, 10, 20)
+    b = engine.place_structure(Source, 10, 24)
+    a.emit_value = 4.0
+    b.emit_value = -9.0
+    engine.sync_segments()
+
+    reads = []
+    for src, y, want_v in ((a, 20, 4.0), (b, 24, -9.0)):
+        cam.center[:] = (11.0, y + 0.5)
+        cam.zoom = TEXT_ZOOM
+        want = font.format_number(want_v, sig=EMIT_NUM_SIG, trim=True)
+        reads.append(_read_number(_render(), want))
+        assert reads[-1] == want, (
+            f"the Source at y={y} shows {reads[-1]!r}, expected {want!r}")
+    assert reads[0] != reads[1], (
+        f"both Sources rendered {reads[0]!r} -- the renderer is drawing a "
+        f"class default rather than each row's own F_EMIT")
+    ok(f"two Sources show their own values ({reads[0]} and {reads[1]})")
+
+
+def test_the_source_label_reads_upright_at_every_facing():
+    """Text has a reading orientation a glyph does not.
+
+    A rotated machine's *glyph* turns with it, which is right for a mark and
+    wrong for a number: a south-facing Source showing an upside-down "-3"
+    is worse than useless. The footprint-space coords the label is drawn in
+    are already world-aligned, so the fix is to not rotate them -- and this
+    checks the consequence rather than the code.
+    """
+    for facing in (cell.DIR_PX, cell.DIR_PY, cell.DIR_NX, cell.DIR_NY):
+        _source_at(-3.0, facing=facing)
+        want = font.format_number(-3.0, sig=EMIT_NUM_SIG, trim=True)
+        got = _read_number(_render(), want)
+        assert got == want, (
+            f"a Source facing {facing} rendered {got!r}, expected {want!r} "
+            f"-- the label is rotating with the machine")
+    ok("a Source's label reads upright at all four facings")
+
+
+def test_the_source_label_gives_way_to_its_glyph_when_small():
+    """Zoomed out, the number must go and the generator glyph come back.
+
+    A number too small to read is noise, but a blank body is worse than the
+    dot it replaced -- a Source would stop being identifiable at a glance.
+    So below the cutoff the type glyph returns, which is a different
+    behaviour from the item labels (they simply fade, because the disc and
+    its ring still carry the sign).
+    """
+    # Comfortably legible.
+    _source_at(5.0, zoom=TEXT_ZOOM)
+    big = int(_glyph_pixels(_render()).sum())
+    # Far too small for a glyph cell: EMIT_MIN_PX is in glyph pixel height.
+    _source_at(5.0, zoom=12.0)
+    small = int(_glyph_pixels(_render()).sum())
+
+    assert big > small * 2, (
+        f"the label measured {big}px zoomed in and {small}px zoomed out; it "
+        f"should shrink away rather than stay drawn")
+    # But something is still drawn: the fallback glyph, not an empty body.
+    assert small > 0, (
+        "a zoomed-out Source drew no mark at all -- the glyph fallback is "
+        "missing, so a generator is unidentifiable at a distance")
+    ok(f"a Source's label gives way to its glyph when small "
+       f"({big}px -> {small}px)")
 
 
 def test_digits_vanish_when_zoomed_out():

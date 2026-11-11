@@ -211,9 +211,12 @@ def type_constants():
     Emitted alongside the tables so the id numbering also has a single
     source: cell.TYPE_NAMES. Also carries the entity-row layout, which the
     shader needs to read gate state out of the entity SSBO -- the stride and
-    the field offsets are decided in core/entity.py and nowhere else.
+    the field offsets are decided in core/entity.py and nowhere else -- and
+    the font bitfield table, whose `CODE_*` constants the number formatter
+    needs before it can name a glyph.
     """
-    from core.entity import ENTITY_STRIDE, Entity, MAX_CHANNELS
+    from core.entity import ENTITY_STRIDE, Entity, MAX_CHANNELS, Source
+    from core import font
 
     lines = [
         f"const int ENTITY_STRIDE = {ENTITY_STRIDE};",
@@ -222,6 +225,12 @@ def type_constants():
         f"const int F_IN_HELD   = {Entity.F_IN_HELD};",
         f"const int F_OUT_VALUE = {Entity.F_OUT_VALUE};",
         f"const int F_OUT_HELD  = {Entity.F_OUT_HELD};",
+        # The renderer draws a Source's emitted value on its body, so it needs
+        # that field's offset. Emitted from the class rather than spelled as
+        # F_IN_VALUE in the shader: the two are equal only because a generator
+        # has no input channels, and if F_EMIT ever moves (it must, if Source
+        # gains an input) a hand-written alias would silently read a channel.
+        f"const int F_EMIT = {Source.F_EMIT};",
         f"const int TYPE_EMPTY = {cell.TYPE_EMPTY};",
     ]
     for tid, name in sorted(cell.TYPE_NAMES.items()):
@@ -229,4 +238,6 @@ def type_constants():
             continue
         const = "TYPE_" + name.upper()
         lines.append(f"const int {const} = {tid};")
+    lines.append("")
+    lines.append(font.glsl_table())
     return "\n".join(lines)
