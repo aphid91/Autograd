@@ -1388,6 +1388,78 @@ def test_the_selection_rectangle_draws_where_it_is_asked():
     ok("nothing drew outside the selection box")
 
 
+# --- the window is resizable ----------------------------------------------
+# The GL viewport does not follow the window on its own, and the default
+# framebuffer never resizes its own viewport, so the world pass has to
+# re-state it every frame. Skip that and the pass keeps drawing into the
+# rectangle the context was created with: the window grows and the new
+# region stays the clear colour, as unused grey.
+#
+# Only a pixel test can see this. Every uniform is already correct when the
+# bug is present -- `resolution` is the live framebuffer size and
+# screen_to_world agrees with it -- so nothing at the state level disagrees
+# with anything. What is wrong is the rectangle the GPU is allowed to write.
+
+def test_the_world_pass_fills_a_resized_window():
+    """The render must cover whatever size it is handed, not the startup one.
+
+    Rendered into a target deliberately *larger* than the harness window, so
+    a pass still clipped to (W, H) leaves the extra region untouched. The
+    clear colour is a sentinel the world never draws rather than the app's
+    own dark grey -- against the real background an undrawn pixel and a
+    legitimately-empty one are the same colour, which is precisely what made
+    the first attempt at this test pass against the broken build.
+    """
+    harness.reset()
+
+    big_w, big_h = W + 256, H + 192
+    sentinel = (1.0, 0.0, 1.0)      # magenta
+    target = ctx.framebuffer(
+        color_attachments=[ctx.texture((big_w, big_h), 4)])
+    try:
+        engine.sync_to_device()
+        target.use()
+        ctx.clear(*sentinel)
+        # Zoomed in far enough that the board covers the whole target, so any
+        # surviving sentinel pixel is a region the pass never wrote rather
+        # than honest off-board space.
+        cam.center[:] = (20.0, 20.0)
+        cam.zoom = PROBE_ZOOM
+        # Leave a stale, too-small viewport behind, which is the state a
+        # resized window is actually in: the old rectangle is still current
+        # and only the render can widen it. Without this the test has no
+        # teeth at all -- binding a framebuffer resets the viewport to that
+        # framebuffer's full size, so the pass would cover the target whether
+        # it set the viewport or not.
+        ctx.viewport = (0, 0, W, H)
+        cam.render((big_w, big_h), engine.clock, engine.belt_device)
+        raw = target.read(components=3, dtype="f1")
+        img = np.frombuffer(raw, dtype=np.uint8).reshape(big_h, big_w, 3)
+    finally:
+        # Hand the default framebuffer back, or the next real frame draws
+        # into our texture and the window goes black.
+        ctx.screen.use()
+        target.release()
+
+    want = np.array([int(c * 255 + 0.5) for c in sentinel])
+    undrawn = np.all(np.abs(img.astype(int) - want) <= 2, axis=2)
+
+    # The far corner is the first place a stale viewport shows, being
+    # outside (W, H) on both axes.
+    corner = undrawn[-40:-4, -40:-4]
+    assert not corner.any(), (
+        f"the corner past ({W}, {H}) was never drawn: "
+        f"{corner.mean() * 100:.0f}% still the clear colour -- the pass is "
+        f"clipped to the startup viewport")
+
+    # And nowhere else either, so a partial fix does not pass.
+    assert not undrawn.any(), (
+        f"{undrawn.mean() * 100:.1f}% of a {big_w}x{big_h} target was left "
+        f"undrawn")
+    ok(f"the world pass filled a {big_w}x{big_h} target "
+       f"(harness window is {W}x{H})")
+
+
 def test_the_selection_rectangle_normalises_its_corners():
     """A drag up-and-left must draw the same box as down-and-right."""
     harness.reset()

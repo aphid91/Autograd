@@ -225,6 +225,16 @@ class Camera:
         w, h = viewport
         board = self.board
 
+        # The GL viewport has to be re-stated every frame, not just at
+        # startup: the window is resizable and the default framebuffer does
+        # not resize its viewport to follow. Without this the pass keeps
+        # drawing into the rectangle the context was created with and the
+        # rest of an enlarged window stays the clear colour. `viewport` is
+        # the authority here rather than ctx.screen.size, because a caller
+        # rendering to its own FBO (the pixel tests) passes that target's
+        # size and must not have the window's imposed on it.
+        self.ctx.viewport = (0, 0, int(w), int(h))
+
         if board.grid_texture is not None:
             board.grid_texture.use(GRID_TEXTURE_UNIT)
         if board.entity_buffer is not None:

@@ -46,7 +46,7 @@ There is no pytest/linter configured.
 | [tests/test_tick.py](tests/test_tick.py) | the clock as wired into the frame loop: rate, `alpha`, keys, phase order |
 | [tests/test_segments.py](tests/test_segments.py) | belt-run derivation: tracing, cuts, undergrounds, merges, audit under churn |
 | [tests/test_belts.py](tests/test_belts.py) | the closed form against the naive oracle, on fixed and randomised configs |
-| [tests/test_item_render.py](tests/test_item_render.py) | reads the framebuffer back: do discs appear where the simulation says, and do the labels say what the formatter says? |
+| [tests/test_item_render.py](tests/test_item_render.py) | reads the framebuffer back: do discs appear where the simulation says, do the labels say what the formatter says, and does the pass fill a resized window? |
 | [tests/test_gates.py](tests/test_gates.py) | firing rules, arithmetic, back pressure, dangling-output discard, and the bubble-free claim |
 | [tests/test_stamp.py](tests/test_stamp.py) | what the stamp transforms preserve: wiring, topology, arithmetic |
 | [tests/test_clipboard.py](tests/test_clipboard.py) | the copy/paste/erase mode machine, and matched-stamp substitution, driven through the fake mouse and keyboard |
@@ -2081,6 +2081,40 @@ tweak. `F5` hot-reloads.
 the entities, so belts visibly join across cell boundaries and a multi-cell
 structure is not sliced up by them. Only the board border draws over
 everything, so the playfield edge stays readable.
+
+### The window is resizable, so the viewport is re-stated every frame
+
+`Camera.render()` sets `ctx.viewport` from the size it was handed, on every
+pass rather than once at startup. The GL viewport does not follow the window
+and the default framebuffer never resizes its own, so without this the pass
+keeps drawing into the rectangle the context was created with: enlarge the
+window and the new region stays the clear colour, as unused grey.
+
+Everything *else* was already resolution-independent and stayed untouched —
+`resolution`, `screen_to_world`, `frame_board` and the shader's
+`gl_FragCoord.xy - resolution * 0.5` all derive from the live framebuffer
+size, which is why the bug showed up as dead space rather than as a wrong
+projection.
+
+Two things worth knowing:
+
+- **The passed-in size is the authority, not `ctx.screen.size`.** A caller
+  rendering to its own framebuffer (the pixel tests) passes that target's
+  size and must not have the window's imposed on it. Note moderngl caches
+  `ctx.screen.size` at context creation and **never refreshes it**, so after
+  a resize it is stale and `ctx.screen.use()` restores the old viewport —
+  re-stating per pass is what makes that harmless. `ctx.clear()` is
+  unaffected (it ignores the cached size with no scissor set), so `app.py`
+  needs no resize handling and has none.
+- **Only a pixel test can see this**, and the obvious two ways to write it
+  both pass against the broken build. Binding a framebuffer **resets the
+  viewport to that framebuffer's full size**, so a test that binds a large
+  target and renders covers it whether or not the pass sets the viewport —
+  `test_the_world_pass_fills_a_resized_window` deliberately leaves a stale
+  too-small viewport set before rendering, which is the state a resized
+  window is actually in. And the sentinel must be a colour the world never
+  draws: cleared to the app's own dark grey, an undrawn pixel and a
+  legitimately-empty one are identical. Both mistakes were made first.
 
 GLSL has no `#include`, so [render/shader_loader.py](render/shader_loader.py)
 implements a minimal one by textual substitution, with an implicit include
