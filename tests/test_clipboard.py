@@ -18,7 +18,7 @@ import glfw
 from core import cell
 from core.clipboard import (MODE_COPY, MODE_ERASE, MODE_OFF, MODE_PASTE,
                             Clipboard, capture)
-from core.entity import Sink, Source, Underground
+from core.entity import Shear, Sink, Source, Underground
 from core.stamp import Stamp
 
 from tests import harness
@@ -669,6 +669,384 @@ def test_ctrl_x_cuts_into_paste_mode():
     assert _row_survivors(20, range(20, 24)) == [20, 21, 22, 23], (
         _row_survivors(20, range(20, 24)))
     ok("the cut stamp pasted back onto the board")
+
+
+# --- matched ghosts: substituting a lined-up stamp -------------------------
+#
+# The feature these cover: a frustrated cell whose occupant is *exactly* what
+# the placement wanted tints green instead of red, and a bare click over a
+# wholly-matched plan deletes the old entities and places the new ones. It
+# exists so per-instance settings -- a Source's emit value, a belt's seed --
+# can be applied to many entities at once, which is otherwise one trip
+# through the Status window each.
+#
+# What makes these worth writing rather than trusting: a substitution that
+# silently did nothing and a refusal look identical on a board where the old
+# and new entities are the same type at the same place. So every test here
+# asserts on something that *distinguishes* them -- a changed emit value, a
+# changed row id, or a live count.
+
+def _ghost_states():
+    """Count of each ghost state on the board, as {state: n}."""
+    arr = cell.ghost_state_arr(board.grid[:, :, cell.CH_Z])
+    return {s: int((arr == s).sum())
+            for s in (cell.GHOST_PENDING, cell.GHOST_FRUSTRATED,
+                      cell.GHOST_MATCHED)}
+
+
+def _copy_a_source(at=(10, 10), emit=7.5):
+    """Place a Source configured to `emit`, copy it, and hold the stamp."""
+    src = engine.place_structure(Source, *at)
+    src.emit_value = emit
+    engine.sync_segments()
+    ctrl_key(glfw.KEY_C)
+    drag_cells((at[0] - 1, at[1] - 1), (at[0] + 2, at[1] + 1))
+    assert orch.clipboard.mode == MODE_PASTE, orch.clipboard.mode
+    return orch.clipboard.stamp
+
+
+def test_a_lined_up_stamp_tints_matched_not_frustrated():
+    """The readable half: green means "already correct", not "blocked"."""
+    _copy_a_source(at=(10, 10), emit=7.5)
+    # Hover the stamp back over the very Source it was copied from.
+    put_cursor_at_cell(10, 10); step()
+
+    states = _ghost_states()
+    assert states[cell.GHOST_MATCHED] > 0, (
+        f"a stamp over its own original should tint matched: {states}")
+    assert states[cell.GHOST_FRUSTRATED] == 0, (
+        f"nothing here is genuinely blocked: {states}")
+    # And the occupant survives under the tint, as with any frustration.
+    assert cell.cell_type(board.cell_word(10, 10)) == cell.TYPE_SOURCE
+    ok(f"a lined-up stamp tinted {states[cell.GHOST_MATCHED]} matched cells")
+
+
+def test_a_misaligned_stamp_still_tints_frustrated():
+    """The guard: only an *exact* match counts, origin included.
+
+    A 2x1 Source overlapping another by one cell is the case a per-cell match
+    test would get wrong -- the shared cell has the same type and facing, so
+    cell-wise it looks like a match, while the footprints are a cell apart.
+    Substituting there would move a machine one cell from where it was shown.
+    """
+    _copy_a_source(at=(10, 10), emit=7.5)
+    # One cell east: the two 2x1 footprints overlap in exactly one cell.
+    put_cursor_at_cell(11, 10); step()
+
+    states = _ghost_states()
+    assert states[cell.GHOST_FRUSTRATED] > 0, (
+        f"a half-overlap is a genuine clash: {states}")
+    assert states[cell.GHOST_MATCHED] == 0, (
+        f"a one-cell offset is not a match: {states}")
+    ok("a stamp offset by one cell tinted frustrated, not matched")
+
+
+def test_a_rotated_stamp_is_not_a_match():
+    """Orientation is part of identity: a turned stamp must not substitute."""
+    _copy_a_source(at=(10, 10), emit=7.5)
+    put_cursor_at_cell(10, 10); step()
+    assert _ghost_states()[cell.GHOST_MATCHED] > 0, "should start matched"
+
+    press_key(glfw.KEY_R)
+    step()
+    states = _ghost_states()
+    assert states[cell.GHOST_MATCHED] == 0, (
+        f"a rotated stamp wires up differently and is not a match: {states}")
+    ok("rotating the stamp dropped it out of the matched state")
+
+
+def test_a_mirrored_stamp_is_not_a_match():
+    """Flip is part of identity, and this is the dangerous case.
+
+    A mirrored chiral machine looks **identical in outline** and wires up
+    differently -- that is why `EntityBuilder.adopt()` copies the flip as
+    well as the rotation. So a flipped stamp over an unflipped machine is
+    exactly the match that must be refused and the one a player could not
+    spot by eye. Mutation-tested: without the flip comparison in
+    `Engine.placement_matches()` every other test here still passes.
+    """
+    _copy_a_source(at=(10, 10), emit=7.5)
+    put_cursor_at_cell(10, 10); step()
+    assert _ghost_states()[cell.GHOST_MATCHED] > 0, "should start matched"
+    assert Source.is_chiral(), (
+        "this test needs a chiral type, or F is a no-op and it proves nothing")
+
+    press_key(glfw.KEY_F)
+    step()
+    entry = orch.clipboard.stamp.entries[0]
+    assert entry.flipped, "F should have mirrored the stamp"
+    # A mirror is a flip *and* a direction change (see core/stamp.py), so put
+    # the facing back: with the direction differing too, the match would be
+    # refused for *that* reason and the flip comparison would go untested --
+    # which is exactly how an earlier version of this test passed against a
+    # build with the flip check removed.
+    entry.direction = cell.DIR_PX
+    orch._refresh_paste_tool()
+    assert orch.paste_tool.stamp.entries[0].flipped
+    assert orch.paste_tool.stamp.entries[0].direction == cell.DIR_PX
+
+    # Re-preview explicitly. The cursor has not moved, so stepping alone
+    # leaves the previous frame's tint on the board -- the other trap this
+    # test fell into, and one that makes any assertion here read stale state.
+    orch._preview(orch.paste_tool)
+
+    states = _ghost_states()
+    assert states[cell.GHOST_MATCHED] == 0, (
+        f"a flipped Source over an unflipped one must not match: {states}")
+    assert states[cell.GHOST_FRUSTRATED] > 0, states
+    ok("a mirrored stamp tinted frustrated, not matched")
+
+
+def test_a_bare_click_substitutes_a_matched_stamp():
+    """The feature: click to swap configured copies in over the originals.
+
+    Asserts the **emit value**, not merely that a Source is still there. A
+    substitution that quietly did nothing would leave an identical-looking
+    board, so the per-instance setting is the only thing that can tell the
+    two apart -- which is also the entire reason the feature exists.
+    """
+    old = engine.place_structure(Source, 20, 20)
+    old.emit_value = 1.0
+    engine.sync_segments()
+
+    _copy_a_source(at=(10, 10), emit=7.5)
+    put_cursor_at_cell(20, 20); step()
+    assert _ghost_states()[cell.GHOST_MATCHED] > 0, "should be lined up"
+
+    live_before = board.live_count
+    click()
+    step()
+
+    placed = engine.entity_at(20, 20)
+    assert placed is not None, "the substitution left the cell empty"
+    assert isinstance(placed, Source), type(placed)
+    assert placed.emit_value == 7.5, (
+        f"the substituted Source emits {placed.emit_value}, so the old one "
+        f"was never replaced")
+    # Note the row is usually *the same integer*: the erase frees it and the
+    # free list hands it straight back. That is correct and is why the emit
+    # value above is the assertion with teeth -- "a different row" would be
+    # testing the allocator, not the substitution.
+    assert board.live_count == live_before, (
+        f"one out, one in: {live_before} -> {board.live_count}")
+    ok("a bare click substituted a configured Source over the old one")
+
+
+def test_substitution_is_refused_when_anything_is_genuinely_blocked():
+    """All-or-nothing: a partial match must not delete the matched half.
+
+    Deleting the lined-up entities would not unblock the real clash, so the
+    plan would still refuse -- and the player would have lost the matched
+    ones for nothing. The whole gesture has to be inert.
+    """
+    # Two Sources side by side, then copy both as one stamp.
+    a = engine.place_structure(Source, 10, 10)
+    a.emit_value = 7.5
+    b = engine.place_structure(Source, 10, 13)
+    b.emit_value = 7.5
+    engine.sync_segments()
+    ctrl_key(glfw.KEY_C)
+    drag_cells((9, 9), (12, 14))
+    assert len(orch.clipboard.stamp) == 2, len(orch.clipboard.stamp)
+
+    # A target where one half lines up and the other hits a different
+    # machine. The stamp is centred on the cursor, so a click at (20,20)
+    # lands its halves at y=19 and y=22 -- the obstacles have to go where the
+    # stamp actually falls, not where the cursor is.
+    engine.place_structure(Source, 20, 19)
+    engine.place_structure(Shear, 20, 22)
+    engine.sync_segments()
+    live_before = board.live_count
+    rows_before = {engine.entity_at(20, 19).row, engine.entity_at(20, 22).row}
+
+    put_cursor_at_cell(20, 20); step()
+    states = _ghost_states()
+    assert states[cell.GHOST_FRUSTRATED] > 0, (
+        f"the Shear is a genuine clash: {states}")
+    assert states[cell.GHOST_MATCHED] > 0, (
+        f"the Source half does line up, so this is a *partial* match: "
+        f"{states}")
+
+    click()
+    step()
+    assert board.live_count == live_before, (
+        f"a partially-matched click must build and delete nothing: "
+        f"{live_before} -> {board.live_count}")
+    rows_after = {engine.entity_at(20, 19).row, engine.entity_at(20, 22).row}
+    assert rows_after == rows_before, (
+        "the matched half was deleted even though the plan was refused")
+    ok("a partially-matched stamp built nothing and deleted nothing")
+
+
+def test_shift_click_keeps_the_old_partial_paste_behaviour():
+    """Shift is the documented "place what fits" policy and must stay so.
+
+    Substitution is a *bare click* feature. Shift already means something
+    else -- place the non-clashing entities and reject the rest -- and
+    overloading it would leave no way to ask for the old behaviour.
+    """
+    old = engine.place_structure(Source, 20, 20)
+    old.emit_value = 1.0
+    old_row = old.row
+    engine.sync_segments()
+
+    _copy_a_source(at=(10, 10), emit=7.5)
+    put_cursor_at_cell(20, 20); step()
+
+    fake["keys"].add(glfw.KEY_LEFT_SHIFT)
+    try:
+        step()
+        click()
+        step()
+    finally:
+        fake["keys"].discard(glfw.KEY_LEFT_SHIFT)
+        step()
+
+    survivor = engine.entity_at(20, 20)
+    assert survivor is not None and survivor.row == old_row, (
+        "shift+click should have left the existing Source alone")
+    assert survivor.emit_value == 1.0, (
+        f"shift+click substituted anyway: emit is {survivor.emit_value}")
+    ok("shift+click rejected the clash instead of substituting")
+
+
+def test_a_matched_belt_substitutes_its_seed():
+    """The other per-instance setting, and the reason this is not Source-only.
+
+    A seeded belt is the case where the entities are *1x1 and identical in
+    every visible way*, so nothing but the seed can distinguish a successful
+    substitution from a no-op.
+    """
+    # A plain run, then a seeded belt copied from elsewhere.
+    engine.place_belt(20, 20, cell.DIR_PX)
+    engine.sync_segments()
+    plain = board.entity_at(20, 20)
+    assert not plain.seed_on, "the target should start unseeded"
+
+    seeded = engine.place_belt(10, 10, cell.DIR_PX)
+    orch._set_seed(seeded.row, True, 4.0)
+    engine.sync_segments()
+    ctrl_key(glfw.KEY_C)
+    # A selection rectangle has to *drag*: a same-cell "drag" never passes
+    # DRAG_THRESHOLD_PX and so is a plain click, which leaves copy mode
+    # instead of capturing. The box covers only this belt either way.
+    drag_cells((9, 9), (11, 11))
+    assert orch.clipboard.mode == MODE_PASTE, orch.clipboard.mode
+    assert len(orch.clipboard.stamp) == 1, len(orch.clipboard.stamp)
+
+    put_cursor_at_cell(20, 20); step()
+    assert _ghost_states()[cell.GHOST_MATCHED] > 0, (
+        "a belt over an identically-facing belt should match")
+
+    click()
+    step()
+    now = board.entity_at(20, 20)
+    assert now is not None and now.seed_on, (
+        "the substituted belt is not seeded, so the old one survived")
+    assert now.seed_value == 4.0, now.seed_value
+    ok("a matched belt substituted and brought its seed with it")
+
+
+def test_a_belt_facing_the_other_way_is_not_a_match():
+    """Direction is identity for a belt too -- it decides where items go."""
+    engine.place_belt(20, 20, cell.DIR_PY)
+    engine.sync_segments()
+
+    engine.place_belt(10, 10, cell.DIR_PX)
+    engine.sync_segments()
+    ctrl_key(glfw.KEY_C)
+    drag_cells((9, 9), (11, 11))
+    assert len(orch.clipboard.stamp) == 1, len(orch.clipboard.stamp)
+
+    put_cursor_at_cell(20, 20); step()
+    states = _ghost_states()
+    assert states[cell.GHOST_MATCHED] == 0, (
+        f"an eastward belt over a northward one is not a match: {states}")
+    assert states[cell.GHOST_FRUSTRATED] > 0, states
+    ok("a belt facing the other way tinted frustrated, not matched")
+
+
+def test_substitution_clears_its_own_preview_before_replanning():
+    """`_substitute()` must drop the old ghosts before it re-plans.
+
+    Same hazard `Engine.preview()` exists for: ghosts occupy real cells, so a
+    re-plan against a board that still holds them collides with the tool's
+    own preview. Here it bites harder than usual, because the re-plan is what
+    decides whether the substitution goes through at all -- a plan that
+    collides with its own leftovers reads as still-blocked and the whole
+    gesture silently does nothing after the old entities were already erased.
+
+    A **belt run** is what exposes it. A single matched placement leaves no
+    ghosts to go stale (its cells are all occupied, so nothing is ghosted),
+    while a stamp mixing matched and free cells does -- the free ones ghost,
+    and those ghosts are what the re-plan would trip over.
+    """
+    # A stamp of three belts, of which the middle one will line up and the
+    # outer two will land on empty cells.
+    engine.place_belt_path((10, 10), (12, 10))
+    engine.sync_segments()
+    ctrl_key(glfw.KEY_C)
+    drag_cells((9, 9), (13, 11))
+    assert len(orch.clipboard.stamp) == 3, len(orch.clipboard.stamp)
+
+    # One matching belt at the centre of where the stamp will land.
+    engine.place_belt(21, 20, cell.DIR_PX)
+    engine.sync_segments()
+    live_before = board.live_count
+
+    put_cursor_at_cell(21, 20); step()
+    states = _ghost_states()
+    assert states[cell.GHOST_MATCHED] > 0, f"the centre should match: {states}"
+    assert states[cell.GHOST_PENDING] > 0, (
+        f"the two free cells should ghost, which is what can go stale: "
+        f"{states}")
+
+    click()
+    step()
+    for x in (20, 21, 22):
+        assert not board.is_empty(x, 20), (
+            f"({x},20) is empty: the substitution collided with its own "
+            f"leftover ghosts and committed nothing")
+    assert board.live_count == live_before + 2, (
+        f"one replaced and two added: {live_before} -> {board.live_count}")
+    ok("substitution re-planned against a cleared board and placed all three")
+
+
+def test_a_matched_multi_entity_stamp_substitutes_every_member():
+    """The real use: reconfigure a row of machines in one click."""
+    # Three configured Sources, copied as one stamp.
+    for y in (10, 13, 16):
+        s = engine.place_structure(Source, 10, y)
+        s.emit_value = 7.5
+    engine.sync_segments()
+    ctrl_key(glfw.KEY_C)
+    drag_cells((9, 9), (12, 17))
+    assert len(orch.clipboard.stamp) == 3, len(orch.clipboard.stamp)
+
+    # Three unconfigured ones in the same arrangement.
+    old_rows = []
+    for y in (20, 23, 26):
+        s = engine.place_structure(Source, 30, y)
+        s.emit_value = 1.0
+        old_rows.append(s.row)
+    engine.sync_segments()
+    live_before = board.live_count
+
+    put_cursor_at_cell(30, 23); step()
+    assert _ghost_states()[cell.GHOST_MATCHED] > 0, "should be lined up"
+    assert _ghost_states()[cell.GHOST_FRUSTRATED] == 0, "nothing else blocks"
+
+    click()
+    step()
+
+    for y in (20, 23, 26):
+        got = engine.entity_at(30, y)
+        assert got is not None and isinstance(got, Source), (y, got)
+        assert got.emit_value == 7.5, (
+            f"the Source at y={y} still emits {got.emit_value}")
+    assert board.live_count == live_before, (
+        f"three out, three in: {live_before} -> {board.live_count}")
+    ok("one click reconfigured all three Sources")
 
 
 def test_a_cut_is_one_continuous_mode_chain():

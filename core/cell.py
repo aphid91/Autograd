@@ -8,7 +8,7 @@ duplicated in GLSL at the top of world.frag -- KEEP THE TWO IN SYNC.
         bits 9-30   entity id   row index into the entity SSBO   (22 bits)
         bit  31     unused -- deliberately left clear, see below
     .y              packed (local_x, local_y) for multi-cell entities
-    .z  bits 0-1    ghost state  0=real, 1=ghost, 2=frustrated
+    .z  bits 0-1    ghost state  0=real, 1=ghost, 2=frustrated, 3=matched
         bit  2       flipped: entity mirrored about its authored X axis
         bit  3       underground end is an exit (not an entrance)
         bit  4       underground end is paired with a partner
@@ -209,11 +209,26 @@ SEED_POS_BIT = 1 << SEED_POS_SHIFT
 GHOST_NONE = 0
 GHOST_PENDING = 1      # a ghost entity of our own, in a free cell
 GHOST_FRUSTRATED = 2   # a cell we wanted but cannot have; .x is someone else's
+#: A cell we wanted, cannot have, and **do not need**: what is already there
+#: is the very thing we were about to place, at the same orientation and the
+#: same origin. A *kind of frustration*, not a third independent thing -- the
+#: occupant's id in `.x` is untouched exactly as GHOST_FRUSTRATED leaves it,
+#: and the only difference is what it is tinted and what a click does with it.
+#:
+#: It exists so the player can see a stamp is **lined up**. Two structures of
+#: the same type at the same rotation look identical in outline, so a red
+#: tint over a perfect match says "blocked" when the truth is "already
+#: correct" -- and a stamp whose every clash is a match can be substituted in
+#: wholesale (see `Engine.matched_rows()` and the orchestrator's commit path).
+#:
+#: Costs no storage: the 2-bit ghost field had `3` spare.
+GHOST_MATCHED = 3
 
 GHOST_NAMES = {
     GHOST_NONE: "real",
     GHOST_PENDING: "ghost",
     GHOST_FRUSTRATED: "frustrated",
+    GHOST_MATCHED: "matched",
 }
 
 EMPTY_WORD = 0
@@ -383,7 +398,24 @@ def is_ghost(word):
 
 
 def is_frustrated(word):
-    return ghost_state(word) == GHOST_FRUSTRATED
+    """True for either flavour of frustration overlay, matched included.
+
+    **Both**, deliberately. Everything that asks this question is asking "is
+    this an overlay on somebody else's cell?" -- segment derivation, which
+    must not cut a run at a tinted cell, and the ghost-clearing path, which
+    must unset the overlay without disturbing the occupant. A matched cell is
+    frustration with a different colour and a different consequence on click;
+    it is not a different kind of cell.
+
+    `is_matched()` is the narrower test, for the two places that care which
+    flavour it is: the renderer's tint and the commit path's substitution.
+    """
+    return ghost_state(word) in (GHOST_FRUSTRATED, GHOST_MATCHED)
+
+
+def is_matched(word):
+    """True only for a frustration whose occupant is what we meant to place."""
+    return ghost_state(word) == GHOST_MATCHED
 
 
 def with_ghost_state(word, state):
@@ -422,7 +454,21 @@ def _self_check():
     assert not is_ghost(pack_flags(GHOST_NONE))
     assert is_frustrated(pack_flags(GHOST_FRUSTRATED))
     assert not is_ghost(pack_flags(GHOST_FRUSTRATED)), "frustrated is not a ghost"
-    for s in (GHOST_NONE, GHOST_PENDING, GHOST_FRUSTRATED):
+
+    # A matched cell is a *flavour of frustration*: it answers the broad
+    # "is this an overlay?" question the same way, and only `is_matched()`
+    # separates the two. Getting this wrong in either direction is a real
+    # bug -- reading matched as un-frustrated would cut a belt run at a
+    # lined-up stamp, and reading it as a ghost entity would have
+    # clear_ghosts() despawn the occupant's row.
+    assert is_frustrated(pack_flags(GHOST_MATCHED)), "matched is frustration"
+    assert is_matched(pack_flags(GHOST_MATCHED))
+    assert not is_matched(pack_flags(GHOST_FRUSTRATED)), "plain != matched"
+    assert not is_ghost(pack_flags(GHOST_MATCHED)), "matched is not a ghost"
+    assert GHOST_MATCHED <= GHOST_MASK, (
+        "the ghost field must have room for the matched state")
+
+    for s in (GHOST_NONE, GHOST_PENDING, GHOST_FRUSTRATED, GHOST_MATCHED):
         assert ghost_state(pack_flags(s)) == s
         # Replacing the ghost field must leave every other bit alone --
         # including the flip bit, which shares .z.
@@ -434,7 +480,7 @@ def _self_check():
     # Every .z flag is independent of the others and of the ghost field --
     # with_ghost_state() in particular must not disturb any of them.
     import itertools
-    for s in (GHOST_NONE, GHOST_PENDING, GHOST_FRUSTRATED):
+    for s in (GHOST_NONE, GHOST_PENDING, GHOST_FRUSTRATED, GHOST_MATCHED):
         for (fl, ex, pr, sd, sp) in itertools.product((False, True),
                                                       repeat=5):
             args = (s, fl, ex, pr, sd, sp)

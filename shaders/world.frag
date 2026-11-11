@@ -44,6 +44,10 @@ uniform int   select_on;      // 0 when no selection is in progress
 #define COL_IN          vec3(0.35, 0.60, 0.95)   // input ports  (blue)
 #define COL_OUT         vec3(0.95, 0.35, 0.30)   // output ports (red)
 #define COL_FRUSTRATED  vec3(0.90, 0.25, 0.22)
+// A frustration that is actually a perfect match -- the stamp is lined up and
+// a bare click will substitute it. Green rather than red because it is the
+// opposite message: not "you cannot build here" but "this is the spot".
+#define COL_MATCHED     vec3(0.30, 0.85, 0.35)
 // Copy mode's selection rectangle: a bright outline with a faint wash, so
 // what is caught reads clearly over belts and machines alike.
 #define COL_SELECT      vec3(0.35, 0.72, 0.98)
@@ -264,8 +268,22 @@ ivec4 fetch(ivec2 c) {
 // share a ghost state. Ghosts chain with ghosts, real belts with real belts,
 // so a preview reads as its own run rather than fusing with what is already
 // built. Change this predicate to let ghosts connect to real belts.
+//
+// GHOST_MATCHED is folded onto GHOST_FRUSTRATED first, so the two flavours of
+// frustration are one layer. They have to be: a matched cell differs from a
+// plain frustrated one only in tint and in what a click does, and leaving
+// them distinct would split a run wherever a stamp was half lined up -- one
+// tinted belt chaining with its neighbour and the next not.
+//
+// Whether *frustration* should share a layer with plain real cells is a
+// separate, older question, deliberately left as it was.
+int layer_of(int z) {
+    int g = ghost_state(z);
+    return g == GHOST_MATCHED ? GHOST_FRUSTRATED : g;
+}
+
 bool same_layer(int a_z, int b_z) {
-    return ghost_state(a_z) == ghost_state(b_z);
+    return layer_of(a_z) == layer_of(b_z);
 }
 
 // Does the cell at `c` emit into the neighbour it faces along `toward`?
@@ -1218,9 +1236,17 @@ void main() {
         // Frustration is an overlay, never a replacement: whatever occupies
         // the cell is drawn above, and this tints on top so you can see
         // exactly what is in the way.
-        if (gstate == GHOST_FRUSTRATED) {
+        //
+        // A *matched* cell is the same overlay in a different colour, and the
+        // colour is the whole feature: two structures of the same type and
+        // rotation look identical in outline, so red over a perfect match
+        // says "blocked" when the truth is "already correct". Green says the
+        // stamp is lined up and a click will substitute it.
+        if (gstate == GHOST_FRUSTRATED || gstate == GHOST_MATCHED) {
             float sd = sd_box(p, vec2(FRUSTRATED_INSET));
-            col = mix(col, COL_FRUSTRATED, fill(sd, px) * FRUSTRATED_ALPHA);
+            vec3 tint_col = (gstate == GHOST_MATCHED) ? COL_MATCHED
+                                                      : COL_FRUSTRATED;
+            col = mix(col, tint_col, fill(sd, px) * FRUSTRATED_ALPHA);
         }
 
         // --- belt items, last ------------------------------------------

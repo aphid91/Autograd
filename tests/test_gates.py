@@ -744,11 +744,20 @@ def test_a_fully_wired_shear_computes_through_belts():
     gate = engine.place_structure(Shear, 20, 20)
 
     # x channel: a Source whose tip emits -Y at (20,27), then belts down.
-    engine.place_structure(Source, 20, 27, cell.DIR_NY)
+    #
+    # The two Sources carry **different, non-default** values. The type
+    # default is 0.0, which is also what an empty slot reads as, so feeding
+    # both channels the default would make `x+y == 0` and `x == 0` true of a
+    # belt carrying nothing at all -- and this is precisely the test meant to
+    # catch a channel wired to the wrong face. Distinct values also mean a
+    # swapped pair fails rather than cancelling out.
+    src_x = engine.place_structure(Source, 20, 27, cell.DIR_NY)
+    src_x.emit_value = 3.0
     for y in range(21, 27):
         engine.place_belt(20, y, cell.DIR_NY)
     # y channel: a Source whose tip emits +X at (13,20), then belts east.
-    engine.place_structure(Source, 12, 20, cell.DIR_PX)
+    src_y = engine.place_structure(Source, 12, 20, cell.DIR_PX)
+    src_y.emit_value = 10.0
     for x in range(14, 20):
         engine.place_belt(x, 20, cell.DIR_PX)
     # Drain the mutated channel east, and the pass-through south.
@@ -766,7 +775,9 @@ def test_a_fully_wired_shear_computes_through_belts():
         f"a fully-drained chain should never block: {stats}")
     assert stats["consumed"] > 100, stats
 
-    # Source emits -1 on both channels, so x+y = -2 and x = -1.
+    # x = 3 and y = 10, so the mutated channel carries x+y = 13 and the
+    # pass-through carries x = 3. Asymmetric on purpose: swapping the two
+    # channels would leave x+y unchanged but send 10 south instead of 3.
     east = engine.segments.at(26, 20)
     south = engine.segments.at(20, 17)
     assert east.count and south.count, (east.count, south.count)
@@ -774,10 +785,10 @@ def test_a_fully_wired_shear_computes_through_belts():
                  for k in range(east.head, east.tail)]
     south_vals = [engine.belts.payload_of(south, k)
                   for k in range(south.head, south.tail)]
-    assert all(v == -2.0 for v in east_vals), (
-        f"the mutated channel should carry x+y = -2, got {east_vals}")
-    assert all(v == -1.0 for v in south_vals), (
-        f"the pass-through should carry x = -1, got {south_vals}")
+    assert all(v == 13.0 for v in east_vals), (
+        f"the mutated channel should carry x+y = 13, got {east_vals}")
+    assert all(v == 3.0 for v in south_vals), (
+        f"the pass-through should carry x = 3, got {south_vals}")
     assert not (engine.segments.audit()
                 + engine.belts.audit(engine.clock.tick))
     ok(f"a belt-fed Shear computed x+y={east_vals[0]} east and passed "
@@ -1103,31 +1114,46 @@ def test_merge_leaves_the_unselected_lane_loaded():
        "control flipped")
 
 
-def test_a_hidden_machine_still_works_on_the_board():
-    """Swap and Sink are off the toolbelt but must still simulate.
+def test_a_machine_placed_without_a_tool_still_works():
+    """A machine placed straight through the engine must simulate.
 
-    An older saved board can contain either, so hiding a machine must be a
-    toolbelt decision and nothing more. This places them the way a load does
-    -- straight through the engine, with no tool involved.
+    This is what a **load** does -- no tool, no builder, no toolbelt -- so it
+    is the path by which a saved board's contents come back to life, and it
+    has to work for every registered type whether or not a tool offers one.
+
+    Swap and Sink are the subjects because they were the two machines hidden
+    from the toolbelt, which made this the only way to get one onto a board.
+    They are placeable again (see `STRUCTURES`), so the hiding is no longer
+    what makes the test interesting -- the tool-free placement path is. The
+    assertions below therefore pin the **mechanism** that made hiding cheap,
+    rather than the fact that these two were hidden.
     """
     from core.entity import ALL_STRUCTURES, HIDDEN_STRUCTURES, STRUCTURES
-    assert Swap in HIDDEN_STRUCTURES and Sink in HIDDEN_STRUCTURES
-    assert Swap not in STRUCTURES and Sink not in STRUCTURES
+    # The split is the thing worth keeping: tools derive from STRUCTURES,
+    # type-reasoning iterates ALL_STRUCTURES, and the two differ by exactly
+    # the hidden set. That holds with the hidden set empty, which is what
+    # makes re-hiding a machine a one-line change.
     assert set(ALL_STRUCTURES) == set(STRUCTURES) | set(HIDDEN_STRUCTURES)
+    assert not (set(STRUCTURES) & set(HIDDEN_STRUCTURES)), (
+        "a machine cannot be both offered and hidden")
+    for _cls in HIDDEN_STRUCTURES:
+        assert _cls in ALL_STRUCTURES, (
+            f"{_cls.__name__} is hidden but not registered, so a save "
+            f"containing one could not be loaded")
 
-    # A hidden Swap still computes, through its real ports.
+    # A Swap computes through its real ports.
     sw = engine.place_structure(Swap, 10, 10)
     got = _fire_once_and_read(sw, [1.0, 7.0, 9.0])
     assert [got[i] for i in range(3)] == [1.0, 9.0, 7.0], got
-    ok("a hidden Swap placed by the engine still fired: (1,7,9) -> (1,9,7)")
+    ok("a Swap placed by the engine fired: (1,7,9) -> (1,9,7)")
 
-    # And a hidden Sink still consumes a saturated belt.
+    # And a Sink consumes a saturated belt.
     harness.reset()
-    engine.place_structure(Source, 7, 10)
+    src = engine.place_structure(Source, 7, 10)
+    src.emit_value = 4.0
     engine.place_belt_path((9, 10), (14, 10))
     engine.place_structure(Sink, 15, 10)
     engine.sync_segments()
     _run(20)
     assert engine.gates.stats["consumed"] > 10, engine.gates.stats
-    ok(f"a hidden Sink still consumed "
-       f"{engine.gates.stats['consumed']} items in 20 ticks")
+    ok(f"a Sink consumed {engine.gates.stats['consumed']} items in 20 ticks")

@@ -22,6 +22,7 @@ them -- that is what makes a frustrated cell different from an absent one.
 from core import cell
 from core.engine_paths import plan_path, path_directions, intent_dir
 from core.entity import STRUCTURES, Belt, Underground
+from core.stamp import Stamp, StampEntry
 
 
 def quadrant_dir(frac):
@@ -346,6 +347,55 @@ class BeltBuilder(EntityBuilder):
         return want
 
 
+class RawBeltBuilder(EntityBuilder):
+    """Place one belt per click, facing wherever R last pointed it.
+
+    The ordinary `BeltBuilder` is a *route planner*: it reads where in a cell
+    you pointed, derives a path, and turns corners for you. That is the right
+    tool for laying a run and the wrong one for fixing a single cell, where
+    the sub-cell rules mean an apparently identical click produces different
+    facings. This tool is the blunt instrument -- click places, `R` rotates,
+    nothing is inferred from the pointer.
+
+    Deliberately shaped like `StructureBuilder` rather than subclassing it:
+    a belt is 1x1 with no ports, so centred placement, chirality and the
+    footprint arithmetic all collapse to nothing, and inheriting them would
+    mean carrying machinery whose every branch is dead here.
+
+    **It does not consult `Belt.ROTATABLE`.** That flag says a belt's facing
+    comes from the path it is drawn along, which is true of the planner and is
+    exactly what this tool exists not to do -- so the rotation lives here, on
+    the tool, rather than being bought by flipping a fact about the type.
+    """
+
+    name = "Raw belt"
+    drag_based = False
+    entity_cls = Belt
+
+    def __init__(self):
+        self.direction = cell.DIR_PX
+
+    def cycle(self, backward=False):
+        self.direction = cell.rotate_dir(self.direction, cw=not backward)
+        return True
+
+    def adopt(self, entity):
+        """Take the facing off a picked-up belt, so Q clones its direction."""
+        self.direction = entity.direction
+        return True
+
+    def status(self):
+        return f"facing {cell.DIR_NAMES[self.direction]}"
+
+    def plan(self, engine, start, end, start_frac=(0.5, 0.5),
+             end_frac=(0.5, 0.5)):
+        # Both fracs ignored on purpose -- see the class docstring.
+        x, y = end
+        blocked = [] if engine.buildable(x, y) else [(x, y)]
+        return BuildPlan([Placement(Belt, x, y, self.direction, blocked)],
+                         all_or_nothing=True)
+
+
 class StructureBuilder(EntityBuilder):
     """Place a single structure, rotatable with R / shift+R.
 
@@ -558,12 +608,198 @@ class PasteBuilder(EntityBuilder):
         return BuildPlan(placements, all_or_nothing=not self.partial)
 
 
+class StampBuilder(PasteBuilder):
+    """A copy-stamp **baked into a toolbelt tool**.
+
+    Paste mode places `Clipboard.stamp` -- whatever was copied most recently.
+    That makes a blueprint you want to keep a fragile thing to hold: one more
+    `ctrl+C` and the history has moved on. Baking takes a snapshot and nails
+    it to a slot, so the stamp survives later copies, row swaps and restarts.
+
+    Subclasses `PasteBuilder` because placing a stamp is placing a stamp:
+    the plan, the per-click all-or-nothing policy and the intra-stamp
+    underground pairing are all identical, and the only differences are where
+    the stamp comes from and that this one lives in a slot. Two consequences
+    of being a slot tool rather than a mode:
+
+    - **`R` and `F` transform this tool's own stamp**, not the clipboard's.
+      In paste mode those keys go to `Clipboard.transform_active()` because
+      the stamp outlives the plan; here the stamp belongs to the tool, so the
+      tool handles them -- which is also what makes the toolbelt's generic
+      `cycle()`/`flip()` dispatch work with no mode branch.
+    - **It takes the partial policy per click the same way**, so the
+      orchestrator's existing "rebuild when shift changes" logic applies
+      unchanged. `partial` is therefore still a plain attribute.
+    """
+
+    drag_based = False
+
+    def __init__(self, stamp, partial=False, name=None):
+        super().__init__(stamp, partial=partial)
+        _x, _y, w, h = stamp.bounds() if stamp else (0, 0, 0, 0)
+        self.name = name or f"Stamp {w}x{h}"
+
+    def cycle(self, backward=False):
+        """Rotate the baked stamp in place.
+
+        Mutates this tool's stamp rather than pushing a copy, matching what
+        `Clipboard.transform_active()` does for the clipboard's: rotating a
+        stamp is adjusting the thing in your hand.
+        """
+        if self.stamp is None:
+            return False
+        self.stamp = self.stamp.rotated(backward=backward)
+        return True
+
+    def flip(self):
+        if self.stamp is None:
+            return False
+        self.stamp = self.stamp.mirrored()
+        return True
+
+
+#: The tool kinds a slot can hold, as `kind -> factory`. This is the registry
+#: the right-click type menu lists and the one the persisted layout names, so
+#: a kind string is a **compatibility surface**: it ends up in the player's
+#: config file, and renaming one silently empties their slot.
+#:
+#: Structures are not listed individually -- `"structure"` takes the type name
+#: as a parameter, so adding a machine to `STRUCTURES` adds it to the menu
+#: with no change here.
+BUILDER_KINDS = {
+    "belt": BeltBuilder,
+    "raw_belt": RawBeltBuilder,
+    "underground": UndergroundBuilder,
+}
+
+
+def make_builder(kind, type_name=None, stamp=None):
+    """Build a tool from its serialised description, or None if unknown.
+
+    Fails **softly** by design: this is fed by a hand-editable config file and
+    by saved layouts that may name a machine a later version renamed. An
+    unknown kind or type leaves the slot empty, which is a recoverable state
+    the player can see, rather than refusing to start.
+    """
+    if kind == "structure":
+        for c in STRUCTURES:
+            if c.__name__ == type_name:
+                return StructureBuilder(c)
+        return None
+    if kind == "stamp":
+        return StampBuilder(stamp) if stamp else None
+    factory = BUILDER_KINDS.get(kind)
+    return factory() if factory else None
+
+
+def describe_builder(tool):
+    """A tool's serialised description, or None if it cannot be persisted.
+
+    The inverse of `make_builder()`. Returns a plain dict so the config layer
+    needs no knowledge of builder classes -- it round-trips what it is given.
+    """
+    if tool is None:
+        return None
+    if isinstance(tool, StampBuilder):
+        if not tool.stamp:
+            return None
+        return {"kind": "stamp", "stamp": stamp_to_data(tool.stamp),
+                "name": tool.name}
+    if isinstance(tool, StructureBuilder):
+        return {"kind": "structure", "type": tool.entity_cls.__name__}
+    for kind, factory in BUILDER_KINDS.items():
+        # Exact type, not isinstance: RawBeltBuilder and BeltBuilder are
+        # siblings, but a subclass relationship among these would otherwise
+        # resolve to whichever kind the dict happened to yield first.
+        if type(tool) is factory:
+            return {"kind": kind}
+    return None
+
+
+def stamp_to_data(stamp):
+    """A stamp as JSON-safe plain data, for the persisted toolbar.
+
+    Types travel as **class names** rather than as the integer type ids saves
+    use. The two formats have opposite priorities: a `.npz` holds thousands of
+    grid words and wants ids, while this holds a handful of entries and wants
+    to stay readable and hand-editable. Type ids are append-only precisely
+    because they are baked into grids; a name here costs nothing and survives
+    a renumbering.
+    """
+    out = []
+    for e in stamp.entries:
+        out.append({
+            "type": e.entity_cls.__name__,
+            "dx": int(e.dx), "dy": int(e.dy),
+            "direction": int(e.direction),
+            "flipped": bool(e.flipped),
+            "is_exit": bool(e.is_exit),
+            "partner": None if e.partner is None else int(e.partner),
+            "emit": None if e.emit is None else float(e.emit),
+            # (on, value) -> a two-element list, since JSON has no tuples.
+            "seed": None if e.seed is None
+                    else [bool(e.seed[0]), float(e.seed[1])],
+        })
+    return out
+
+
+def stamp_from_data(data):
+    """Rebuild a stamp from `stamp_to_data()`, or None if it cannot be.
+
+    Validating rather than trusting: this comes from a file the player can
+    edit and an older version may have written. An entry naming an unknown
+    type makes the **whole stamp** invalid rather than being skipped -- a
+    blueprint with a hole in it would paste silently wrong, which is worse
+    than an empty slot.
+    """
+    if not isinstance(data, list) or not data:
+        return None
+    by_name = {c.__name__: c for c in (Belt, Underground) + tuple(STRUCTURES)}
+    entries = []
+    for item in data:
+        if not isinstance(item, dict):
+            return None
+        entity_cls = by_name.get(item.get("type"))
+        if entity_cls is None:
+            return None
+        try:
+            direction = int(item.get("direction", 0)) % 4
+            dx, dy = int(item.get("dx", 0)), int(item.get("dy", 0))
+            partner = item.get("partner")
+            partner = None if partner is None else int(partner)
+            emit = item.get("emit")
+            emit = None if emit is None else float(emit)
+            seed = item.get("seed")
+            if seed is not None:
+                seed = (bool(seed[0]), float(seed[1]))
+        except (TypeError, ValueError, IndexError):
+            return None
+        entries.append(StampEntry(
+            entity_cls, dx, dy, direction,
+            flipped=bool(item.get("flipped", False)),
+            is_exit=bool(item.get("is_exit", False)),
+            partner=partner, emit=emit, seed=seed,
+        ))
+    # A partner index pointing outside the stamp is the dangling state
+    # `unpair_under()` exists to prevent, so drop the link rather than the
+    # entry -- an unpaired underground end is legal.
+    for e in entries:
+        if e.partner is not None and not 0 <= e.partner < len(entries):
+            e.partner = None
+    return Stamp(entries)
+
+
 def default_builders():
     """The toolbelt's starting tools, in slot order.
 
-    Belt and its underground form first, then one StructureBuilder per
-    registered structure. Adding a machine is a new Entity subclass in
-    core/entity.py plus its entry in STRUCTURES -- nothing here changes.
+    The belt tools first, then one StructureBuilder per registered structure.
+    Adding a machine is a new Entity subclass in core/entity.py plus its entry
+    in STRUCTURES -- nothing here changes.
+
+    This is the **default** layout only. The player's saved arrangement, if
+    there is one, is applied over the top by `app.py` -- see
+    `core/config.py`. Deliberately still exactly this list when there is no
+    saved layout, so a first run looks as it always did.
     """
-    return ([BeltBuilder(), UndergroundBuilder()]
+    return ([BeltBuilder(), RawBeltBuilder(), UndergroundBuilder()]
             + [StructureBuilder(c) for c in STRUCTURES])

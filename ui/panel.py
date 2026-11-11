@@ -6,7 +6,7 @@ from core import cell, persistence
 from core.belts import UNIT
 from core.entity import Belt, Source
 from ui.input_manager import STATE_NAMES
-from core.toolbelt import SLOT_COUNT, SPLIT_AFTER
+from core.toolbelt import ROW_COUNT, ROW_SIZE, SLOT_COUNT, SPLIT_AFTER
 
 
 class UIRequests:
@@ -18,7 +18,7 @@ class UIRequests:
                  "toggle_pause", "step_tick", "tick_rate",
                  "segment_debug", "rebuild_segments", "audit_segments",
                  "debug_feed", "clear_items", "close_status",
-                 "set_emit", "set_seed")
+                 "set_emit", "set_seed", "set_slot", "swap_rows")
 
     def __init__(self):
         self.reload_shader = False
@@ -56,6 +56,17 @@ class UIRequests:
         #: and the value box are one setting and either one changing has to
         #: carry the other's current state.
         self.set_seed = None
+        #: `(slot, kind, type_name)` from the right-click type menu, or None.
+        #:
+        #: A *description* rather than a built tool, for the same reason
+        #: `set_emit` carries a row: the panel never mutates game state, and
+        #: constructing a builder here would have the UI own a piece of it.
+        #: The orchestrator resolves the description -- which is also what
+        #: lets the "stamp" kind reach for the live clipboard, something the
+        #: panel has no business doing.
+        self.set_slot = None
+        #: Tab's equivalent as a button: swap which row the digits address.
+        self.swap_rows = False
 
 
 class UI:
@@ -301,6 +312,49 @@ class UI:
         imgui.end()
 
     # --- toolbelt -------------------------------------------------------
+    def _draw_slot_menu(self, orch, req, slot):
+        """The right-click type menu for one slot: every tool it could hold.
+
+        Factorio-style customisation. The list is **generated**, not written
+        out: the belt-ish tools come from `BUILDER_KINDS` and the machines
+        from `STRUCTURES`, so adding a machine puts it in this menu with no
+        change here -- the same property the GLSL tables have.
+
+        Every item emits a *description* into `req.set_slot` rather than a
+        tool. See `UIRequests.set_slot` for why the panel does not build one.
+        """
+        from core.builders import BUILDER_KINDS
+        from core.entity import STRUCTURES
+
+        imgui.text_disabled(f"Slot {slot % ROW_SIZE + 1}"
+                            f"  (row {slot // ROW_SIZE + 1})")
+        imgui.separator()
+
+        for kind in BUILDER_KINDS:
+            label = BUILDER_KINDS[kind].name
+            if imgui.menu_item_simple(label):
+                req.set_slot = (slot, kind, None)
+
+        imgui.separator()
+        for c in STRUCTURES:
+            if imgui.menu_item_simple(c.__name__):
+                req.set_slot = (slot, "structure", c.__name__)
+
+        # "Stamp" bakes the clipboard's *current* stamp into this slot, so it
+        # only appears when there is one to bake. Offered last because it is
+        # the one entry whose meaning depends on session state rather than on
+        # what the build supports.
+        stamp = orch.clipboard.stamp
+        if stamp:
+            imgui.separator()
+            _x, _y, w, h = stamp.bounds()
+            if imgui.menu_item_simple(f"Stamp ({len(stamp)} entities {w}x{h})"):
+                req.set_slot = (slot, "stamp", None)
+
+        imgui.separator()
+        if imgui.menu_item_simple("Clear slot"):
+            req.set_slot = (slot, None, None)
+
     def draw_toolbelt(self, orch, req):
         """Factorio-style slot bar, docked to the bottom centre of the view."""
         belt = orch.toolbelt
@@ -308,8 +362,8 @@ class UI:
 
         slot = 48.0
         pad = 4.0
-        gap = 18.0          # the 5/6 split
-        width = SLOT_COUNT * slot + (SLOT_COUNT - 1) * pad + gap + 20.0
+        gap = 18.0          # the 5/6 split, within a row
+        width = ROW_SIZE * slot + (ROW_SIZE - 1) * pad + gap + 20.0
 
         imgui.set_next_window_pos(
             imgui.ImVec2(vp.work_pos.x + vp.work_size.x * 0.5,
@@ -343,36 +397,60 @@ class UI:
             imgui.push_style_color(imgui.Col_.window_bg, tint)
 
         if imgui.begin("##toolbelt", None, flags):
-            for i in range(SLOT_COUNT):
-                if i:
-                    imgui.same_line(0.0, gap if i == SPLIT_AFTER else pad)
+            # The active row is drawn **on top**, so "the row the number keys
+            # address" is always the one nearest the status line and the
+            # board. Tab therefore visibly exchanges the two rows rather than
+            # just moving a highlight, which is what the key is named for.
+            for r in (belt.row, (belt.row + 1) % ROW_COUNT):
+                active_row = (r == belt.row)
+                for col in range(ROW_SIZE):
+                    i = r * ROW_SIZE + col
+                    if col:
+                        imgui.same_line(
+                            0.0, gap if col == SPLIT_AFTER else pad)
 
-                tool = belt.slots[i]
-                selected = (i == belt.selected)
-                label = tool.name if tool is not None else ""
-                # 1..9 then 0, matching the key that selects the slot.
-                digit = (i + 1) % 10
+                    tool = belt.slots[i]
+                    selected = (i == belt.selected)
+                    label = tool.name if tool is not None else ""
+                    # 1..9 then 0, matching the key -- but only on the active
+                    # row, since the digits do not reach the other one.
+                    digit = f"{(col + 1) % 10}" if active_row else "·"
 
-                if selected:
-                    imgui.push_style_color(
-                        imgui.Col_.button, imgui.ImVec4(0.30, 0.48, 0.70, 1.0))
-                    imgui.push_style_color(
-                        imgui.Col_.button_hovered, imgui.ImVec4(0.36, 0.55, 0.78, 1.0))
-                elif tool is None:
-                    imgui.push_style_color(
-                        imgui.Col_.button, imgui.ImVec4(0.16, 0.16, 0.19, 1.0))
-                    imgui.push_style_color(
-                        imgui.Col_.button_hovered, imgui.ImVec4(0.20, 0.20, 0.24, 1.0))
-                else:
-                    imgui.push_style_color(
-                        imgui.Col_.button, imgui.ImVec4(0.24, 0.24, 0.28, 1.0))
-                    imgui.push_style_color(
-                        imgui.Col_.button_hovered, imgui.ImVec4(0.30, 0.30, 0.35, 1.0))
+                    if selected:
+                        imgui.push_style_color(
+                            imgui.Col_.button, imgui.ImVec4(0.30, 0.48, 0.70, 1.0))
+                        imgui.push_style_color(
+                            imgui.Col_.button_hovered, imgui.ImVec4(0.36, 0.55, 0.78, 1.0))
+                    elif tool is None:
+                        imgui.push_style_color(
+                            imgui.Col_.button, imgui.ImVec4(0.16, 0.16, 0.19, 1.0))
+                        imgui.push_style_color(
+                            imgui.Col_.button_hovered, imgui.ImVec4(0.20, 0.20, 0.24, 1.0))
+                    else:
+                        # The inactive row is dimmed, so which digits are live
+                        # is readable without counting rows.
+                        base = (0.24, 0.24, 0.28) if active_row \
+                            else (0.19, 0.19, 0.22)
+                        hov = (0.30, 0.30, 0.35) if active_row \
+                            else (0.25, 0.25, 0.29)
+                        imgui.push_style_color(
+                            imgui.Col_.button, imgui.ImVec4(*base, 1.0))
+                        imgui.push_style_color(
+                            imgui.Col_.button_hovered, imgui.ImVec4(*hov, 1.0))
 
-                if imgui.button(f"{digit}\n{label}##slot{i}",
-                                imgui.ImVec2(slot, slot)):
-                    req.select_slot = i
-                imgui.pop_style_color(2)
+                    if imgui.button(f"{digit}\n{label}##slot{i}",
+                                    imgui.ImVec2(slot, slot)):
+                        # A clicked button knows its own flat index, so it
+                        # selects across rows without needing Tab first.
+                        req.select_slot = i
+                    imgui.pop_style_color(2)
+
+                    # Right-click opens the type menu for this slot, which is
+                    # how the bar is customised. Opened here and drawn below,
+                    # since imgui popups must be begun after their anchor.
+                    if imgui.begin_popup_context_item(f"##slotmenu{i}"):
+                        self._draw_slot_menu(orch, req, i)
+                        imgui.end_popup()
 
             # Active tool's state, under the bar. An empty hand says so: it is
             # the default state and clicking does nothing, which is worth
@@ -407,6 +485,14 @@ class UI:
                     req.flip_tool = True
             else:
                 imgui.text_disabled("empty slot")
+
+            # Tab's equivalent, plus the hint that right-click customises a
+            # slot -- neither is discoverable from the bar alone.
+            imgui.same_line()
+            if imgui.small_button(f"Tab: row {belt.row + 1}"):
+                req.swap_rows = True
+            imgui.same_line()
+            imgui.text_disabled("  (right-click a slot to change it)")
         imgui.end()
         if tinted:
             imgui.pop_style_color()

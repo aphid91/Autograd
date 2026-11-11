@@ -49,8 +49,8 @@ There is no pytest/linter configured.
 | [tests/test_item_render.py](tests/test_item_render.py) | reads the framebuffer back: do discs appear where the simulation says, and do the labels say what the formatter says? |
 | [tests/test_gates.py](tests/test_gates.py) | firing rules, arithmetic, back pressure, dangling-output discard, and the bubble-free claim |
 | [tests/test_stamp.py](tests/test_stamp.py) | what the stamp transforms preserve: wiring, topology, arithmetic |
-| [tests/test_clipboard.py](tests/test_clipboard.py) | the copy/paste/erase mode machine, driven through the fake mouse and keyboard |
-| [tests/test_inspect.py](tests/test_inspect.py) | the Status window, the per-Source emit value, the per-belt seed, the save filename box |
+| [tests/test_clipboard.py](tests/test_clipboard.py) | the copy/paste/erase mode machine, and matched-stamp substitution, driven through the fake mouse and keyboard |
+| [tests/test_inspect.py](tests/test_inspect.py) | the Status window, the per-Source emit value, the per-belt seed, the save filename box, the persisted toolbar |
 
 **Scenarios are independent.** `harness.reset()` clears the board, camera,
 input state and toolbelt before each one, so a failure names the scenario
@@ -77,6 +77,19 @@ appeared three files away as "the belt phase ran but nothing moved". Same
 reasoning as restoring imgui's `want_capture_mouse`, with a sharper failure
 mode.
 
+`harness.reset()` also restores the **toolbar layout and the active row**,
+for the same class of reason. `select_tool()` finds a tool by *name*, so a
+scenario that re-assigned a slot through the type menu would have an
+unrelated later one die of `StopIteration` a long way from the cause — and a
+left-over active row would have every digit land on the wrong tool. Restoring
+the defaults is also what keeps the harness independent of the player's
+persisted bar: it never loads one, and now it cannot acquire one either.
+
+`select_tool()` **tabs to reach row 2** and goes through the real keys rather
+than calling `Toolbelt.select()`, so a break in the digit map or the row swap
+surfaces in whichever scenario asked for a row-2 tool rather than only in the
+one test that covers rows directly.
+
 **Beware exact float multiples when asserting tick counts.** `0.3 // 0.1` is
 2, not 3, so a single `advance()` spanning several periods runs an unreliable
 number of ticks. Tests that care about the count use `request_step(n)` or
@@ -99,7 +112,9 @@ surfaced as one shuffle seed in twelve failing a pixel test.
 | Left-drag | pan the camera |
 | `F` | **per-tool**: flip (mirror) the held structure |
 | `shift+F` | frame the whole board |
-| `1`-`9`, `0` | select a toolbelt slot |
+| `1`-`9`, `0` | select a slot in the **active** toolbelt row |
+| `Tab` | swap which toolbelt row the number keys address |
+| Right-click a slot | the **type menu**: put any tool in that slot |
 | `ctrl+C` | copy mode — left-drag a selection box |
 | `ctrl+V` | paste mode, if anything has been copied |
 | `X` | erase mode — left-drag a box to delete what it touched |
@@ -159,6 +174,139 @@ hand back what the player already holds.
 Every tool names the type it places (`EntityBuilder.entity_cls`), so
 `Toolbelt.select_tool_for()` is a generic lookup rather than a per-type
 branch. A type with no builder fails softly and leaves the hand empty.
+
+**Q scans both rows, and brings the active row with it.** Failing because
+the tool happens to sit on the row the digits are not addressing would be a
+surprise — and with Swap and Sink defaulting to row 2 it would be the common
+case. The active row is searched *first*, so a type with tools on both rows
+resolves to the one whose digits are already live; the row then follows the
+selection, or the highlighted slot and the live digits would be in different
+rows and the next number key would silently change tools.
+
+Within a row it is **first match wins**, which is a real rule rather than an
+accident now that two tools can place the same type: the belt planner and the
+raw belt tool both claim `Belt`, so `Q` on a belt lands on whichever sits in
+the earlier slot. That makes the answer depend on the player's layout, which
+is the price of a customisable bar, and
+`test_q_on_a_belt_resolves_to_the_earliest_slot` pins it so the rule is
+stated rather than discovered.
+
+### Two rows, and a customisable bar
+
+The toolbelt is **two rows of ten**. The number keys address the *active* row
+and `Tab` swaps which one that is, so twenty tools are each one modifier-free
+key away.
+
+**The rows are a view onto one flat list.** Row `r` owns indices
+`r*ROW_SIZE .. (r+1)*ROW_SIZE`, and `selected` is an index into that flat
+list rather than a (row, column) pair. That matters at every call site: a
+stashed slot, a persisted layout and `select_tool_for()`'s answer are all one
+integer, and none of them has to agree with the orchestrator about which row
+is up.
+
+**`Tab` changes addressing, not state.** The hand keeps whatever it holds,
+even when that tool is now on the inactive row, and any in-flight gesture
+survives. Clearing the hand (or jumping to the same column in the new row)
+would make `Tab` destructive mid-belt-run. The panel draws the active row on
+*top* so the swap is visible as an exchange rather than a moved highlight,
+and dims the inactive row's digits since they are not live.
+
+**A digit is a column; a clicked slot is a flat index.** The input manager
+reports which digit was pressed and `Orchestrator._select_column()` adds the
+active row's offset — the same division of labour that has input report `R`
+rather than what `R` means. A panel button already knows its own row, so it
+selects across rows without needing `Tab` first. Key `0` is the one digit
+with its own branch in that map (it means column 9), which makes it the one
+that can quietly keep addressing row 1 while 1–9 follow the swap; tested
+separately for exactly that reason.
+
+#### The type menu, and a persisted layout
+
+Right-clicking a slot opens a menu of every tool it could hold, Factorio
+style. The list is **generated**: the belt-ish tools from
+`builders.BUILDER_KINDS` and the machines from `STRUCTURES`, so adding a
+machine puts it in the menu with no change to the panel — the same property
+the GLSL tables have.
+
+**The panel only requests.** `UIRequests.set_slot` carries a *description* —
+`(slot, kind, type_name)` — and the orchestrator resolves it, matching how
+`set_emit` and `set_seed` carry a row. That is load-bearing for the `"stamp"`
+kind, whose source is the live clipboard the panel has no business reaching
+into.
+
+The layout persists in `gates_config.json` beside the quicksave filename, and
+by the same route: `app.py` loads it and calls `Orchestrator.apply_toolbar()`,
+and `toolbar_dirty` flags a change for `app.py` to write. **Nothing loads it
+implicitly** — the harness builds a real `Orchestrator`, so an implicit load
+would give every test run the player's own bar (see core/config.py). It is
+written on the edit rather than at shutdown, like the filename, so a crash
+cannot lose an arrangement built up over a session.
+
+Three things about the stored form:
+
+- **A kind string is a compatibility surface.** It ends up in the player's
+  file, so renaming one silently empties their slot. Structures are not
+  listed individually — `"structure"` takes the type *name*, so a new machine
+  needs no new kind.
+- **Types travel as class names, not the integer ids saves use.** The two
+  formats have opposite priorities: a `.npz` holds thousands of grid words
+  and wants ids, while this holds a handful of entries and wants to stay
+  readable and hand-editable.
+- **A bad entry costs one slot.** The file is hand-editable and an older
+  version may have written it, so an entry naming a machine this build does
+  not have empties that slot and leaves the rest alone. Refusing the whole
+  layout would discard the arrangement; *shifting* the survivors left would
+  be worse, since position is the content — hence a `None` placeholder rather
+  than a skip. A layout longer than the bar is truncated and a shorter one
+  padded, so changing `SLOT_COUNT` does not invalidate a saved file.
+
+An absent layout (`[]`) means "no saved layout" and leaves
+`default_builders()` alone, so a first run looks exactly as it did before any
+of this existed.
+
+#### A baked stamp is a slot tool
+
+The type menu offers **Stamp** whenever something has been copied. It bakes
+the clipboard's *current* stamp into a `StampBuilder` nailed to that slot, so
+a blueprint worth keeping survives later copies, row swaps and restarts —
+paste mode places `Clipboard.stamp`, which one more `ctrl+C` moves on from.
+
+`StampBuilder` subclasses `PasteBuilder` because placing a stamp is placing a
+stamp: the plan, the per-click all-or-nothing policy and the intra-stamp
+underground pairing are identical. Two differences follow from being a slot
+tool rather than a mode:
+
+- **`R` and `F` transform this tool's own stamp.** In paste mode those keys
+  go to `Clipboard.transform_active()` because the stamp outlives the plan;
+  here the stamp belongs to the tool, so the toolbelt's generic
+  `cycle()`/`flip()` dispatch reaches it with no mode branch.
+- **It is the one kind carrying data rather than a name**, so its entries
+  round-trip through JSON — and what they carry is exactly the per-instance
+  settings (a Source's emit value, a belt's seed) that the matched-ghost
+  substitution below exists to apply. Losing them on a restart would defeat
+  the reason for baking a stamp at all.
+
+### Raw belts: the blunt instrument
+
+`BeltBuilder` is a *route planner* — it reads where in a cell you pointed,
+derives a path, and turns corners for you. That is right for laying a run and
+wrong for fixing one cell, where the sub-cell rules mean two apparently
+identical clicks produce different facings.
+
+`RawBeltBuilder` is the other tool: click places one belt, `R` rotates, and
+**nothing is inferred from the pointer**. Both `start_frac` and `end_frac`
+are ignored on purpose.
+
+Shaped like `StructureBuilder` rather than subclassing it — a belt is 1×1
+with no ports, so centred placement, chirality and the footprint arithmetic
+all collapse to nothing, and inheriting them would mean carrying machinery
+whose every branch is dead.
+
+**It does not consult `Belt.ROTATABLE`.** That flag says a belt's facing
+comes from the path it is drawn along, which is true of the planner and is
+precisely what this tool exists not to do. Buying the rotation by flipping a
+fact about the *type* would have made the flag lie (and `core/entity.py`
+asserts it is `False`), so the rotation lives on the tool.
 
 ### Copy, paste and erase are modes, not tools
 
@@ -320,6 +468,22 @@ footprint, and channel contents — an occupied output zone shows as
 The live value lives in the entity row at `Source.F_EMIT`, and `fire()` reads
 it, so two Sources on one board can emit different numbers.
 
+**Both per-instance defaults are `0.0`** — `Source.EMIT_VALUE` and
+`Belt.SEED_VALUE`. Arithmetically neutral, so placing either does not inject
+a number the player has to notice and correct, and a seeded zero is still
+visible since the item disc's ring tints by sign (zero reads red).
+
+That has a consequence for tests, and it bit three of them: **the default is
+now indistinguishable from a zeroed row**, so `initialise()` writing the
+field and `initialise()` doing nothing at all look identical on a fresh view.
+Anything asserting a default has to dirty the field first, or recycle a row
+(`test_a_placed_source_starts_at_the_type_default` erases a configured Source
+and expects the free list to hand the row back). The same trap caught two
+*integration* tests that fed gates from default Sources: `x+y == 0` and
+`x == 0` are true of a belt carrying nothing, so those now use distinct
+non-zero values — which also makes them catch a swapped channel pair, which
+matching values never could.
+
 **`F_EMIT` deliberately squats on an input slot** (`F_IN_VALUE + 0`). A
 generator has no input channels — `INPUTS` is empty — so nothing in the tick,
 the port pass or the renderer can ever read those twelve slots on a Source.
@@ -416,9 +580,11 @@ which would otherwise have every later belt quietly injecting items.
 ### Persistent UI preferences
 
 [core/config.py](core/config.py) holds a flat JSON file of panel state that
-should survive a restart — currently just the quicksave filename. Not part of
-the `.npz`: a save file is a *board*, and putting the name there would change
-it every time you loaded a different file.
+should survive a restart — the quicksave filename, and the customised toolbar
+(see "Two rows, and a customisable bar"). Not part of the `.npz`: a save file
+is a *board*, and putting the filename there would change it every time you
+loaded a different file, while a toolbar belongs to the player rather than to
+any one factory.
 
 **Nothing loads it implicitly.** `app.py` calls `load()` at startup and
 `save()` when the value changes; `Orchestrator` and `UI` take it as plain
@@ -478,14 +644,14 @@ everything else is grouped by layer.
 | [core/entity.py](core/entity.py) | `Entity` view base, `Belt`, `Structure` and the machine set, type registry |
 | [core/gameboard.py](core/gameboard.py) | grid array, entity table, free list, dirty tracking, device transfer |
 | [core/engine_paths.py](core/engine_paths.py) | pure path geometry (elbows, Bresenham) |
-| [core/builders.py](core/builders.py) | `EntityBuilder`/`BuildPlan`; `BeltBuilder`, `StructureBuilder`, `UndergroundBuilder`, `PasteBuilder` |
+| [core/builders.py](core/builders.py) | `EntityBuilder`/`BuildPlan`; `BeltBuilder`, `RawBeltBuilder`, `StructureBuilder`, `UndergroundBuilder`, `PasteBuilder`, `StampBuilder`; the serialisable tool registry |
 | [core/stamp.py](core/stamp.py) | copy-stamps: entries, the rotate/mirror algebra, the history ring |
 | [core/clipboard.py](core/clipboard.py) | copy/paste mode state, the stashed tool, and `capture()` |
 | [core/glsl_types.py](core/glsl_types.py) | emits the per-type GLSL tables from the entity classes |
 | [core/font.py](core/font.py) | the 6×8 bitfield font, and the reference number formatter |
 | [core/persistence.py](core/persistence.py) | save/load the board to a single `.npz` (`.w` zeroed — derived) |
-| [core/config.py](core/config.py) | persistent panel preferences (the quicksave filename), loaded only by `app.py` |
-| [core/toolbelt.py](core/toolbelt.py) | ten slots, one active tool |
+| [core/config.py](core/config.py) | persistent panel preferences (quicksave filename, toolbar layout), loaded only by `app.py` |
+| [core/toolbelt.py](core/toolbelt.py) | two rows of ten slots, one active tool, one active row |
 | [core/tick.py](core/tick.py) | the simulation clock: tick counter, fixed timestep, phase order |
 | [core/segments.py](core/segments.py) | belt runs coalesced into the O(1) simulation unit; derived from the grid |
 | [core/belts.py](core/belts.py) | closed-form item transport, and the naive oracle it is tested against |
@@ -519,8 +685,9 @@ bit  31     unused — deliberately clear
 `.y` packs `(local_x, local_y)` so a multi-cell entity's cells each know their
 offset from the origin — the **placed** offset, after flip and rotation, not
 the authored one (see "Orientation" under Structures). `.z` bits 0-1 hold the
-ghost state (`0` real / `1` ghost / `2` frustrated — see "Frustrated cells"
-below), bit 2 the flip flag, bits 3-4 an underground end's role and pairing,
+ghost state (`0` real / `1` ghost / `2` frustrated / `3` matched — see
+"Frustrated cells" below; the field is now full), bit 2 the flip flag,
+bits 3-4 an underground end's role and pairing,
 and bits 5-6 a belt's seed and that seed's sign. Everything in `.z` past the
 ghost state is there for one reason: the renderer resolves it per-cell
 straight from the grid texture, with no entity-row lookup — so each is
@@ -873,8 +1040,8 @@ results in those zones.
 | `Route` | a,b → a down **one** of two outputs, on the sign of b |
 | `Merge` | a,b,c → whichever of a,b the control c selects |
 | `Source` | → a per-instance constant on every connected port |
-| `Swap` | x,y,z → x, (z,y if x>0 else y,z) — *hidden, see below* |
-| `Sink` | destroys whatever arrives, up to 4 per tick — *hidden* |
+| `Swap` | x,y,z → x, (z,y if x>0 else y,z) |
+| `Sink` | destroys whatever arrives, up to 4 per tick |
 
 **A positive control is always the active case.** `Swap` swaps when x>0,
 `Route` sends right when b>0, `Merge` selects `a` when c>0. Zero counts as
@@ -886,19 +1053,35 @@ note [tests/test_stamp.py](tests/test_stamp.py) also asserts Swap's polarity,
 since its mirror-invariance check needs to know which branch is the
 pass-through.
 
-**`Swap` and `Sink` are hidden from the toolbelt but still defined.** They
-are absent from `STRUCTURES` and so have no tool, but keep their classes and
-their type ids, so an older saved board still loads, draws and simulates one.
-Hiding a machine is a toolbelt decision and nothing more — `ALL_STRUCTURES`
-is what the type-geometry checks iterate, and
-`test_a_hidden_machine_still_works_on_the_board` places both through the
-engine the way a load does. **Type ids are append-only** for the same reason:
-they are baked into every saved grid word, so renumbering would silently
-reinterpret old saves.
+**`Swap` and `Sink` are placeable again.** They were hidden when the toolbelt
+had exactly ten slots and every one was spoken for, which made "is this
+machine worth a slot?" a real question — Sink lost it to the rule that a
+dangling output destroys what it is sent. Two rows and a right-click type
+menu remove the question: a machine the player never picks costs nothing.
 
-Sink is hidden because it is now redundant — a dangling output destroys what
-it is sent, so there is nothing left for it to do that leaving a port
-unconnected does not.
+What settled it was that hiding a machine was not actually free. The pipette
+resolves a type *through its tool* (`Toolbelt.select_tool_for()`), so `Q` on
+a Sink already sitting on the board did nothing at all — a dead key on a real
+entity. Sink is still redundant for discarding an output (leave the face
+unconnected instead), but it is no longer unreachable.
+
+**The mechanism survives with an empty set.** `HIDDEN_STRUCTURES` is `()` now
+rather than deleted, because the split it expresses is the load-bearing one:
+`STRUCTURES` is what *tools* derive from and `ALL_STRUCTURES` is what
+anything reasoning about *types* iterates — the type-geometry self-checks,
+the GLSL tables. A machine moved into the hidden set keeps its class and its
+type id, so a saved board containing one still loads, draws and simulates;
+only the tool goes away. That asymmetry is what made hiding a machine a
+one-line change, and it is worth keeping available.
+
+**Type ids are append-only** for the same reason they always were: they are
+baked into every saved grid word, so renumbering would silently reinterpret
+old saves. Re-offering a machine changes no id.
+
+`test_a_machine_placed_without_a_tool_still_works` is the descendant of the
+old hidden-machine test. It now pins the *mechanism* — the two sets'
+relationship, and that a machine placed straight through the engine with no
+tool involved simulates correctly, which is the path a **load** takes.
 
 #### A dangling output is a sink
 
@@ -1382,6 +1565,79 @@ Consequences worth knowing:
 - A frustrated cell is *not* a ghost. `cell.is_ghost()` is false for it;
   `cell.is_frustrated()` is the separate test.
 
+#### A matched cell is frustration that means the opposite
+
+`GHOST_MATCHED` is a frustration whose occupant is **exactly what the
+placement wanted** — same type, origin, orientation and flip. Two structures
+of the same type at the same rotation look identical in outline, so a red
+tint over a perfect match says "blocked" when the truth is "already
+correct". Matched cells tint green instead, and that colour is the whole
+feature: it is how the player sees a stamp is *lined up*.
+
+It cost **no storage**: the ghost field is 2 bits and value `3` was spare.
+
+**It is a flavour of frustration, not a third kind of cell.** `.x` is
+untouched exactly as before, and `cell.is_frustrated()` covers *both* — that
+is the broad "is this an overlay?" question, and everything asking it wants
+both: segment derivation (which must not cut a run at a tinted cell) and
+`clear_frustrated()` (which must unset the overlay without disturbing the
+occupant). `cell.is_matched()` is the narrow test, used in exactly two
+places: the shader's tint and the commit path. Getting the breadth wrong is
+a real bug in either direction — reading matched as un-frustrated cuts a belt
+run under a lined-up stamp; reading it as a ghost entity has
+`clear_ghosts()` despawn the occupant's row. The shader folds matched onto
+frustrated in `layer_of()` for the same reason, or a half-lined-up stamp
+would split a run into three rendering layers.
+
+#### Substituting a lined-up stamp
+
+A bare click over a plan whose **every** clash is a match deletes the matched
+entities and places the stamp in their stead
+(`Orchestrator._substitute()`). That is the point of the whole mechanism:
+per-instance settings are reachable only one entity at a time through the
+Status window, so changing twenty Sources means twenty trips. Instead,
+configure one, copy it, rotate until it lines up, click.
+
+- **Matching is per *placement*, never per cell, and the origin is part of
+  it.** Two 2×1 Shears offset by one cell share a cell that compares equal
+  type-and-facing on its own, so a per-cell test would call a half-overlap a
+  match and move a machine one cell from where the player saw it.
+  Mutation-testing shows the origin comparison is *redundant* given the
+  "every cell is that same row" loop — two instances of one type can only
+  disagree about their origin by covering a cell the other does not — but it
+  states the invariant the loop merely implies.
+- **Orientation and flip are part of identity.** The flip is the dangerous
+  one: a mirrored chiral machine looks identical in outline and wires up
+  differently, which is why `adopt()` copies it too. That makes it the match
+  a player could not spot by eye, and it is mutation-tested — an earlier
+  version of its test passed against a build with the check removed, because
+  the mirror had changed the *direction* as well and the refusal came from
+  there.
+- **All-or-nothing.** `Engine.matched_rows()` returns `None` if anything
+  clashes that is not a match, because deleting the matched entities would
+  not unblock the real clash — the plan would still refuse and the player
+  would have lost them for nothing. An empty list is the different answer
+  "nothing was blocked".
+- **Erase everything, then re-plan.** The plan in hand was computed against
+  the occupied board, so every placement carries `blocked_cells` and
+  `buildable` is empty; it cannot be committed as-is. Clearing the whole
+  matched set up front also means the re-plan never sees a half-deleted
+  underground pair, whose partner `erase()` releases.
+- **Bare clicks only.** Shift already means "place what fits, reject the
+  clashes" and overloading it would leave no way to ask for that. The guard
+  is *defensive rather than load-bearing* — shift makes a paste `partial`,
+  which makes the plan not `all_or_nothing`, so the branch is already
+  unreachable — but that reasoning runs through two other objects, and a
+  tool that was all-or-nothing *and* honoured shift would otherwise silently
+  acquire substitution.
+
+A note for the tests: a substitution that quietly did nothing and a refusal
+leave **identical-looking boards**, since the old and new entities are the
+same type in the same place. So every test asserts on something that
+distinguishes them — a changed emit value, a changed seed, a live count.
+"A Source is still there" passes either way. The row id is *not* such a
+signal: the erase frees the row and the free list hands it straight back.
+
 ### Previewing is not the same as building
 
 Two distinctions in `BuildPlan` that are easy to collapse and shouldn't be:
@@ -1547,11 +1803,13 @@ All are authored at `DIR_PX` and rotated; all are continuous rectangles.
 | `Max` | 2×1 | a,b → max(a,b) on both outputs |
 | `Mac` | 2×1 | x,y,z → x, y, z + x·y |
 | `Floor` | 2×1 | a → ⌊a⌋ |
-| `Swap` *(hidden)* | 1×2 | x,y,z → x, (z,y if x>0 else y,z) |
-| `Sink` *(hidden)* | 2×2 | two inputs per cell, folded to one channel each |
+| `Swap` | 1×2 | x,y,z → x, (z,y if x>0 else y,z) |
+| `Sink` | 2×2 | two inputs per cell, folded to one channel each |
 
-The toolbelt order is belt and underground in slots 1–2, then this table's
-order from slot 3.
+The **default** layout is the belt planner, the raw belt tool and underground
+in slots 1–3, then this table's order from slot 4 — thirteen tools, so Swap
+and Sink start on row 2. It is only the starting arrangement: the bar is
+customisable and persisted (see "Two rows, and a customisable bar").
 
 The machines carrying a control share an idiom: a **pass-through channel**
 crosses the body on one axis unchanged, while the channel taking the *long
@@ -1898,9 +2156,12 @@ bugs:
 - `InputManager` is the **only** place that reads input or consults
   `io.want_capture_keyboard` / `io.want_capture_mouse`. It reports *that* `R`
   was pressed, never what `R` means.
-- The toolbelt always has `SLOT_COUNT` (10) slots; empty ones are selectable
-  and simply have no active tool. Switching tools cancels any in-flight gesture
-  and its preview — a half-drawn belt run means nothing to the structure tool.
+- The toolbelt always has `SLOT_COUNT` (20) slots — `ROW_COUNT` rows of
+  `ROW_SIZE` — and `selected` is a flat index into all of them. Empty slots
+  are selectable and simply have no active tool. Switching tools cancels any
+  in-flight gesture and its preview — a half-drawn belt run means nothing to
+  the structure tool. `Tab` is the exception: it re-aims the number keys and
+  deliberately disturbs neither the hand nor the gesture.
 - Scroll is event-based, so `InputManager` installs a glfw scroll callback and
   **chains to imgui's**; dropping the previous callback would break scrolling
   in the UI panels.
@@ -1958,9 +2219,17 @@ CPU implementation is kept afterwards as the test oracle, per
 
 Copy/paste landed as `PasteBuilder` plus [core/clipboard.py](core/clipboard.py)
 and needed no change to the builder abstraction, which is the evidence that
-shape was right. Still shaped for but not built: **undo** (which would record
-the rows a committed `BuildPlan` produced) and named/persisted blueprints (the
-stamp history is in-session only).
+shape was right. `StampBuilder` is the second piece of evidence: baking a
+stamp into a toolbelt slot was a subclass of `PasteBuilder` and nothing else.
+
+Blueprints are now **half** persisted: a stamp baked into a slot survives a
+restart, so the thing worth keeping can be kept. What is still missing is
+*naming* them and a library independent of the twenty slots — the in-session
+history is still in-session. **Undo** remains shaped for but not built (it
+would record the rows a committed `BuildPlan` produced); note the
+matched-stamp substitution is the first gesture that deletes and places in
+one click, which makes it the first that would want a single undo entry
+rather than two.
 
 The empty hand's gesture is now **inspect** rather than the
 structure-selection tool originally planned for it — that slot is taken, so a
@@ -1982,9 +2251,12 @@ candidates are rate (every gate fires as fast as it can) and whether a gate
 may hold state between fires (only `Merge` does, and only by leaving an input
 loaded).
 
-The toolbelt is now **full**: ten slots for belt, underground and eight
-machines. A further machine needs either a slot-switching mechanism or a
-second page, which is the next piece of UI the vocabulary will demand.
+The toolbelt was full at ten slots, which is what prompted hiding machines
+and what the second row and the type menu answered. Twenty slots hold the
+thirteen current tools with room to spare, and a machine no longer has to
+earn a slot to exist — Swap and Sink came back on the strength of that alone.
+What is *not* solved is a bar with more tools than slots: a third row would
+need a key, and twenty is already more than the number row addresses.
 
 Per-machine configuration now has two worked examples and still no general
 mechanism, and the pair shows why one is wanted. `Source.F_EMIT` reuses an

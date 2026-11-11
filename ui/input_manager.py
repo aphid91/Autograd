@@ -61,7 +61,7 @@ import glfw
 from imgui_bundle import imgui
 
 from core.engine_paths import bresenham
-from core.toolbelt import SLOT_COUNT
+from core.toolbelt import ROW_SIZE as _ROW_SIZE
 
 STATE_IDLE = 0
 STATE_PLANNING = 1
@@ -122,7 +122,7 @@ class Intents:
         "drag_pan_px", "toggle_pause", "step_tick", "pipette",
         "copy_mode", "paste_mode", "exit_mode", "shift_held",
         "select_rect", "commit_select", "stamp_steps",
-        "erase_mode", "cut_mode", "commit_erase",
+        "erase_mode", "cut_mode", "commit_erase", "swap_rows",
     )
 
     def __init__(self):
@@ -146,7 +146,14 @@ class Intents:
         # use this to aim a belt from which part of the square was clicked.
         self.cursor_frac = (0.5, 0.5)
         self.cursor_in_world = False
-        self.select_slot = None    # slot index requested this frame
+        #: Slot *column* requested this frame, 0..9, or None. A column within
+        #: whichever row is active rather than a flat slot index: the
+        #: toolbelt owns which row the digits address, and the input manager
+        #: reports only which digit was pressed -- the same discipline that
+        #: has it report `R` rather than what `R` means.
+        self.select_slot = None
+        #: Tab: swap which row the number keys address.
+        self.swap_rows = False
         self.scroll_steps = 0.0    # scroll notches this frame
         self.scroll_at = None      # cursor position to anchor the zoom on
         self.drag_pan_px = (0.0, 0.0)   # camera drag delta, framebuffer px
@@ -348,11 +355,17 @@ class InputManager:
         it.frame_board = f_key and shift
 
         # --- toolbelt selection ---
-        # Number keys only: scroll is zoom now, Factorio-style.
+        # Number keys only: scroll is zoom now, Factorio-style. Reported as a
+        # *column* (0..9) -- which row it lands in is the toolbelt's business.
         for key, digit in _SLOT_KEYS.items():
             if self._edge(key, not want_kb):
-                it.select_slot = (SLOT_COUNT - 1) if digit == 0 else digit - 1
+                it.select_slot = (_ROW_SIZE - 1) if digit == 0 else digit - 1
                 break
+
+        # Tab swaps the active row. No modifier: it is frequent, and imgui
+        # only wants Tab while a text field has focus -- which `want_kb`
+        # already covers.
+        it.swap_rows = self._edge(glfw.KEY_TAB, not want_kb)
 
         # --- scroll: zoom, or walk the stamp history ---
         # shift+scroll in paste mode is the history walk, Factorio-style, so

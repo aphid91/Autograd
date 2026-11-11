@@ -68,6 +68,12 @@ def main():
     # See core/config.py.
     prefs = config.load()
     orch.ui.save_name = prefs["save_name"]
+    # The customised toolbar, for the same reasons and by the same route: the
+    # player's layout must not leak into a test run, so the Orchestrator takes
+    # it as plain data rather than reading the file. `None` (no saved layout)
+    # leaves `default_builders()` in place.
+    orch.apply_toolbar(
+        config.toolbar_from_data(prefs["toolbar"], len(orch.toolbelt.slots)))
 
     # Pick up the quicksave if there is one; otherwise start from the demo
     # layout, so a first run still has something on the board. This reads the
@@ -109,6 +115,15 @@ def main():
         if orch.ui.save_name_dirty:
             orch.ui.save_name_dirty = False
             prefs["save_name"] = orch.ui.save_name
+            config.save(prefs)
+
+        # Same treatment for the toolbar. Written on the edit rather than at
+        # shutdown for the reason above -- a crash or a kill must not lose an
+        # arrangement built up over a session -- and a slot change is a few
+        # keystrokes per hour, so there is nothing to batch.
+        if orch.toolbar_dirty:
+            orch.toolbar_dirty = False
+            prefs["toolbar"] = orch.toolbar_data()
             config.save(prefs)
 
         imgui.render()

@@ -25,6 +25,10 @@ const int SEG_ID_SHIFT  = 16, SEG_ID_MASK  = 0x7FFF;  // 15 bits: sign stays cle
 const int GHOST_NONE       = 0;
 const int GHOST_PENDING    = 1;
 const int GHOST_FRUSTRATED = 2;
+// A frustration whose occupant is exactly what the pending build wanted: the
+// stamp is lined up. Tinted differently so "already correct" does not read as
+// "blocked" -- see core/cell.py's GHOST_MATCHED.
+const int GHOST_MATCHED    = 3;
 
 // Type ids are generated from cell.TYPE_NAMES, and the per-type tables
 // further down from the Entity subclasses -- see core/glsl_types.py, which

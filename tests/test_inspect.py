@@ -156,10 +156,29 @@ def test_inspected_never_returns_a_stale_view():
 
 # --- the Source's emit value -----------------------------------------------
 def test_a_placed_source_starts_at_the_type_default():
-    """`initialise()` seeds EMIT_VALUE; a zeroed row would read 0.0."""
+    """`initialise()` seeds EMIT_VALUE over whatever the row last held.
+
+    EMIT_VALUE is 0.0 and so is a fresh row, so placing onto a clean row
+    asserts nothing about whether `initialise()` writes the field at all.
+    The test therefore **recycles a row that holds a different value**: place
+    a configured Source, erase it so the row returns to the free list, and
+    place another expecting the free list to hand the same row back. That is
+    the case a dropped `initialise()` would break -- a new Source inheriting
+    the previous one's setting.
+    """
+    first = engine.place_structure(Source, 10, 10)
+    row = first.row
+    first.emit_value = 77.5
+    engine.erase(10, 10)
+
     src = engine.place_structure(Source, 10, 10)
-    assert src.emit_value == Source.EMIT_VALUE, src.emit_value
-    ok(f"a placed Source emits {Source.EMIT_VALUE} by default")
+    assert src.row == row, (
+        f"expected the free list to reuse row {row}, got {src.row}; the test "
+        f"needs a recycled row to have anything to prove")
+    assert src.emit_value == Source.EMIT_VALUE, (
+        f"a placed Source emits {src.emit_value}, inherited from the erased "
+        f"one rather than reset to {Source.EMIT_VALUE}")
+    ok(f"a placed Source emits {Source.EMIT_VALUE}, even on a recycled row")
 
 
 def test_the_emit_value_is_per_instance():
@@ -174,7 +193,7 @@ def test_the_emit_value_is_per_instance():
     assert a.emit_value == 5.0
     assert b.emit_value == Source.EMIT_VALUE, (
         f"setting one Source changed another: {b.emit_value}")
-    assert Source.EMIT_VALUE == -1.0, "the class default should be untouched"
+    assert Source.EMIT_VALUE == 0.0, "the class default should be untouched"
     ok("two Sources held different emit values independently")
 
 
@@ -209,6 +228,11 @@ def test_changing_the_emit_value_flushes_material_in_flight():
     not having taken.
     """
     src = engine.place_structure(Source, 10, 10)
+    # A distinctive value, not the type default. The default is 0.0 now, which
+    # is also what an *absent* payload reads as -- so asserting the belt
+    # carries the default would pass on a belt carrying nothing, and the
+    # flush below would then have nothing to prove.
+    src.emit_value = 3.25
     for x in range(12, 20):
         engine.place_belt(x, 10, cell.DIR_PX)
     engine.sync_segments()
@@ -219,7 +243,7 @@ def test_changing_the_emit_value_flushes_material_in_flight():
     seg = engine.segments.at(13, 10)
     assert seg.count > 0, "need items in flight to flush"
     old = {engine.belts.payload_of(seg, k) for k in range(seg.head, seg.tail)}
-    assert old == {Source.EMIT_VALUE}, old
+    assert old == {3.25}, old
 
     orch._set_emit(src.row, 9.0)
     assert seg.count == 0, (
@@ -415,8 +439,11 @@ def test_a_placed_belt_is_not_seeded():
     view = board.entity_at(10, 10)
     assert not view.seed_on, "a freshly drawn belt must not be seeded"
     assert engine.segments.at(10, 10).count == 0
-    # The value still has its default, so ticking the box produces a visible
-    # item rather than an invisible zero.
+    # The value sits at the type default, ready for the box to be ticked.
+    # That default is 0.0 now, which a fresh row also reads as -- so this
+    # line no longer distinguishes "seeded the default" from "wrote nothing".
+    # `core/entity.py`'s self-check covers that on a dirtied row; here the
+    # load-bearing half is the flag being off.
     assert view.seed_value == Belt.SEED_VALUE, view.seed_value
     ok("a placed belt starts unseeded, with the default value ready")
 
@@ -777,3 +804,186 @@ def test_the_harness_never_inherits_the_players_filename():
             f"{cls.__name__}.__init__ reads the config; that would give the "
             f"test harness the player's own filename")
     ok("neither UI nor Orchestrator reads the player's config at construction")
+
+
+# --- the customisable toolbar ----------------------------------------------
+#
+# Same ownership concerns as the filename box, and one more: the toolbar is
+# the first *structured* thing in the config file, so the validation matters
+# as much as the round trip. A layout naming a machine this build does not
+# have must cost one slot, not the whole arrangement or a crash on startup.
+
+def test_the_type_menu_only_requests_a_slot_change():
+    """The panel hands over a description; the orchestrator resolves it.
+
+    Why it matters: the `"stamp"` kind's source is the live clipboard, which
+    the panel has no business reaching into. Keeping construction in the
+    orchestrator is what makes that boundary hold -- and it is the same
+    discipline `set_emit` and `set_seed` follow.
+    """
+    from core.builders import RawBeltBuilder, StructureBuilder
+
+    req = UIRequests()
+    assert req.set_slot is None, "no request by default"
+
+    # Structures carry a type name; the fixed kinds do not.
+    req.set_slot = (0, "structure", "Floor")
+    orch._set_slot(*req.set_slot)
+    assert isinstance(orch.toolbelt.slots[0], StructureBuilder)
+    assert orch.toolbelt.slots[0].entity_cls.__name__ == "Floor"
+
+    orch._set_slot(1, "raw_belt", None)
+    assert isinstance(orch.toolbelt.slots[1], RawBeltBuilder)
+
+    # A None kind is the menu's "Clear slot" -- distinct from an unknown kind.
+    orch._set_slot(1, None, None)
+    assert orch.toolbelt.slots[1] is None
+
+    # An unknown kind or machine fails softly and changes nothing.
+    orch.toolbelt.set_slot(2, None)
+    assert not orch._set_slot(2, "no_such_kind", None)
+    assert not orch._set_slot(2, "structure", "NoSuchMachine")
+    assert orch.toolbelt.slots[2] is None
+    ok("the type menu's request resolved, cleared, and failed softly")
+
+
+def test_assigning_a_slot_marks_the_layout_dirty_but_writes_nothing():
+    """`app.py` persists; the orchestrator only flags. Same rule as save_name.
+
+    The harness builds a real Orchestrator, so an orchestrator that wrote the
+    file itself would have every test run overwrite the player's toolbar.
+    """
+    orch.toolbar_dirty = False
+    orch._set_slot(0, "structure", "Floor")
+    assert orch.toolbar_dirty, "a slot change must flag the layout for saving"
+
+    # And nothing in the apply path reaches for the config module.
+    from orchestrator import Orchestrator
+    names = Orchestrator._set_slot.__code__.co_names
+    assert "save" not in names, (
+        "_set_slot writes the config file; app.py owns that")
+    ok("assigning a slot flagged the layout without writing a file")
+
+
+def test_the_toolbar_round_trips_through_the_config():
+    """Every default tool must survive describe -> JSON -> make.
+
+    Swept over the whole default layout rather than one example, because the
+    failure mode is per *kind*: a tool with no `describe_builder()` branch
+    saves as an empty slot, silently, and only for players who happened to
+    have that tool somewhere in their bar.
+    """
+    import json
+    from core.builders import default_builders
+    from core.toolbelt import SLOT_COUNT
+
+    tools = default_builders()
+    slots = list(tools) + [None] * (SLOT_COUNT - len(tools))
+    data = config.toolbar_to_data(slots)
+    assert len(data) == SLOT_COUNT, len(data)
+    # Every real tool described itself. An un-describable one would be None
+    # here and would come back as an empty slot.
+    for i, tool in enumerate(tools):
+        assert data[i] is not None, (
+            f"{type(tool).__name__} has no describe_builder() branch, so it "
+            f"would vanish from a saved toolbar")
+
+    # It has to survive actual JSON, not just a dict round trip -- tuples
+    # become lists and that is where a seed pair can break.
+    back = config.toolbar_from_data(json.loads(json.dumps(data)), SLOT_COUNT)
+    assert back is not None
+    assert [getattr(t, "name", None) for t in back] == \
+        [getattr(t, "name", None) for t in slots]
+    ok(f"all {len(tools)} default tools round-tripped through JSON")
+
+
+def test_a_baked_stamp_round_trips_with_its_contents():
+    """A stamp tool is the one kind carrying data rather than just a name.
+
+    And the data is exactly the per-instance settings the matched-ghost
+    feature exists to apply, so losing them on a restart would quietly
+    defeat the reason for baking a stamp in the first place.
+    """
+    import json
+    from core.builders import (StampBuilder, describe_builder, make_builder,
+                               stamp_from_data)
+    from core.stamp import Stamp, StampEntry
+
+    stamp = Stamp([
+        StampEntry(Source, 0, 0, cell.DIR_PY, emit=5.5),
+        StampEntry(Belt, 2, 0, cell.DIR_NX, seed=(True, -3.25)),
+    ])
+    desc = json.loads(json.dumps(describe_builder(StampBuilder(stamp))))
+    tool = make_builder("stamp", stamp=stamp_from_data(desc["stamp"]))
+    assert tool is not None
+
+    got = [(e.entity_cls.__name__, e.dx, e.dy, e.direction, e.emit, e.seed)
+           for e in tool.stamp.entries]
+    assert got == [("Source", 0, 0, cell.DIR_PY, 5.5, None),
+                   ("Belt", 2, 0, cell.DIR_NX, None, (True, -3.25))], got
+    ok("a baked stamp kept its emit value, its seed and its orientations")
+
+
+def test_a_saved_layout_survives_an_unknown_entry():
+    """One bad slot must cost one slot.
+
+    The file is hand-editable and an older version may have written it, so
+    an entry naming a machine that no longer exists is a thing that will
+    happen. Refusing the whole layout would discard an arrangement built up
+    over sessions; shifting the remaining tools left would be worse, since
+    position *is* the content -- so a bad entry becomes an empty slot and
+    everything around it stays put.
+    """
+    data = [
+        {"kind": "belt"},
+        {"kind": "structure", "type": "NoSuchMachine"},
+        {"kind": "raw_belt"},
+        "not even a dict",
+        {"kind": "structure", "type": "Floor"},
+    ]
+    back = config.toolbar_from_data(data, 6)
+    names = [getattr(t, "name", None) for t in back]
+    assert names == ["Belt", None, "Raw belt", None, "Floor", None], names
+    ok("an unknown entry emptied its own slot and shifted nothing")
+
+
+def test_no_saved_layout_leaves_the_defaults_alone():
+    """The first-run path: an absent layout must not blank the bar."""
+    from core.toolbelt import SLOT_COUNT
+
+    assert config.toolbar_from_data([], SLOT_COUNT) is None
+    assert config.toolbar_from_data(None, SLOT_COUNT) is None
+    assert config.toolbar_from_data("junk", SLOT_COUNT) is None
+    # And `apply_toolbar(None)` is the no-op that relies on it.
+    before = [getattr(t, "name", None) for t in orch.toolbelt.slots]
+    assert not orch.apply_toolbar(None)
+    after = [getattr(t, "name", None) for t in orch.toolbelt.slots]
+    assert after == before, "apply_toolbar(None) changed the bar"
+
+    # The default layout is unchanged by this feature existing: a first run
+    # still gets exactly `default_builders()` in order.
+    from core.builders import default_builders
+    assert before[:len(default_builders())] == \
+        [t.name for t in default_builders()]
+    ok("no saved layout left the default bar exactly as it was")
+
+
+def test_the_config_default_for_the_toolbar_is_an_empty_layout():
+    """A config file predating the toolbar must load without a toolbar key."""
+    import json
+
+    with tempfile.TemporaryDirectory() as d:
+        path = os.path.join(d, "old_config.json")
+        with open(path, "w", encoding="utf-8") as fh:
+            json.dump({"save_name": "mybase.npz"}, fh)
+        loaded = config.load(path)
+        assert loaded["save_name"] == "mybase.npz"
+        assert loaded["toolbar"] == [], loaded["toolbar"]
+
+        # And a round trip through save() keeps both keys.
+        loaded["toolbar"] = [{"kind": "belt"}]
+        assert config.save(loaded, path)
+        again = config.load(path)
+        assert again["toolbar"] == [{"kind": "belt"}], again["toolbar"]
+        assert again["save_name"] == "mybase.npz"
+    ok("an older config loaded with an empty layout and saved both keys")

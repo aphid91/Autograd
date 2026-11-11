@@ -146,10 +146,17 @@ class Entity:
     FIRE_SELECT = 2
     FIRE_RULE = FIRE_ALL
 
-    #: Value a Source emits. Only meaningful for types with no inputs; one
-    #: day this becomes per-instance configuration, hence the class attribute
-    #: rather than a literal in the tick.
-    EMIT_VALUE = -1.0
+    #: Value a *freshly placed* Source emits. The live value is per instance,
+    #: in the row at `Source.F_EMIT`; this is only the starting point, which
+    #: is why it stays a class attribute rather than a literal in the tick.
+    #:
+    #: Zero rather than a non-zero marker: a Source's job is to be configured,
+    #: and starting at an arithmetically neutral value means placing one does
+    #: not inject a number the player has to notice and correct. Note this
+    #: makes the class default indistinguishable from a zeroed row -- see
+    #: `Source.initialise()`, which is what keeps "placed" and "never
+    #: initialised" from collapsing into each other.
+    EMIT_VALUE = 0.0
 
     # --- appearance ------------------------------------------------------
     # Declared here, beside the ports, so a machine is defined in exactly one
@@ -681,9 +688,14 @@ class Belt(Entity):
     F_SEED_ON = Entity._GATE_FIELDS_END + 0
     F_SEED_VALUE = Entity._GATE_FIELDS_END + 1
 
-    #: What a freshly ticked seed box starts at, so switching the checkbox on
-    #: produces a visible item rather than an invisible zero.
-    SEED_VALUE = 1.0
+    #: What a freshly ticked seed box starts at.
+    #:
+    #: Zero, matching a Source's default (see `Entity.EMIT_VALUE`): the two
+    #: are the only per-instance values the player configures, and they should
+    #: start from the same neutral place. A seeded zero is still **visible** --
+    #: the disc's ring tints by sign, and zero reads as red -- so ticking the
+    #: box produces something to look at even though the number is nothing.
+    SEED_VALUE = 0.0
 
     def initialise(self, x, y, direction, is_ghost=False, flipped=False,
                    seed_on=False, seed_value=None):
@@ -1401,24 +1413,33 @@ class Sink(Structure):
         return port_index // 2
 
 
-#: Every placeable structure, in the order the toolbelt offers them. Belt and
-#: underground belt take slots 1 and 2, so this list starts at slot 3.
+#: Every placeable structure, in the order the toolbelt's **default** layout
+#: offers them. The belt tools take the first slots, so this list starts after
+#: them -- but the toolbelt is customisable and persisted now, so this is the
+#: starting arrangement rather than the arrangement.
 #:
-#: **Hidden machines stay defined.** `Swap` and `Sink` are deliberately absent
-#: -- Swap pending a rethink, Sink because a dangling output now destroys what
-#: it is sent and so does the same job without occupying a slot. Both classes
-#: remain registered with their type ids, so a saved board containing one
-#: still loads, draws and simulates correctly; only the *tool* is gone.
-#:
-#: That is the whole cost of hiding a machine, which is the point: placement,
-#: the GLSL tables and the type registry all derive from the classes, while
-#: the toolbelt derives from this tuple.
-STRUCTURES = (Shear, Source, Route, Merge, Reciprocal, Max, Mac, Floor)
+#: `Swap` and `Sink` are back. They were hidden when the toolbelt had exactly
+#: ten slots and every one was spoken for, which made "is this machine worth a
+#: slot?" a real question -- Sink lost it to the rule that a dangling output
+#: destroys what it is sent, and so does a sink's job without taking a slot.
+#: With two rows and a right-click menu that question is gone: a machine the
+#: player never picks costs nothing, and *not* offering one meant `Q` on a
+#: Sink already on the board did nothing at all, since the pipette resolves a
+#: type through its tool. Sink is still redundant for discarding an output --
+#: leave the face unconnected instead -- but it is no longer unreachable.
+STRUCTURES = (Shear, Source, Route, Merge, Reciprocal, Max, Mac, Floor,
+              Swap, Sink)
 
-#: Machines defined but not offered by the toolbelt. Named so the self-check
-#: and the GLSL tests can still cover their geometry -- a hidden machine that
-#: an old save can resurrect must stay as correct as a placeable one.
-HIDDEN_STRUCTURES = (Swap, Sink)
+#: Machines defined but not offered by the toolbelt's type menu.
+#:
+#: Empty today. Kept as a mechanism rather than deleted, because the split it
+#: expresses is the load-bearing one: `STRUCTURES` is what the *tools* derive
+#: from and `ALL_STRUCTURES` is what anything reasoning about *types*
+#: iterates. A machine put here stays registered with its type id, so a saved
+#: board containing one still loads, draws and simulates -- only the tool goes
+#: away. That asymmetry is what made hiding a machine cost one line, and it is
+#: worth keeping available.
+HIDDEN_STRUCTURES = ()
 
 #: Every machine, placeable or not. What anything reasoning about *types*
 #: rather than about *tools* should iterate.
@@ -1483,9 +1504,12 @@ def _self_check():
 
     # Source emits its constant; Sink emits nothing at all.
     src = _view(Source)
-    # A bare view sits on a zeroed row, so its emit value is 0.0 -- `spawn()`
-    # is what seeds EMIT_VALUE, via Source.initialise(). Assert what fire()
-    # actually promises: whatever this instance holds, on every channel.
+    # A bare view sits on a zeroed row, so its emit value is 0.0. Note this
+    # now *coincides* with EMIT_VALUE rather than differing from it, so this
+    # pair of assertions no longer distinguishes "spawn() seeded the default"
+    # from "nobody wrote anything" -- the explicit non-default checks below
+    # are what carry that weight. Assert what fire() actually promises:
+    # whatever this instance holds, on every channel.
     assert src.emit_value == 0.0, "a zeroed row should read as 0.0"
     assert src.fire([]) == [0.0] * Source.out_channels()
     assert len(src.fire([])) == Source.out_channels()
@@ -1525,6 +1549,14 @@ def _self_check():
 
     # initialise() seeds the *value* default but leaves the flag off, so a
     # belt drawn by the ordinary path never injects until it is asked to.
+    #
+    # Dirty both fields first. SEED_VALUE is 0.0, which a zeroed row already
+    # reads as, so initialising a fresh view would assert nothing about
+    # whether initialise() writes the field at all -- it has to be seen
+    # *overwriting* something. Same reasoning applies to the flag: a recycled
+    # row can arrive with a seed left on it.
+    blt.seed_on = True
+    blt.seed_value = 99.0
     blt.initialise(1, 2, cell.DIR_PX)
     assert not blt.seed_on, "a freshly placed belt must not be seeded"
     assert blt.seed_value == Belt.SEED_VALUE, blt.seed_value
@@ -1544,9 +1576,12 @@ def _self_check():
     seeded_belt.initialise(0, 0, cell.DIR_PY, seed_on=True, seed_value=3.5)
     assert seeded_belt.seed_on and seeded_belt.seed_value == 3.5
 
-    # initialise() seeds the class default, which is how a placed Source
-    # starts at EMIT_VALUE rather than at 0.0.
+    # initialise() seeds the class default. Dirtied first for the same reason
+    # the belt's seed is: EMIT_VALUE is 0.0 and so is a zeroed row, and an
+    # assertion that cannot tell "wrote the default" from "wrote nothing"
+    # would survive initialise() dropping the field entirely.
     seeded = _view(Source)
+    seeded.emit_value = 99.0
     seeded.initialise(3, 4, cell.DIR_PX)
     assert seeded.emit_value == Source.EMIT_VALUE, seeded.emit_value
     override = _view(Source)

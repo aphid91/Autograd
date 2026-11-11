@@ -396,7 +396,7 @@ class Gameboard:
         return view
 
     # --- frustration overlay --------------------------------------------
-    def set_frustrated(self, x, y):
+    def set_frustrated(self, x, y, matched=False):
         """Mark a cell as wanted-but-unavailable, leaving its occupant intact.
 
         This writes only the ghost field of .z. The cell's .x -- type,
@@ -404,12 +404,17 @@ class Gameboard:
         so the renderer draws the existing entity and tints it rather than
         replacing it. That is the whole point of a frustrated cell: you can see
         what is in your way.
+
+        `matched` writes the GHOST_MATCHED flavour instead: the occupant *is*
+        what we were about to place. Same overlay, same untouched `.x`, same
+        bookkeeping -- only the tint and the meaning of a click differ, which
+        is why it is a parameter here rather than a second method.
         """
         if not self.in_bounds(x, y):
             return
         z = int(self.grid[y, x, cell.CH_Z])
         self.grid[y, x, cell.CH_Z] = cell.with_ghost_state(
-            z, cell.GHOST_FRUSTRATED
+            z, cell.GHOST_MATCHED if matched else cell.GHOST_FRUSTRATED
         )
         self._frustrated.append((x, y))
         self.mark_dirty(x, y)
@@ -430,7 +435,11 @@ class Gameboard:
             if not self.in_bounds(x, y):
                 continue
             z = int(self.grid[y, x, cell.CH_Z])
-            if cell.ghost_state(z) == cell.GHOST_FRUSTRATED:
+            # Both flavours -- `is_frustrated()` covers matched as well, which
+            # is exactly why it is the broad test. Checking for the plain
+            # state alone would leave every matched tint stuck on the board
+            # after the preview moved away.
+            if cell.is_frustrated(z):
                 self.grid[y, x, cell.CH_Z] = cell.with_ghost_state(
                     z, cell.GHOST_NONE
                 )

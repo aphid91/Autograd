@@ -36,6 +36,16 @@ DEFAULTS = {
     # an untouched text box behaving exactly as the buttons did before it
     # existed. Not None: imgui's text input deals in strings.
     "save_name": "",
+    # The customised toolbar: one entry per slot, flat across both rows, each
+    # either None for an empty slot or a `describe_builder()` dict. An empty
+    # list means "no saved layout", which falls back to `default_builders()`
+    # -- so a first run looks exactly as it did before this existed.
+    #
+    # Unlike `save_name` this is structured data, and it comes from a file the
+    # player can edit. `load()` validates its *shape* here and
+    # `toolbar_from_data()` validates the contents, because a bad entry must
+    # cost one slot rather than the whole layout.
+    "toolbar": [],
 }
 
 
@@ -76,6 +86,61 @@ def save(values, path=CONFIG_PATH):
     except OSError:
         return False
     return True
+
+
+def toolbar_to_data(slots):
+    """The toolbelt's slots as JSON-safe plain data.
+
+    `slots` is the flat list across both rows, so the saved layout is
+    row-agnostic -- which row is "up" is session state, not a preference, and
+    persisting it would mean a restart could silently re-aim the number keys.
+
+    A tool that cannot describe itself saves as an empty slot rather than
+    being skipped, because **position is the content here**: dropping an
+    entry would shift every later tool one slot left on the next launch.
+    """
+    from core.builders import describe_builder
+    return [describe_builder(t) for t in slots]
+
+
+def toolbar_from_data(data, slot_count):
+    """Rebuild a flat slot list from `toolbar_to_data()`.
+
+    Returns a list of exactly `slot_count` entries (tools or None), or None if
+    there is no usable layout at all -- which is the signal to fall back to
+    the defaults rather than to start with an empty bar.
+
+    **Per-slot validation.** An entry naming a kind or machine this build does
+    not have empties that one slot and leaves the rest alone. That is the
+    behaviour a hand-edited file and a version change both want: losing one
+    tool is obvious and fixable in two clicks, while refusing the whole layout
+    would silently discard an arrangement the player built up over sessions.
+
+    A layout longer than the bar is truncated and a shorter one is padded, so
+    changing `SLOT_COUNT` does not invalidate a saved file.
+    """
+    from core.builders import make_builder, stamp_from_data
+    if not isinstance(data, list) or not data:
+        return None
+    out = []
+    for item in data[:slot_count]:
+        if not isinstance(item, dict):
+            out.append(None)
+            continue
+        kind = item.get("kind")
+        stamp = None
+        if kind == "stamp":
+            stamp = stamp_from_data(item.get("stamp"))
+        name = item.get("name")
+        tool = make_builder(kind, type_name=item.get("type"), stamp=stamp)
+        if tool is not None and kind == "stamp" and isinstance(name, str):
+            # A baked stamp's name is the only label the player can have
+            # chosen, so it is worth carrying back rather than regenerating
+            # it from the bounds.
+            tool.name = name
+        out.append(tool)
+    out.extend([None] * (slot_count - len(out)))
+    return out
 
 
 def resolve_save_path(name, default):

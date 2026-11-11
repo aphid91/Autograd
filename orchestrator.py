@@ -26,7 +26,7 @@ import os
 import glfw
 
 from core import config, persistence
-from core.builders import PasteBuilder, default_builders
+from core.builders import PasteBuilder, default_builders, make_builder
 from core.clipboard import Clipboard, MODE_COPY, MODE_PASTE, capture
 from core.entity import Belt, Source
 from render.camera import Camera
@@ -56,6 +56,11 @@ class Orchestrator:
         self.paste_tool = None
         #: Live selection rectangle in cells, or None. Drawn by the camera.
         self.select_rect = None
+        #: Set when the toolbar layout changes, so `app.py` knows to persist
+        #: it. The orchestrator does not write files itself -- same discipline
+        #: as `UI.save_name_dirty`, and for the same reason (see
+        #: core/config.py: a test harness builds a real Orchestrator).
+        self.toolbar_dirty = False
 
         self.cursor_cell = None
         #: Entity row the Status window is inspecting, or None when closed.
@@ -202,8 +207,19 @@ class Orchestrator:
         self.select_rect = None
         self._on_tool_changed()
 
+    def _select_column(self, column):
+        """Pick a slot by its *column* in the active row -- what a digit means.
+
+        The number keys and the panel's buttons speak different languages on
+        purpose: a digit names a column within whichever row is up, while a
+        clicked button already knows its flat index. Resolving the column
+        here, against the toolbelt's own `row_start`, keeps the input manager
+        from having to know which row is active.
+        """
+        return self._select_slot(self.toolbelt.row_start + column)
+
     def _select_slot(self, slot):
-        """Pick a toolbelt slot, leaving any clipboard mode on the way.
+        """Pick a toolbelt slot by flat index, leaving any clipboard mode.
 
         **Picking a tool wins over the stash.** Every other way out of a mode
         restores what the player was holding when they entered it, because
@@ -226,6 +242,133 @@ class Orchestrator:
             self._on_tool_changed()
             return True
         return False
+
+    def _set_slot(self, slot, kind, type_name):
+        """Apply the right-click type menu's choice to a slot.
+
+        The panel hands over a *description* and this resolves it, which is
+        what keeps builder construction out of the UI -- and is load-bearing
+        for the `"stamp"` kind, whose source is the live clipboard the panel
+        should not be reaching into.
+
+        Three things worth knowing:
+
+        - **A `None` kind clears the slot.** Distinct from an unknown kind,
+          which is a failure; this is the menu's "Clear slot".
+        - **The selection is left alone.** Re-assigning the slot you are
+          holding should leave you holding that slot with its new tool, so
+          `set_slot()` does not touch `selected`. But any in-flight gesture
+          belongs to the *old* tool, so it is abandoned when the slot being
+          changed is the one in hand.
+        - **It marks the layout dirty**, not saved. Writing the file is
+          `app.py`'s job -- see core/config.py on why nothing here touches
+          the player's config.
+        """
+        if kind is None:
+            tool = None
+        else:
+            stamp = self.clipboard.stamp if kind == "stamp" else None
+            if kind == "stamp" and not stamp:
+                # Nothing to bake. The menu only offers this with a stamp in
+                # hand, so reaching here means the clipboard changed between
+                # the menu being drawn and this running.
+                return False
+            tool = make_builder(kind, type_name=type_name, stamp=stamp)
+            if tool is None:
+                return False
+        if not self.toolbelt.set_slot(slot, tool):
+            return False
+        self.toolbar_dirty = True
+        if slot == self.toolbelt.selected:
+            self._on_tool_changed()
+        return True
+
+    def toolbar_data(self):
+        """The current layout as plain data, for `app.py` to persist."""
+        return config.toolbar_to_data(self.toolbelt.slots)
+
+    def apply_toolbar(self, slots):
+        """Install a saved layout. Called by `app.py`, never implicitly.
+
+        `slots` is a flat list across both rows, as `config.toolbar_from_data`
+        produces. A `None` argument means "no saved layout" and leaves the
+        defaults in place, which is what makes a first run look unchanged.
+        """
+        if slots is None:
+            return False
+        for i, tool in enumerate(slots):
+            self.toolbelt.set_slot(i, tool)
+        # The hand may now hold a slot whose tool changed underneath it.
+        self._on_tool_changed()
+        return True
+
+    def _substitute(self, tool, plan):
+        """Replace lined-up entities with the plan that matched them.
+
+        The point of the whole matched-ghost mechanism. Per-instance settings
+        -- a Source's emitted value, a belt's seed -- are reachable only one
+        entity at a time through the Status window, so changing twenty Sources
+        means twenty trips. With this, the player configures *one*, copies it,
+        rotates the stamp until it lines up, and clicks: the old entities go
+        and the configured copies take their exact places.
+
+        Returns the plan to commit, or None if substitution does not apply --
+        in which case the caller leaves the plan blocked and the red tint
+        stands, exactly as before.
+
+        **Erase everything first, then re-plan.** Three reasons, and the order
+        is load-bearing:
+
+        - The plan in hand was computed against the *occupied* board, so
+          every placement carries `blocked_cells` and `buildable` is empty.
+          It cannot be committed as-is; the board has to be cleared and the
+          gesture re-planned against the result.
+        - Erasing one underground end releases its partner
+          (`Engine.unpair_under`), so deleting and re-planning per placement
+          would let a half-deleted pair re-pair against a survivor. Clearing
+          the whole matched set up front means the re-plan sees no
+          half-states.
+        - `Engine.erase()` invalidates segments, which is correct and is the
+          same cost any edit pays.
+
+        Guarded on the re-plan actually succeeding. If anything still clashes
+        the substitution is abandoned -- but the erase has already happened,
+        so this reports the new plan rather than the old one and lets the
+        caller refuse on current facts.
+        """
+        if plan is None or tool is None:
+            return None
+        rows = self.engine.matched_rows(plan)
+        if not rows:
+            # None  -> something clashes that is not a match.
+            # []    -> nothing was blocked, so there is nothing to substitute
+            #          and the caller's own `blocked` test already said so.
+            return None
+
+        # Drop the preview before erasing. Its ghosts occupy real cells, and
+        # the re-plan below must not see them -- the same hazard
+        # Engine.preview() exists to avoid.
+        #
+        # **Defensive rather than load-bearing**, and mutation-testing says
+        # so: `_preview()` goes through `Engine.preview()`, which clears the
+        # old preview itself before planning, so removing this line changes
+        # nothing today. It stays because the erase loop below runs *between*
+        # here and that clear, and it should not be reasoning about somebody
+        # else's cells while the tool's own ghosts are still on the board --
+        # `erase()` takes an entity from any one of its cells, and a ghost
+        # sharing a cell with a matched row is a state worth not creating.
+        self.engine.clear_ghosts()
+        for row in rows:
+            if not self.engine.board.is_row_alive(row):
+                continue
+            ox, oy = self.engine.board.view(row).origin
+            self.engine.erase(ox, oy)
+
+        self._preview(tool)
+        fresh = self.last_plan
+        if fresh is None or (fresh.all_or_nothing and not fresh.ok):
+            return None
+        return fresh
 
     def _capture_selection(self, rect):
         """Turn a released selection rectangle into a stamp.
@@ -500,8 +643,15 @@ class Orchestrator:
 
         # 3. toolbelt selection. Changing tools drops any in-flight preview --
         # a half-drawn belt run means nothing to the structure tool.
+        #
+        # Tab is handled first, so a digit pressed in the same frame addresses
+        # the row the player just swapped to. It deliberately does **not**
+        # touch the hand or any in-flight gesture: Tab re-aims the number keys
+        # and nothing more, so tabbing mid-belt-run keeps the run.
+        if intents.swap_rows:
+            self.toolbelt.swap_rows()
         if intents.select_slot is not None:
-            self._select_slot(intents.select_slot)
+            self._select_column(intents.select_slot)
 
         # Q: pick up or put down. In copy or paste mode it means neither --
         # it leaves the mode with an *empty* hand, dropping the stashed tool
@@ -598,6 +748,25 @@ class Orchestrator:
             # must keep showing why: leave the tint in place.
             plan = self.last_plan
             blocked = plan is not None and plan.all_or_nothing and not plan.ok
+            if blocked and not intents.shift_held:
+                # ...unless every clash is a **match**: the cells it wants are
+                # already occupied by exactly what it was going to put there.
+                # Then the player is lining a stamp up over existing machines
+                # to re-stamp them with new settings, so substitute.
+                #
+                # The `shift_held` half is **defensive rather than
+                # load-bearing**, and mutation-testing says so: shift makes a
+                # paste `partial`, which makes the plan not `all_or_nothing`,
+                # so `blocked` is already False and this branch is
+                # unreachable under shift. It stays because that reasoning
+                # runs through two other objects -- the modifier reaching
+                # PasteBuilder and the policy reaching BuildPlan -- and a
+                # tool that was all-or-nothing *and* honoured shift would
+                # otherwise silently acquire substitution. Saying "bare
+                # clicks only" here costs one condition and does not depend
+                # on the paste policy staying as it is.
+                plan = self._substitute(tool, plan)
+                blocked = plan is None
             if not blocked:
                 # A pasted underground pair must join to *itself* rather than
                 # to whatever happens to sit near the paste site, so the
@@ -630,10 +799,16 @@ class Orchestrator:
             self.camera.frame_board(viewport)
         if requests.clear_board:
             engine.clear_board()
+        if requests.swap_rows:
+            self.toolbelt.swap_rows()
         if requests.select_slot is not None:
             # Same path as the number keys, so clicking a slot in the bar
             # leaves a clipboard mode exactly as pressing its digit does.
+            # A *flat* index, unlike the keys' column -- a clicked button
+            # knows which row it is in and so can select across rows.
             self._select_slot(requests.select_slot)
+        if requests.set_slot is not None:
+            self._set_slot(*requests.set_slot)
         # The panel's R / F buttons go through the same path as the keys, so
         # they transform the stamp in paste mode rather than reaching past it
         # into the toolbelt.

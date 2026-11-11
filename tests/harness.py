@@ -24,8 +24,10 @@ import moderngl
 from imgui_bundle import imgui
 
 from core import cell
+from core.builders import default_builders
 from core.clipboard import MODE_OFF
 from core.tick import PHASE_BELT, TICKS_PER_SEC
+from core.toolbelt import ROW_COUNT, ROW_SIZE
 
 W, H = 1024, 768
 BOARD = 64
@@ -122,6 +124,22 @@ def reset():
     # preview its one-cell idle run, and a scenario opening with
     # `live_count == 0` would fail on a board it never touched.
     orch.toolbelt.clear()
+    # The **layout** is global state too, and in two parts. A scenario that
+    # re-assigned a slot through the type menu would otherwise hand the next
+    # one a bar it never asked for -- and since `select_tool()` finds a tool
+    # by name, a missing or duplicated tool makes an unrelated scenario fail
+    # with a StopIteration a long way from the cause. Restoring the defaults
+    # also keeps the harness independent of the player's persisted bar: it
+    # never loads one, and now it cannot acquire one either.
+    for i, tool in enumerate(default_builders()):
+        orch.toolbelt.set_slot(i, tool)
+    for i in range(len(default_builders()), len(orch.toolbelt.slots)):
+        orch.toolbelt.set_slot(i, None)
+    # And which row the digits address: `select_tool()` tabs to reach row 2,
+    # so leaving the row swapped would have every later scenario's digits
+    # land on the wrong tools.
+    orch.toolbelt.row = 0
+    orch.toolbar_dirty = False
     # The clipboard is global state like everything else here: a scenario
     # that left copy or paste mode on would hand the next one a different
     # gesture machine, and a leftover stamp history would make a paste test
@@ -268,19 +286,36 @@ def press_key(key, frames=1):
 
 
 def select_tool(name):
-    """Press the number key whose slot holds the named tool.
+    """Press the keys that select the named tool, Tab included if needed.
 
     By name rather than by digit: the slot order shifts whenever a tool is
     added, and every scenario cares about *which tool*, never which key
-    reaches it.
+    reaches it. That indirection is what kept the suite working when two
+    machines came back onto the bar and pushed everything after them along.
+
+    Goes through the **real keys** rather than calling `Toolbelt.select()`,
+    deliberately: a scenario asking for a tool should exercise the same path
+    the player uses, so a break in digit mapping or row swapping surfaces
+    here rather than only in the one test that covers it directly.
     """
     idx = next(i for i, s in enumerate(orch.toolbelt.slots)
                if s is not None and s.name == name)
-    assert idx < 10, f"{name} is past the number keys"
-    digit = 0 if idx == 9 else idx + 1
+    row, col = idx // ROW_SIZE, idx % ROW_SIZE
+    # Tab until the tool's row is the one the digits address. A loop rather
+    # than a single press so this still works if ROW_COUNT ever grows.
+    for _ in range(ROW_COUNT):
+        if orch.toolbelt.row == row:
+            break
+        press_key(glfw.KEY_TAB)
+    assert orch.toolbelt.row == row, (
+        f"could not tab to row {row} holding {name}")
+    digit = 0 if col == ROW_SIZE - 1 else col + 1
     key = next(k for k, d in _SLOT_DIGITS.items() if d == digit)
     press_key(key)
-    assert orch.toolbelt.active.name == name, orch.toolbelt.active.name
+    assert orch.toolbelt.active is not None \
+        and orch.toolbelt.active.name == name, (
+            f"selecting {name} landed on "
+            f"{getattr(orch.toolbelt.active, 'name', None)}")
     return orch.toolbelt.active
 
 

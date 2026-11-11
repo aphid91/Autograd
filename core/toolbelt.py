@@ -1,19 +1,39 @@
 """Toolbelt: the Factorio-style slot bar. At most one tool is active.
 
-Ten slots, selected with 1..9,0. Slots beyond the available tools stay visible
-but empty, so the bar's shape is stable as tools are added. The UI splits it
-visually between slots 5 and 6.
+**Two rows of ten.** The number keys address the *active* row and `Tab` swaps
+which row that is, so twenty tools are reachable with one modifier-free key
+each. The rows are a view onto one flat `slots` list -- row `r` owns indices
+`r*ROW_SIZE .. (r+1)*ROW_SIZE`, and `selected` is an index into that flat list
+rather than a (row, column) pair. That matters at every call site: a stashed
+slot, a persisted layout and `select_tool_for()`'s answer are all one integer,
+and none of them has to agree with the orchestrator about which row is up.
+
+`Tab` therefore changes which digits reach which tools **without changing what
+is held.** Swapping rows mid-gesture would otherwise be a silent tool change.
 
 **The default state is an empty hand**, and it is a real state rather than
 "an empty slot happens to be selected". `selected` is NO_SELECTION then, no
-slot is highlighted, and clicking the board does nothing. That distinction
-matters because an empty slot is still a *slot* -- selecting one is a
-deliberate act that should look different from holding nothing, and a future
-structure-selection tool will live on the empty hand rather than on slot 7.
+slot is highlighted, and clicking the board inspects rather than builds. That
+distinction matters because an empty slot is still a *slot* -- selecting one
+is a deliberate act that should look different from holding nothing, and the
+inspect gesture lives on the empty hand rather than on a slot.
 """
 
-SLOT_COUNT = 10
-SPLIT_AFTER = 5  # the visual gap falls between this slot and the next
+#: Slots per row, and the number of rows. Ten per row because that is what the
+#: number row addresses. Two places assume it: `ui/input_manager.py` maps a
+#: digit to a column, and `Orchestrator._select_column()` adds the active
+#: row's offset. The split is deliberate -- the input layer reports which
+#: digit was pressed and the orchestrator decides which slot that reaches,
+#: the same division that has input report `R` rather than what `R` means.
+ROW_SIZE = 10
+ROW_COUNT = 2
+
+#: Total slots. Kept as the old name because it is what the panel's layout and
+#: the input manager's digit clamp both mean by "how many slots are there".
+SLOT_COUNT = ROW_SIZE * ROW_COUNT
+
+#: The visual gap, within a row, falls between this column and the next.
+SPLIT_AFTER = 5
 
 #: `selected` when the hand is empty. Not a valid slot index.
 NO_SELECTION = -1
@@ -27,7 +47,33 @@ class Toolbelt:
         # The hand starts empty, Factorio-style: nothing is held until the
         # player picks something up.
         self.selected = NO_SELECTION
+        #: Which row the number keys address. Independent of `selected`, so
+        #: swapping rows never changes what is held.
+        self.row = 0
 
+    # --- rows ------------------------------------------------------------
+    @property
+    def row_start(self):
+        """Flat index of the active row's first slot."""
+        return self.row * ROW_SIZE
+
+    def swap_rows(self):
+        """Tab: make the other row the one the number keys address.
+
+        **Holds nothing and drops nothing.** The hand keeps whatever it has,
+        even when that tool now sits on the inactive row -- a row swap is a
+        change of *addressing*, not of state, and silently clearing the hand
+        (or jumping to the same column in the new row) would make Tab a
+        destructive key mid-gesture.
+        """
+        self.row = (self.row + 1) % ROW_COUNT
+        return True
+
+    def row_of(self, index):
+        """Which row a flat slot index belongs to."""
+        return index // ROW_SIZE
+
+    # --- queries ---------------------------------------------------------
     @property
     def active(self):
         """The active builder, or None for an empty hand or an empty slot."""
@@ -50,11 +96,27 @@ class Toolbelt:
         self.selected = NO_SELECTION
 
     def select(self, index):
-        """Select a slot by index. Empty slots are selectable (tool = None)."""
+        """Select a slot by flat index. Empty slots are selectable (tool=None).
+
+        Takes a flat index rather than a column, so a caller restoring a
+        stashed slot or applying a persisted layout needs to know nothing
+        about which row is currently up.
+        """
         if 0 <= index < SLOT_COUNT:
             self.selected = index
             return True
         return False
+
+    def set_slot(self, index, builder):
+        """Put `builder` in a slot, or None to empty it. For the type menu.
+
+        Does not change the selection: re-assigning the slot you are holding
+        should leave you holding that slot, now with the new tool in it.
+        """
+        if not 0 <= index < SLOT_COUNT:
+            return False
+        self.slots[index] = builder
+        return True
 
     def select_tool_for(self, entity_cls):
         """Select the slot whose builder places `entity_cls`, if there is one.
@@ -63,22 +125,32 @@ class Toolbelt:
         this finds the tool that builds it. Returns the builder, or None if
         no slot holds one -- a type can exist on the board without being
         placeable, so this must fail softly.
+
+        **Scans both rows, and switches rows to reach a match.** Q's job is
+        "give me the tool for this thing"; failing because the tool happens to
+        sit on the inactive row would be a surprise, and leaving the row alone
+        after selecting across it would leave the number keys addressing a row
+        the highlighted slot is not in.
+
+        The active row is searched **first**, so a type with tools on both
+        rows resolves to the one whose digits are already live. Within a row
+        it is first match wins, which is a real rule rather than an accident:
+        two tools can legitimately place the same type (the belt planner and
+        the raw belt tool both place `Belt`), so Q's answer depends on slot
+        order -- the earliest slot offering the type.
         """
-        for i, tool in enumerate(self.slots):
+        order = (list(range(self.row_start, self.row_start + ROW_SIZE))
+                 + [i for i in range(SLOT_COUNT)
+                    if self.row_of(i) != self.row])
+        for i in order:
+            tool = self.slots[i]
             if tool is None:
                 continue
             if getattr(tool, "entity_cls", None) is entity_cls:
                 self.selected = i
+                self.row = self.row_of(i)
                 return tool
         return None
-
-    def select_key(self, digit):
-        """Map a number-row digit to a slot: 1..9 -> 0..8, 0 -> 9."""
-        if digit == 0:
-            return self.select(SLOT_COUNT - 1)
-        if 1 <= digit <= 9:
-            return self.select(digit - 1)
-        return False
 
     def scroll(self, delta):
         """Scroll through slots, wrapping. Positive scrolls toward slot 1.

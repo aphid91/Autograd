@@ -77,6 +77,11 @@ def test_glsl_cell_encoding_matches_python():
         ("TYPE_SOURCE", cell.TYPE_SOURCE), ("TYPE_SINK", cell.TYPE_SINK),
         ("GHOST_PENDING", cell.GHOST_PENDING),
         ("GHOST_FRUSTRATED", cell.GHOST_FRUSTRATED),
+        # The matched state is hand-mirrored in common.glsl like the rest of
+        # the ghost field, so it needs pinning like the rest. It also has to
+        # *fit* -- it is the value that uses up the 2-bit field's last slot,
+        # so a widened ghost state would silently truncate it.
+        ("GHOST_MATCHED", cell.GHOST_MATCHED),
     ]:
         assert _glsl_int(_name) == _want, (
             f"{_name}: shader says {_glsl_int(_name)}, cell.py says {_want}")

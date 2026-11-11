@@ -89,6 +89,88 @@ class Engine:
         """Can a new entity go here? Occupied and out-of-bounds cells cannot."""
         return self.board.is_empty(x, y)
 
+    def placement_matches(self, placement):
+        """Is `placement` already built, exactly, where it wants to go?
+
+        "Exactly" means one entity covering the placement's whole footprint
+        with the same type, origin, orientation and flip. That is what lets a
+        lined-up stamp be substituted in: the cells it wants are occupied by
+        the thing it was going to put there, so deleting and re-placing is a
+        no-op geometrically and carries the *new* per-instance settings.
+
+        Checked per **placement**, never per cell, and the origin is part of
+        it. Two 2x1 Shears offset by one cell overlap in a single cell that
+        would compare equal type-and-facing on its own, so a per-cell test
+        would call a half-overlap a match and substitute a structure one cell
+        from where the player saw it. Comparing the origin makes the two
+        footprints the same footprint rather than merely compatible.
+
+        Returns the matching row, or None. A row rather than a bool because
+        the substitution has to erase exactly these entities, and finding
+        them again later would mean trusting the board not to have changed.
+        """
+        cells = placement.cells()
+        if not cells:
+            return None
+        first = self.board.entity_at(*cells[0])
+        if first is None or first.is_ghost:
+            return None
+        if type(first) is not placement.entity_cls:
+            return None
+        if first.direction != placement.direction:
+            return None
+        if bool(first.flipped) != bool(placement.flipped):
+            return None
+        if tuple(first.origin) != (placement.x, placement.y):
+            return None
+        # An underground's role is part of its identity: an entrance and an
+        # exit of the same facing are different machines, and substituting
+        # one for the other would quietly reverse where material surfaces.
+        if placement.entity_cls is Underground:
+            if bool(first.is_exit) != bool(placement.is_exit):
+                return None
+        # Every cell must be that same entity -- which is what actually
+        # rejects a half-overlap, and the reason this is a per-placement test
+        # rather than a per-cell one.
+        #
+        # Mutation-testing shows the origin comparison above is **redundant**
+        # given this loop: two instances of one type can only disagree about
+        # their origin by covering a cell the other does not, so some cell
+        # here resolves to a different row (or to none) and this rejects it.
+        # It stays because it states the invariant the loop merely implies --
+        # "same footprint", not "footprints that happen to agree cell by
+        # cell" -- and because it is the check that would still hold if a
+        # future type's footprint could contain another's.
+        for c in cells[1:]:
+            other = self.board.entity_at(*c)
+            if other is None or other.row != first.row:
+                return None
+        return first.row
+
+    def matched_rows(self, plan):
+        """Rows a plan would substitute, or None if it cannot be substituted.
+
+        `None` -- not an empty list -- when the plan has any frustration that
+        is *not* a match, because substitution is all-or-nothing: deleting the
+        matched entities would not unblock the genuinely-clashing ones, so the
+        plan would still refuse and the player would have lost the matched
+        ones for nothing.
+
+        An empty list is a real answer meaning "nothing to delete" (a plan
+        that was never blocked). Callers distinguish the two.
+        """
+        if plan is None:
+            return None
+        rows = []
+        for p in plan.placements:
+            if not p.frustrated:
+                continue
+            row = self.placement_matches(p)
+            if row is None:
+                return None
+            rows.append(row)
+        return rows
+
     def entity_at(self, x, y, skip_ghosts=True):
         """The real entity occupying (x, y), or None.
 
@@ -159,6 +241,14 @@ class Engine:
         single-cell ghosts of the same type instead.
         """
         blocked = set(plan.frustrated_cells)
+        # Cells whose occupant is exactly what the placement wanted. Tinted
+        # differently so the player can see a stamp is lined up, and the set
+        # the commit path substitutes. Collected per placement, because a
+        # match is a property of a whole footprint -- see placement_matches().
+        matched = set()
+        for p in plan.previewable:
+            if p.frustrated and self.placement_matches(p) is not None:
+                matched.update(p.cells())
 
         for p in plan.previewable:
             if not p.frustrated:
@@ -195,7 +285,7 @@ class Engine:
                     self.preview_only_rows.append(view.row)
 
         for (x, y) in blocked:
-            self.board.set_frustrated(x, y)
+            self.board.set_frustrated(x, y, matched=(x, y) in matched)
 
     def commit_ghosts(self, paired_cells=()):
         """Turn the ghost preview into real entities. Returns the count.

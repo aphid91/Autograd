@@ -15,6 +15,7 @@ from imgui_bundle import imgui
 from core import cell
 from core.builders import BeltBuilder
 from core.entity import Mac, Shear, Sink, Source, Swap, Underground
+from core.toolbelt import ROW_SIZE
 from engine import MODE_HORIZONTAL_FIRST, MODE_VERTICAL_FIRST, MODE_LINE
 from ui.input_manager import STATE_IDLE, STATE_PLANNING, STATE_ERASING
 
@@ -206,6 +207,13 @@ def test_fast_drag_leaves_no_gaps():
     assert not gaps, f"fast drag left belts behind at {gaps}"
     ok("interpolated erase across a 28-cell jump")
 
+#: The key that means "the tenth column". Worth testing separately because it
+#: is the one digit with its own branch in the input manager's digit-to-column
+#: map (`0` means column 9, not column -1), so it is the one that can quietly
+#: disagree with the other nine about which row it addresses.
+_DIGIT_0_KEY = glfw.KEY_0
+
+
 def test_toolbelt_selection():
     """Toolbelt selection."""
     # The hand starts *empty*, Factorio-style -- not on slot 0. An empty hand
@@ -215,30 +223,51 @@ def test_toolbelt_selection():
     assert orch.toolbelt.empty_handed, orch.toolbelt.selected
     # Select by name rather than by hardcoded digit: the slot order shifts
     # whenever a tool is added, and every test below cares about *which tool*,
-    # never about which key reaches it.
-    _SLOT_DIGITS = {glfw.KEY_1: 1, glfw.KEY_2: 2, glfw.KEY_3: 3, glfw.KEY_4: 4,
-                    glfw.KEY_5: 5, glfw.KEY_6: 6, glfw.KEY_7: 7, glfw.KEY_8: 8,
-                    glfw.KEY_9: 9, glfw.KEY_0: 0}
-    _DIGIT_KEYS = {v: k for k, v in _SLOT_DIGITS.items()}
-
-    def select_tool(name):
-        """Press the number key whose slot holds the named tool."""
-        idx = next(i for i, s in enumerate(orch.toolbelt.slots)
-                   if s is not None and s.name == name)
-        assert idx < 10, f"{name} is past the number keys"
-        key = _DIGIT_KEYS[0 if idx == 9 else idx + 1]
-        fake["keys"].add(key); step(); fake["keys"].discard(key); step()
-        assert orch.toolbelt.active.name == name, orch.toolbelt.active.name
-        return orch.toolbelt.active
-
+    # never about which key reaches it. This used to carry its own copy of
+    # `harness.select_tool()`, which then had to learn about rows twice --
+    # so it uses the shared one and spends its assertions on the *mapping*
+    # instead, which is the thing this scenario is actually about.
     for _name in ("Route", "Shear", "Max", "Underground"):
         select_tool(_name)
         ok(f"number key selected {_name}")
-    # Slot 10 is the last tool rather than empty now that the machine set
-    # fills the bar, so select it by name and assert the index instead.
-    select_tool("Floor")
-    assert orch.toolbelt.selected == 9, orch.toolbelt.selected
-    ok("key 0 selected slot 10")
+
+    # Key 0 is the tenth column, not the tenth tool: the digits address a
+    # row, so 0 means "last slot of whichever row is up".
+    tenth = orch.toolbelt.slots[ROW_SIZE - 1]
+    select_tool(tenth.name)
+    assert orch.toolbelt.selected == ROW_SIZE - 1, orch.toolbelt.selected
+    assert orch.toolbelt.row == 0, orch.toolbelt.row
+    ok(f"key 0 selected column 10 of row 1 ({tenth.name})")
+
+    # Row 2 is reachable only through Tab, and reaching it must not disturb
+    # what the other row holds. Swap and Sink live there in the default
+    # layout, which is the case that would silently fail if Tab were broken:
+    # `select_tool` would land on row 1's tool of the same column.
+    row2 = [s for s in orch.toolbelt.slots[ROW_SIZE:] if s is not None]
+    assert row2, "the default layout should put tools on row 2"
+    select_tool(row2[0].name)
+    assert orch.toolbelt.row == 1, orch.toolbelt.row
+    assert orch.toolbelt.selected >= ROW_SIZE, orch.toolbelt.selected
+    ok(f"Tab reached row 2 and a digit selected {row2[0].name}")
+
+    # Key 0 has to respect the row like every other digit -- see
+    # `_DIGIT_0_KEY`. Checked on row 2, where "column 10 of the active row"
+    # and "slot 10" are different answers.
+    assert orch.toolbelt.row == 1, "still on row 2 for this check"
+    press_key(_DIGIT_0_KEY)
+    assert orch.toolbelt.selected == ROW_SIZE * 2 - 1, (
+        f"key 0 on row 2 selected slot {orch.toolbelt.selected}, not the "
+        f"last slot of row 2")
+    ok("key 0 addressed the active row like the other digits")
+
+    # And Tab is purely an addressing change: it must not alter the hand.
+    held = orch.toolbelt.selected
+    press_key(glfw.KEY_TAB)
+    assert orch.toolbelt.row == 0, "Tab should have swapped back"
+    assert orch.toolbelt.selected == held, (
+        f"Tab changed the held slot from {held} to {orch.toolbelt.selected}")
+    ok("Tab re-aimed the digits without changing what was held")
+
     select_tool("Belt")
     assert orch.toolbelt.active.name == "Belt"
     ok("key 1 back to Belt")
@@ -280,14 +309,31 @@ def test_structure_placement_is_click_based_and_all_or_nothing():
     ok("R rotated the Shear to 1x2")
 
     # Overlapping placement frustrates and builds nothing.
+    #
+    # The obstacle has to be a *different* machine. Hovering this tool over an
+    # entity it would have placed identically is a **match**, not a plain
+    # clash: it tints green and a click substitutes it (see the matched-ghost
+    # tests in test_clipboard.py). Overlapping the rotated Shear at (30,30)
+    # with the same rotated Shear tool was therefore exactly the case that
+    # stopped being a refusal, which is why this now places a Source to
+    # collide with instead.
+    select_tool("Source")
+    put_cursor_at_cell(40, 40); step()
+    click()
+    assert not board.is_empty(40, 40), "need an obstacle to collide with"
+
+    select_tool("Shear")
     live_before = board.live_count
-    put_cursor_at_cell(30, 30); step()
+    put_cursor_at_cell(40, 40); step()
     frustrated = int((cell.ghost_state_arr(board.grid[:, :, cell.CH_Z])
                       == cell.GHOST_FRUSTRATED).sum())
+    matched = int((cell.ghost_state_arr(board.grid[:, :, cell.CH_Z])
+                   == cell.GHOST_MATCHED).sum())
     assert frustrated > 0, "overlap should tint"
+    assert matched == 0, "a different machine is not a match"
     assert len(engine.ghost_rows) == 0, "all-or-nothing must ghost nothing"
     # The occupant survives underneath the tint.
-    assert cell.cell_type(board.cell_word(30, 30)) == cell.TYPE_SHEAR
+    assert cell.cell_type(board.cell_word(40, 40)) == cell.TYPE_SOURCE
     click()
     assert board.live_count == live_before, "blocked placement must build nothing"
     ok(f"overlap tinted {frustrated} cells, built nothing, occupant intact")
@@ -519,6 +565,145 @@ def test_q_pipettes_a_belt_and_an_underground():
     assert _t.direction == cell.DIR_PY, cell.DIR_NAMES[_t.direction]
     assert _t.placing_exit, "pipetting an exit should leave you laying an exit"
     ok("Q picked up an underground exit with its facing and role")
+
+
+def test_q_reaches_a_tool_on_the_inactive_row():
+    """The pipette scans **both** rows and switches rows to reach a match.
+
+    Q's job is "give me the tool for this thing". Failing because the tool
+    happens to sit on the row the number keys are not addressing would be a
+    surprise, and it is reachable with the default layout: Swap and Sink live
+    on row 2, and before the bar had two rows they had no tool at all -- which
+    is exactly why pressing Q on one did nothing.
+
+    The row has to come along, too. Selecting a slot on row 2 while the digits
+    still address row 1 would leave the highlighted slot and the live digits
+    in different rows, so the next number key would silently change tools.
+    """
+    from core.entity import Swap
+    from core.toolbelt import ROW_SIZE
+
+    # Swap is on row 2 in the default layout -- the premise of the test.
+    swap_slot = next(i for i, s in enumerate(orch.toolbelt.slots)
+                     if s is not None and s.name == "Swap")
+    assert swap_slot >= ROW_SIZE, (
+        f"Swap is at slot {swap_slot}, on row 1; this test needs a tool on "
+        f"the inactive row to have anything to prove")
+
+    engine.place_structure(Swap, 30, 30)
+    engine.sync_segments()
+    orch.toolbelt.clear()
+    orch.toolbelt.row = 0
+    step()
+
+    put_cursor_at_cell(30, 30); step()
+    press_key(glfw.KEY_Q)
+
+    tool = orch.toolbelt.active
+    assert tool is not None and tool.name == "Swap", (
+        f"Q on a Swap landed on {getattr(tool, 'name', None)}")
+    assert orch.toolbelt.selected == swap_slot, orch.toolbelt.selected
+    assert orch.toolbelt.row == 1, (
+        f"Q selected a row-2 slot but left the digits on row "
+        f"{orch.toolbelt.row + 1}")
+    ok("Q reached Swap on row 2 and brought the active row with it")
+
+
+def test_the_raw_belt_tool_places_one_belt_per_click():
+    """The blunt instrument: click places, R rotates, nothing is inferred.
+
+    The planner reads where in a cell you pointed and derives a path, which
+    is right for laying a run and wrong for fixing one cell -- two
+    apparently identical clicks there produce different facings. This tool
+    exists so a single belt is predictable, so the test's whole point is
+    that the sub-cell position is **ignored**.
+    """
+    from core.entity import Belt as _Belt
+
+    tool = select_tool("Raw belt")
+    assert not tool.drag_based, "a raw belt is click-based like a structure"
+    assert tool.entity_cls is _Belt, tool.entity_cls
+
+    # Click in the far corner of a cell -- the position the planner would
+    # read as "face north-east". A raw belt must ignore it and use R's facing.
+    tool.direction = cell.DIR_PX
+    put_cursor_at(30 + 0.95, 30 + 0.95); step()
+    click()
+    placed = board.entity_at(30, 30)
+    assert placed is not None, "a single click should have placed a belt"
+    assert placed.direction == cell.DIR_PX, (
+        f"the raw belt took its facing from the cursor corner "
+        f"({cell.DIR_NAMES[placed.direction]}) instead of from R")
+    ok("a raw belt ignored the sub-cell position and used the tool's facing")
+
+    # R rotates it, and the next click follows. The expected facing is
+    # derived rather than spelled out, so this tests that the *tool* and the
+    # *placement* agree rather than re-asserting which way R turns -- that
+    # convention is core/cell.py's and is pinned there.
+    want = cell.rotate_dir(cell.DIR_PX, cw=True)
+    press_key(glfw.KEY_R)
+    assert tool.direction == want, cell.DIR_NAMES[tool.direction]
+    put_cursor_at(35 + 0.05, 35 + 0.05); step()
+    click()
+    second = board.entity_at(35, 35)
+    assert second is not None and second.direction == want, (
+        cell.DIR_NAMES[second.direction] if second else None)
+    ok(f"R rotated the raw belt to {cell.DIR_NAMES[want]} and the click "
+       f"followed it")
+
+    # One click, one belt -- no run, no path planning.
+    assert board.is_empty(31, 30) and board.is_empty(36, 35), (
+        "a raw belt click must place exactly one cell")
+    ok("each click placed exactly one belt")
+
+
+def test_the_raw_belt_tool_does_not_change_belt_rotatability():
+    """`Belt.ROTATABLE` stays False, and the raw tool rotates anyway.
+
+    The flag means "a belt's facing comes from the path it is drawn along",
+    which is true of the planner and is exactly what this tool exists not to
+    do. Buying the raw tool's rotation by flipping a fact about the *type*
+    would have made the flag lie -- so the rotation lives on the tool, and
+    this pins that it does.
+    """
+    from core.entity import Belt as _Belt
+    assert _Belt.ROTATABLE is False, (
+        "a belt's facing still comes from its path, for the planner")
+    tool = select_tool("Raw belt")
+    before = tool.direction
+    assert tool.cycle(), "the raw belt tool must rotate regardless"
+    assert tool.direction != before
+    ok("Belt.ROTATABLE stayed False while the raw tool still rotated")
+
+
+def test_q_on_a_belt_resolves_to_the_earliest_slot():
+    """Two tools place Belt, so the pipette's answer is slot order.
+
+    A real rule rather than an accident: `select_tool_for()` is first match
+    wins, searching the active row first. Worth pinning because it is the
+    one place where adding a tool changed an existing gesture's outcome --
+    Q on a belt could have started landing on the raw tool.
+    """
+    from core.entity import Belt as _Belt
+
+    both = [(i, s) for i, s in enumerate(orch.toolbelt.slots)
+            if s is not None and getattr(s, "entity_cls", None) is _Belt]
+    assert len(both) >= 2, (
+        f"this test needs two Belt-placing tools, found {both}")
+    earliest = min(i for i, _s in both)
+
+    engine.place_belt(30, 30, cell.DIR_PX)
+    engine.sync_segments()
+    orch.toolbelt.clear()
+    orch.toolbelt.row = 0
+    step()
+    put_cursor_at_cell(30, 30); step()
+    press_key(glfw.KEY_Q)
+
+    assert orch.toolbelt.selected == earliest, (
+        f"Q landed on slot {orch.toolbelt.selected}, not the earliest "
+        f"Belt slot {earliest}")
+    ok(f"Q on a belt resolved to slot {earliest}, the earliest Belt tool")
 
 
 def test_the_belt_planner_shows_a_ghost_when_idle():
