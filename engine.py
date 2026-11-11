@@ -576,6 +576,129 @@ class Engine:
         self.stats["placed"] += 1
         return view
 
+    # --- rotating and flipping what is already built --------------------
+    def turn_in_place(self, x, y, backward=False):
+        """Rotate the entity at (x, y) without moving it. True if it turned.
+
+        The empty hand's R. In-place rather than erase-and-replace, which is
+        what keeps per-instance settings: the row is kept and only its facing
+        changes, so a Source's emit value and a belt's seed travel with the
+        turn for free rather than needing to be copied across.
+
+        **The cell set never changes**, so this can never be blocked and
+        needs no placement check -- `Entity.inplace_turns()` only offers
+        rotations that preserve the footprint. Many machines are 2x1, whose
+        only such rotation is a half turn, so R and shift+R do the same thing
+        on them; a square footprint takes quarter turns in either direction.
+        A type that cannot turn at all returns False and nothing happens,
+        which is the stated policy for a shape that would have to move.
+
+        An underground is the one type with its own answer: both R and F mean
+        "reverse this pair", because reversing a run is the common edit and
+        tearing up the undergrounds to do it is the irritation. See
+        `reverse_under()`.
+        """
+        view = self.entity_at(x, y)
+        if view is None:
+            return False
+        if view.type_id == cell.TYPE_UNDER:
+            return self.reverse_under(view)
+        turns = view.inplace_turns()
+        if not turns:
+            return False
+        # The turn to apply, as quarter-turns CCW. A single permitted turn
+        # (the 2x1 case) ignores the direction entirely -- there is only one
+        # rotation that preserves the footprint, so shift cannot mean a
+        # different one.
+        step = turns[0] if len(turns) == 1 else (turns[-1] if backward
+                                                 else turns[0])
+        view.direction = cell.rotate_dir_ccw_n(view.direction, step)
+        self._restamp_turned(view)
+        return True
+
+    def flip_in_place(self, x, y):
+        """Mirror the entity at (x, y) where it stands. True if it flipped.
+
+        The empty hand's F. A flip never changes the extent -- it permutes
+        cells within the footprint's bounding box -- so unlike a rotation
+        this is footprint-preserving for *every* type and needs no geometry
+        test. What it does need is for the mirror to mean something: an
+        achiral type (only Sink) looks identical mirrored, and a belt has no
+        ports to mirror at all, so both report False rather than dirtying the
+        board for no visible change.
+        """
+        view = self.entity_at(x, y)
+        if view is None:
+            return False
+        if view.type_id == cell.TYPE_UNDER:
+            # F and R are the same gesture on an underground: reverse.
+            return self.reverse_under(view)
+        if not view.INPLACE_TURNABLE or not view.is_chiral():
+            return False
+        view.flipped = not view.flipped
+        self._restamp_turned(view)
+        return True
+
+    def _restamp_turned(self, view):
+        """Publish an orientation change to the grid and the simulation.
+
+        The row is the source of truth for the facing but the *cells* carry a
+        copy -- `.x`'s direction field and `.z`'s flip bit, both of which the
+        renderer reads per-pixel with no row lookup -- so a turn that skipped
+        this would leave the entity drawn at its old orientation.
+
+        Restamping writes the cells, and `Gameboard.write_cell()` notifies
+        the segment hook, so the belt network re-derives on its own: a turned
+        belt joins a different run, and a turned machine feeds a different
+        one. The extent is deliberately *not* rewritten -- a footprint
+        preserving turn leaves it alone, which is the invariant that makes
+        this safe.
+        """
+        self.board.restamp(view)
+        self.stats["turned"] = self.stats.get("turned", 0) + 1
+
+    def reverse_under(self, view):
+        """Swap an underground end's role, and its partner's. True if changed.
+
+        Both R and F mean this, because an underground has no other sensible
+        in-place transform: it is 1x1 so a quarter turn is footprint-legal,
+        but turning one end alone takes it off the axis it shares with its
+        partner and breaks a pair the player did not ask to break.
+        Reversing is the edit actually wanted -- "run this underground the
+        other way" -- and doing it to both ends at once is what makes
+        reversing a whole belt run cheap instead of a teardown.
+
+        **Swapping the roles must also reverse the facing.** The exit is
+        downstream of the entrance *by position*, so toggling `is_exit` alone
+        would leave an exit sitting upstream of its own entrance -- the span
+        traversed backwards, which is geometrically incoherent rather than
+        merely surprising. Reversing `direction` on both ends puts the pair
+        back in agreement: the end that was diving now surfaces, the material
+        flows the other way, and neither cell moves.
+
+        An unpaired end reverses on its own, which is the same operation with
+        nothing to keep in step.
+        """
+        mate = None
+        if view.paired:
+            candidate = self.board.view(view.partner)
+            # Only follow a link the other end agrees with. A preview's
+            # pairing is one-way (see commit_ghosts), so a ghost exit can
+            # point at an entrance that does not point back, and dragging
+            # that entrance's role around would edit a real entity on the
+            # strength of a preview.
+            if (candidate.type_id == cell.TYPE_UNDER
+                    and candidate.partner == view.row
+                    and not candidate.is_ghost):
+                mate = candidate
+        for end in (view, mate):
+            if end is None:
+                continue
+            end.is_exit = not end.is_exit
+            end.direction = cell.rotate_dir_ccw_n(end.direction, 2)
+            self._restamp_turned(end)
+        return True
+
     def erase(self, x, y):
         """Remove whatever occupies a cell. Ghosts are left alone.
 
@@ -661,6 +784,33 @@ class Engine:
         # has to be laid out again before the next upload.
         self.belt_device.invalidate_layout()
         return n
+
+    def reset_sim(self):
+        """Restart the simulation from tick zero, keeping the factory.
+
+        ctrl+R. Everything a belt-network edit does -- every item in flight
+        discarded, belts and gate channels alike -- plus the one thing an
+        edit deliberately does *not* do: the tick counter goes back to 0.
+
+        The counter has to be part of this. An item's position is a closed
+        form function of `clock.tick` and its own entry tick, so a flush that
+        left the counter where it was would restart the factory at tick
+        four million -- arithmetically fine, but it means "start over" leaves
+        the clock somewhere the player cannot see and the readouts disagree
+        with the state. A board replacement already resets the clock for the
+        same reason (see load_board); this is that half without the board
+        half.
+
+        Seeds go back on afterwards, so a seeded run starts loaded exactly as
+        it does after a load or a clear -- and after the reset rather than
+        before, since the flush would otherwise wipe what was just placed.
+        """
+        self.flush_material()
+        self.clock.reset()
+        # Re-seed against the new timeline: seed_segments() dates its pushes
+        # from clock.tick, so it must run after the reset or every seeded
+        # item would carry an entry tick from the old one.
+        return self.seed_segments()
 
     def seed_segments(self):
         """Put one item on each run holding a seeded belt cell. Returns the count.

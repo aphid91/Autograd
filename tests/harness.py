@@ -240,6 +240,23 @@ def ctrl_key(key):
     step()
 
 
+def shift_key(key):
+    """Tap a key with shift held -- shift+R, shift+F.
+
+    Separate from ctrl_key() because shift is reported as *state* as well as
+    gating an edge (`shift_held` drives paste's per-click policy), so a
+    scenario must hold it across the frame the edge lands on rather than
+    pressing the two independently.
+    """
+    fake["keys"].add(glfw.KEY_LEFT_SHIFT)
+    fake["keys"].add(key)
+    step()
+    fake["keys"].discard(key)
+    step()
+    fake["keys"].discard(glfw.KEY_LEFT_SHIFT)
+    step()
+
+
 def drag_cells(a, b, steps=3):
     """Left-drag from cell `a` to cell `b`, in enough hops to pass threshold.
 

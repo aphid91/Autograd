@@ -118,6 +118,18 @@ class Entity:
     # path they are drawn along, so rotating one in isolation is meaningless.
     ROTATABLE = False
 
+    # Whether an *already placed* entity may be turned or mirrored where it
+    # stands, by R/F with an empty hand. Distinct from ROTATABLE, which is a
+    # statement about the tool that places the type: a belt's facing comes
+    # from the path it is drawn along (so ROTATABLE is False) but turning one
+    # that already exists is a perfectly ordinary edit.
+    #
+    # True by default, so a new machine gets the gesture for free; the turns
+    # it actually permits are still decided by geometry in inplace_turns().
+    # Underground overrides the gesture entirely rather than clearing this --
+    # its R and F both mean "reverse the pair" (see Underground).
+    INPLACE_TURNABLE = True
+
     # --- firing ----------------------------------------------------------
     #: When this type fires. Declared rather than special-cased: the tick
     #: reads FIRE_RULE and never names a machine, which is what keeps
@@ -373,6 +385,42 @@ class Entity:
         """(w, h) of this type rotated into `direction`."""
         w, h = cls.FOOTPRINT
         return (h, w) if direction % 2 else (w, h)
+
+    @classmethod
+    def inplace_turns(cls):
+        """Quarter-turns that leave this type's cell set unchanged, as a tuple.
+
+        The set of rotations an **already placed** entity may take without
+        moving: rotating in place must not ask for a cell the entity does not
+        already own, or the turn could be blocked by a neighbour and "rotate
+        this machine" would become a placement question.
+
+        Footprint-preserving is the whole test, because every current type is
+        a solid rectangle and `cells_for()` fills the bounding box: if the
+        extent is unchanged then so is the cell set, whatever the origin.
+        A square (1x1 belt, 2x2 Sink) turns freely; an oblong turns only by
+        180 degrees, which is why `R` and `shift+R` are the same thing on a
+        2x1 machine. Deliberately excludes 0 -- a no-op is not a turn.
+
+        A type whose cells are *not* the full bounding box (an L tetromino,
+        say) would need the cell set compared rather than the extent, and
+        would then almost certainly answer "no turns at all". Returning an
+        empty tuple is how rotation silently fails on such a type, which is
+        the stated policy -- so this stays a predicate about geometry and no
+        caller has to special-case a shape.
+
+        **This deliberately does not consult `ROTATABLE`.** That flag is
+        about *tools* -- it says a belt's facing comes from the path it is
+        drawn along, so the planner does not offer R -- and a belt already
+        sitting on the board is the opposite case: turning it is exactly the
+        edit the player means. See `INPLACE_TURNABLE` for the per-type veto.
+        """
+        if not cls.INPLACE_TURNABLE:
+            return ()
+        w, h = cls.FOOTPRINT
+        # Relative to whatever the entity's current facing is, so the answer
+        # is the same at every orientation: a quarter turn swaps the extent.
+        return (1, 2, 3) if w == h else (2,)
 
     @classmethod
     def centre_offset(cls, direction):
@@ -767,9 +815,27 @@ class Underground(Entity):
         self._set(self.F_IS_EXIT, 1.0 if is_exit else 0.0)
         self._set(self.F_PARTNER, float(partner))
 
+    #: R and F on a placed underground both mean "reverse this pair" rather
+    #: than the generic turn -- a quarter turn would be footprint-legal on a
+    #: 1x1 but would take this end off the axis it shares with its partner.
+    #: Engine.turn_in_place() branches on the type for that; the flag stays
+    #: True because the gesture *is* available, just differently defined.
+    INPLACE_TURNABLE = True
+
     @property
     def is_exit(self):
         return bool(self._get(self.F_IS_EXIT))
+
+    @is_exit.setter
+    def is_exit(self, value):
+        """Swap diving for surfacing. Callers must keep the pair coherent.
+
+        The role is positional -- an exit sits downstream of its entrance --
+        so changing it on one end alone describes a pair that cannot exist.
+        Engine.reverse_under() is the supported way in: it reverses both ends
+        and both facings together.
+        """
+        self._set(self.F_IS_EXIT, 1.0 if value else 0.0)
 
     @property
     def partner(self):

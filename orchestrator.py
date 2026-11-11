@@ -640,6 +640,8 @@ class Orchestrator:
             engine.clock.toggle_pause()
         if intents.step_tick:
             engine.clock.request_step()
+        if intents.reset_sim:
+            engine.reset_sim()
 
         # 3. toolbelt selection. Changing tools drops any in-flight preview --
         # a half-drawn belt run means nothing to the structure tool.
@@ -715,10 +717,28 @@ class Orchestrator:
                 self._refresh_paste_tool()
                 tool = self.paste_tool
                 intents.update_plan = True
+        elif tool is None:
+            # Empty hand: R and F transform whatever is **on the board** under
+            # the cursor rather than a held tool. Same split as the left
+            # click, which builds with a tool and inspects without one: the
+            # key says "rotate", and what it rotates is whatever the hand is
+            # not holding.
+            #
+            # In place, so per-instance settings survive -- a Source keeps its
+            # emit value and a belt its seed, because the row is kept and only
+            # the facing changes. The engine refuses any turn that would move
+            # the entity, so this cannot fail destructively; a type with no
+            # footprint-preserving rotation simply does nothing.
+            if intents.cursor_in_world and intents.cursor_cell is not None:
+                if intents.cycle_tool:
+                    engine.turn_in_place(*intents.cursor_cell,
+                                         backward=intents.cycle_backward)
+                if intents.flip_tool:
+                    engine.flip_in_place(*intents.cursor_cell)
         else:
-            if intents.cycle_tool and tool is not None:
+            if intents.cycle_tool:
                 tool.cycle(backward=intents.cycle_backward)
-            if intents.flip_tool and tool is not None:
+            if intents.flip_tool:
                 tool.flip()
 
         # 5. build / erase

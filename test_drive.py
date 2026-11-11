@@ -16,6 +16,9 @@ Two kinds of test live under tests/:
   tests/test_tick.py       the simulation clock as wired into the frame loop.
                            core/tick.py self-checks the Clock in isolation;
                            these cover the orchestrator wiring and the keys.
+  tests/test_turn.py       rotating and flipping what is already built -- the
+                           footprint invariant, the settings that must survive
+                           it, and ctrl+R's restart.
 
 core/cell.py and core/entity.py also run self-checks at import, so simply
 importing anything here exercises the cell encoding and the entity geometry.
@@ -26,7 +29,7 @@ import sys
 from tests import (
     harness, test_belts, test_clipboard, test_gates, test_glsl,
     test_inspect, test_item_render, test_scenarios, test_segments, test_stamp,
-    test_tick,
+    test_tick, test_turn,
 )
 
 
@@ -53,6 +56,7 @@ def main(argv):
     ran += harness.run_all(_scenarios(test_stamp), only=only)
     ran += harness.run_all(_scenarios(test_clipboard), only=only)
     ran += harness.run_all(_scenarios(test_inspect), only=only)
+    ran += harness.run_all(_scenarios(test_turn), only=only)
     if not ran:
         print(f"no tests matched {only!r}")
         return 1

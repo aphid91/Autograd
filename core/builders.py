@@ -500,6 +500,24 @@ class UndergroundBuilder(EntityBuilder):
         self.direction = cell.rotate_dir(self.direction, cw=not backward)
         return True
 
+    def flip(self):
+        """Swap which end the next click lays: entrance <-> exit.
+
+        The alternation is a convenience for laying a fresh pair, and it is
+        wrong whenever the player wants the *other* half -- arriving at the
+        far side of a gap with the tool primed for an entrance, wanting to
+        close an existing entrance's pair. Without this the only way across
+        is to place the unwanted end and erase it.
+
+        F rather than a binding of its own because this is the same question
+        F answers everywhere else: which of a type's two mirror-image
+        orientations am I placing? An underground pair is chiral in the one
+        way that matters -- which end dives -- and `is_chiral()` cannot see
+        it, since the roles live in a field rather than in the port layout.
+        """
+        self.placing_exit = not self.placing_exit
+        return True
+
     def adopt(self, entity):
         """Take the facing off a picked-up end, and lay the same kind next.
 

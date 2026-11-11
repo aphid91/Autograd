@@ -51,6 +51,7 @@ There is no pytest/linter configured.
 | [tests/test_stamp.py](tests/test_stamp.py) | what the stamp transforms preserve: wiring, topology, arithmetic |
 | [tests/test_clipboard.py](tests/test_clipboard.py) | the copy/paste/erase mode machine, and matched-stamp substitution, driven through the fake mouse and keyboard |
 | [tests/test_inspect.py](tests/test_inspect.py) | the Status window, the per-Source emit value, the per-belt seed, the save filename box, the persisted toolbar |
+| [tests/test_turn.py](tests/test_turn.py) | the empty hand's R/F: the footprint invariant, the settings that must survive an in-place turn, the underground reversal, and ctrl+R's restart |
 
 **Scenarios are independent.** `harness.reset()` clears the board, camera,
 input state and toolbelt before each one, so a failure names the scenario
@@ -110,7 +111,7 @@ surfaced as one shuffle seed in twelve failing a pixel test.
 | `Q` | **pipette**: fill an empty hand from the board, or empty a full one |
 | Scroll | zoom, anchored at the cursor |
 | Left-drag | pan the camera |
-| `F` | **per-tool**: flip (mirror) the held structure |
+| `F` | **per-tool**: flip (mirror) the held structure; with an **empty hand**, mirror what is under the cursor |
 | `shift+F` | frame the whole board |
 | `1`-`9`, `0` | select a slot in the **active** toolbelt row |
 | `Tab` | swap which toolbelt row the number keys address |
@@ -121,13 +122,14 @@ surfaced as one shuffle seed in twelve failing a pixel test.
 | `ctrl+X` | cut: the same box, captured as a stamp, then straight to paste |
 | shift+scroll | **paste mode**: walk the copy history (older / newer) |
 | Left-click | build with the active tool (fires on **release**); with an **empty hand**, inspect what is there |
-| `R` / `shift+R` | **per-tool**: belt path shape, or structure rotation |
+| `R` / `shift+R` | **per-tool**: belt path shape, or structure rotation; with an **empty hand**, turn what is under the cursor |
 | Right-click | cancel a plan, or drag to erase |
 | `Esc` | cancel a plan, or a tool's multi-step state |
 | `F5` | reload the world shaders |
 | `Delete` | clear the board |
 | `Space` | pause / resume the simulation |
 | `.` | run exactly one tick (works while paused) |
+| `ctrl+R` | restart the simulation: tick back to 0, every item discarded |
 
 `R` and `F` deliberately mean different things in different tools — the input
 manager reports only that they were pressed and the active builder decides.
@@ -161,6 +163,130 @@ app's real default and declares the tool it needs. That also stops `reset()`
 leaving a stray ghost — its trailing `step()` would otherwise have a
 drag-based tool preview its idle run, and a scenario opening with
 `live_count == 0` would fail on a board it never touched.
+
+### R and F with an empty hand turn what is already built
+
+The empty hand's second and third gestures, alongside inspect, and resolved
+the same way: the input manager reports that `R` was pressed, and the
+**orchestrator** sends it to the board rather than to a tool because only it
+knows the hand is empty. With a tool held, `R` and `F` still belong to the
+tool — which is what keeps the feature from being a hazard, since a player
+rotating a held structure over a built-up area must not be silently turning
+the machines underneath it.
+
+**In place, never erase-and-replace.** The row is kept and only its
+orientation changes, so per-instance settings travel with the turn for free —
+a Source's emit value, a belt's seed. Re-placing would lose them *invisibly*,
+since the board looks identical either way: same type, same cells, same
+facing. That is why every test in [tests/test_turn.py](tests/test_turn.py)
+asserts on a setting or a row id rather than on the resulting direction.
+
+**A turn may only ask for cells the entity already owns**, which is the
+invariant the whole gesture rests on. It means a turn can never be blocked,
+needs no placement check, and cannot half-succeed — a Shear boxed in on every
+side still turns. `Entity.inplace_turns()` is the predicate, and it returns
+the rotations that leave the *extent* alone:
+
+- A **square** footprint (a 1×1 belt or underground, a 2×2 Sink, a
+  hypothetical n×n) takes quarter turns, so `R` and `shift+R` differ.
+- An **oblong** takes only the half turn, so `R` and `shift+R` are the same
+  thing on it. Deliberate rather than an oversight: with one legal rotation,
+  making shift mean anything else would mean moving the machine, and making
+  it a no-op would leave the player unable to turn a Shear with shift held.
+- Since `cells_for()` fills the bounding box, footprint-preserving *is*
+  cell-set-preserving — so the extent test is the whole check for every type
+  that exists.
+
+**Flip needs no geometry test at all**, because mirroring permutes cells
+within the bounding box and so preserves the footprint for every type. What
+it needs is for the mirror to be *visible*: an achiral type (only `Sink`) and
+a belt (no ports) report no change rather than dirtying the board, matching
+what `F` already does on the toolbelt.
+
+**A shape with no footprint-preserving rotation fails silently**, as asked.
+Nothing is shaped that way yet and nothing can be — every rectangle has a
+half turn, and `FOOTPRINT` *is* the cell set — so `INPLACE_TURNABLE = False`
+is the declared veto in the meantime, pinned by a test so it is known to work
+before anything depends on it. A real L-tetromino would compare cell sets
+instead, and would almost certainly then answer "no turns".
+
+**`INPLACE_TURNABLE` is deliberately not `ROTATABLE`.** That older flag is a
+statement about *tools* — a belt's facing comes from the path it is drawn
+along, so the planner does not offer `R`, and `core/entity.py` asserts it
+stays `False`. A belt already on the board is the opposite case: turning it is
+exactly the edit the player means. Keying the in-place turn off `ROTATABLE`
+would have made belts, the most common thing on any board, the one type the
+gesture could not touch. Same split the raw belt tool made, one layer down.
+
+**The orientation must reach the grid, not just the row.** `.x` carries a copy
+of the facing and `.z` the flip bit, both read per-pixel with no row lookup,
+so `Engine._restamp_turned()` restamps — and because every grid write funnels
+through `Gameboard.write_cell()`, the segment index re-derives on its own: a
+turned belt joins a different run. Skipping the restamp leaves the entity
+*drawn* at its old orientation while simulating the new one, which is silent
+in any row-level assertion; that is why the tests check `cell_dir()` out of
+the grid and the segmentation count, not only the view.
+
+#### An underground reverses instead of turning
+
+`R` and `F` both mean "reverse this pair" on a placed underground end. It is
+1×1, so a quarter turn would be footprint-legal — but it would take the end
+off the axis it shares with its partner and break a pair the player never
+asked to break. Reversing a run is the edit actually wanted, and doing it to
+both ends at once is what makes reversing a long belt cheap instead of a
+teardown of every underground along it.
+
+**Swapping the roles must also reverse the facing.** The exit is downstream of
+the entrance *by position*, so toggling `is_exit` alone would leave an exit
+sitting upstream of its own entrance — geometrically incoherent rather than
+merely surprising. Both ends flip role and facing together, neither cell
+moves, and the pairing survives. Two consequences:
+
+- **Either end is a handle on the whole pair.** The player reaches for
+  whichever is nearer, so hovering the exit must not give a different result
+  from hovering the entrance.
+- **Two reversals are the identity.** Worth stating separately: role-swap and
+  facing-reversal are each involutions, but an implementation that reversed
+  only the hovered end's facing would come back with a coherent-*looking*
+  pair pointing the wrong way.
+
+An unpaired end reverses alone, since an unpaired end is a legal thing to
+leave on the board. A one-way ghost pairing is ignored (see "A ghost exit's
+pairing is one-way"), or a preview would license editing a real entity.
+
+**`F` on the underground *tool* swaps which end the next click lays.** The
+entrance→exit alternation is a convenience for laying a fresh pair and is
+wrong whenever the player wants the far half — arriving at the other side of a
+gap primed for an entrance. Without it the only way across is to place the
+unwanted end and erase it. On the tool `R` and `F` stay separate (facing and
+role); on a *placed* end they deliberately coincide, which makes "R and F are
+interchangeable for undergrounds" an easy over-generalisation to make one
+layer up — hence a test for each.
+
+### ctrl+R restarts the simulation
+
+Everything a belt-network edit does — every item in flight discarded, belts
+*and* gate channels, via `Engine.flush_material()` — plus the one thing an
+edit deliberately does not do: `clock.reset()`, so the tick counter goes back
+to 0. The factory itself is untouched, which is the difference from `Delete`.
+
+The counter has to be part of it. An item's position is a closed form over
+`clock.tick` and its own entry tick, so a flush that left the counter where it
+was would restart the factory at tick four million — arithmetically fine, but
+"start over" then leaves the clock somewhere the player cannot see. A board
+replacement already resets it for the same reason; this is that half without
+the board half.
+
+Seeds go back on **after** the reset, for both reasons at once: a flush
+empties every ring, and `seed_segments()` dates its pushes from `clock.tick`,
+so seeding first would both be wiped and carry entry ticks from the old
+timeline.
+
+`ctrl+R` is **subtracted** from the bare key's meaning rather than merely
+checked beside it (`cycle = r_key and not ctrl`). Both halves matter: a bare
+`R` that also reset would be catastrophic and invisible, since it is the
+most-pressed key in the game; and a `ctrl+R` that also reached the tool would
+silently turn whatever is in hand while resetting. Same split `C` and `V` use.
 
 **Q never consults the board when the hand is full.** It is the universal
 "put this down", so it must not depend on what happens to be under the
@@ -1832,6 +1958,11 @@ unless it wants a new glyph — see "Generated GLSL tables" below. The
 builders, the toolbelt, the stub logic and the port arrows are all generic.
 Five machines were added at once this way and needed no change to any of
 them.
+
+The in-place turn is generic too: a new machine gets `R`/`F` with an empty
+hand for free, and which turns it permits follow from `FOOTPRINT` (see "R and
+F with an empty hand"). Only a type that is *not* a solid rectangle would need
+to say anything, by setting `INPLACE_TURNABLE = False`.
 
 A new *glyph* is the one thing still hand-written: a `sd_*` function in
 [world.frag](shaders/world.frag), a `GLYPH_*` constant in

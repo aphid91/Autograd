@@ -119,7 +119,7 @@ class Intents:
         "begin_plan", "update_plan", "commit_plan", "cancel_plan",
         "erase_at", "cursor_cell", "cursor_in_world", "cursor_frac",
         "select_slot", "scroll_steps", "scroll_at",
-        "drag_pan_px", "toggle_pause", "step_tick", "pipette",
+        "drag_pan_px", "toggle_pause", "step_tick", "reset_sim", "pipette",
         "copy_mode", "paste_mode", "exit_mode", "shift_held",
         "select_rect", "commit_select", "stamp_steps",
         "erase_mode", "cut_mode", "commit_erase", "swap_rows",
@@ -161,6 +161,9 @@ class Intents:
         # is the primary way to watch one tick's worth of state change.
         self.toggle_pause = False
         self.step_tick = False
+        #: ctrl+R: restart the simulation from tick zero on the same board.
+        #: Distinct from clear_board, which removes the factory as well.
+        self.reset_sim = False
         # Q. Means "pick up what is under the cursor" with an empty hand and
         # "put down what I am holding" otherwise -- the orchestrator decides
         # which, since only it knows what the hand contains.
@@ -311,13 +314,21 @@ class InputManager:
 
         it.reload_shader = self._edge(glfw.KEY_F5, not want_kb)
         it.clear_board = self._edge(glfw.KEY_DELETE, not want_kb)
-        cycle = self._edge(glfw.KEY_R, not want_kb)
+        r_key = self._edge(glfw.KEY_R, not want_kb)
         escape = self._edge(glfw.KEY_ESCAPE, not want_kb)
         it.pipette = self._edge(glfw.KEY_Q, not want_kb)
 
         # ctrl+C / ctrl+V. Gated strictly on ctrl so bare C and V stay free.
         ctrl = (self._key(glfw.KEY_LEFT_CONTROL)
                 or self._key(glfw.KEY_RIGHT_CONTROL))
+
+        # ctrl+R restarts the simulation, so the bare key keeps its per-tool
+        # meaning and the modifier takes the rarer action -- the same split C
+        # and V use. Must be subtracted from `cycle` rather than merely
+        # checked alongside it: a ctrl+R that also rotated the held structure
+        # would reset the sim and silently turn the thing in your hand.
+        cycle = r_key and not ctrl
+        it.reset_sim = r_key and ctrl
         c_key = self._edge(glfw.KEY_C, not want_kb)
         v_key = self._edge(glfw.KEY_V, not want_kb)
         it.copy_mode = c_key and ctrl
