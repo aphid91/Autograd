@@ -151,9 +151,12 @@ SLEEPERS = (
         lambda on: engine.belts.set_sleep_enabled(on),
         lambda ids: setattr(engine.belts, "_asleep", set(ids)),
     ),
-    # Gate sleep goes here when it lands. Deliberately left as a comment
-    # rather than omitted silently, so the next person adding it finds the
-    # seam instead of extending main().
+    _Sleeper(
+        "gates",
+        lambda: engine.gates._asleep,
+        lambda on: engine.gates.set_sleep_enabled(on),
+        lambda ids: setattr(engine.gates, "_asleep", set(ids)),
+    ),
 )
 
 
@@ -293,6 +296,35 @@ def build(rng, runs=12, run_len=34):
             board.spawn(Shear, 5, y, cell.DIR_PX)
         y += 4
 
+    # Two rows of gates that **abut with no belt between them**, which is the
+    # `deliver_direct()` path and its own wake edge. The fixture had none of
+    # this -- zero gates with a direct gate neighbour, zero direct deliveries
+    # over 250 ticks -- so both gate-to-gate mutations (dropping the wake,
+    # and making the adjacency index one-directional instead of symmetric)
+    # passed against a board that never exercised them.
+    #
+    # A Source abutting a machine is the shape that matters, and it is also
+    # the motif real designs use most: a constant wired straight into a gate
+    # with no belt. The machine then abuts a Sink, so a delivered value has
+    # somewhere to go and the chain is three gates long -- enough for a
+    # missing wake to strand the middle one.
+    for _ in range(2):
+        if y + 3 >= board.height:
+            break
+        m = rng.choice((Shear, Max, Floor, Reciprocal))
+        x = 1
+        if board.is_empty(x, y) and board.is_empty(x + 1, y):
+            board.spawn(Source, x, y, cell.DIR_PX)
+        x += 2
+        cells = m.cells_for(x, y, cell.DIR_PX, False)
+        if all(board.is_empty(cx, cy) for (cx, cy) in cells):
+            board.spawn(m, x, y, cell.DIR_PX)
+        x += m.FOOTPRINT[0]
+        cells = Sink.cells_for(x, y, cell.DIR_PX, False)
+        if all(board.is_empty(cx, cy) for (cx, cy) in cells):
+            board.spawn(Sink, x, y, cell.DIR_PX)
+        y += 4
+
     # The rest: a starved machine feeding a run that will sleep, with a Sink
     # at the far end so the run has a real consumer to deliver to.
     for _ in range(runs):
@@ -318,6 +350,51 @@ def build(rng, runs=12, run_len=34):
 def starved_gates():
     """Live gates with at least one input, for the random feeder below."""
     return [g for g in engine.gates.gates() if g.input_count() > 0]
+
+
+def mutual_sleep_instances():
+    """Gates asleep while a run that feeds them is holding items.
+
+    The **mutual sleep** shape, checked as an invariant rather than left to
+    the end-to-end diff, because it is the one failure mode where both
+    layers' predicates are locally defensible and compose into a deadlock:
+
+        the gate sleeps because its feeding run is "at rest"
+        the run is at rest because the gate is not taking from it
+        -> neither moves again, and the items are stranded for ever
+
+    Nothing in the predicate forbids this shape directly -- `_gate_is_inert()`
+    sleeps any gate holding nothing, deliberately, because the wake edges are
+    what guarantee it comes back. So this is the invariant that checks those
+    edges from the *outcome* side: if the conjunction below ever holds, some
+    wake was missed, whatever the predicate thought.
+
+    **Both layers must be asleep for this to be a deadlock**, and that
+    qualifier is the whole subtlety. A sleeping gate whose loaded upstream run
+    is *awake* is a transient, not a stall: the run is still ticked, it
+    delivers, and `accept_from()` wakes the gate. That state really does
+    occur, and routinely -- the gate sleeps during the structure phase, when
+    the run was still empty, and the belt phase then pushes onto it, so the
+    sleep decision is one phase stale by construction.
+
+    Reporting the transients would make this fire on a correct build at tick
+    0, which is exactly how a check gets disabled and then deleted. So the
+    test is the conjunction, which is the condition under which nothing can
+    ever move again.
+
+    Deliberately a report rather than a bare assert: the end-to-end diff is
+    what ultimately fails the run, and a deadlock does reach it eventually.
+    This names it at the moment it forms, which is many ticks earlier and far
+    easier to read than a ring-state difference.
+    """
+    out = []
+    belts_asleep = engine.belts._asleep
+    for row in sorted(engine.gates._asleep):
+        _down, upstream = engine.gates._segments_of_gate(row)
+        for seg in upstream:
+            if seg.count and seg.sid in belts_asleep:
+                out.append((row, seg.sid, seg.count))
+    return out
 
 
 def main():
@@ -385,6 +462,17 @@ def main():
         run_one_tick(t)
         for sl, was in zip(SLEEPERS, before):
             wake_edges[sl.name] += len(was - sl.asleep())
+        # Checked here, while the engine still holds the timeline under
+        # test's state -- after the oracle tick below it holds the oracle's,
+        # and the oracle has no sleep set to inspect.
+        stuck = mutual_sleep_instances()
+        if stuck:
+            problems.append((t, [
+                f"MUTUAL SLEEP: gate {g} is asleep while segment {s} "
+                f"feeding it holds {n} item(s) -- neither will move again"
+                for (g, s, n) in stuck[:4]]))
+            sleep_state = snapshot()
+            break
         sleep_state = snapshot()
 
         # (2) the oracle: its own state, and sleeping *latched* off in every

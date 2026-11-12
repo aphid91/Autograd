@@ -821,6 +821,13 @@ class Engine:
         # run would have it born asleep. Waking everything is the safe reset:
         # a spuriously awake segment costs one tick and then sleeps again.
         self.belts.wake_all()
+        # And every gate, for a sharper version of the same reason: a gate
+        # sleeps on the claim that its neighbours are quiet, and a rebuild
+        # has just replaced every one of those neighbours. The gate rows
+        # themselves survive, so unlike the segments nothing here would look
+        # obviously wrong -- the sleep set would simply be reasoning about an
+        # adjacency that no longer exists.
+        self.gates.wake_all_gates()
         # Order matters: rebuild() first, so flush_material() resets the
         # anchors of the runs that now exist rather than the ones that just
         # stopped existing.
@@ -937,6 +944,10 @@ class Engine:
         # have been asleep holding items, and a producer upstream is probably
         # still loaded, so let the next tick decide rather than assuming.
         self.belts.wake_all()
+        # Gates too: a gate asleep behind a full run was sleeping on the claim
+        # that the run could not change, and the run has just emptied from
+        # outside the tick.
+        self.gates.wake_all_gates()
 
     def flush_material(self):
         """Discard every item in flight, on belts *and* inside gates.
