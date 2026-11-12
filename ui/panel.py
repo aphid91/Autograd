@@ -18,6 +18,7 @@ class UIRequests:
                  "cycle_backward", "flip_tool", "quicksave", "quickload",
                  "toggle_pause", "step_tick", "tick_rate",
                  "segment_debug", "sleep_debug",
+                 "sleep_show_belts", "sleep_show_gates",
                  "rebuild_segments", "audit_segments", "profile_ticks",
                  "debug_feed", "clear_items", "close_status",
                  "set_emit", "set_seed", "set_slot", "swap_rows",
@@ -42,6 +43,11 @@ class UIRequests:
         #: New state for the shader's segment overlay, or None for no change.
         self.segment_debug = None
         self.sleep_debug = None
+        #: New state for the sleep overlay's per-family masks, or None for no
+        #: change. Unticked forces that family to read asleep, which is how
+        #: one is isolated to compare against the other.
+        self.sleep_show_belts = None
+        self.sleep_show_gates = None
         self.rebuild_segments = False
         self.audit_segments = False
         #: Ticks to profile and dump to the console, 0 to stop a running
@@ -319,11 +325,36 @@ class UI:
             req.segment_debug = on
         imgui.text_disabled("recompiles the shader; zero cost when off")
 
-        changed, on = imgui.checkbox(
-            "Sleep overlay", "SLEEP_DEBUG" in orch.camera.defines)
+        sleep_on = "SLEEP_DEBUG" in orch.camera.defines
+        changed, on = imgui.checkbox("Sleep overlay", sleep_on)
         if changed:
             req.sleep_debug = on
         imgui.text_disabled("blue = asleep (skipped), amber = awake")
+        # Which families report their real state. Shown only while the overlay
+        # is compiled in, since they do nothing otherwise -- and indented,
+        # because they modify it rather than standing beside it.
+        #
+        # Requests rather than direct writes, like every other panel control:
+        # the panel only asks. These happen to land on the camera rather than
+        # the board, but routing them differently for that reason would make
+        # "the panel only requests" a rule with exceptions.
+        if sleep_on:
+            imgui.indent()
+            changed, on = imgui.checkbox(
+                "report belts", orch.camera.sleep_show_belts)
+            if changed:
+                req.sleep_show_belts = on
+            imgui.same_line()
+            changed, on = imgui.checkbox(
+                "report gates", orch.camera.sleep_show_gates)
+            if changed:
+                req.sleep_show_gates = on
+            # The point of the pair: belts and gates have *different*
+            # schedulers -- belts are edge-triggered and genuinely skipped,
+            # gates are prefiltered but visited every tick -- so comparing
+            # their amber needs one family silenced at a time.
+            imgui.text_disabled("unticked = force blue, to isolate the other")
+            imgui.unindent()
         # The count beside the colour, because the overlay answers "where"
         # and this answers "how much" -- and on a board built as a computer
         # the ratio is the number that matters. Taken from the sim rather

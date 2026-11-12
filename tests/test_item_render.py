@@ -1621,3 +1621,126 @@ def test_the_sleep_overlay_separates_asleep_from_awake():
            f"full-but-resting reads {ram_col.astype(int)}")
     finally:
         cam.set_define("SLEEP_DEBUG", was)
+
+
+def test_the_sleep_masks_isolate_belts_from_gates():
+    """Unticking a family forces it blue, leaving the other to carry amber.
+
+    The two schedulers are *different* -- belts are edge-triggered and
+    genuinely skipped, gates are prefiltered but visited every tick -- so
+    comparing their amber means silencing one family at a time. The failure
+    mode is a mask that does nothing, which looks identical to a board where
+    that family happens to be asleep. So this asserts the same cell changes
+    colour when the mask changes, which no single render can show.
+
+    Only a pixel test can see any of this: the masks are uniforms read inside
+    the overlay's own branch and have no Python-side consequence at all.
+    """
+    was = "SLEEP_DEBUG" in cam.defines
+    try:
+        # An awake belt and an awake gate, so both families have something to
+        # report.
+        src = engine.place_structure(Source, 8, 20)
+        src.emit_value = 1.0
+        engine.place_belt_path((10, 20), (18, 20))
+        # A *second* Source with nowhere to put its output, so it fires once
+        # and then sits holding a value for ever. The overlay's gate test is
+        # "does this row hold anything", and a Source feeding a working belt
+        # holds nothing at end of tick -- the belt phase drains the zone one
+        # phase after the structure phase fills it, which is the whole
+        # bubble-free design. So the obvious fixture renders a *blue* gate
+        # and the gate mask then has nothing to change: the vacuity guard
+        # below caught exactly that.
+        #
+        # A real consumer that *refuses* is what blocks it -- a dangling face
+        # would discard instead (a dangling output is a sink), leaving the
+        # zone clear and the gate blue again. So: a one-cell run off the east
+        # face, which holds two items at the default spacing and then takes
+        # no more.
+        stuck = engine.place_structure(Source, 8, 24)
+        stuck.emit_value = 1.0
+        engine.place_belt(10, 24)
+        engine.sync_segments()
+
+        _at_whole_tick()
+        for _ in range(5):
+            engine.clock.request_step()
+            engine.clock.advance(0.0)
+
+        tick = engine.clock.tick
+        busy = engine.segments.at(14, 20)
+        assert busy is not None
+        assert not engine.belts.is_at_rest(busy, tick), (
+            "the Source-fed run should be awake; the fixture is wrong")
+        # The blocked gate must actually be holding at the tick sampled, or
+        # the gate half of this test is vacuous -- it would compare a blue
+        # gate against a blue gate and pass whatever the mask did. Asserted
+        # rather than assumed, because "how many ticks until the short run
+        # backs up" is exactly the kind of fixture detail that drifts.
+        held = engine.board.view(stuck.row)
+        assert any(held.out_held(c) for c in range(held.output_count())), (
+            "the blocked Source should be holding a result by now; the "
+            "fixture is wrong and the gate mask assertion would be vacuous")
+
+        # A bare cell on the awake run, for the same reason the test above
+        # needs one: items draw over the overlay, so a cell under a disc
+        # reports the disc's colour whatever the mask did.
+        occupied = {int(engine.belts.position_of(busy, k, tick) // UNIT)
+                    for k in range(busy.head, busy.tail)}
+        probe_x = next((cx for off, (cx, _cy) in enumerate(busy.cells)
+                        if off not in occupied and cx >= 14), None)
+        assert probe_x is not None, (
+            f"no bare cell on the awake run; items at offsets {occupied}")
+
+        assert cam.set_define("SLEEP_DEBUG", True), cam.compile_error
+        assert cam.compile_error is None, cam.compile_error
+        # Both the belt row (20) and the blocked gate (24) must be on screen
+        # at once, so this centres between them rather than on the run.
+        cam.center[:] = (12.0, 22.0)
+        cam.zoom = 22.0
+
+        # The gate cell to sample, found from the Source's own footprint
+        # rather than hardcoded, so a change to its shape does not silently
+        # move the probe onto bare board.
+        gx, gy = stuck.origin
+
+        # Both families reporting: the belt is amber.
+        cam.sleep_show_belts = True
+        cam.sleep_show_gates = True
+        belt_shown = _mean_rgb(_render(), probe_x, 20)
+        assert _is_warm(belt_shown), (
+            f"with belts reported, the awake run should be amber, "
+            f"got {belt_shown}")
+
+        # Belts silenced: the *same cell* must now read blue. This is the
+        # whole assertion -- a mask that did nothing would leave it amber.
+        cam.sleep_show_belts = False
+        belt_hidden = _mean_rgb(_render(), probe_x, 20)
+        assert _is_cold(belt_hidden), (
+            f"with belts masked off, the awake run must be forced blue, "
+            f"got {belt_hidden} (was {belt_shown.astype(int)})")
+
+        # And the gate mask must be independent: silencing belts must not
+        # have silenced the gates too. Checked by toggling the gate mask
+        # with belts still off, so any change is the gate mask's alone.
+        gate_shown = _mean_rgb(_render(), gx, gy)
+        cam.sleep_show_gates = False
+        gate_hidden = _mean_rgb(_render(), gx, gy)
+        assert _is_cold(gate_hidden), (
+            f"with gates masked off, the gate body must read blue, "
+            f"got {gate_hidden}")
+        # The gate was holding something, so masking it had to change it.
+        # Without this the test passes on a gate that was blue all along and
+        # says nothing about the gate mask at all.
+        assert not np.allclose(gate_shown, gate_hidden, atol=6), (
+            f"the gate mask changed nothing: {gate_shown.astype(int)} vs "
+            f"{gate_hidden.astype(int)} -- the gate may have been asleep "
+            f"already, which would make this test vacuous")
+
+        ok(f"belt amber {belt_shown.astype(int)} -> masked "
+           f"{belt_hidden.astype(int)}; gate {gate_shown.astype(int)} -> "
+           f"masked {gate_hidden.astype(int)}")
+    finally:
+        cam.set_define("SLEEP_DEBUG", was)
+        cam.sleep_show_belts = True
+        cam.sleep_show_gates = True

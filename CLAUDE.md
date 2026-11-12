@@ -2199,6 +2199,42 @@ while staying internally consistent. Two tools, both free when off:
   "GLSL disagrees with Python" bugs). Holding nothing is also the question a
   player reading the board actually wants answered.
 
+  **Two checkboxes mask the families independently** — `report belts` and
+  `report gates`, unticking one forcing it to read asleep. Belts and gates
+  have *different* schedulers (belts are edge-triggered and genuinely
+  skipped; gates are prefiltered but visited every tick), so comparing their
+  amber needs one family silenced at a time.
+
+  Three decisions here:
+
+  - **Uniforms, not `#define`s.** The point is to flick between them while
+    watching one running factory, and a recompile would drop a frame. That is
+    the opposite trade from `SLEEP_DEBUG` itself, which is an `#ifdef`
+    precisely because it must cost nothing when off. `Camera._set()` already
+    skips a uniform the shader does not declare, so the masks need no
+    mirroring of the define.
+  - **Forced blue, not hidden.** Blue already means "not being worked on", so
+    a masked family reads as calm background and the unmasked one pops out of
+    it. Hiding the tint would leave the entity's own colour showing and make
+    the two families hard to compare at a glance.
+  - **The mask decides whether to *ask*, never what the answer is.** The
+    predicate stays the single source of the real state.
+
+  Pinned by `test_the_sleep_masks_isolate_belts_from_gates`, which asserts
+  the **same cell changes colour** when a mask changes — no single render can
+  show that, and a mask that did nothing would be indistinguishable from a
+  family that happened to be asleep. Both mutations (either mask ignored) are
+  caught.
+
+  The gate half needs a gate that is actually *holding* something, and the
+  obvious fixture does not produce one: a Source feeding a working belt holds
+  nothing at end of tick, because the belt phase drains the zone one phase
+  after the structure phase fills it — that is the bubble-free design working
+  as intended. So the test adds a Source whose one-cell run backs up and
+  **asserts `out_held` before sampling**, because a blue-vs-blue comparison
+  would pass whatever the mask did. The vacuity guard caught exactly that on
+  the first attempt.
+
   Three things the pixel test had to get right, each of which it got wrong
   first:
   - **Items draw over the overlay**, so an awake cell *under a disc* reads

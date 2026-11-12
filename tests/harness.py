@@ -173,6 +173,13 @@ def reset():
     orch.annotation_layer.enabled = True
     cam.center[:] = (BOARD / 2, BOARD / 2)
     cam.zoom = 16.0
+    # The sleep overlay's per-family masks default to "report both", which is
+    # the app's own default. A scenario that silenced one would otherwise
+    # have the next one's pixel test read a forced-blue belt as a genuinely
+    # sleeping one -- a passing assertion about the wrong thing, which is the
+    # worst outcome for a test that reads the framebuffer.
+    cam.sleep_show_belts = True
+    cam.sleep_show_gates = True
     # The clock is global state like everything else here: a scenario that
     # paused the sim or ran it far forward must not leave the next one
     # starting mid-timeline. clear_board() above already resets the tick

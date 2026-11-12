@@ -51,6 +51,12 @@ class Camera:
         #: live behind #ifdef rather than a uniform so they are not compiled
         #: at all when off -- see shader_loader.load().
         self.defines = set()
+        #: Sleep-overlay masks. Each forces that family of cells to read
+        #: asleep (blue) when False, so one family can be isolated and the
+        #: two compared. Plain uniforms, not defines: flicking between them
+        #: while watching a running factory must not recompile.
+        self.sleep_show_belts = True
+        self.sleep_show_gates = True
         self.reload_shader()
 
     # --- shader ---------------------------------------------------------
@@ -258,6 +264,12 @@ class Camera:
         else:
             self._set("sim_tick", 0)
             self._set("sim_alpha", 0.0)
+
+        # Sleep-overlay masks. Set unconditionally: `_set()` skips a uniform
+        # the shader does not declare, and with SLEEP_DEBUG compiled out these
+        # are exactly that -- so there is no need to mirror the define here.
+        self._set("sleep_show_belts", 1 if self.sleep_show_belts else 0)
+        self._set("sleep_show_gates", 1 if self.sleep_show_gates else 0)
 
         # The selection box, in *world* units so the shader needs no cell
         # maths: lo is the box's lower-left corner and hi is one past its

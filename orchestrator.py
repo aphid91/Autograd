@@ -1342,6 +1342,13 @@ class Orchestrator:
             self.camera.set_define("SEGMENT_DEBUG", requests.segment_debug)
         if requests.sleep_debug is not None:
             self.camera.set_define("SLEEP_DEBUG", requests.sleep_debug)
+        # Plain attributes rather than set_define(): these are uniforms, so
+        # flicking between them while watching a running factory costs
+        # nothing and recompiles nothing. See render/camera.py.
+        if requests.sleep_show_belts is not None:
+            self.camera.sleep_show_belts = requests.sleep_show_belts
+        if requests.sleep_show_gates is not None:
+            self.camera.sleep_show_gates = requests.sleep_show_gates
         if requests.rebuild_segments:
             engine.invalidate_segments()
         if requests.audit_segments:

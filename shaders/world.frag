@@ -27,6 +27,21 @@ uniform vec2  select_lo;
 uniform vec2  select_hi;
 uniform int   select_on;      // 0 when no selection is in progress
 
+// Sleep overlay masks: 1 shows the real asleep/awake answer, 0 forces that
+// family of cells to read asleep. Uniforms rather than `#define`s so toggling
+// one does *not* recompile -- the point is to flick between belts-only and
+// gates-only while watching the same running factory, and a recompile would
+// drop a frame and reset nothing else. That is the opposite trade from
+// SLEEP_DEBUG itself, which is a #ifdef precisely because it should cost
+// nothing when off.
+//
+// Forcing blue rather than hiding the tint entirely: blue is already "not
+// being worked on", so a masked family reads as a calm background and the
+// unmasked one pops out of it. Hiding would leave the entity's own colour
+// showing and make the two families hard to compare at a glance.
+uniform int   sleep_show_belts;
+uniform int   sleep_show_gates;
+
 // ======================================================================
 // TUNABLES -- everything here is safe to fiddle with.
 // ======================================================================
@@ -1282,7 +1297,12 @@ void main() {
             bool known = false;
             bool resting = false;
             if (sid != 0) {
-                resting = segment_at_rest(sid, sim_tick);
+                // Masked off -> report asleep, so the belts drop to a flat
+                // blue field and only the gates carry amber. The predicate is
+                // still the one place the answer comes from; the mask only
+                // decides whether to ask.
+                resting = (sleep_show_belts == 0)
+                        || segment_at_rest(sid, sim_tick);
                 known = true;
             } else if (is_structure(type)) {
                 // A gate is "awake" when it holds anything -- a fed input or
@@ -1294,11 +1314,13 @@ void main() {
                 // GLSL-disagrees-with-Python bugs. Holding nothing is the
                 // necessary condition the prefilter shares, and it is the
                 // one a player reading the board actually wants.
-                int row = cell_id(c.x);
                 bool holds = false;
-                for (int ch = 0; ch < MAX_CHANNELS; ++ch) {
-                    if (gate_in_held(row, ch) || gate_out_held(row, ch)) {
-                        holds = true;
+                if (sleep_show_gates != 0) {
+                    int row = cell_id(c.x);
+                    for (int ch = 0; ch < MAX_CHANNELS; ++ch) {
+                        if (gate_in_held(row, ch) || gate_out_held(row, ch)) {
+                            holds = true;
+                        }
                     }
                 }
                 resting = !holds;
