@@ -191,10 +191,17 @@ bool segment_at_rest(int sid, int tick) {
         // still advancing is not yet a fixed point.
         return sf.x >= sf.y;
     }
-    // Holding items: inert exactly while nothing can enter, which is the
-    // room test from BeltSim.has_room() -- the last item has not yet moved a
-    // full spacing clear of the entrance. This is the RAM case: a run
-    // storing a value nobody is taking.
+    // Holding items: both halves of the tick must be unable to act.
+    //
+    // The head must already be at the end -- a run whose head is still
+    // travelling has a pop coming on a future tick, with no external event
+    // to announce it (positions are a closed form over `tick`, so they
+    // advance whether or not the run is visited). Omitting this reported a
+    // seeded run as asleep from its first tick; see BeltSim.is_at_rest().
+    if (item_position(sid, si.x, tick, 0.0) < sf.y) return false;
+    // ...and nothing can enter: the last item has not yet moved a full
+    // spacing clear of the entrance. This is the RAM case, a run storing a
+    // value nobody is taking.
     return item_position(sid, si.y - 1, tick, 0.0) < sf.w;
 }
 

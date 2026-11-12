@@ -352,12 +352,44 @@ class SegmentIndex:
         # The downstream cell must actually take from us. It does not if it
         # faces back at us (two belts nose to nose), and it does not if some
         # other incoming direction wins the tie-break.
+        #
+        # `_taken_from()` deliberately, not `_belt_taken_from()`: if a machine
+        # port wins that cell's tie-break then it does not take from us, and
+        # comparing against `(x, y)` -- a belt cell -- already says so. Using
+        # the belt-only form would report None there and read as "nothing
+        # wins", which would wrongly let this run continue into a cell the
+        # machine owns.
         if self._taken_from(nx, ny) != (x, y):
             return None
         return (nx, ny), 0
 
     def _incoming(self, x, y):
-        """Directions (from (x,y)'s view) holding a belt-like cell emitting at us."""
+        """Directions (from (x,y)'s view) holding **anything** emitting at us.
+
+        Belts, underground exits *and* machine output ports, in one set. The
+        merge is the whole point: `take_dir()` resolves contention, and it can
+        only do that correctly if it is shown every contender at once.
+
+        **This was split in two and it was a real bug.** `_incoming()` used to
+        collect belt-like neighbours only, while `_node_behind()` separately
+        collected machine ports, and each called `take_dir()` on its own
+        partial set. The renderer, meanwhile, builds one merged mask through
+        `feeds_into()` -- which already covers belts, undergrounds and ports --
+        and calls `take_dir()` once. So on a cell with a belt *and* a machine
+        port aimed at it, the two sides could pick different winners.
+
+        The observable failure: a Source feeding an eastward run, plus any
+        belt pointed at that run's tail from another side. The tracer saw only
+        the belt, moved the tail one cell back, and never asked
+        `_node_behind()` about the original tail -- so `seg.src` became None
+        and the Source silently had nowhere to put items, blocking for ever
+        with a full waiting zone. The renderer still drew the Source's
+        connection stub, because its merged set picked the Source. "Items sent
+        down the visibly-unconnected belt emerge on the connected one" is the
+        same disagreement seen from the other end.
+
+        One set, one `take_dir()`, matching `common.glsl`.
+        """
         here = self._cell_at(x, y)
         if here is None:
             return []
@@ -376,6 +408,13 @@ class SegmentIndex:
             nx, ny = x + step[0], y + step[1]
             n = self._cell_at(nx, ny)
             if n is None:
+                # Not belt-like -- but a *machine* with an output port facing
+                # us is just as much a source, and must compete in the same
+                # tie-break rather than in a separate one. `_cell_at()`
+                # returns None for a structure, so this is where a port
+                # enters the set.
+                if self._port_at(nx, ny, (d + 2) % 4, want_output=True):
+                    out.append(d)
                 continue
             t, nd, _row = n
             # It emits at us only if its facing points back our way.
@@ -397,7 +436,13 @@ class SegmentIndex:
         """Which neighbouring cell (x, y) actually takes material from.
 
         Returns (nx, ny) or None. Resolves multi-source contention through
-        take_dir(), so exactly one upstream cell ever wins.
+        `take_dir()` over the **full** candidate set, so exactly one upstream
+        cell ever wins -- and it is the same one the renderer draws.
+
+        The winner may be a *machine* cell rather than a belt-like one, since
+        `_incoming()` includes output ports. Callers that care about the
+        difference ask `_belt_taken_from()`; callers that only want "who
+        actually feeds this cell" want this.
         """
         here = self._cell_at(x, y)
         if here is None:
@@ -410,19 +455,46 @@ class SegmentIndex:
         step = cell.DIR_STEPS[d]
         return x + step[0], y + step[1]
 
+    def _belt_taken_from(self, x, y):
+        """`_taken_from()`, but only when the winner is part of a run.
+
+        A machine winning the tie-break means this cell is fed *from outside
+        the belt network*, which for tracing purposes is the same as being
+        unfed: a run cannot continue backwards into a gate. So the cell is a
+        tail, and the gate becomes its `seg.src`.
+
+        Separate from `_taken_from()` rather than folded into it because the
+        two questions genuinely differ, and conflating them is how the
+        original bug would come back. "Who feeds this cell" must include
+        machines (that is what fixes the tie-break); "where does this run
+        continue backwards to" must not.
+        """
+        got = self._taken_from(x, y)
+        if got is None:
+            return None
+        return got if self._cell_at(*got) is not None else None
+
     def _is_tail(self, x, y):
         """Is (x, y) the upstream end of a run?
 
-        Not just "no orthogonal neighbour feeds me". A paired underground
-        *exit* is fed across the buried span by an entrance several cells
-        away, which `_incoming()` cannot see -- it only probes the four
-        adjacent cells. Treating such an exit as a tail starts a second trace
-        over cells the entrance's run already covers, and the two segments
-        double-claim them.
+        Not just "no orthogonal neighbour feeds me". Two cases where the
+        simple test is wrong:
+
+        A paired underground *exit* is fed across the buried span by an
+        entrance several cells away, which `_incoming()` cannot see -- it only
+        probes the four adjacent cells. Treating such an exit as a tail starts
+        a second trace over cells the entrance's run already covers, and the
+        two segments double-claim them.
+
+        A cell fed by a **machine port** *is* a tail, even though something
+        does feed it: a run cannot extend backwards into a gate. Hence
+        `_belt_taken_from()` rather than `_taken_from()` -- the latter now
+        reports machine winners too, and using it here would make every
+        Source-fed run tailless and send it into the closed-loop fallback.
         """
         if self._fed_by_under(x, y) is not None:
             return False
-        return self._taken_from(x, y) is None
+        return self._belt_taken_from(x, y) is None
 
     def _fed_by_under(self, x, y):
         """The paired entrance diving into this underground exit, or None."""
@@ -610,32 +682,34 @@ class SegmentIndex:
         `behind` made such a run read as dangling: the items flowed nowhere
         and the generator blocked forever with a full waiting zone.
 
-        Contention is resolved by `take_dir()`, the same authority the belt
-        path and the renderer use, so a cell with several things pointing at
-        it takes from exactly one and the picture matches the simulation.
+        Contention is resolved by `take_dir()` over the **whole** candidate
+        set, via `_taken_from()` -- belts and ports together, exactly as the
+        renderer's `feeds_into()` loop does it.
+
+        **It used to run its own `take_dir()` over machine ports alone**, and
+        that was the bug `_incoming()` documents at length: two partial sets,
+        two independent tie-breaks, and a renderer that merged them. A belt
+        aimed at a Source-fed run's tail would win the tracer's belt-only
+        resolution, move the tail back a cell, and leave this method never
+        asked -- so `seg.src` went None and the Source blocked for ever while
+        still being *drawn* connected.
+
+        Now there is one resolution and this method only interprets it: if the
+        winner is a machine cell, that machine's port feeds the run.
         """
         x, y = xy
-        here = self._cell_at(x, y)
-        if here is None:
+        got = self._taken_from(x, y)
+        if got is None:
             return None
-        _t, facing, _row = here
-
-        candidates = []
-        for d in range(4):
-            # The cell we output into is never a source, as in _incoming().
-            if d == facing:
-                continue
-            step = cell.DIR_STEPS[d]
-            nx, ny = x + step[0], y + step[1]
-            if self._port_at(nx, ny, (d + 2) % 4, want_output=True):
-                candidates.append(d)
-
-        d = take_dir(facing, candidates)
-        if d is None:
+        nx, ny = got
+        # A belt-like winner means the run continues backwards and this is not
+        # a node at all -- `_is_tail()` would not have made this cell a tail.
+        if self._cell_at(nx, ny) is not None:
             return None
-        step = cell.DIR_STEPS[d]
-        return self._port_at(x + step[0], y + step[1], (d + 2) % 4,
-                             want_output=True)
+        # The winner is a machine. The face pointing at us is the one along
+        # the step from it to us.
+        toward = cell.step_to_dir(x - nx, y - ny)
+        return self._port_at(nx, ny, toward, want_output=True)
 
     def _node_ahead(self, xy):
         """The structure input port this cell drains into, or None."""

@@ -328,52 +328,52 @@ class GateSim:
 
         # --- the sleep pass ---
         #
-        # Two jobs, and they are deliberately on *different* row sets.
+        # **Entirely vectorised, and it has to be.** The first version walked
+        # the rejected rows in Python and asked a per-gate predicate, which on
+        # a real board (cpu.npz, 670 gates) took the prefilter from 1.40ms to
+        # 6.81ms a tick -- a 4.9x *regression* on the very pass whose whole
+        # purpose is to avoid per-gate Python. The sleep set is supposed to
+        # remove work, and a scheduler that costs more than the work it skips
+        # is worse than no scheduler. Measured, not assumed: this is exactly
+        # what `tools/probe_batch_prefilter.py` already recorded about slicing
+        # versus looping, re-learned one layer up.
         #
-        # **Put rejected gates to sleep.** A gate the prefilter just rejected
-        # is starved or blocked, which is the precondition for being inert --
-        # so this is where the candidates are, not among the admitted. The
-        # predicate then adds the part occupancy cannot see: whether anything
-        # could change that before next tick.
-        #
-        # **Skip gates already asleep.** The masks above are computed for
-        # every row regardless, because they are one vectorised slice and
-        # excluding rows first would cost more than it saves (sorting rows
-        # buys ~15% while slicing buys 60x -- see
-        # tools/probe_batch_prefilter.py). What sleeping removes is the
-        # *per-gate Python*, which is the expensive half.
-        asleep = self._asleep
-        awake = ready & has_room
-        if asleep:
-            # An admitted gate that is asleep stays skipped. It can only be
-            # here if it is ready and unblocked, which a sleeping gate should
-            # never be -- but a stale sleep set is a silent freeze, so this
-            # is belt and braces rather than trust: being admitted means
-            # something changed, and something changing means it should wake.
-            for i, row in enumerate(rows):
-                if awake[i] and int(row) in asleep:
-                    asleep.discard(int(row))
+        # The predicate is "holds nothing on any declared channel", which is
+        # two reductions over masks already computed above. Nothing per-gate
+        # survives.
+        holds_in = (held & in_used).any(axis=1)
+        holds_out = ((~free) & out_used).any(axis=1)
+        inert = ~(holds_in | holds_out)
 
-        # Only consider gates that did *not* get admitted. `np.nonzero` over
-        # the rejection mask keeps this a vectorised selection; the per-gate
-        # predicate then runs on candidates only, which on a quiet board is
-        # where almost every row already is.
-        rejected = np.nonzero(~awake)[0]
-        for i in rejected:
-            row = int(rows[i])
-            if row in asleep:
-                continue
-            # `held_in` is "a declared input channel is fed" and `held_out`
-            # is "a declared output zone is occupied" -- both expressed as
-            # *occupancy*, so an undeclared lane contributes False to each and
-            # cannot be mistaken for either. `free` is the inverse of
-            # occupancy, so the zone test is `~free & out_used` rather than
-            # `free & out_used`; passing the latter would read every
-            # undeclared lane as "not free" and never sleep anything.
-            if self._gate_is_inert(row, held[i] & in_used[i],
-                                   (~free[i]) & out_used[i]):
-                asleep.add(row)
+        awake = ready & has_room
+        asleep = self._asleep
+        # Gates to put to sleep: inert, and not admitted. An admitted gate is
+        # one the phase is about to run, so sleeping it would skip real work.
+        # (With this predicate the two are nearly disjoint anyway -- a gate
+        # holding nothing is starved unless it has no inputs at all -- but
+        # `ready` is True for a generator, which holds nothing and must still
+        # fire, so the exclusion is load-bearing for exactly that case.)
+        to_sleep = inert & ~awake
+        # Gates to wake: anything now holding something. Belt-and-braces over
+        # the explicit wake edges at `accept_from()` / `took_from()` /
+        # `deliver_direct()` -- those are what make sleeping *correct*, and
+        # this is a cheap backstop against one being missed, since a stale
+        # sleep set is a silent freeze rather than a visible error. Costs one
+        # more vectorised set operation, not a loop.
+        to_wake = ~inert
+
+        if asleep:
+            asleep.difference_update(rows[to_wake].tolist())
+        asleep.update(rows[to_sleep].tolist())
         self.stats["gates_asleep"] = len(asleep)
+
+        # **`admit` needs no filtering against the sleep set**, which is the
+        # part that makes this cheap. `to_sleep` excludes admitted rows and
+        # `to_wake` covers everything holding anything, so a row cannot be
+        # both admitted and asleep after this pass -- the two masks partition
+        # the table between them. Re-filtering `admit` would put a Python
+        # membership test per admitted gate back into the pass, which is the
+        # cost just removed.
         return admit.tolist(), starved, blocked
 
     # --- waking the belts a gate touches ----------------------------------

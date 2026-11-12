@@ -338,8 +338,32 @@ class BeltSim:
         length = self.length_of(seg)
         if seg.head == seg.tail:
             return seg.anchor >= length
-        # Holding items: inert exactly while nothing can enter. The head
-        # reaching the end is the consumer's business and arrives as a wake.
+        # Holding items: **both** halves of the tick have to be unable to act.
+        #
+        # Nothing can enter -- that is the room test, and it was the only test
+        # here originally. But the *pop* is also work, and it needs the head
+        # to be exactly at the end. A run whose head is still travelling has
+        # work to do on some future tick with no external event to announce
+        # it: an item's position is a closed form over `tick`, so it keeps
+        # advancing whether or not the run is visited, and the arrival is the
+        # run's own business rather than a wake anyone raises.
+        #
+        # Missing this stranded every **seeded** run that feeds a starved
+        # gate. `seed_segments()` pushes at position 0, which is the entrance,
+        # so `has_room()` is False immediately and the run was slept on its
+        # very first tick -- while the item visibly slid down the belt (closed
+        # form) and then sat at the end for ever, because the pop never ran.
+        # Nothing could wake it either: a seeded run has no producer, so no
+        # `src` edge exists, and the gate ahead was starved precisely because
+        # delivery never happened. The player sees a seeded value travel the
+        # belt and then refuse to enter the gate.
+        #
+        # The head-at-end case is still a real fixed point, and it is the one
+        # that matters for memory: a full run parked against a consumer that
+        # will not take. There the pop is attempted and refused, and the
+        # consumer taking *is* an event that raises a wake.
+        if self.position_of(seg, seg.head, tick) < length:
+            return False
         return not self.has_room(seg, tick)
 
     def wake(self, seg):

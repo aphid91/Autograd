@@ -1469,9 +1469,38 @@ as one bogus segment.
 four.** It used to look only at the cell directly behind the belt's own
 facing, which silently missed the normal way to use a multi-port machine — a
 Source's north face feeding an eastward run read as *dangling*, so items
-flowed nowhere and the generator blocked with a full zone. Contention there is
-resolved by the same `take_dir()` the belt path and renderer use, so a cell
-with several things pointing at it takes from exactly one.
+flowed nowhere and the generator blocked with a full zone.
+
+**There is exactly one candidate set, and exactly one `take_dir()`.** This is
+the part that was wrong for a long time: `_incoming()` collected belt-like
+neighbours, `_node_behind()` separately collected machine ports, and *each
+called `take_dir()` on its own partial set*. The renderer meanwhile builds
+one merged mask through `feeds_into()` — which already covers belts,
+undergrounds and ports — and resolves once. So on a cell with a belt **and** a
+machine port aimed at it, the two sides could pick different winners.
+
+The failure was severe and silent. A Source feeding a run, plus any belt
+pointed at that run's tail from another side: the tracer saw only the belt,
+moved the tail back a cell, and never asked `_node_behind()` about the
+original tail — so `seg.src` became `None`, the generator blocked for ever
+with a full waiting zone, and the renderer still drew its connection stub.
+Items sent down the apparently-unconnected belt emerged on the connected one,
+which is the same disagreement from the other end.
+
+`_incoming()` now includes ports, so one `take_dir()` decides everything.
+That makes `_taken_from()` able to return a *machine* cell, which splits one
+question into two that must not be conflated:
+
+- **"Who feeds this cell?"** (`_taken_from`) must include machines — that is
+  what fixes the tie-break.
+- **"Where does this run continue backwards to?"** (`_belt_taken_from`) must
+  not. A run cannot extend into a gate, so a machine-fed cell **is** a tail.
+  `_is_tail()` uses the belt-only form; using the other would make every
+  Source-fed run tailless and send it into the closed-loop fallback.
+
+Pinned by `test_a_belt_aimed_at_a_tail_does_not_disconnect_the_machine`,
+which asserts on `seg.src` rather than on item flow — a run whose tail moved
+one cell still *looks* right.
 
 `_node_ahead()` deliberately stays single-directional: a belt delivers to the
 one cell it faces.
@@ -1554,9 +1583,29 @@ A factory is the easy case; a CPU is 99%+ idle.
   `None`.
 
 So `BeltSim.is_at_rest()` names two fixed points: **empty with a saturated
-anchor**, and **holding items with no room** — the RAM case, a run storing a
-value nobody is taking. A sleeping run's item positions freeze too, so the
-closed form keeps describing it and the renderer needs no special case.
+anchor**, and **holding items whose head is already at the end, with no
+room** — the RAM case, a run storing a value nobody is taking. A sleeping
+run's item positions freeze too, so the closed form keeps describing it and
+the renderer needs no special case.
+
+**The head-at-end clause is load-bearing, and leaving it out broke seeded
+belts.** "Holding items with no room" was originally treated as a fixed point
+on its own, reasoning that nothing could *enter*. True — but the **pop** is
+work too, and it needs the head at the end, which arrives with *no external
+event*: an item's position is a closed form over `tick`, so it advances
+whether or not the run is visited. The arrival is the run's own business, not
+a wake anybody raises.
+
+A seed is pushed at position 0 — the entrance — so `has_room()` is False
+immediately and the run was slept on its **very first tick**. The item then
+visibly slid down the belt (closed form) and sat at the end for ever, because
+the pop never ran. Nothing could wake it: a seeded run has no producer, so no
+`src` edge exists, and the gate ahead stayed starved precisely because
+delivery never happened. The report was "a seeded belt feeding a gate never
+loads it", and a seeded loop around a Shear is exactly that shape.
+
+Mirrored in `segment_at_rest()` in `common.glsl`, since the sleep overlay
+would otherwise paint a travelling seeded run as asleep.
 
 **The anchor clause is load-bearing and nearly invisible.** An empty run whose
 anchor has not yet saturated *looks* idle but still advances, and dropping the

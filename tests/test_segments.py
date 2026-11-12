@@ -593,3 +593,107 @@ def test_segment_overlay_toggles_without_breaking_the_shader():
         # The camera is shared across scenarios, and a stray define would
         # leave every later one rendering the debug build.
         cam.set_define("SEGMENT_DEBUG", was)
+
+
+def test_a_belt_aimed_at_a_tail_does_not_disconnect_the_machine():
+    """One candidate set, one tie-break -- the same one the renderer uses.
+
+    `_incoming()` (belts) and `_node_behind()` (machine ports) used to
+    collect separate candidate sets and run `take_dir()` on each
+    independently, while the shader's `feeds_into()` loop builds one merged
+    mask and resolves once. So a cell with a belt *and* a port aimed at it
+    could get different winners from the two sides.
+
+    The visible failure was severe and silent: a Source feeding a run, plus
+    any belt pointed at that run's tail from another side, and the Source
+    was dropped -- `seg.src` became None, the generator blocked for ever with
+    a full waiting zone, and the renderer still drew its connection stub.
+    Items sent down the apparently-unconnected belt emerged on the connected
+    one, which is the same disagreement seen from the other end.
+
+    Asserted on `seg.src` rather than on item flow, because that is the
+    thing that changed: a run whose tail moved one cell still *looks* right.
+    """
+    harness.reset()
+    # A Source feeding an eastward run from its east face.
+    engine.place_structure(Source, 2, 10, cell.DIR_PX)
+    engine.place_belt_path((4, 10), (9, 10))
+    engine.sync_segments()
+
+    seg = engine.segments.at(4, 10)
+    assert seg is not None and seg.src is not None, (
+        f"fixture wrong: the Source should feed this run, got {seg.src}")
+    fed_by = seg.src
+    ok(f"Source feeds the run at (4,10): src={fed_by}")
+
+    # Now aim an unrelated belt at the run's tail from the south. The player
+    # has not connected it to anything -- it merely points at that cell.
+    engine.place_belt(4, 9, cell.DIR_PY)
+    engine.invalidate_segments()
+    engine.sync_segments()
+
+    seg = engine.segments.at(4, 10)
+    assert seg is not None, "(4,10) left the segmentation entirely"
+    assert seg.src == fed_by, (
+        f"the extra belt disconnected the Source: src was {fed_by}, "
+        f"now {seg.src} -- the generator has nowhere to put items and will "
+        f"block for ever while still being drawn connected")
+    ok("the Source survived a belt being aimed at its run's tail")
+
+
+def test_a_seeded_run_delivers_into_a_starved_gate():
+    """A seeded run must not sleep before its item reaches the end.
+
+    `is_at_rest()` treated "holding items with no room" as a fixed point on
+    its own, on the grounds that nothing could *enter*. But the **pop** is
+    work too, and it needs the head at the end -- which arrives with no
+    external event, since an item's position is a closed form over `tick`
+    and advances whether or not the run is visited.
+
+    A seed is pushed at position 0, the entrance, so `has_room()` is False
+    immediately and the run was slept on its very first tick. The item then
+    visibly slid down the belt and stopped, for ever: a seeded run has no
+    producer so no `src` edge exists, and the gate ahead stayed starved
+    precisely because delivery never happened. "A seeded belt feeding a gate
+    never loads it" was the report.
+
+    Asserted on the gate's channel rather than on the sleep set, because
+    that is what the player sees.
+    """
+    harness.reset()
+    gate = engine.place_structure(Shear, 10, 10, cell.DIR_PX)
+    engine.place_belt_path((5, 10), (9, 10))
+    engine.sync_segments()
+
+    seg = engine.segments.at(7, 10)
+    assert seg is not None and seg.dst is not None, (
+        "fixture wrong: the run should drain into the Shear")
+
+    held = engine.board.entity_at(6, 10)
+    held.seed_on = True
+    held.seed_value = 7.0
+    engine.invalidate_segments()
+    engine.sync_segments()
+    assert engine.belts.total_items() == 1, (
+        f"the seed did not land: {engine.belts.total_items()} items")
+
+    # The run is 5 cells at one cell per tick, so the head arrives well
+    # inside this budget. Looped rather than pinned to an exact tick so the
+    # test is about delivery, not about transit time.
+    for _ in range(12):
+        engine.clock.request_step()
+        engine.clock.advance(0.0)
+        if any(gate.in_held(c) for c in range(gate.input_count())):
+            break
+    else:
+        raise AssertionError(
+            f"the seeded value never reached the gate: "
+            f"{engine.belts.total_items()} item(s) still on the belt, "
+            f"segment asleep={seg.sid in engine.belts._asleep} -- a seeded "
+            f"run slept before its head reached the end and nothing could "
+            f"wake it")
+
+    got = [gate.in_value(c) for c in range(gate.input_count())
+           if gate.in_held(c)]
+    assert 7.0 in got, f"expected the seeded 7.0 to arrive, got {got}"
+    ok(f"the seeded value {got} reached the starved gate")
