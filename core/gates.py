@@ -94,8 +94,10 @@ a port face has exactly one neighbour. The pass reads only end-of-structure
 state and writes disjoint slots.
 """
 
+import numpy as np
+
 from core import cell
-from core.entity import Entity
+from core.entity import MAX_CHANNELS, Entity
 
 
 class GateSim:
@@ -122,6 +124,9 @@ class GateSim:
         #: See the "resolving a segment's ends" block below.
         self._src_cache = {}
         self._dst_cache = {}
+        #: (rows, n_in, n_out, strict) arrays for the prefilter, or None.
+        #: See _gate_table().
+        self._gate_table_cache = None
 
     def invalidate_connectivity(self):
         """Drop every cached derivation of the grid and the segmentation.
@@ -144,6 +149,7 @@ class GateSim:
         self._faces_cache.clear()
         self._src_cache.clear()
         self._dst_cache.clear()
+        self._gate_table_cache = None
 
     # --- gate discovery ---------------------------------------------------
     #: Types that are rows but not gates. Checked against the raw type column
@@ -180,6 +186,117 @@ class GateSim:
                 continue
             yield view
 
+    # --- the vectorised prefilter -----------------------------------------
+    #
+    # Most gates on a large board can do nothing on a given tick: measured on
+    # a 672-gate board, 576 were starved and 96 blocked, with none firing. The
+    # phase below still built a view for each, asked its firing rule, resolved
+    # its connectivity and tested its zones -- about 48k Python-level calls a
+    # tick to reach "no".
+    #
+    # `_candidate_rows()` answers "could this gate possibly act?" for every
+    # gate at once, as array operations over the entity table. The per-gate
+    # Python path then runs only on the survivors, unchanged.
+    #
+    # **It must never exclude a gate the full phase would have fired**, or it
+    # changes behaviour rather than merely speeding it up. So it tests only
+    # *necessary* conditions, and only ones that are pure row state:
+    #
+    #   - the type's firing rule is satisfiable by occupancy alone. FIRE_ALL
+    #     needs every declared channel fed; FIRE_ANY needs one. FIRE_SELECT
+    #     is value-dependent and `inputs_ready()` is overridable, so those
+    #     types are **always admitted** and decided in Python.
+    #   - at least one output zone is free. With every zone full a gate is
+    #     blocked under both the all-or-nothing rule and the generator's
+    #     "fill whichever are free".
+    #
+    # Everything else -- connectivity, the arithmetic, which inputs are
+    # consumed -- stays exactly where it was.
+    #
+    # This is also the shape the GPU port wants: a cheap parallel predicate
+    # over every entity, then a compacted index list to dispatch the
+    # expensive kernel over. The prefilter is the predicate pass and the
+    # survivor list is the compaction, so the port replaces each half with a
+    # dispatch instead of restructuring the phase.
+    def _gate_table(self):
+        """(rows, n_in, n_out, strict) for every live gate, as arrays.
+
+        Rebuilt only when the set of gates changes, since all four are
+        functions of which rows hold which type -- not of anything the tick
+        mutates. `strict` marks the rows whose readiness is decided by
+        occupancy (FIRE_ALL); the rest are always admitted.
+        """
+        if self._gate_table_cache is not None:
+            return self._gate_table_cache
+
+        rows, n_in, n_out, strict = [], [], [], []
+        for gate in self.gates():
+            cls = type(gate)
+            rows.append(gate.row)
+            n_in.append(gate.input_count())
+            n_out.append(gate.output_count())
+            # FIRE_ANY needs one fed channel; FIRE_ALL needs all of them.
+            # FIRE_SELECT (and any type overriding inputs_ready()) is not
+            # expressible as an occupancy count, so it is never filtered out.
+            strict.append(cls.FIRE_RULE == cls.FIRE_ALL)
+
+        table = (np.asarray(rows, dtype=np.int64),
+                 np.asarray(n_in, dtype=np.int64),
+                 np.asarray(n_out, dtype=np.int64),
+                 np.asarray(strict, dtype=bool))
+        self._gate_table_cache = table
+        return table
+
+    def _candidate_rows(self):
+        """(admitted rows, n_starved, n_blocked) for this tick.
+
+        Conservative -- see the block comment above. The two rejection counts
+        come back with the set because the masks that decide them are already
+        computed here: classifying a skip costs nothing, and it is what keeps
+        `starved` and `blocked` meaning what they always meant. Without that
+        the prefilter would silently empty two stats the panel and three tests
+        read, which is a behaviour change dressed as an optimisation.
+        """
+        rows, n_in, n_out, strict = self._gate_table()
+        if not len(rows):
+            return [], 0, 0
+
+        blk = self.board.entities[rows]
+        held = blk[:, Entity.F_IN_HELD:Entity.F_IN_HELD + MAX_CHANNELS] > 0.0
+        free = blk[:, Entity.F_OUT_HELD:Entity.F_OUT_HELD + MAX_CHANNELS] \
+            <= 0.0
+
+        # Mask the channel columns a type does not declare, so an unused slot
+        # cannot be mistaken for an unfed one (or a free zone).
+        lanes = np.arange(MAX_CHANNELS)
+        in_used = lanes[None, :] < n_in[:, None]
+        out_used = lanes[None, :] < n_out[:, None]
+
+        n_fed = (held & in_used).sum(1)
+        # A type with no inputs is vacuously ready -- that is what lets a
+        # Source through with no special case.
+        ready = np.where(strict, n_fed == n_in, n_fed > 0) | (n_in == 0)
+        # No outputs at all (a Sink) can never be output-blocked.
+        has_room = ((free & out_used).sum(1) > 0) | (n_out == 0)
+
+        # Readiness is tested first in the phase below, so a gate that is both
+        # unready and full counts as starved -- matching the order the
+        # per-gate path would have reported it in.
+        starved = int((~ready).sum())
+        blocked = int((ready & ~has_room).sum())
+        # A **list in ascending row order**, not a set: the phase iterates
+        # this directly, and a set's order varies with hash layout. The phase
+        # is designed to be order-independent (that is the whole point of the
+        # two-phase split), but a nondeterministic iteration order would make
+        # any *future* order dependence a heisenbug rather than a test
+        # failure. Ascending row order is also what the old whole-table scan
+        # produced, so stats and any logging stay comparable.
+        return rows[ready & has_room].tolist(), starved, blocked
+
+    def invalidate_gate_table(self):
+        """Drop the cached gate table. Called when the gate set changes."""
+        self._gate_table_cache = None
+
     # --- structure phase --------------------------------------------------
     def structure_phase(self):
         """Fire every gate that can. Returns the number that fired.
@@ -187,9 +304,33 @@ class GateSim:
         Reads input channels and output waiting zones; writes output waiting
         zones and clears inputs. Deliberately touches no belt state -- see
         the module docstring.
+
+        A vectorised prefilter decides which gates are worth looking at (see
+        `_candidate_rows()`); the per-gate logic below is unchanged and still
+        makes every real decision. A gate the prefilter skips is one that
+        would have been counted `starved` or `blocked`, so those stats are
+        credited in bulk rather than per gate.
+
+        **Views are built for the admitted rows only.** Iterating `gates()`
+        and testing membership would still construct a view per gate on the
+        board, which is the bulk of what the prefilter exists to avoid -- it
+        left `gates()` discovery as the phase's floor at 0.72ms. The admitted
+        rows come straight from the prefilter, which already knows them.
         """
         fired = 0
-        for gate in self.gates():
+        admit, pre_starved, pre_blocked = self._candidate_rows()
+        self.stats["starved"] += pre_starved
+        self.stats["blocked"] += pre_blocked
+        board = self.board
+        for row in admit:
+            # The gate table is rebuilt whenever the gate set changes, so a
+            # row in it is live and real -- but a ghost can be committed or
+            # despawned without the *set* changing, so the cheap guards stay.
+            if not board.is_row_alive(row):
+                continue
+            gate = board.view(row)
+            if gate.is_ghost:
+                continue
             if not gate.inputs_ready():
                 self.stats["starved"] += 1
                 continue
