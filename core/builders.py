@@ -164,10 +164,18 @@ class BuildPlan:
 
     @property
     def ok(self):
-        """True if the plan would create everything it wanted."""
-        return bool(self.placements) and not any(
-            p.frustrated for p in self.placements
-        )
+        """True if the plan would create everything it wanted.
+
+        An **annotation-only paste** is ok with no placements at all: there
+        is nothing to be blocked by, and the notes are the payload. Without
+        this the `all_or_nothing and not ok` test would read "zero entities,
+        so nothing succeeded" and refuse a stamp that holds only labels.
+        The `placements` requirement still stands for every other builder,
+        where an empty plan genuinely means the gesture produced nothing.
+        """
+        if not self.placements:
+            return bool(self.stamp is not None and self.stamp.annotations)
+        return not any(p.frustrated for p in self.placements)
 
     def __repr__(self):
         return (f"<BuildPlan {len(self.placements)} placements, "

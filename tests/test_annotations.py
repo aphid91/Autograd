@@ -25,9 +25,9 @@ from core import cell
 from core.annotations import PALETTE, Stroke, TextBox
 from core.clipboard import capture
 from tests.harness import (board, click, ctrl_key, drag_cells, drag_world,
-                           engine, enter_erase_mode, fake, install_tool, orch,
-                           press_key, put_cursor_at, put_cursor_at_cell,
-                           select_tool, step)
+                           engine, enter_cut_mode, enter_erase_mode, fake,
+                           install_tool, orch, press_key, put_cursor_at,
+                           put_cursor_at_cell, select_tool, step)
 
 import glfw
 
@@ -460,6 +460,225 @@ def test_moving_survives_the_cursor_leaving_the_box():
           f"cells and ended cleanly")
 
 
+# --- resizing --------------------------------------------------------------
+def test_dragging_the_grip_resizes_without_moving():
+    """The grip is the bottom-right; the anchor is the top-left.
+
+    So a resize changes the extent and leaves the position alone -- dragging
+    the corner must not drag the whole label.
+    """
+    box = _open_box()
+    anchor = (box.x, box.y)
+    w0, h0 = box.w, box.h
+    x0, y0, x1, y1 = box.bounds()
+    # Grab the grip (world bottom-right) and drag out and down.
+    drag_world((x1, y0), (x1 + 3.0, y0 - 1.0), steps=6)
+
+    assert abs(box.w - (w0 + 3.0)) < 1e-6, f"width {w0} -> {box.w}, want +3"
+    assert abs(box.h - (h0 + 1.0)) < 1e-6, (
+        f"height {h0} -> {box.h}; dragging the grip down should grow it")
+    assert (box.x, box.y) == anchor, (
+        f"a resize must not move the anchor: {anchor} -> {(box.x, box.y)}")
+    print(f"  OK: the grip resized {w0}x{h0} to {box.w}x{box.h} in place")
+
+
+def test_the_grip_wins_over_the_body():
+    """Grabbing the corner must never be read as grabbing the box.
+
+    The grip is checked before the body hit test, so the two cannot be
+    confused -- otherwise the corner would move the box instead of resizing.
+    """
+    box = _open_box()
+    before = (box.x, box.y, box.w, box.h)
+    x0, y0, x1, y1 = box.bounds()
+    drag_world((x1, y0), (x1 + 2.0, y0), steps=5)
+    assert (box.x, box.y) == before[:2], "the anchor should not have moved"
+    assert box.w > before[2], "and the width should have grown"
+    print("  OK: a drag from the corner resized rather than moved")
+
+
+def test_a_resize_cannot_shrink_the_box_to_nothing():
+    """A box dragged to zero would be invisible and then unclickable.
+
+    Unrecoverable except through the panel's clear-all, so the resize clamps
+    to the same minimum a fresh box gets.
+    """
+    box = _open_box()
+    x0, y0, x1, y1 = box.bounds()
+    # Drag the grip far past the anchor, up and to the left.
+    drag_world((x1, y0), (x0 - 10.0, y1 + 10.0), steps=8)
+    assert box.w > 0.0 and box.h > 0.0, (box.w, box.h)
+    assert box.w >= 1.0 and box.h >= 0.5, (
+        f"the box collapsed to {box.w}x{box.h}")
+    print(f"  OK: a collapsing drag clamped at {box.w}x{box.h}")
+
+
+def test_a_stroke_gets_no_grip():
+    """Only text boxes are resizable, so only they draw a handle."""
+    _draw_tool()
+    drag_world((10.0, 40.0), (16.0, 40.0), steps=6)
+    s = _notes().items[0]
+    press_key(glfw.KEY_Q)
+    orch.inspect_note = s.aid
+    step()
+    assert orch._resize_handle_box() is None, (
+        "a stroke must not offer a resize handle")
+    print("  OK: a stroke offered no resize grip")
+
+
+def test_no_grip_without_a_selection():
+    _draw_tool()
+    drag_world((10.0, 44.0), (14.0, 44.0))
+    press_key(glfw.KEY_Q)
+    orch.inspect_note = None
+    step()
+    assert orch._resize_handle_box() is None
+    print("  OK: nothing selected means no grip")
+
+
+# --- the paste preview -----------------------------------------------------
+def test_a_paste_previews_its_notes():
+    """The stamp's labels show where they would land, before the click.
+
+    Built from the live plan's own `paste_origin`, so what is previewed and
+    what is placed cannot disagree about position.
+    """
+    _belt_run((10, 20), (14, 20))
+    _text_tool()
+    drag_world((10.0, 22.0), (15.0, 21.0), steps=5)
+    orch._set_note_text(_notes().items[0].aid, "ADDER")
+    assert len(_notes()) == 1
+
+    ctrl_key(glfw.KEY_C)
+    drag_cells((9, 19), (16, 23))
+    assert orch.clipboard.pasting
+    assert len(orch.clipboard.stamp.annotations) == 1
+
+    # Hover a long way from the original, so a previewed note can only be
+    # the paste's.
+    put_cursor_at_cell(40, 50)
+    step()
+    preview = orch._paste_note_preview()
+    assert len(preview) == 1, (
+        f"the paste should preview its one note, got {len(preview)}")
+    px0 = preview[0].bounds()[0]
+    assert px0 > 30.0, (
+        f"the previewed note should sit at the cursor, not at the source: "
+        f"{preview[0].bounds()}")
+    # And it is a *copy* -- previewing must not touch the store or the stamp.
+    assert len(_notes()) == 1, "previewing must not place anything"
+    assert preview[0] is not orch.clipboard.stamp.annotations[0]
+    press_key(glfw.KEY_ESCAPE)
+    print(f"  OK: the paste previewed its note at x={px0:.0f}, placing nothing")
+
+
+def test_the_preview_follows_the_cursor():
+    _belt_run((10, 30), (13, 30))
+    _draw_tool()
+    drag_world((10.0, 31.0), (13.0, 31.0), steps=4)
+    ctrl_key(glfw.KEY_C)
+    drag_cells((9, 29), (15, 32))
+    assert orch.clipboard.pasting
+
+    put_cursor_at_cell(30, 30)
+    step()
+    first = orch._paste_note_preview()[0].bounds()[0]
+    put_cursor_at_cell(45, 30)
+    step()
+    second = orch._paste_note_preview()[0].bounds()[0]
+    assert second > first + 10.0, (
+        f"the preview should track the cursor: {first} -> {second}")
+    press_key(glfw.KEY_ESCAPE)
+    print("  OK: the previewed note followed the paste cursor")
+
+
+def test_nothing_previews_without_a_paste():
+    """Every other builder has no stamp, so this must be empty and cheap."""
+    select_tool("Belt")
+    put_cursor_at_cell(20, 20)
+    step()
+    assert orch._paste_note_preview() == ()
+    _draw_tool()
+    step()
+    assert orch._paste_note_preview() == ()
+    print("  OK: no stamp in hand means no previewed notes")
+
+
+# --- the text tool over an existing box ------------------------------------
+def test_the_text_tool_does_not_stack_a_box_on_a_box():
+    """A drag starting on a label edits it instead of stacking a new one.
+
+    Two overlapping boxes would be illegible and the new one would swallow
+    clicks meant for the old, so the gesture is reinterpreted.
+    """
+    tool = _text_tool()
+    drag_world((10.0, 30.0), (16.0, 28.0), steps=5)
+    first = _notes().items[0]
+    orch._set_note_text(first.aid, "FIRST")
+    orch.inspect_note = None
+    step()
+
+    # A drag that *starts* inside the existing box.
+    drag_world((13.0, 29.0), (22.0, 24.0), steps=6)
+    assert len(_notes()) == 1, (
+        f"no second box should have been made, got {len(_notes())}")
+    assert orch.inspect_note == first.aid, (
+        "and the existing box should have been opened instead")
+    assert first.text == "FIRST", "its text must be untouched"
+    print("  OK: a drag from inside the box opened it rather than stacking")
+
+
+def test_clicking_a_box_with_the_text_tool_opens_it():
+    """The other half of the same rule, and the one you reach for by reflex.
+
+    Fixing a typo should not require putting the tool down.
+    """
+    _text_tool()
+    drag_world((10.0, 40.0), (16.0, 38.0), steps=5)
+    box = _notes().items[0]
+    orch._set_note_text(box.aid, "TYPO")
+    orch.inspect_note = None
+    step()
+
+    put_cursor_at(13.0, 39.0)
+    step()
+    click()
+    assert len(_notes()) == 1, "a click on a box must not make a new one"
+    assert orch.inspect_note == box.aid, (
+        "clicking a box with the text tool should open its window")
+    print("  OK: a click with the text tool opened the box under it")
+
+
+def test_the_text_tool_still_works_on_empty_board():
+    """The suppression must be narrow: empty space still makes a box."""
+    _text_tool()
+    drag_world((10.0, 50.0), (16.0, 48.0), steps=5)
+    assert len(_notes()) == 1
+    # A second, well clear of the first.
+    drag_world((30.0, 50.0), (36.0, 48.0), steps=5)
+    assert len(_notes()) == 2, "a drag on empty space should still make one"
+    assert orch.inspect_note == _notes().items[-1].aid, (
+        "and the new box should be the one opened")
+    print("  OK: drags on empty space still made boxes")
+
+
+def test_the_text_tool_draws_over_a_stroke():
+    """Only *boxes* block a new box.
+
+    A stroke is not something a label would collide with illegibly, and
+    refusing to label a circled region would be a surprise.
+    """
+    _draw_tool()
+    drag_world((10.0, 60.0), (18.0, 60.0), steps=6)
+    assert len(_notes()) == 1
+    _text_tool()
+    # Start the drag right on the stroke's ink.
+    drag_world((13.0, 60.0), (19.0, 58.0), steps=5)
+    assert len(_notes()) == 2, (
+        "a stroke must not block a new text box")
+    print("  OK: a label was created over a stroke")
+
+
 # --- the enable flag -------------------------------------------------------
 def test_disabling_the_layer_keeps_the_data():
     """Disabled is hidden, never deleted.
@@ -605,20 +824,79 @@ def test_copying_a_selection_brings_its_notes():
           f"{len(stamp.annotations)} note")
 
 
-def test_a_note_alone_does_not_make_a_stamp():
-    """Annotations do not decide whether a selection caught anything.
+def test_a_note_alone_makes_a_real_stamp():
+    """An annotation-only selection is copyable.
 
-    A sloppy drag across a stray label must not replace the held tool with a
-    paste mode, so `Stamp` stays falsey without entities.
+    A block of commentary is worth reusing independently of any machines, so
+    notes count towards whether a stamp holds anything. `len()` stays the
+    *entity* count, since that is what the status line and the type menu
+    mean by it.
     """
     _draw_tool()
     drag_world((40.0, 30.0), (44.0, 30.0))
     stamp = capture(board, 39, 29, 45, 31, annotations=_notes())
-    assert not stamp, "a selection with no entities is still an empty stamp"
-    assert len(stamp.annotations) == 0, (
-        "and carries no annotations, so nothing is held in a stamp that "
-        "reads as empty")
-    print("  OK: a note alone did not make a pasteable stamp")
+    assert stamp, "a selection holding only notes is still a stamp"
+    assert len(stamp) == 0, "but its entity count is zero"
+    assert len(stamp.annotations) == 1
+    # The box comes from the annotations, since there is nothing else to
+    # measure -- a zero box would centre the paste on nothing.
+    _x, _y, w, h = stamp.bounds()
+    assert w >= 1 and h >= 1, f"an annotation-only stamp needs a box: {w}x{h}"
+    print(f"  OK: notes alone gave a real {w}x{h} stamp with 0 entities")
+
+
+def test_an_empty_selection_is_still_empty():
+    """The other half: nothing at all is not a stamp.
+
+    Worth stating separately now that notes count -- the guard that returns
+    the player to their tool rather than into a paste mode with nothing to
+    place keys off this.
+    """
+    stamp = capture(board, 40, 40, 44, 44, annotations=_notes())
+    assert not stamp, "a selection over bare board catches nothing"
+    print("  OK: a selection over bare board is still an empty stamp")
+
+
+def test_an_annotation_only_stamp_pastes():
+    _draw_tool()
+    drag_world((10.0, 30.0), (14.0, 30.0), steps=5)
+    assert len(_notes()) == 1
+
+    ctrl_key(glfw.KEY_C)
+    drag_cells((9, 29), (15, 31))
+    assert orch.clipboard.pasting, (
+        "copying notes alone should still reach paste mode")
+    stamp = orch.clipboard.stamp
+    assert len(stamp) == 0 and len(stamp.annotations) == 1
+
+    put_cursor_at_cell(40, 30)
+    step()
+    click()
+    assert len(_notes()) == 2, (
+        f"the paste should have added a note, got {len(_notes())}")
+    pasted = _notes().items[-1]
+    assert pasted.bounds()[0] > 35.0, (
+        f"the pasted note should be at the paste site: {pasted.bounds()}")
+    press_key(glfw.KEY_ESCAPE)
+    print("  OK: an annotation-only stamp pasted at the cursor")
+
+
+def test_cutting_notes_alone_takes_them_and_holds_them():
+    _draw_tool()
+    drag_world((10.0, 50.0), (14.0, 50.0), steps=5)
+    aid = _notes().items[0].aid
+    enter_cut_mode()
+    drag_cells((9, 49), (15, 51))
+    assert _notes().get(aid) is None, "the cut should have taken the note"
+    assert orch.clipboard.pasting, "and left us holding it in paste mode"
+    assert len(orch.clipboard.stamp.annotations) == 1
+    put_cursor_at_cell(40, 50)
+    step()
+    click()
+    assert len(_notes()) == 1, "pasting it back should restore one note"
+    assert _notes().items[0].bounds()[0] > 35.0
+    press_key(glfw.KEY_ESCAPE)
+    print("  OK: ctrl+shift+D cut a note on its own and pasted it back")
 
 
 def test_pasting_a_stamp_places_its_notes():

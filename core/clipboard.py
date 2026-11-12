@@ -276,12 +276,12 @@ def capture(board, x0, y0, x1, y1, include_ghosts=False, annotations=None):
                  annotations.in_rect(lo_x, lo_y, hi_x + 1, hi_y + 1)]
 
     if not rows:
-        # No entities. Annotations alone do **not** make a stamp: `Stamp` is
-        # falsey without entries, so the orchestrator would treat this as an
-        # empty selection anyway -- returning the notes here would build a
-        # stamp that reads as empty while carrying data, which is a worse
-        # thing to have than neither.
-        return Stamp()
+        # No entities, but notes alone are a perfectly good stamp -- a block
+        # of commentary is worth reusing independently of any machines. The
+        # box comes from the annotations in that case (see `Stamp.bounds()`),
+        # and normalise() rebases them against it exactly as it would with
+        # entities present.
+        return Stamp([], notes).normalise()
 
     entries = []
     row_to_index = {}

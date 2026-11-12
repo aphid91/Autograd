@@ -137,11 +137,13 @@ class Stamp:
     thing -- continuous world coordinates, no cells, no orientation, no row --
     and `place()` stays entity-only so every existing caller is unaffected.
 
-    **Annotations do not decide whether a stamp is empty.** `__bool__` and
-    `__len__` still report entities only, so a selection catching nothing but
-    a stray label is "nothing copied" and leaves the player in their tool.
-    Treating a lone annotation as a paste-able stamp would mean a sloppy drag
-    across a note silently replacing what the player had in hand.
+    **An annotation-only stamp is a real stamp.** `__bool__` counts both, so
+    a selection catching nothing but labels can be copied and pasted -- which
+    is what makes a block of commentary reusable on its own, independently of
+    any machines. `__len__` deliberately stays the **entity** count, since
+    that is what every existing caller means by it (the paste status line,
+    the type menu's "N entities WxH"); `len(stamp.annotations)` is the other
+    number and callers that want it ask for it.
     """
 
     __slots__ = ("entries", "annotations")
@@ -158,7 +160,7 @@ class Stamp:
         return len(self.entries)
 
     def __bool__(self):
-        return bool(self.entries)
+        return bool(self.entries) or bool(self.annotations)
 
     # --- geometry --------------------------------------------------------
     def bounds(self):
@@ -167,9 +169,16 @@ class Stamp:
         Measured over *cells*, not entry origins: a 2x1 structure at the east
         edge extends the box past its own offset, and the paste cursor centres
         on the box rather than on the origins.
+
+        **Entities decide the box whenever there are any.** A note hanging
+        outside the machines must not move the box and shift where the paste
+        cursor sits -- the box belongs to the factory and the notes ride
+        along. With *no* entities the annotations are all there is, so they
+        define it instead; otherwise an annotation-only stamp would report a
+        zero box, centre on nothing, and paste at the cursor's corner.
         """
         if not self.entries:
-            return (0, 0, 0, 0)
+            return self._annotation_bounds()
         xs, ys = [], []
         for e in self.entries:
             for (cx, cy) in e.cells():
@@ -177,6 +186,31 @@ class Stamp:
                 ys.append(cy)
         lo_x, lo_y = min(xs), min(ys)
         return (lo_x, lo_y, max(xs) - lo_x + 1, max(ys) - lo_y + 1)
+
+    def _annotation_bounds(self):
+        """The box of the annotations alone, in whole cells.
+
+        Only consulted for an annotation-only stamp. Floored and ceiled to
+        the cell lattice because a stamp's box is a cell rectangle everywhere
+        else -- `place()` adds integer offsets and the paste cursor is a cell
+        -- so a fractional box here would put the notes at a sub-cell offset
+        from where the preview drew them.
+        """
+        if not self.annotations:
+            return (0, 0, 0, 0)
+        import math
+        xs0, ys0, xs1, ys1 = [], [], [], []
+        for a in self.annotations:
+            x0, y0, x1, y1 = a.bounds()
+            xs0.append(x0)
+            ys0.append(y0)
+            xs1.append(x1)
+            ys1.append(y1)
+        lo_x = math.floor(min(xs0))
+        lo_y = math.floor(min(ys0))
+        hi_x = math.ceil(max(xs1))
+        hi_y = math.ceil(max(ys1))
+        return (lo_x, lo_y, max(1, hi_x - lo_x), max(1, hi_y - lo_y))
 
     def normalise(self):
         """Shift every entry so the covered box starts at (0, 0).
@@ -186,10 +220,10 @@ class Stamp:
         plain translation.
 
         Annotations shift by the same amount, so a label keeps its position
-        relative to the machines it describes. They deliberately do **not**
-        contribute to `bounds()`, so a note hanging outside the entities does
-        not move the box and change where the paste cursor sits -- the box is
-        the factory's, and the notes ride along.
+        relative to the machines it describes. They do not contribute to
+        `bounds()` while there are entities -- a note hanging outside the
+        machines must not move the box and shift the paste cursor -- but they
+        define it when the stamp holds nothing else. See `bounds()`.
         """
         lo_x, lo_y, _w, _h = self.bounds()
         for e in self.entries:

@@ -35,7 +35,7 @@ from render.camera import Camera
 from engine import Engine
 from ui.annotation_layer import AnnotationLayer
 from ui.input_manager import (InputManager, NOTE_BOX, NOTE_MOVE, NOTE_NONE,
-                              NOTE_STROKE, STATE_PLANNING)
+                              NOTE_RESIZE, NOTE_STROKE, STATE_PLANNING)
 from core.toolbelt import Toolbelt
 from ui.panel import UI, UIRequests
 
@@ -530,9 +530,36 @@ class Orchestrator:
             # Text boxes only. A stroke has no handle worth grabbing -- its
             # bbox is mostly empty space, so a drag starting "on" a circled
             # region would move it from a point nowhere near its ink.
-            if isinstance(note, TextBox) and note.hit_point(*cursor_world):
-                return NOTE_MOVE
+            if isinstance(note, TextBox):
+                # The grip is checked first and is *outside* the box's own
+                # hit area at the corner, so grabbing it can never be
+                # mistaken for grabbing the body.
+                if self._on_resize_handle(note, cursor_world):
+                    return NOTE_RESIZE
+                if note.hit_point(*cursor_world):
+                    return NOTE_MOVE
         return NOTE_NONE
+
+    def _on_resize_handle(self, box, world):
+        """Whether a world point is on `box`'s resize grip.
+
+        Tested in **screen space**, because the grip is drawn at a fixed
+        pixel size (see `AnnotationLayer._draw_handle`) -- a world-space
+        radius would be unclickable when zoomed out and cover the whole
+        label when zoomed in. The drawn target and the clickable target have
+        to be the same shape, so both work in pixels.
+        """
+        from ui.annotation_layer import HANDLE_PX
+        viewport = glfw.get_framebuffer_size(self.window)
+        x0, y0, x1, y1 = box.bounds()
+        # The grip sits at the box's bottom-right, which in world terms is
+        # (x1, y0).
+        hx, hy = self.camera.world_to_screen(x1, y0, viewport)
+        sx, sy = self.camera.world_to_screen(world[0], world[1], viewport)
+        # A square pad around the corner, slightly larger than the drawn
+        # mark so the grip is forgiving to hit.
+        pad = HANDLE_PX
+        return abs(sx - hx) <= pad and abs(sy - hy) <= pad
 
     def _note_draw(self, point, tool):
         """Extend (or start) the stroke being drawn."""
@@ -560,8 +587,28 @@ class Orchestrator:
         window is where the text is typed. That is also why a too-small drag
         is widened to a minimum rather than rejected -- a click that barely
         moved still means "put a label here".
+
+        **A drag that started on an existing text box makes nothing**, and
+        opens that box instead. Stacking a fresh empty label on top of one
+        already there is almost never the intent -- the two would overlap
+        illegibly and the new one would swallow clicks meant for the old --
+        so the gesture is reinterpreted as "edit this one". Which makes the
+        text tool behave like the empty hand over a label, and means the
+        player does not have to put the tool down to fix a typo.
+
+        The test is on the **start** of the drag, not the released rectangle:
+        where the gesture began is what the player was pointing at when they
+        committed to it, and testing the whole rectangle would refuse any
+        drag that merely swept past a label.
         """
         x0, y0, x1, y1 = rect
+        start = (x0, y0)
+        existing = self._text_box_at(*start)
+        if existing is not None:
+            self.inspect_row = None
+            self.inspect_note = existing.aid
+            return None
+
         lo_x, hi_x = (x0, x1) if x0 <= x1 else (x1, x0)
         lo_y, hi_y = (y0, y1) if y0 <= y1 else (y1, y0)
         w = max(MIN_BOX_W, hi_x - lo_x)
@@ -574,6 +621,52 @@ class Orchestrator:
         self.inspect_row = None
         self.inspect_note = box.aid
         return box
+
+    def _text_box_at(self, wx, wy):
+        """The topmost text box at a world point, or None.
+
+        Narrower than `AnnotationStore.hit()`, which answers for any
+        annotation: the text tool only defers to *boxes*, since a stroke is
+        not something a new label would collide with illegibly and refusing
+        to draw a label over one would be a surprise.
+        """
+        if not self.annotation_layer.enabled:
+            return None
+        for a in reversed(self.annotations.items):
+            if isinstance(a, TextBox) and a.hit_point(wx, wy):
+                return a
+        return None
+
+    def _paste_note_preview(self):
+        """The current paste plan's annotations, where they would land.
+
+        Drawn as ghosts beside the entity ghosts, so the player can see the
+        labels coming with the stamp rather than discovering them on release.
+        Built from the live plan's `paste_origin`, which is the same number
+        the commit uses -- so what is previewed and what is placed cannot
+        disagree about position.
+
+        Empty for every builder but a paste, and cheap: a stamp carries a
+        handful of notes and this runs once per frame.
+        """
+        plan = self.last_plan
+        if plan is None or plan.stamp is None or plan.paste_origin is None:
+            return ()
+        if not plan.stamp.annotations:
+            return ()
+        return plan.stamp.place_annotations(*plan.paste_origin)
+
+    def _resize_handle_box(self):
+        """The text box to draw a resize grip on, or None.
+
+        Only the box the Status window has open -- the same gate the move
+        gesture uses, and for the same reason: a grip on every label would
+        litter the board and make left-drag unreliable near any of them.
+        """
+        if not self.annotation_layer.enabled:
+            return None
+        note = self.inspected_note()
+        return note if isinstance(note, TextBox) else None
 
     def _paste_annotations(self, plan):
         """Add a pasted stamp's annotations to the live store.
@@ -606,6 +699,31 @@ class Orchestrator:
         if a is None:
             return False
         a.translate(dx, dy)
+        self.annotations.revision += 1
+        return True
+
+    def _resize_note(self, aid, dx, dy):
+        """Grow or shrink the open text box by a world-space delta.
+
+        The grip is the box's **bottom-right** and the anchor is its
+        top-left, so this changes the extent and leaves `x`/`y` alone --
+        dragging the corner must not drag the whole label. World +Y is up and
+        the box hangs downward from its anchor, so dragging the grip *down*
+        (negative dy) makes it taller.
+
+        Clamped to the same minimum a fresh box gets, since a box dragged to
+        nothing would be invisible and then unclickable -- unrecoverable
+        except through the panel's clear-all.
+        """
+        a = self.annotations.get(aid)
+        if not isinstance(a, TextBox):
+            return False
+        w = max(MIN_BOX_W, a.w + dx)
+        h = max(MIN_BOX_H, a.h - dy)
+        if w == a.w and h == a.h:
+            return False
+        a.w = w
+        a.h = h
         self.annotations.revision += 1
         return True
 
@@ -941,6 +1059,8 @@ class Orchestrator:
         # is an **empty-hand** gesture -- there is no tool to be holding.
         if intents.note_move is not None:
             self._move_note(self.inspect_note, *intents.note_move)
+        if intents.note_resize is not None:
+            self._resize_note(self.inspect_note, *intents.note_resize)
 
         # 3. toolbelt selection. Changing tools drops any in-flight preview --
         # a half-drawn belt run means nothing to the structure tool.
@@ -1241,6 +1361,8 @@ class Orchestrator:
             in_progress=self._live_stroke,
             drag_rect=self._note_box,
             selected_id=self.inspect_note,
+            preview=self._paste_note_preview(),
+            handle_of=self._resize_handle_box(),
         )
 
     def seed_demo(self):

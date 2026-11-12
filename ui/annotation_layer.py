@@ -39,6 +39,15 @@ from core.annotations import PALETTE, Stroke, TextBox
 #: behind the control-signal overlay's PASS_ALPHA.
 ALPHA = 0.92
 
+#: Opacity for a *previewed* annotation -- a paste's notes, drawn where they
+#: would land but not yet placed. Low enough to read as pending, since a
+#: pasted label is otherwise identical to one already on the board.
+GHOST_ALPHA = 0.45
+
+#: The resize grip on the selected text box: a right-angle corner mark at the
+#: box's bottom-right, in screen pixels so it stays grabbable at any zoom.
+HANDLE_PX = 11.0
+
 #: Screen-pixel size below which a text label is not drawn at all. Under this
 #: imgui's font is illegible mush, and a smear of grey pixels over the board
 #: is worse than nothing. The shader's item labels fade out over a band for
@@ -104,13 +113,21 @@ class AnnotationLayer:
         self.drawn = 0
 
     def draw(self, store, camera, viewport, in_progress=None,
-             drag_rect=None, selected_id=None):
+             drag_rect=None, selected_id=None, preview=(), handle_of=None):
         """Draw everything. `store` is an AnnotationStore.
 
         `in_progress` is the stroke being drawn this frame (not yet in the
         store), `drag_rect` the live text-box rectangle as world coords, and
         `selected_id` the annotation the Status window has open -- drawn with
         a selection box so the player can see which one they are editing.
+
+        `preview` is a list of annotations that are **not** in the store: a
+        paste's notes, positioned where they would land. Drawn at a lower
+        alpha so they read as pending rather than placed -- the same
+        distinction the entity ghosts make, and necessary because a pasted
+        label is otherwise indistinguishable from one already on the board.
+
+        `handle_of` is a TextBox to draw a resize grip on.
         """
         self.drawn = 0
         # The zero-cost-when-off guard. Before any imgui call, any iteration
@@ -121,7 +138,8 @@ class AnnotationLayer:
 
         if store is None:
             return 0
-        if not store and in_progress is None and drag_rect is None:
+        if (not store and in_progress is None and drag_rect is None
+                and not preview):
             return 0
 
         vw, vh = viewport
@@ -140,6 +158,17 @@ class AnnotationLayer:
             elif isinstance(a, TextBox):
                 self._draw_text(dl, a, to_screen, zoom, vw, vh)
 
+        # A paste's notes, under the same code path at ghost alpha. Drawn
+        # after the store so a previewed note sits over what it would land
+        # on, matching how the entity ghosts read.
+        for a in preview:
+            if isinstance(a, Stroke):
+                self._draw_stroke(dl, a, to_screen, zoom, vw, vh,
+                                  alpha=GHOST_ALPHA)
+            elif isinstance(a, TextBox):
+                self._draw_text(dl, a, to_screen, zoom, vw, vh,
+                                alpha=GHOST_ALPHA)
+
         if in_progress is not None and len(in_progress.points) >= 1:
             self._draw_stroke(dl, in_progress, to_screen, zoom, vw, vh)
 
@@ -151,10 +180,14 @@ class AnnotationLayer:
             if sel is not None:
                 self._draw_selection(dl, sel, to_screen)
 
+        if handle_of is not None:
+            self._draw_handle(dl, handle_of, to_screen)
+
         return self.drawn
 
     # --- per-type drawing ------------------------------------------------
-    def _draw_stroke(self, dl, stroke, to_screen, zoom, vw, vh):
+    def _draw_stroke(self, dl, stroke, to_screen, zoom, vw, vh,
+                     alpha=ALPHA):
         pts = stroke.points
         if not pts:
             return
@@ -169,7 +202,7 @@ class AnnotationLayer:
             return
 
         thickness = max(MIN_STROKE_PX, stroke.world_width() * zoom)
-        col = _rgba(stroke.colour)
+        col = _rgba(stroke.colour, alpha)
 
         if len(pts) == 1:
             # A dot: a click with no drag. Drawn as a filled circle, since a
@@ -186,7 +219,7 @@ class AnnotationLayer:
         dl.add_polyline(screen, col, 0, thickness)
         self.drawn += 1
 
-    def _draw_text(self, dl, box, to_screen, zoom, vw, vh):
+    def _draw_text(self, dl, box, to_screen, zoom, vw, vh, alpha=ALPHA):
         x0, y0, x1, y1 = box.bounds()
         # The anchor is the box's top-left in world terms, which is (x0, y1).
         sx, sy = to_screen(x0, y1)
@@ -195,12 +228,12 @@ class AnnotationLayer:
                         max(sx, ex), max(sy, ey), vw, vh):
             return
 
-        col = _rgba(box.colour)
+        col = _rgba(box.colour, alpha)
         # A faint outline, so an empty box is still findable and clickable.
         # Without it a text box with no text yet would be invisible, and the
         # creation flow deliberately makes one of exactly that kind.
         dl.add_rect(imgui.ImVec2(sx, sy), imgui.ImVec2(ex, ey),
-                    _rgba(box.colour, ALPHA * 0.35), 0.0, 0, 1.0)
+                    _rgba(box.colour, alpha * 0.35), 0.0, 0, 1.0)
         self.drawn += 1
 
         if not box.text:
@@ -236,6 +269,33 @@ class AnnotationLayer:
         dl.add_rect_filled(lo, hi, imgui.IM_COL32(200, 200, 255, 36))
         dl.add_rect(lo, hi, imgui.IM_COL32(220, 220, 255, 190), 0.0, 0, 1.5)
         self.drawn += 2
+
+    def _draw_handle(self, dl, box, to_screen):
+        """The resize grip, at the box's bottom-right corner.
+
+        Sized in **screen pixels** rather than world units so it stays the
+        same grabbable size at every zoom -- a world-sized grip would be
+        sub-pixel when zoomed out and enormous when zoomed in. That is also
+        why `Orchestrator` does the hit test in screen space: the drawn
+        target and the clickable target have to be the same shape.
+
+        Drawn as two strokes making a right angle rather than a filled
+        triangle, which reads as a grip rather than as part of the label.
+        """
+        x0, y0, x1, y1 = box.bounds()
+        # Bottom-right in world terms is (x1, y0); screen y is flipped, so
+        # that corner is the largest screen y.
+        cx, cy = to_screen(x1, y0)
+        col = imgui.IM_COL32(255, 255, 255, 230)
+        dl.add_line(imgui.ImVec2(cx - HANDLE_PX, cy), imgui.ImVec2(cx, cy),
+                    col, 2.0)
+        dl.add_line(imgui.ImVec2(cx, cy - HANDLE_PX), imgui.ImVec2(cx, cy),
+                    col, 2.0)
+        # A short diagonal across the corner, the conventional resize mark.
+        dl.add_line(imgui.ImVec2(cx - HANDLE_PX * 0.55, cy),
+                    imgui.ImVec2(cx, cy - HANDLE_PX * 0.55),
+                    imgui.IM_COL32(255, 255, 255, 150), 1.5)
+        self.drawn += 3
 
     def _draw_selection(self, dl, annotation, to_screen):
         """A dashed-ish box round whatever the Status window has open."""

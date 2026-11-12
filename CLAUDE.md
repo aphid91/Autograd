@@ -824,6 +824,17 @@ player who has forgotten it would otherwise think the notes were lost.
 A test pins each, because a suite exercising only one would miss the other's
 rule entirely.
 
+#### A paste previews its notes
+
+The stamp's annotations draw as ghosts at `GHOST_ALPHA` alongside the entity
+ghosts, positioned from the live plan's own `paste_origin` — the same number
+the commit uses, so what is previewed and what is placed cannot disagree
+about position. `place_annotations()` returns copies, so previewing never
+touches the store or the stamp.
+
+Without it a pasted label is indistinguishable from one already on the
+board, and the player discovers the labels only on release.
+
 #### Dragging the open text box
 
 With the Status window open on a text box and an **empty hand**, a left-drag
@@ -867,6 +878,53 @@ gesture to poll* before `poll()` has published `cursor_world` — and last
 frame's position misjudges the frame a press lands on, which is the only
 frame that matters for arming.
 
+#### And resizing it, from a corner grip
+
+The selected box draws a right-angle grip at its **bottom-right**, and
+dragging it resizes instead of moving. It reuses the move gesture's whole
+machine — the arming, the latch, the delta — and differs only in what the
+delta is applied to, which is why `NOTE_RESIZE` is a second gesture kind
+rather than a flag.
+
+- **The grip is sized and hit-tested in screen pixels**, not world units. A
+  world-sized grip would be sub-pixel when zoomed out and cover the whole
+  label when zoomed in. The drawn target and the clickable target have to be
+  the same shape, so `_on_resize_handle()` projects to screen space too.
+- **The grip is checked before the body**, so grabbing the corner can never
+  be read as grabbing the box.
+- **The anchor does not move.** The grip is the bottom-right and the anchor
+  is the top-left, so a resize changes the extent only — dragging the corner
+  must not drag the whole label. World +Y is up and the box hangs downward,
+  so dragging the grip *down* (negative dy) makes it taller.
+- **`_note_resizing` latches with the move claim**, for the same reason: a
+  resize drags the grip away from the cursor, so re-asking per frame would
+  flip to a move partway through.
+- **It clamps to `MIN_BOX_W`/`MIN_BOX_H`.** A box dragged to nothing would
+  be invisible and then unclickable — unrecoverable except through the
+  panel's clear-all.
+
+Strokes get no grip: only text boxes are resizable.
+
+#### The text tool defers to an existing box
+
+A drag whose **start** lands on an existing text box makes nothing and opens
+that box instead; so does a plain click. Stacking a fresh empty label on one
+already there is almost never the intent — the two would overlap illegibly
+and the new one would swallow clicks meant for the old — so the gesture is
+reinterpreted as "edit this one". That also means fixing a typo does not
+require putting the tool down, matching what the empty hand already does
+over a label.
+
+Two narrowing decisions:
+
+- **The start of the drag, not the released rectangle.** Where the gesture
+  began is what the player was pointing at when they committed to it;
+  testing the whole rectangle would refuse any drag that merely swept past a
+  label.
+- **Only *boxes* block a box** (`_text_box_at`, narrower than
+  `AnnotationStore.hit()`). A stroke is not something a label collides with
+  illegibly, and refusing to label a circled region would be a surprise.
+
 #### Notes travel with a stamp, and text stays upright
 
 A copy rectangle touching a note's bbox takes the note
@@ -877,13 +935,23 @@ is what leaves `place()` entity-only and every existing caller unaffected.
 
 Three rules, each load-bearing:
 
-- **A note alone does not make a stamp.** `Stamp.__bool__` still counts
-  entities only, so a sloppy drag across a stray label reads as an empty
-  selection and leaves the player in their tool rather than in a paste mode.
-- **Notes do not contribute to `bounds()`.** A label hanging outside the
-  machines must not move the box and change where the paste cursor sits.
-  They shift with `normalise()` regardless, so a label keeps its position
-  relative to what it describes.
+- **An annotation-only stamp is a real stamp.** `Stamp.__bool__` counts
+  both, so a block of commentary is reusable on its own. `__len__` stays the
+  *entity* count, since that is what the paste status line and the type menu
+  mean by it; `len(stamp.annotations)` is the other number.
+
+  Two consequences worth knowing. `bounds()` falls back to the annotations'
+  own box when there are no entities — a zero box would centre the paste on
+  nothing and land it at the cursor's corner — and floors/ceils it to the
+  cell lattice, since a stamp's box is a cell rectangle everywhere else.
+  And `BuildPlan.ok` is true for a plan with **no placements but notes to
+  place**: there is nothing to be blocked by, and without that the
+  `all_or_nothing and not ok` test reads "zero entities, so nothing
+  succeeded" and refuses the paste.
+- **Notes do not contribute to `bounds()` while there are entities.** A
+  label hanging outside the machines must not move the box and change where
+  the paste cursor sits. They shift with `normalise()` regardless, so a
+  label keeps its position relative to what it describes.
 - **Position transforms; glyphs never do.** A rotated stamp moves its labels
   with their machines and leaves the text readable — the same rule the
   Source emit label already follows ("The label does not rotate with the

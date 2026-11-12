@@ -97,6 +97,12 @@ NOTE_BOX = 2      # text: left-drag sizes a box
 #: hand is empty -- which is why it is a separate gesture kind rather than a
 #: third annotation tool.
 NOTE_MOVE = 3
+#: Cursor over the resize grip at the open box's bottom-right: a left-drag
+#: resizes instead of moving. A separate kind rather than a flag on
+#: NOTE_MOVE because the two differ only in what the delta is applied to,
+#: and the orchestrator -- which owns the hit test -- is the right place to
+#: decide which the player grabbed.
+NOTE_RESIZE = 4
 
 # How far the cursor must move, in framebuffer pixels, before a held left
 # button counts as a camera drag rather than a click. Small enough that a
@@ -148,6 +154,7 @@ class Intents:
         "erase_mode", "cut_mode", "commit_erase", "swap_rows",
         "cursor_world", "note_draw", "note_draw_end", "note_erase",
         "note_box", "note_box_end", "note_move", "note_move_end",
+        "note_resize",
     )
 
     def __init__(self):
@@ -246,6 +253,10 @@ class Intents:
         #: it to suppress the click the release would otherwise be: a drag
         #: that ends over bare board must not then close the window.
         self.note_move_end = False
+        #: World-space `(dx, dy)` to resize the open text box by, or None.
+        #: The same delta `note_move` carries, reported separately because
+        #: it is applied to the box's extent rather than to its position.
+        self.note_resize = None
         # Note there is no separate "clicked an annotation" intent. An empty
         # hand is click-based, so `commit_plan` already fires on a bare click
         # and `cursor_world` says where -- the orchestrator checks annotations
@@ -284,6 +295,10 @@ class InputManager:
         #: it comes from "is the cursor over the open box?", which the drag
         #: itself falsifies as soon as the pointer outruns the box.
         self._note_moving = False
+        #: True when that claim is a *resize* rather than a move. Latched
+        #: alongside it, since a resize drags the grip away from the cursor
+        #: and re-asking would flip to a move partway through.
+        self._note_resizing = False
         #: World position of the last left-press, for anchoring a move at the
         #: press rather than at wherever the threshold happened to be crossed.
         self._press_world = (0.0, 0.0)
@@ -545,12 +560,13 @@ class InputManager:
         # So the claim is latched. `_note_moving` is set when a press lands
         # with NOTE_MOVE offered and cleared on release, and the branch runs
         # on the latch rather than on the live hit test.
-        if self._note_moving or (note == NOTE_MOVE
+        if self._note_moving or (note in (NOTE_MOVE, NOTE_RESIZE)
                                  and self.state == STATE_IDLE):
             if escape:
                 self.state = STATE_IDLE
                 self._note_anchor = None
                 self._note_moving = False
+                self._note_resizing = False
                 return it
 
             if self.state == STATE_NOTE_MOVING:
@@ -558,14 +574,21 @@ class InputManager:
                 if a is not None:
                     # A *delta* rather than an absolute position, so the box
                     # keeps its grab offset: dragging from one corner must
-                    # not teleport the box's origin under the cursor.
-                    it.note_move = (wx - a[0], wy - a[1])
+                    # not teleport the box's origin under the cursor. Resize
+                    # reports through its own intent, since the same delta
+                    # means something different there.
+                    delta = (wx - a[0], wy - a[1])
+                    if self._note_resizing:
+                        it.note_resize = delta
+                    else:
+                        it.note_move = delta
                     self._note_anchor = (wx, wy)
                 if left_release:
                     it.note_move_end = True
                     self.state = STATE_IDLE
                     self._note_anchor = None
                     self._note_moving = False
+                    self._note_resizing = False
                 return it
             if self.state == STATE_ARMED:
                 moved = ((mx - self._press_px[0]) ** 2
@@ -582,6 +605,7 @@ class InputManager:
                     # empty-hand handling so it still selects or dismisses.
                     self.state = STATE_IDLE
                     self._note_moving = False
+                    self._note_resizing = False
                     it.commit_plan = True
                 return it
             if left_press:
@@ -592,12 +616,17 @@ class InputManager:
                 self._press_world = (wx, wy)
                 # Latch the claim. From here the branch runs on this flag
                 # rather than on the hit test, which the drag itself
-                # invalidates within a frame or two.
+                # invalidates within a frame or two. Which *kind* of drag it
+                # is latches with it, for the same reason: a resize moves the
+                # grip away from the cursor, so re-asking would flip to a
+                # move partway through.
                 self._note_moving = True
+                self._note_resizing = (note == NOTE_RESIZE)
                 return it
             # No press over the box: fall through, so hovering it still
             # previews and the other keys keep working.
             self._note_moving = False
+            self._note_resizing = False
 
         # --- annotation tools: their own continuous gesture ---------------
         # Held *before* the clipboard modes are consulted, because an
@@ -895,6 +924,7 @@ class InputManager:
         # anywhere on the board drag whatever the Status window had open.
         self._note_anchor = None
         self._note_moving = False
+        self._note_resizing = False
 
 
 def _trace(a, b):
