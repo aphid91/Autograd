@@ -46,13 +46,34 @@ There is no pytest/linter configured.
 | [tests/test_tick.py](tests/test_tick.py) | the clock as wired into the frame loop: rate, `alpha`, keys, phase order |
 | [tests/test_segments.py](tests/test_segments.py) | belt-run derivation: tracing, cuts, undergrounds, merges, audit under churn |
 | [tests/test_belts.py](tests/test_belts.py) | the closed form against the naive oracle, on fixed and randomised configs |
-| [tests/test_item_render.py](tests/test_item_render.py) | reads the framebuffer back: do discs appear where the simulation says, do the labels say what the formatter says, and does the pass fill a resized window? |
+| [tests/test_item_render.py](tests/test_item_render.py) | reads the framebuffer back: do discs appear where the simulation says, do the labels say what the formatter says, does the sleep overlay separate asleep from awake, and does the pass fill a resized window? |
 | [tests/test_gates.py](tests/test_gates.py) | firing rules, arithmetic, back pressure, dangling-output discard, and the bubble-free claim |
 | [tests/test_stamp.py](tests/test_stamp.py) | what the stamp transforms preserve: wiring, topology, arithmetic |
 | [tests/test_clipboard.py](tests/test_clipboard.py) | the copy/paste/erase mode machine, and matched-stamp substitution, driven through the fake mouse and keyboard |
 | [tests/test_inspect.py](tests/test_inspect.py) | the Status window, the per-Source emit value, the per-belt seed, the save filename box, the persisted toolbar |
 | [tests/test_turn.py](tests/test_turn.py) | the empty hand's R/F: the footprint invariant, the settings that must survive an in-place turn, the underground reversal, and ctrl+R's restart |
 | [tests/test_annotations.py](tests/test_annotations.py) | the note overlay: the draw/erase gestures, the text-box flow, what the Show-notes flag gates, and how notes travel through copy, paste and saves |
+
+### Performance tools
+
+Not part of the suite — they take too long and some are randomised sweeps —
+but they are how a tick-performance change is justified and how the caching
+and scheduling are kept honest. Run them by hand from `tools/`.
+
+| file | answers |
+|---|---|
+| [tools/profile_tick.py](tools/profile_tick.py) | where the tick's time goes: structure vs belt as the board grows, the parts inside each phase, the cost of a rebuild. `--profile` adds cProfile, `--scale` grows the board |
+| [tools/probe_tick_ceiling.py](tools/probe_tick_ceiling.py) | how much of the cost is the *representation* rather than the work — attribution by concern, marginal cost per gate/segment, the view tax per field, and the vectorised floor |
+| [tools/probe_batch_prefilter.py](tools/probe_batch_prefilter.py) | what the gate prefilter is worth on a starved board vs a saturated one. Also records the measurement that **sorting rows buys ~15% while slicing buys 60×**, and that scattered gathers are 0.5% of the tick — which is why the entity table was *not* reorganised |
+| [tools/probe_wakelist.py](tools/probe_wakelist.py) | whether an idle segment is provably a no-op (both fixed points, by brute force), and what fraction of a CPU-shaped board is asleep |
+| [tools/check_cache_coherence.py](tools/check_cache_coherence.py) | the four `GateSim` caches against freshly-computed answers, after each of 150 random edits. Catches the row/segment-id recycling hazard |
+| [tools/check_prefilter_safe.py](tools/check_prefilter_safe.py) | that the prefilter never excludes a gate the full path would fire, over ~58k gate-ticks of mixed machine types |
+| [tools/check_wakelist_safe.py](tools/check_wakelist_safe.py) | a sleeping timeline against a fully-ticked one, diffed every tick. Reports its sleep→wake transition count, because a run with none proves nothing |
+
+**Each `check_*.py` is mutation-tested**, and that is not ceremony: the first
+`check_wakelist_safe.py` passed against four separate mutations because it
+was vacuous in two ways at once (see "A segment at rest is not ticked"). A
+checker nobody has tried to break is a checker that probably cannot.
 
 **Scenarios are independent.** `harness.reset()` clears the board, camera,
 input state and toolbelt before each one, so a failure names the scenario
@@ -1470,6 +1491,73 @@ The randomised sweep also checks **fractional-time invariants** at every
 tick, which is what caught the second bug above; whole-tick sampling alone
 missed it entirely.
 
+#### A segment at rest is not ticked
+
+The tick skips segments it can prove cannot change. That matters most for the
+workload this is actually built for: a **computer** made of these parts runs
+one trace through a sea of memory, so on a CPU-shaped board 1101 of 1101
+segments were inert while the belt phase spent 91% of its time proving it.
+A factory is the easy case; a CPU is 99%+ idle.
+
+**Sleeping is provable, not heuristic**, which is what makes it safe:
+
+- the anchor advance is `min(anchor + v, L)`, which **saturates** and then
+  returns `L` for ever;
+- the pop needs `head != tail`, so an empty ring never pops;
+- the push needs `offer()` to yield a value, and an idle producer yields
+  `None`.
+
+So `BeltSim.is_at_rest()` names two fixed points: **empty with a saturated
+anchor**, and **holding items with no room** — the RAM case, a run storing a
+value nobody is taking. A sleeping run's item positions freeze too, so the
+closed form keeps describing it and the renderer needs no special case.
+
+**The anchor clause is load-bearing and nearly invisible.** An empty run whose
+anchor has not yet saturated *looks* idle but still advances, and dropping the
+clause is undetectable end-to-end — the anchor re-saturates before any item's
+position depends on it, so it is correct by luck under today's spacing.
+`tools/probe_wakelist.py` therefore checks `is_at_rest()` against the
+definition (does an idle tick really change nothing?) rather than against
+observable behaviour, and that is the only thing that catches it.
+
+**Waking is edge-triggered, never polled** — polling is the cost being
+removed. Only two things can change a sleeping run, and both are gate events:
+the gate **upstream** filling a waiting zone, or the gate **downstream**
+freeing an input. `GateSim._wake_around()` raises both from
+`structure_phase()` and `deliver_direct()`, the only places gate channels
+change, through a reverse index built from the same `seg.src`/`seg.dst` the
+forward resolution uses — so the two cannot disagree about who is adjacent to
+whom. A seed wakes its own run (it pushes outside the offer/accept protocol),
+and a rebuild or `clear_items()` wakes everything, since segment ids are
+reassigned and a recycled id would otherwise have a run born asleep.
+
+This is also the GPU shape: the awake set is a compacted index buffer and
+`is_at_rest()` is a per-segment predicate a compute pass can evaluate and
+compact — the same structure `GateSim._candidate_rows()` has.
+
+**A missed wake fails silently and cumulatively.** It corrupts nothing on the
+tick it happens; it just fails to move one run, and the error compounds over
+the next hundred ticks — on a board the size of a CPU that reads as a logic
+bug in the circuit rather than a scheduler bug in the engine. Hence
+[tools/check_wakelist_safe.py](tools/check_wakelist_safe.py), which runs two
+timelines on one board (one sleeping, one fully ticked) and diffs ring state
+and every entity row every tick.
+
+Its first version was **vacuous in two independent ways**, and both are worth
+knowing because each looked fine:
+
+- It called `wake_all()` before the oracle tick *and* let both timelines
+  continue from the sleeping result, so the two agreed by construction. Four
+  separate mutations passed.
+- Its board only ever went quiet and never woke — **zero** sleep→wake
+  transitions over 60 ticks — so the wake edges were never exercised at all.
+  Source-fed runs either stay busy forever or sleep once and stay asleep;
+  forcing the edge needs a **starved gate** that is then fed.
+
+It now keeps the oracle's state separate, builds starved gates and feeds them
+at random, and **reports the transition count** so a vacuous run is visible
+rather than silent.
+
 #### Driving it before gates exist
 
 `BeltSim.tick()` takes `offer(seg)` / `accept(seg, payload)` callbacks per
@@ -1615,6 +1703,44 @@ through to the `FIRE_ALL` branch instead would make such a machine wait for
 a lane it is supposed to be able to ignore: silent, and exactly the bug the
 enum value exists to make visible. The enum survives because it is also the
 declared home for a future per-type rate limit.
+
+#### Most gates cannot act, so they are filtered out in bulk
+
+`GateSim._candidate_rows()` answers "could this gate possibly act this tick?"
+for **every gate at once**, as array operations over the entity table, and
+the per-gate path then runs only on the survivors. On a 672-gate board 576
+were starved and 96 blocked with none firing — about 48k Python-level calls a
+tick to reach "no". The phase went 1.31 → 0.16 ms.
+
+**It must be conservative**: it may admit a gate that turns out to do
+nothing, but excluding one that *would* have fired is a behaviour change, not
+an optimisation. So it tests only *necessary* conditions that are pure row
+state — the type's rule is satisfiable by occupancy (`FIRE_ALL` needs every
+channel, `FIRE_ANY` one, and **`FIRE_SELECT` is value-dependent so those
+types are always admitted** and decided in Python), and at least one output
+zone is free. Connectivity, the arithmetic and consumption are untouched.
+[tools/check_prefilter_safe.py](tools/check_prefilter_safe.py) evaluates the
+full readiness predicate for every gate every tick and asserts no excluded
+gate would have fired.
+
+Two things that are easy to get wrong here:
+
+- **Build views for the admitted rows only.** Iterating `gates()` and testing
+  membership still costs a view per gate on the board, which is most of what
+  the prefilter exists to avoid — it left discovery as the phase's floor.
+- **`starved` and `blocked` are credited in bulk**, from the masks that
+  already decide them. Three tests assert on those counts and were right to:
+  letting the prefilter silently empty two observable stats would be a
+  behaviour change dressed as a speedup.
+
+`deliver_direct()` gets the same treatment through `_rows_holding_output()` —
+a gate holding nothing has nothing to hand a neighbour (96 of 672 on that
+board), 1.02 → 0.15 ms.
+
+**The gain is workload-dependent and that is correct.** On a saturated board
+where every gate fires there is nothing to skip and the prefilter costs
+0.04 ms for no benefit. It pays exactly in proportion to how idle the factory
+is — which, for a computer, is almost always.
 
 #### Two mechanisms the second gate vocabulary needed
 
@@ -1975,6 +2101,43 @@ while staying internally consistent. Two tools, both free when off:
   recompiles and the disabled build does not contain the code at all —
   `shader_loader.load()` takes a `defines` set, injected after `#version`.
   `Camera.set_define()` drives it.
+- **The `SLEEP_DEBUG` shader overlay** tints by what the tick is actually
+  visiting: **blue for asleep** (skipped) and **amber for awake**. On a board
+  built as a computer that is one amber trace through a field of blue, which
+  is the scheduler's whole behaviour made visible. Same `#ifdef` mechanism as
+  above, and the panel reports the `asleep/total` ratio beside the checkbox —
+  the overlay answers *where*, the number answers *how much*.
+
+  **Nothing new is uploaded for it.** `segment_at_rest()` in `common.glsl`
+  re-derives the predicate from the segment record the renderer already
+  has — `head`, `tail`, `anchor`, `length`, `spacing` are exactly the terms
+  `BeltSim.is_at_rest()` uses. So it is a second implementation of a Python
+  rule, like `item_position()` beside `BeltSim.position_of()`, and pinned the
+  same way.
+
+  A **gate** body uses a deliberately weaker test: does it hold anything on
+  any channel. That is a necessary condition the prefilter shares, not the
+  full readiness predicate — the type's fire rule and its connectivity live
+  in Python and in the entity class, and mirroring them into GLSL is the
+  thing generated tables exist to avoid (it has already caused two
+  "GLSL disagrees with Python" bugs). Holding nothing is also the question a
+  player reading the board actually wants answered.
+
+  Three things the pixel test had to get right, each of which it got wrong
+  first:
+  - **Items draw over the overlay**, so an awake cell *under a disc* reads
+    green-over-amber. A "not blue" predicate therefore passes on the item's
+    own colour whatever the overlay did — which let "always report asleep"
+    through. The test samples a stretch of awake belt the items have not
+    reached, and tests positively for amber.
+  - **A full, blocked run must be checked separately.** It is at rest while
+    *holding* items, which is the other branch of the predicate and the one
+    that matters for memory; without a row in that state, "a run holding
+    items is never asleep" renders correctly and the overlay still lies about
+    RAM.
+  - **The anchor clause is invisible here too**, for the same reason it is
+    invisible to `check_wakelist_safe.py` (see "A segment at rest is not
+    ticked"). `tools/probe_wakelist.py` is what covers it.
 
 The **Segments** inspector window (checkbox in the main panel) shows counts,
 id-pool state, capacity totals, the hovered segment's full ring state, and a
@@ -2727,9 +2890,19 @@ them, already world-aligned rather than rotated with the facing — while the
 **item** labels should stay in the shader, since a saturated board at max
 zoom would put thousands on screen and `text_opacity()` already fades them
 out instead);
-**incremental segment rebuild** (currently whole-board on any real edit;
-the inspector reports rebuild counts so there is a number to point at before
-anyone optimises it);
+**incremental segment rebuild** (currently whole-board on any real edit, and
+now the largest single number in the profile — ~88 ms at 1190 segments. It is
+edit-time rather than per-tick, so it reads as placement latency rather than a
+low tick rate; the inspector reports rebuild counts, and
+[tools/profile_tick.py](tools/profile_tick.py)'s `churn` experiment times it.
+Note a memo over `_cell_at()` was tried and **reverted**: correct, but only
+~6%, since dict hashing costs about what the numpy reads did);
+**a batched belt phase** (segments are independent — the loop is already
+documented as becoming `gl_GlobalInvocationID.x` — so head/tail/anchor could
+advance as array ops for every awake segment at once. This is the one
+remaining change that would both close the CPU gap and *be* the GPU port
+rather than prepare for it. It touches the closed form's tick order, which
+`tests/test_belts.py`'s oracle guards closely, so measure first);
 **compute shader passes** (the context is 4.3 and all four SSBOs are bound
 and read, but nothing dispatches);
 curved corner geometry (corners are currently a right-angle join of two

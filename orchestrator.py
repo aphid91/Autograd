@@ -1319,6 +1319,8 @@ class Orchestrator:
             engine.clock.set_rate(requests.tick_rate)
         if requests.segment_debug is not None:
             self.camera.set_define("SEGMENT_DEBUG", requests.segment_debug)
+        if requests.sleep_debug is not None:
+            self.camera.set_define("SLEEP_DEBUG", requests.sleep_debug)
         if requests.rebuild_segments:
             engine.invalidate_segments()
         if requests.audit_segments:

@@ -17,7 +17,8 @@ class UIRequests:
                  "verify_round_trip", "select_slot", "cycle_tool",
                  "cycle_backward", "flip_tool", "quicksave", "quickload",
                  "toggle_pause", "step_tick", "tick_rate",
-                 "segment_debug", "rebuild_segments", "audit_segments",
+                 "segment_debug", "sleep_debug",
+                 "rebuild_segments", "audit_segments",
                  "debug_feed", "clear_items", "close_status",
                  "set_emit", "set_seed", "set_slot", "swap_rows",
                  "annotations_on", "set_note_text", "set_note_style",
@@ -40,6 +41,7 @@ class UIRequests:
         self.tick_rate = None
         #: New state for the shader's segment overlay, or None for no change.
         self.segment_debug = None
+        self.sleep_debug = None
         self.rebuild_segments = False
         self.audit_segments = False
         #: New debug-feed value, `False` to disable it, or None for no change.
@@ -306,6 +308,21 @@ class UI:
         if changed:
             req.segment_debug = on
         imgui.text_disabled("recompiles the shader; zero cost when off")
+
+        changed, on = imgui.checkbox(
+            "Sleep overlay", "SLEEP_DEBUG" in orch.camera.defines)
+        if changed:
+            req.sleep_debug = on
+        imgui.text_disabled("blue = asleep (skipped), amber = awake")
+        # The count beside the colour, because the overlay answers "where"
+        # and this answers "how much" -- and on a board built as a computer
+        # the ratio is the number that matters. Taken from the sim rather
+        # than recomputed: this is what the belt phase actually skipped.
+        asleep = engine.belts.stats.get("asleep", 0)
+        total = index.count
+        if total:
+            imgui.text(f"asleep: {asleep}/{total} "
+                       f"({100.0 * asleep / total:.0f}%)")
         if imgui.button("Force rebuild"):
             req.rebuild_segments = True
         imgui.same_line()

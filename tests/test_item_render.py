@@ -27,6 +27,7 @@ surrounding grey washes the hue below any sensible threshold.
 import numpy as np
 
 from core import cell, font
+from core.entity import Source
 from core.belts import UNIT
 
 from tests import harness
@@ -1471,3 +1472,152 @@ def test_the_selection_rectangle_normalises_its_corners():
     assert np.array_equal(forward, backward), (
         "corner order changed the rendered box")
     ok("the selection box is corner-order independent")
+
+
+def _mean_rgb(img, cx, cy, half=6):
+    """Mean colour near a cell's centre.
+
+    Mean rather than `_peak_cast`'s extreme: the sleep overlay is a flat wash
+    over a whole cell, not an antialiased disc blended into its surroundings,
+    so averaging is the stable reading here and picking the most saturated
+    pixel would just find whatever the belt drew underneath.
+    """
+    sx, sy = cam.world_to_screen(cx + 0.5, cy + 0.5, (W, H))
+    x, y = int(round(sx)), int(round(sy))
+    patch = img[max(0, y - half):y + half + 1,
+                max(0, x - half):x + half + 1].astype(float)
+    if patch.size == 0:
+        return np.zeros(3)
+    return patch.reshape(-1, 3).mean(axis=0)
+
+
+def _is_cold(c):
+    """Blue-dominant: the asleep tint."""
+    return c[2] > c[0] + 20
+
+
+def _is_warm(c):
+    """Red-dominant: the awake (amber) tint.
+
+    A *positive* test, which means the cell sampled must have no item on it.
+    Items draw last, over every overlay (an item is cargo on a cell, not part
+    of it), so an awake cell *under a disc* reads green-over-amber -- and a
+    negation-of-cold predicate then passes on the item's own colour, whatever
+    the overlay did. That is not hypothetical: it let "always report asleep"
+    through. Sample a stretch of awake belt the items have not reached.
+    """
+    return c[0] > c[2] + 40 and c[0] > c[1] + 20
+
+
+def test_the_sleep_overlay_separates_asleep_from_awake():
+    """The sleep overlay must actually distinguish the two states.
+
+    This is the only test that can see the overlay at all, and it is worth
+    having because the failure mode is a debug view that lies: an overlay
+    that tints everything one colour looks plausible and tells the player
+    nothing. So the board deliberately holds **both** states at once and the
+    test asserts they render differently.
+
+    `segment_at_rest()` in common.glsl is a second implementation of
+    `BeltSim.is_at_rest()` -- the same duplication `item_position()` already
+    has, for the same reason (the shader cannot call Python) -- so what is
+    really being pinned is that the two agree about a run the simulation has
+    actually put to sleep.
+    """
+    was = "SLEEP_DEBUG" in cam.defines
+    try:
+        # Row 20: fed by a Source, so it carries items and stays awake.
+        src = engine.place_structure(Source, 8, 20)
+        src.emit_value = 1.0
+        engine.place_belt_path((10, 20), (18, 20))
+        # Row 26: a bare run with nothing feeding it. Provably at rest.
+        engine.place_belt_path((10, 26), (18, 26))
+        # Row 32: the **RAM case**, and the one that matters most for a board
+        # built as a computer -- a short run packed full against a consumer
+        # that will not take, so it is at rest while *holding* items. That is
+        # the second of `is_at_rest()`'s two fixed points, and it exercises a
+        # different branch of the shader's predicate from the empty run
+        # above. Without it, "a run holding items is never asleep" renders
+        # correctly on this board and the overlay still lies about memory.
+        ram_src = engine.place_structure(Source, 8, 32)
+        ram_src.emit_value = 1.0
+        engine.place_belt_path((10, 32), (13, 32))
+        engine.sync_segments()
+
+        _at_whole_tick()
+        # Five ticks is the window where all three states hold at once: the
+        # long run is awake with its far end still bare (so the awake test
+        # can be a positive check for amber -- see `_is_warm`), and the short
+        # run has already packed full and gone to rest.
+        for _ in range(5):
+            engine.clock.request_step()
+            engine.clock.advance(0.0)
+
+        # The simulation's own view, which the overlay must agree with.
+        tick = engine.clock.tick
+        idle = engine.segments.at(14, 26)
+        busy = engine.segments.at(14, 20)
+        ram = engine.segments.at(12, 32)
+        assert idle is not None and busy is not None and ram is not None
+        assert engine.belts.is_at_rest(idle, tick), (
+            "the unfed run should be at rest; the fixture is wrong")
+        assert not engine.belts.is_at_rest(busy, tick), (
+            "the Source-fed run should be awake; the fixture is wrong")
+        assert ram.count and engine.belts.is_at_rest(ram, tick), (
+            f"the short run should be at rest *holding* items; got "
+            f"{ram.count} items, at_rest="
+            f"{engine.belts.is_at_rest(ram, tick)}")
+
+        # Pick a cell on the awake run that no item has reached, or the test
+        # measures item colour instead of the overlay.
+        occupied = {int(engine.belts.position_of(busy, k, tick) // UNIT)
+                    for k in range(busy.head, busy.tail)}
+        probe_x = None
+        for off, (cx, _cy) in enumerate(busy.cells):
+            if off not in occupied and cx >= 14:
+                probe_x = cx
+                break
+        assert probe_x is not None, (
+            f"no bare cell on the awake run; items at offsets {occupied}")
+
+        assert cam.set_define("SLEEP_DEBUG", True), cam.compile_error
+        assert cam.compile_error is None, cam.compile_error
+
+        # All three rows have to be on screen at once, so this zooms out
+        # further than PROBE_ZOOM: rows 20..32 span 13 cells.
+        cam.center[:] = (14.0, 26.0)
+        cam.zoom = 22.0
+        img = _render()
+        cold = _mean_rgb(img, 14, 26)
+        warm = _mean_rgb(img, probe_x, 20)
+
+        assert _is_cold(cold), (
+            f"the sleeping run at (14,26) should read blue, got {cold}")
+        assert _is_warm(warm), (
+            f"the awake run at ({probe_x},20) should read amber, got {warm}")
+        # And they must differ *substantially*, which is the real content of
+        # the test: an overlay that washed everything one colour would still
+        # pass a loose per-cell predicate while telling the player nothing.
+        assert cold[2] > warm[2] + 50, (
+            f"asleep should be markedly bluer than awake: {cold} vs {warm}")
+
+        # The RAM case: at rest while holding items. Sampled at the cell's
+        # *edge* rather than its centre, because every cell of this run has a
+        # disc on it and the disc would otherwise be what is measured. The
+        # overlay inset is 0.40 of a cell, so 0.42 out from centre is inside
+        # the tint and clear of the 0.22-radius disc.
+        ram_cx, ram_cy = ram.cells[len(ram.cells) // 2]
+        sx, sy = cam.world_to_screen(ram_cx + 0.5, ram_cy + 0.92, (W, H))
+        edge = img[max(0, int(round(sy)) - 2):int(round(sy)) + 3,
+                   max(0, int(round(sx)) - 2):int(round(sx)) + 3]
+        ram_col = edge.astype(float).reshape(-1, 3).mean(axis=0)
+        assert _is_cold(ram_col), (
+            f"a full, blocked run is at rest and must read blue -- this is "
+            f"the memory case the sleep set exists for -- got {ram_col} at "
+            f"({ram_cx},{ram_cy})")
+
+        ok(f"asleep reads {cold.astype(int)}, "
+           f"awake reads {warm.astype(int)} at x={probe_x}, "
+           f"full-but-resting reads {ram_col.astype(int)}")
+    finally:
+        cam.set_define("SLEEP_DEBUG", was)

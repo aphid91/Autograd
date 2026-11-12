@@ -237,6 +237,24 @@ uniform int   select_on;      // 0 when no selection is in progress
 // direction a run is indexed from is readable.
 #define SEG_DEBUG_TAIL_R  0.12
 
+// --- sleep debug overlay ---
+// Tints belt cells and gate bodies by whether the tick currently skips them,
+// so the scheduler's decisions are visible on the board. Compiled out
+// entirely unless SLEEP_DEBUG is defined.
+//
+// The colours are deliberately *not* the red/green the item rings use for
+// sign: this answers "is work happening here", which is an orthogonal
+// question, and reusing that pair would read as a value judgement about the
+// items. Blue is cold/asleep, amber is hot/awake.
+#define COL_ASLEEP        vec3(0.24, 0.42, 0.78)
+#define COL_AWAKE         vec3(0.98, 0.70, 0.18)
+#define SLEEP_ALPHA       0.55
+#define SLEEP_INSET       0.40   // half-extent of the tinted patch, in cells
+// Awake runs get a brighter wash than sleeping ones: on a CPU-shaped board
+// almost everything is asleep, so the few awake cells are what the player is
+// looking for and should pop out of a calm blue field.
+#define SLEEP_AWAKE_BOOST 1.35
+
 // --- ghosts / overlays ---
 #define GHOST_ALPHA       0.45
 #define FRUSTRATED_ALPHA  0.55
@@ -1248,6 +1266,49 @@ void main() {
                     float dot_a = fill(length(p) - SEG_DEBUG_TAIL_R, px);
                     col = mix(col, vec3(1.0), dot_a * 0.9);
                 }
+            }
+        }
+#endif
+
+#ifdef SLEEP_DEBUG
+        // Tint by whether the tick is still visiting this cell. A belt cell
+        // takes its segment's state; a gate body takes its own readiness.
+        //
+        // Drawn in the same place as the segment overlay and for the same
+        // reason: over the entity, so the answer reads through whatever is
+        // beneath it.
+        {
+            int sid = segment_id(c.w);
+            bool known = false;
+            bool resting = false;
+            if (sid != 0) {
+                resting = segment_at_rest(sid, sim_tick);
+                known = true;
+            } else if (is_structure(type)) {
+                // A gate is "awake" when it holds anything -- a fed input or
+                // a waiting result. That is deliberately *not* the full
+                // prefilter predicate (which also needs the type's fire rule
+                // and its connectivity): those live in Python and in the
+                // entity class, and duplicating them here would be a second
+                // copy of a rule that has already caused two
+                // GLSL-disagrees-with-Python bugs. Holding nothing is the
+                // necessary condition the prefilter shares, and it is the
+                // one a player reading the board actually wants.
+                int row = cell_id(c.x);
+                bool holds = false;
+                for (int ch = 0; ch < MAX_CHANNELS; ++ch) {
+                    if (gate_in_held(row, ch) || gate_out_held(row, ch)) {
+                        holds = true;
+                    }
+                }
+                resting = !holds;
+                known = true;
+            }
+            if (known) {
+                float tint = fill(sd_box(p, vec2(SLEEP_INSET)), px);
+                vec3 scol = resting ? COL_ASLEEP : COL_AWAKE;
+                float a = SLEEP_ALPHA * (resting ? 1.0 : SLEEP_AWAKE_BOOST);
+                col = mix(col, scol, clamp(tint * a, 0.0, 1.0));
             }
         }
 #endif
