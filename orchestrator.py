@@ -504,28 +504,34 @@ class Orchestrator:
     def _note_gesture(self, cursor_world=None):
         """Which annotation gesture the input manager should run.
 
-        A held tool decides first. With an **empty hand**, a cursor over the
-        text box the Status window has open means the move gesture instead --
-        dragging repositions the box rather than panning the camera.
+        Move and resize come **first**, and are available both with an empty
+        hand and with the text tool held. With the tool, a drag over the open
+        box used to draw a new box on top of it (or, once the stacking guard
+        landed, do nothing at all) -- but the box is right there under the
+        cursor with its grip drawn on it, so dragging it is obviously what
+        the player means. Editing a label should not require putting the tool
+        down, which is the same reasoning that has a click with the text tool
+        open an existing box.
 
-        That is gated on the window being open on *that* box rather than on
-        merely hovering any note, deliberately: a left-drag is the camera pan
-        everywhere else on the board, and silently stealing it wherever a
-        label happens to lie would make panning unreliable near annotations.
-        Having the window open is the player saying which box they are
-        working on.
+        They are gated on the Status window being open on *that* box rather
+        than on merely hovering any note, deliberately: with an empty hand a
+        left-drag is the camera pan, and with the text tool it is "draw a new
+        box" -- silently stealing either wherever a label happens to lie
+        would make both unreliable near annotations. Having the window open
+        is the player saying which box they are working on.
         """
         tool = self._note_tool()
         if isinstance(tool, DrawAnnotationTool):
+            # The pen takes both buttons for drawing and erasing, so there is
+            # no spare gesture to give a box. Nothing is lost: the player can
+            # still grab the box with an empty hand or the text tool.
             return NOTE_STROKE
-        if isinstance(tool, TextAnnotationTool):
-            return NOTE_BOX
-        if tool is not None:
-            return NOTE_NONE
+
+        empty = self.toolbelt.empty_handed
         if (cursor_world is not None
                 and self.annotation_layer.enabled
                 and not self.clipboard.active
-                and self.toolbelt.empty_handed):
+                and (empty or isinstance(tool, TextAnnotationTool))):
             note = self.inspected_note()
             # Text boxes only. A stroke has no handle worth grabbing -- its
             # bbox is mostly empty space, so a drag starting "on" a circled
@@ -538,6 +544,9 @@ class Orchestrator:
                     return NOTE_RESIZE
                 if note.hit_point(*cursor_world):
                     return NOTE_MOVE
+
+        if isinstance(tool, TextAnnotationTool):
+            return NOTE_BOX
         return NOTE_NONE
 
     def _on_resize_handle(self, box, world):

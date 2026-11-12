@@ -609,8 +609,9 @@ never be edited. Only when no note is hit does the click fall through to the
 entity beneath, so bare board still closes the window. The window itself
 branches on `inspect_note` vs `inspect_row`, never both.
 
-With a text box open, a **drag** inside it moves the box rather than panning
-— see "Dragging the open text box".
+With a text box open, a **drag** inside it moves the box and a drag from its
+corner grip resizes it — with an empty hand or the text tool held, rather
+than panning or drawing. See "Dragging the open text box".
 
 The orchestrator holds `inspect_row` — a **row, not a view**. Views must never
 outlive the frame they were made in, since a row can be freed and handed to an
@@ -856,18 +857,29 @@ board, and the player discovers the labels only on release.
 
 #### Dragging the open text box
 
-With the Status window open on a text box and an **empty hand**, a left-drag
-starting inside that box moves it instead of panning the camera. Not a tool
-gesture — the hand is empty — so it is a third `note` kind (`NOTE_MOVE`)
-rather than a third annotation tool.
+With the Status window open on a text box, a left-drag starting inside that
+box moves it — **with an empty hand or with the text tool held**. A third
+`note` kind (`NOTE_MOVE`) rather than a third annotation tool, since with an
+empty hand there is no tool for it to belong to.
+
+**It is resolved before the held tool's own gesture**, which is what lets
+the text tool move a box instead of drawing one on top of it. The box is
+under the cursor with its grip drawn on it, so dragging it is obviously what
+the player means, and editing a label should not require putting the tool
+down — the same reasoning that has a click with the text tool open an
+existing box. The **pen** is the exception and keeps both buttons: it has no
+spare gesture to give a box, and nothing is lost, since an empty hand or the
+text tool can still grab one.
 
 Four decisions, each of which had an obvious wrong alternative:
 
 - **Having the window open is what claims the gesture**, not merely hovering
-  a note. Left-drag is the camera pan everywhere else, and stealing it
-  wherever a label happens to lie would make panning unreliable across an
-  annotated board. Opening the window is the player naming the box they are
-  working on.
+  a note. With an empty hand a left-drag is the camera pan; with the text
+  tool it is "draw a new box". Stealing either wherever a label happens to
+  lie would make both unreliable across an annotated board, so opening the
+  window is the player naming the box they are working on. With nothing
+  selected the text tool draws as usual, and a drag starting on an
+  *unselected* box is caught by the stacking guard below instead.
 - **Text boxes only.** A stroke's bbox is mostly empty space, so a drag
   starting "on" a circled region would grab it from a point nowhere near its
   ink.
@@ -922,7 +934,8 @@ rather than a flag.
   be invisible and then unclickable — unrecoverable except through the
   panel's clear-all.
 
-Strokes get no grip: only text boxes are resizable.
+Strokes get no grip: only text boxes are resizable. Like the move, the grip
+works with an empty hand **or** the text tool held.
 
 #### The text tool defers to an existing box
 

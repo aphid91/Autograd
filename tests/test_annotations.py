@@ -536,6 +536,111 @@ def test_no_grip_without_a_selection():
     print("  OK: nothing selected means no grip")
 
 
+def test_the_text_tool_can_move_the_open_box():
+    """Move works with the tool held, not only with an empty hand.
+
+    The box is right there under the cursor with its grip drawn on it, so
+    dragging it is obviously what the player means -- and editing a label
+    should not require putting the tool down. A drag here used to draw a new
+    box on top of it, and then (once the stacking guard landed) nothing at
+    all.
+    """
+    tool = _text_tool()
+    drag_world((10.0, 30.0), (16.0, 28.0), steps=5)
+    box = _notes().items[0]
+    assert orch.toolbelt.active is tool, "the text tool is still held"
+    before = box.bounds()
+    cam_before = tuple(orch.camera.center)
+
+    drag_world((13.0, 29.0), (20.0, 25.0), steps=8)
+
+    after = _notes().get(box.aid).bounds()
+    assert after[0] > before[0] + 3.0, (
+        f"the box should have moved: {before} -> {after}")
+    assert len(_notes()) == 1, "and no new box should have been drawn"
+    assert tuple(orch.camera.center) == cam_before
+    print("  OK: the text tool moved the open box instead of drawing one")
+
+
+def test_the_text_tool_can_resize_the_open_box():
+    _text_tool()
+    drag_world((10.0, 40.0), (16.0, 38.0), steps=5)
+    box = _notes().items[0]
+    w0, h0, anchor = box.w, box.h, (box.x, box.y)
+    x0, y0, x1, y1 = box.bounds()
+
+    drag_world((x1, y0), (x1 + 3.0, y0 - 1.0), steps=6)
+
+    assert abs(box.w - (w0 + 3.0)) < 1e-6, f"width {w0} -> {box.w}"
+    assert abs(box.h - (h0 + 1.0)) < 1e-6, f"height {h0} -> {box.h}"
+    assert (box.x, box.y) == anchor, "a resize must not move the anchor"
+    assert len(_notes()) == 1, "and must not draw a new box"
+    print(f"  OK: the text tool resized the box to {box.w}x{box.h}")
+
+
+def test_the_text_tool_still_draws_on_empty_space():
+    """The move/resize claim must be narrow.
+
+    It is gated on the Status window being open on the box under the cursor,
+    so everywhere else the tool's own gesture still wins -- otherwise the
+    tool would stop being able to make boxes at all.
+    """
+    _text_tool()
+    drag_world((10.0, 50.0), (16.0, 48.0), steps=5)
+    assert len(_notes()) == 1
+    # Well clear of the first, with the first still selected.
+    drag_world((40.0, 50.0), (46.0, 48.0), steps=5)
+    assert len(_notes()) == 2, (
+        "a drag on empty space must still draw a box while one is selected")
+    print("  OK: the tool still drew a box clear of the selected one")
+
+
+def test_a_closed_window_leaves_the_text_tool_drawing():
+    """Without a selection there is no box to grab, so the tool draws.
+
+    Which is also what makes the stacking guard the thing that catches a
+    drag starting on an *unselected* box -- see
+    `test_the_text_tool_does_not_stack_a_box_on_a_box`.
+    """
+    _text_tool()
+    drag_world((10.0, 60.0), (16.0, 58.0), steps=5)
+    box = _notes().items[0]
+    orch.inspect_note = None
+    step()
+    assert orch._note_gesture((13.0, 59.0)) != 3, (
+        "with no selection the move gesture must not be offered")
+    # And the drag is caught by the stacking guard rather than moving it.
+    before = box.bounds()
+    drag_world((13.0, 59.0), (22.0, 55.0), steps=6)
+    assert _notes().get(box.aid).bounds() == before, "the box must not move"
+    assert len(_notes()) == 1, "and no new box should appear"
+    assert orch.inspect_note == box.aid, "the drag reopened it instead"
+    print("  OK: with nothing selected the tool drew, and the guard caught it")
+
+
+def test_the_draw_tool_does_not_steal_the_box_gestures():
+    """The pen keeps both buttons.
+
+    It has no spare gesture to give a box, and nothing is lost: the player
+    can still grab the box with an empty hand or the text tool.
+    """
+    _text_tool()
+    drag_world((10.0, 20.0), (16.0, 18.0), steps=5)
+    box = _notes().items[0]
+    assert orch.inspect_note == box.aid
+    _draw_tool()
+    step()
+    assert orch._note_gesture((13.0, 19.0)) == 1, (
+        "the draw tool should still report its own stroke gesture")
+    before = box.bounds()
+    n0 = len(_notes())
+    drag_world((13.0, 19.0), (18.0, 17.0), steps=6)
+    assert _notes().get(box.aid).bounds() == before, (
+        "the pen must not move the box")
+    assert len(_notes()) == n0 + 1, "it should have drawn a stroke"
+    print("  OK: the pen drew a stroke rather than grabbing the box")
+
+
 # --- the paste preview -----------------------------------------------------
 def test_a_paste_previews_its_notes():
     """The stamp's labels show where they would land, before the click.
