@@ -118,20 +118,32 @@ class GateSim:
         self._drains_cache = {}
         #: gate row -> ((world_cell, face, channel), ...). See _output_faces().
         self._faces_cache = {}
+        #: segment id -> (row, channel) | None, for each end of a run.
+        #: See the "resolving a segment's ends" block below.
+        self._src_cache = {}
+        self._dst_cache = {}
 
     def invalidate_connectivity(self):
-        """Drop the cached output connectivity and port geometry.
+        """Drop every cached derivation of the grid and the segmentation.
 
         Called when the thing they are derived from changes: the grid (a
         placement, an erase, an in-place turn) or the segmentation. Cheap and
         idempotent.
 
-        Both caches are keyed by row, and a row is recycled by the free list,
-        so dropping them together on any grid change is what keeps a new
-        entity from inheriting the previous occupant's ports.
+        All four caches are keyed by an id that gets **recycled** -- a row by
+        the free list, a segment id by `SegmentIndex._release_sid()` -- so
+        dropping them together on any grid change is what keeps a new entity
+        from inheriting the previous occupant's ports, or a new run from
+        inheriting the previous one's gate.
+
+        One call for all four deliberately: they share an invalidation
+        condition exactly, and splitting them would be four things to forget
+        instead of one.
         """
         self._drains_cache.clear()
         self._faces_cache.clear()
+        self._src_cache.clear()
+        self._dst_cache.clear()
 
     # --- gate discovery ---------------------------------------------------
     #: Types that are rows but not gates. Checked against the raw type column
@@ -340,16 +352,69 @@ class GateSim:
         return moved
 
     # --- resolving a segment's ends to (gate, channel) --------------------
+    #
+    # Both ends resolve to a **(row, channel)** pair that is fixed for the
+    # segment's whole life: `seg.src` / `seg.dst` are written once by
+    # `SegmentIndex._resolve_ends()` during a rebuild and never touched
+    # again, and the port geometry they are matched against cannot change
+    # without a grid write. Yet `offer_to()` and `took_from()` each resolved
+    # the source end per segment per tick, and `accept_from()` the sink end:
+    # 1.80ms of a 2.19ms belt phase on a 672-segment board, 82% of it, for an
+    # answer settled at the last edit.
+    #
+    # The cache therefore stores `(row, channel)` and **not the view**. A view
+    # must never outlive the frame it was made in -- a row can be freed and
+    # handed to an unrelated entity -- so caching one would be the exact
+    # hazard `Orchestrator.inspect_row` documents. The view is rebuilt per
+    # call from the cached row, which is cheap; what was expensive was the
+    # face-by-face search that found the channel.
+    #
+    # `None` is a real cached answer (a dangling end), so a sentinel
+    # distinguishes "resolved to nothing" from "not yet asked".
+    _UNRESOLVED = object()
+
     def _src_port(self, seg):
         """The (gate_view, out_channel) feeding this segment, or None."""
+        hit = self._src_cache.get(seg.sid, self._UNRESOLVED)
+        if hit is self._UNRESOLVED:
+            hit = self._resolve_src(seg)
+            self._src_cache[seg.sid] = hit
+        return self._bind(hit)
+
+    def _dst_port(self, seg):
+        """The (gate_view, in_channel) this segment drains into, or None."""
+        hit = self._dst_cache.get(seg.sid, self._UNRESOLVED)
+        if hit is self._UNRESOLVED:
+            hit = self._resolve_dst(seg)
+            self._dst_cache[seg.sid] = hit
+        return self._bind(hit)
+
+    def _bind(self, resolved):
+        """A cached (row, channel) -> a live (view, channel), or None.
+
+        The liveness and ghost tests stay here rather than in the resolver:
+        they are about the entity's *current* state, and a ghost can be
+        committed or despawned without the segmentation changing. Only the
+        geometry -- which channel sits on which face -- is cached.
+        """
+        if resolved is None:
+            return None
+        row, channel = resolved
+        if not self.board.is_row_alive(row):
+            return None
+        gate = self.board.view(row)
+        if gate.is_ghost:
+            return None
+        return gate, channel
+
+    def _resolve_src(self, seg):
+        """The (row, out_channel) feeding this segment, or None. Uncached."""
         if seg.src is None:
             return None
         row, face = seg.src
         if not self.board.is_row_alive(row):
             return None
         gate = self.board.view(row)
-        if gate.is_ghost:
-            return None
         # Which output channel sits on that face, at the gate cell adjacent
         # to the segment's tail. The cell matters: a machine can emit on the
         # same facing from more than one cell of its footprint.
@@ -362,28 +427,26 @@ class GateSim:
         want = (tail[0] - step[0], tail[1] - step[1])
         for (xy, f, channel) in self._output_faces(gate):
             if f == face and xy == want:
-                return gate, channel
+                return row, channel
         return None
 
-    def _dst_port(self, seg):
-        """The (gate_view, in_channel) this segment drains into, or None."""
+    def _resolve_dst(self, seg):
+        """The (row, in_channel) this segment drains into, or None. Uncached."""
         if seg.dst is None:
             return None
         row, face = seg.dst
         if not self.board.is_row_alive(row):
             return None
         gate = self.board.view(row)
-        if gate.is_ghost:
-            return None
-        # As in _src_port(): `face` points from the gate toward the belt, so
-        # the gate cell is one step *backwards* from the segment's head.
+        # As in _resolve_src(): `face` points from the gate toward the belt,
+        # so the gate cell is one step *backwards* from the segment's head.
         head = seg.cells[-1]
         step = cell.DIR_STEPS[face]
         want = (head[0] - step[0], head[1] - step[1])
         channel = self._input_channel_for(gate, face, at=want)
         if channel is None:
             return None
-        return gate, channel
+        return row, channel
 
     # --- generators -------------------------------------------------------
     def _fire_generator(self, gate):

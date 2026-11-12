@@ -48,8 +48,24 @@ def fresh_faces(gate):
 
 
 def compare(label):
-    """Every gate's cached answers against freshly computed ones."""
+    """Every gate's and segment's cached answers against fresh ones."""
     problems = []
+    # Segment end resolution: cached (row, channel) against a fresh resolve.
+    # Compared as rows rather than views, since that is what is stored --
+    # a view is rebuilt per call and two views of one row are not equal.
+    for seg in engine.segments.segments.values():
+        for which, fresh in (("src", gates._resolve_src),
+                             ("dst", gates._resolve_dst)):
+            cache = (gates._src_cache if which == "src"
+                     else gates._dst_cache)
+            if seg.sid not in cache:
+                continue
+            want = fresh(seg)
+            got = cache[seg.sid]
+            if got != want:
+                problems.append(
+                    f"{label}: segment {seg.sid} {which} "
+                    f"cached {got} fresh {want}")
     for gate in gates.gates():
         want_f = fresh_faces(gate)
         got_f = gates._output_faces(gate)
