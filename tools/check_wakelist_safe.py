@@ -1,14 +1,60 @@
 """Differential check: sleeping must not change the simulation at all.
 
-`BeltSim` now skips segments it believes are at rest. That is only sound if a
-skipped segment really was a fixed point *and* something wakes it the moment
-it stops being one. Both halves fail silently: a wrongly-slept run simply
-stops moving, which on a board the size of a CPU looks like a logic bug in the
+The tick skips work it believes cannot change anything. That is only sound if
+a skipped unit really was a fixed point *and* something wakes it the moment it
+stops being one. Both halves fail silently: a wrongly-slept run simply stops
+moving, which on a board the size of a CPU looks like a logic bug in the
 circuit rather than a scheduler bug in the engine.
 
 So this runs the same board twice, tick for tick, with the sleep machinery on
-and off, and compares the full item state of every segment after every tick.
-Any divergence is reported with the tick and segment it first appeared on.
+and off, and compares the full state of every segment *and* every entity row
+after every tick. Any divergence is reported with the tick it first appeared
+on.
+
+**Written to cover every sleeping layer, not just the belts.** `BeltSim` is
+the only one that sleeps today; gate sleep is the next step, and the whole
+point of a differential check is that it must already be watching when the
+new mechanism lands rather than being extended alongside it (an optimisation
+and its own safety net landing together is how the first version of this file
+ended up vacuous). So:
+
+  - the oracle disables sleeping through `SLEEPERS` below, one entry per
+    layer, rather than naming `engine.belts` directly;
+  - the snapshot already captured every entity row, which is where gate
+    channels live, so gate sleep needs no new comparison -- a gate that
+    wrongly slept shows up as a row that differs;
+  - the transition count is per layer, so "this run did not exercise the wake
+    edges" is answerable for each one separately. A combined count would let
+    busy belts hide a gate layer that never woke once, which is exactly the
+    failure this file exists to make visible.
+
+Adding a layer means adding one `_Sleeper` entry. If that entry is missing the
+oracle still sleeps in that layer, both timelines agree by construction, and
+the check silently proves nothing -- so `main()` reports a transition count
+per layer and warns when one is zero.
+
+What this deliberately does not cover
+-------------------------------------
+
+Two wake edges are outside its reach, and both are named here rather than
+left to be rediscovered as "the checker passed so it must be fine":
+
+- **The wake on a segment rebuild** (`Engine.sync_segments()`). The board
+  here never changes mid-run, so removing that `wake_all()` passes. Covering
+  it needs an *edit* in the middle of both timelines, and a rebuild
+  reassigns every segment id -- so the two snapshots would no longer line up
+  by id and the whole comparison would need to be keyed on cells instead.
+  That is a bigger change than it sounds and is not attempted;
+  `tools/check_cache_coherence.py` is what exercises edits today.
+- **The anchor clause of `is_at_rest()`**, which is invisible end to end for
+  the reason the module docstring in core/belts.py gives: an empty run's
+  unsaturated anchor re-saturates before any item position depends on it.
+  `tools/probe_wakelist.py` checks the predicate against its *definition*
+  rather than against behaviour, which is the only thing that catches it.
+
+And one more, recorded in `build()`: the wake raised by `_fire_generator()`
+is **unreachable by construction**, so removing it passes. That is an
+argument, not an untested gap -- see the docstring there.
 
 Two timelines, one board
 ------------------------
@@ -58,6 +104,59 @@ engine = harness.engine
 MACHINES = (Shear, Route, Merge, Reciprocal, Max, Floor, Swap, Sink)
 
 
+# --- the sleeping layers --------------------------------------------------
+#
+# One entry per subsystem that skips work it believes is inert. Each supplies
+# three things, and no more, which is what keeps this file from having to know
+# how a layer stores its own sleep set:
+#
+#   `asleep`   the set of currently-sleeping ids -- snapshotted and restored
+#              with the rest of the timeline's state, and diffed tick over
+#              tick to count wake edges.
+#   `enable`   latch sleeping on or off. The oracle turns it *off*, which is
+#              deliberately not the same as waking everything: waking lets the
+#              coming tick re-sleep, so the oracle would accumulate a sleep
+#              set and stop being one after a single tick. That is precisely
+#              the bug that made the first version of this check vacuous.
+#   `restore`  put a snapshotted sleep set back.
+#
+# A layer missing from this list is a layer the oracle also sleeps in, so both
+# timelines agree by construction and the check proves nothing. `main()`
+# therefore reports a transition count per layer and warns on zero rather than
+# summing them -- a busy belt layer must not be able to vouch for a gate layer
+# that never woke.
+class _Sleeper:
+    __slots__ = ("name", "_get", "_enable", "_restore")
+
+    def __init__(self, name, get, enable, restore):
+        self.name = name
+        self._get = get
+        self._enable = enable
+        self._restore = restore
+
+    def asleep(self):
+        return set(self._get())
+
+    def enable(self, on):
+        self._enable(on)
+
+    def restore(self, ids):
+        self._restore(ids)
+
+
+SLEEPERS = (
+    _Sleeper(
+        "belts",
+        lambda: engine.belts._asleep,
+        lambda on: engine.belts.set_sleep_enabled(on),
+        lambda ids: setattr(engine.belts, "_asleep", set(ids)),
+    ),
+    # Gate sleep goes here when it lands. Deliberately left as a comment
+    # rather than omitted silently, so the next person adding it finds the
+    # seam instead of extending main().
+)
+
+
 def _enlarge():
     if board.width >= BOARD:
         return
@@ -71,13 +170,19 @@ _enlarge()
 
 # --- state capture --------------------------------------------------------
 def snapshot():
-    """Everything a tick can change: ring state, items, and gate channels."""
+    """Everything a tick can change, plus every layer's sleep set.
+
+    The entity array is copied wholesale rather than reaching for named gate
+    fields, which is what makes this cover gate sleep for free: a gate that
+    wrongly slept leaves an input channel or a waiting zone holding what the
+    oracle consumed, and that is a row that differs.
+    """
     segs = {}
     for sid, s in engine.segments.segments.items():
         segs[sid] = (s.head, s.tail, s.anchor,
                      tuple(s.enter_tick) if s.enter_tick is not None else (),
                      tuple(s.payload) if s.payload is not None else ())
-    return segs, board.entities.copy(), set(engine.belts._asleep)
+    return segs, board.entities.copy(), tuple(sl.asleep() for sl in SLEEPERS)
 
 
 def restore(snap):
@@ -92,7 +197,8 @@ def restore(snap):
         if s.payload is not None:
             s.payload[:] = pl
     board.entities[:] = ents
-    engine.belts._asleep = set(asleep)
+    for sleeper, ids in zip(SLEEPERS, asleep):
+        sleeper.restore(ids)
 
 
 def compare_segs(a, b):
@@ -129,6 +235,33 @@ def build(rng, runs=12, run_len=34):
 
     A couple of Source-fed rows stay for contrast, so the continuously-busy
     case is covered too.
+
+    **And a couple where a generator's own run sleeps full and then drains**
+    -- Source into a 3-cell run into a starved Shear. The two contrast rows
+    above never reach that state (32 cells with a dangling far end never
+    fill), so these are what take the belt layer from 8 wake transitions to
+    54 and exercise the holding-items fixed point under a real consumer.
+
+    They do **not**, however, make the `_wake_around()` in `_fire_generator()`
+    load-bearing, and that is worth stating because removing it still passes
+    this check. Measured: over 400 ticks of random feeding, 200 generator
+    fires, and in **zero** of them was an adjacent segment asleep.
+
+    It is unreachable by construction, not by luck of the fixture. A
+    generator fires only when its output zone is clear; the zone is cleared by
+    `took_from()`, which runs *inside* the belt tick of a segment that just
+    accepted a push -- so that segment was awake on that tick, and is still
+    awake on the next structure phase when the Source refills. For a run to
+    be asleep as its Source fires, the zone would have had to drain while the
+    run slept, and draining is something only an awake run does.
+
+    So that call is **defensive rather than load-bearing**, in the same sense
+    `took_from()` itself is (see core/gates.py): correct by construction given
+    where the room check sits, and kept because the protocol is then right by
+    argument rather than by coincidence. A splitter, or any producer that can
+    be offered speculatively, would change that. This docstring is the record
+    that it is known-untested rather than believed-covered -- the distinction
+    the first version of this file got wrong by assuming the latter.
     """
     engine.clear_board()
     y = 1
@@ -141,6 +274,23 @@ def build(rng, runs=12, run_len=34):
         for x in range(2, run_len):
             if board.is_empty(x, y):
                 board.spawn(Belt, x, y, cell.DIR_PX)
+        y += 4
+
+    # Two rows where a generator's own run sleeps: Source -> short run ->
+    # starved gate. Short so it fills and reaches the holding-items fixed
+    # point quickly; a Shear so it needs a second input it never gets on its
+    # own, which is what keeps the run blocked until main() feeds it.
+    for _ in range(2):
+        if y + 3 >= board.height:
+            break
+        if board.is_empty(0, y):
+            board.spawn(Source, 0, y, cell.DIR_PX)
+        for x in range(2, 5):
+            if board.is_empty(x, y):
+                board.spawn(Belt, x, y, cell.DIR_PX)
+        cells = Shear.cells_for(5, y, cell.DIR_PX, False)
+        if all(board.is_empty(cx, cy) for (cx, cy) in cells):
+            board.spawn(Shear, 5, y, cell.DIR_PX)
         y += 4
 
     # The rest: a starved machine feeding a run that will sleep, with a Sink
@@ -179,15 +329,16 @@ def main():
 
     build(rng)
     problems = []
-    slept_total = 0
-    seg_total = 0
 
     # The two timelines, each carrying its own full board state. They start
     # identical; `sleep_state` keeps whatever sleep set accumulates, and
     # `full_state` is never allowed to have one.
     sleep_state = snapshot()
     full_state = snapshot()
-    wake_edges = 0
+    #: Sleep -> wake transitions per layer. Kept apart rather than summed so a
+    #: busy layer cannot vouch for one that never woke.
+    wake_edges = {sl.name: 0 for sl in SLEEPERS}
+    slept_by_layer = {sl.name: 0 for sl in SLEEPERS}
 
     def run_one_tick(at_tick):
         """One tick at a fixed tick number, from whatever is loaded."""
@@ -213,30 +364,44 @@ def main():
                 g.set_input(c, 2.0)
 
     for t in range(args.ticks):
-        slept_total += len(sleep_state[2])
-        seg_total += len(sleep_state[0])
+        for sl, ids in zip(SLEEPERS, sleep_state[2]):
+            slept_by_layer[sl.name] += len(ids)
 
         # The stimulus for this tick, chosen once and replayed into both.
         plan = [r for r in feedable if rng.random() < 0.15]
 
-        # (1) the timeline under test: its own state, its own sleep set.
+        # (1) the timeline under test: its own state, its own sleep sets, and
+        #     sleeping on. `enable(True)` is re-asserted every tick because
+        #     the oracle below latches it off -- the two timelines share one
+        #     engine, so each has to state its own scheduling.
+        for sl in SLEEPERS:
+            sl.enable(True)
+        # After enable(), not before: turning sleeping on must not be allowed
+        # to clear the sleep set this timeline has accumulated, and
+        # set_sleep_enabled(False) clears it by design.
         restore(sleep_state)
         feed(plan)
-        was_asleep = set(engine.belts._asleep)
+        before = [sl.asleep() for sl in SLEEPERS]
         run_one_tick(t)
-        wake_edges += len(was_asleep - set(engine.belts._asleep))
+        for sl, was in zip(SLEEPERS, before):
+            wake_edges[sl.name] += len(was - sl.asleep())
         sleep_state = snapshot()
 
-        # (2) the oracle: its own state, and sleeping disabled outright. It
-        #     must never inherit the sleeping timeline's state or its skips.
+        # (2) the oracle: its own state, and sleeping *latched* off in every
+        #     layer. Latched rather than woken: waking everything still lets
+        #     this tick re-sleep, so the oracle would accumulate a sleep set
+        #     and stop being an oracle after one tick. That exact mistake is
+        #     what let four separate mutations through the first version.
         restore(full_state)
+        for sl in SLEEPERS:
+            sl.enable(False)
         feed(plan)
-        engine.belts.wake_all()
         run_one_tick(t)
         full_state = snapshot()
-        # Keep the oracle free of any sleep set it just accumulated, so the
-        # next oracle tick is a genuine full tick.
-        full_state = (full_state[0], full_state[1], set())
+        # Belt and braces: the oracle's snapshot must carry no sleep set, so
+        # even a layer that ignored `enable(False)` cannot skip next tick.
+        full_state = (full_state[0], full_state[1],
+                      tuple(set() for _ in SLEEPERS))
 
         diffs = compare_segs(sleep_state[0], full_state[0])
         # Gate channels must match too -- a slept run that failed to deliver
@@ -252,17 +417,22 @@ def main():
 
     print(f"seed {args.seed}, {args.ticks} ticks, "
           f"{engine.segments.count} segments")
-    if seg_total:
-        print(f"  mean asleep at tick start: "
-              f"{slept_total / max(args.ticks, 1):.1f} of "
-              f"{seg_total / max(args.ticks, 1):.1f}")
-    # Reported because a run with no wake transitions proves nothing about
-    # the wake edges, however many ticks it ran -- that is exactly how the
-    # first version of this check passed against four mutations.
-    print(f"  sleep -> wake transitions: {wake_edges}")
-    if not wake_edges:
-        print("  WARNING: no segment ever woke, so this run did not "
-              "exercise the wake edges at all")
+    # Per layer, because a run with no wake transitions proves nothing about
+    # that layer's wake edges however many ticks it ran -- which is exactly
+    # how the first version of this check passed against four mutations. Not
+    # summed: a busy belt layer must not be able to vouch for a gate layer
+    # that never woke once.
+    vacuous = []
+    for sl in SLEEPERS:
+        n = wake_edges[sl.name]
+        mean = slept_by_layer[sl.name] / max(args.ticks, 1)
+        print(f"  {sl.name}: {n} sleep -> wake transitions, "
+              f"mean {mean:.1f} asleep at tick start")
+        if not n:
+            vacuous.append(sl.name)
+    for name in vacuous:
+        print(f"  WARNING: nothing in '{name}' ever woke, so this run did "
+              f"not exercise its wake edges at all")
     if problems:
         t, diffs = problems[0]
         print(f"\nDIVERGENCE at tick {t}:")

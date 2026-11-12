@@ -68,7 +68,7 @@ and scheduling are kept honest. Run them by hand from `tools/`.
 | [tools/probe_wakelist.py](tools/probe_wakelist.py) | whether an idle segment is provably a no-op (both fixed points, by brute force), and what fraction of a CPU-shaped board is asleep |
 | [tools/check_cache_coherence.py](tools/check_cache_coherence.py) | the four `GateSim` caches against freshly-computed answers, after each of 150 random edits. Catches the row/segment-id recycling hazard |
 | [tools/check_prefilter_safe.py](tools/check_prefilter_safe.py) | that the prefilter never excludes a gate the full path would fire, over ~58k gate-ticks of mixed machine types |
-| [tools/check_wakelist_safe.py](tools/check_wakelist_safe.py) | a sleeping timeline against a fully-ticked one, diffed every tick. Reports its sleep→wake transition count, because a run with none proves nothing |
+| [tools/check_wakelist_safe.py](tools/check_wakelist_safe.py) | a sleeping timeline against a fully-ticked one, diffed every tick, **per sleeping layer** (`SLEEPERS`). Reports a sleep→wake transition count for each, because a layer with none proves nothing — and a combined count would let busy belts vouch for a gate layer that never woke |
 
 #### Profiling the board in front of you
 
@@ -1633,6 +1633,55 @@ knowing because each looked fine:
 It now keeps the oracle's state separate, builds starved gates and feeds them
 at random, and **reports the transition count** so a vacuous run is visible
 rather than silent.
+
+##### It is written for every sleeping layer, not just the belts
+
+Gate sleep is the next step, and a differential check has to be watching
+*before* the mechanism lands rather than arriving with it — an optimisation
+and its own safety net landing together is precisely how the first version
+ended up vacuous. So the checker was generalised first, with belts as the
+only registered layer:
+
+- **`SLEEPERS` is a registry**, one `_Sleeper` per layer supplying three
+  things and no more: its sleep set, a latch, and a restore. The checker
+  never names `engine.belts`.
+- **The snapshot already copies every entity row**, which is where gate
+  channels live — so gate sleep needs no new comparison at all. A gate that
+  wrongly slept leaves a channel holding what the oracle consumed, and that
+  is a row that differs.
+- **Transition counts are per layer, never summed.** A busy belt layer must
+  not be able to vouch for a gate layer that never woke once.
+
+**`set_sleep_enabled(False)` is not `wake_all()`**, and the difference is the
+load-bearing one. Waking clears the set *now* but leaves the coming tick free
+to re-sleep, so an oracle built on it accumulates a sleep set and stops being
+an oracle after one tick. Mutation-testing confirms this is still live: with
+the latch removed **and** the oracle's belt-and-braces set-clear removed, a
+genuinely unsafe mutation (sleeping every run that holds items) passes. Both
+guards are kept, and `test_sleeping_can_be_latched_off_for_a_differential_check`
+pins the latch in the suite rather than leaving it to a tool nobody runs in CI.
+
+Three wake edges it **cannot** see, named so they are known gaps rather than
+assumed coverage:
+
+- **The rebuild wake.** The board never changes mid-run, so removing
+  `wake_all()` from `sync_segments()` passes. Covering it needs an edit
+  inside both timelines, and a rebuild reassigns every segment id — so the
+  comparison would have to be keyed on cells instead. Not attempted.
+- **The anchor clause**, invisible end to end for the reason above;
+  `probe_wakelist.py` is what catches it.
+- **The generator wake** in `_fire_generator()`, which is **unreachable by
+  construction**. A generator fires only when its output zone is clear; the
+  zone is cleared by `took_from()`, which runs *inside* the belt tick of a
+  segment that just accepted a push — so that run was awake then and is still
+  awake when the Source refills. Measured: 200 generator fires over 400
+  ticks, and in **zero** of them was an adjacent segment asleep. So it is
+  defensive rather than load-bearing, in the same sense `took_from()` itself
+  is; a splitter would change that.
+
+Adding the generator rows to the fixture took the belt layer from 8 wake
+transitions to 54 and added the holding-items fixed point under a real
+consumer, which is worth having regardless of the above.
 
 #### Driving it before gates exist
 

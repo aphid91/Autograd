@@ -131,6 +131,9 @@ class BeltSim:
         #: Empty means "everything ticks", which is the pre-sleep behaviour
         #: and so the safe default after any wholesale change.
         self._asleep = set()
+        #: False disables sleeping outright. Only
+        #: `tools/check_wakelist_safe.py` sets it -- see set_sleep_enabled().
+        self._sleep_enabled = True
         #: Per-tick timing, disarmed. `Engine` replaces it with the clock's,
         #: for the same reason `GateSim.profiler` is assigned rather than
         #: injected: diagnostics, not a dependency.
@@ -351,6 +354,26 @@ class BeltSim:
         """Wake every segment. Used after a rebuild or a wholesale change."""
         self._asleep.clear()
 
+    def set_sleep_enabled(self, on):
+        """Turn sleeping off entirely, for a differential check.
+
+        `wake_all()` is not enough on its own for that job, and the difference
+        is what made the first `check_wakelist_safe.py` vacuous: waking
+        everything before a tick still lets that tick *re-sleep* runs, so the
+        "oracle" accumulates a sleep set of its own and stops being an oracle
+        after one tick. This latches the behaviour off instead, so a reference
+        timeline ticks every segment every tick however quiet the board gets.
+
+        Not a performance switch and not reachable from the UI -- the only
+        caller is `tools/check_wakelist_safe.py`. It exists so a checker can
+        ask for "no scheduling at all" in one call per layer, rather than
+        knowing how each layer stores its own sleep set.
+        """
+        self._sleep_enabled = bool(on)
+        if not self._sleep_enabled:
+            self._asleep.clear()
+        return self._sleep_enabled
+
     def awake_segments(self):
         """The segments a tick must visit, in segment-id order.
 
@@ -384,6 +407,7 @@ class BeltSim:
         """
         popped = pushed = 0
         asleep = self._asleep
+        sleeping = self._sleep_enabled
         prof = self.profiler
         # Building the awake list is timed apart from ticking it, because the
         # two scale with different things and the wake list changed which one
@@ -402,7 +426,7 @@ class BeltSim:
             # `not (p or q)` guard is belt and braces -- a segment that just
             # popped or pushed is not at rest by either test -- but it keeps
             # "did work" and "is inert" from having to agree.
-            if not (p or q) and self.is_at_rest(seg, tick):
+            if sleeping and not (p or q) and self.is_at_rest(seg, tick):
                 asleep.add(seg.sid)
         self.stats["ticks"] += 1
         self.stats["asleep"] = len(asleep)

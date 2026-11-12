@@ -721,3 +721,62 @@ def test_an_idle_run_sleeps_and_a_gate_firing_wakes_it():
     assert engine.belts.total_items() > before_items, (
         "the woken run took no item, so the wake arrived too late to matter")
     ok("the gate firing woke its output run and delivered an item")
+
+
+def test_sleeping_can_be_latched_off_for_a_differential_check():
+    """`set_sleep_enabled(False)` must stop a tick re-sleeping anything.
+
+    This exists for `tools/check_wakelist_safe.py`, whose oracle timeline has
+    to tick every segment every tick however quiet the board gets. The
+    distinction from `wake_all()` is the whole point and is not obvious:
+    waking everything clears the set *now* but leaves the coming tick free to
+    re-sleep, so an oracle built on `wake_all()` accumulates a sleep set and
+    stops being an oracle after one tick.
+
+    That is not hypothetical -- it is the bug that made the first version of
+    that checker vacuous against four separate mutations. Mutation-testing the
+    checker shows it is *still* load-bearing: with the latch removed and the
+    oracle's belt-and-braces set-clear removed too, a genuinely unsafe
+    mutation (sleeping every run that holds items) passes. So the latch is
+    pinned here rather than only exercised by a tool nobody runs in CI.
+    """
+    harness.reset()
+    sh = engine.place_structure(Shear, 8, 5)
+    engine.place_belt_path((10, 5), (15, 5))
+    engine.place_structure(Sink, 16, 5)
+    engine.sync_segments()
+    try:
+        # Quiet board: with sleeping on, runs settle.
+        for _ in range(5):
+            engine.clock.request_step()
+            engine.clock.advance(0.0)
+        assert engine.belts._asleep, "the fixture should have gone to sleep"
+
+        # Latched off: the set clears *and* stays clear through a tick that
+        # would otherwise re-sleep every one of them. `wake_all()` alone
+        # would pass the first assertion and fail the second.
+        engine.belts.set_sleep_enabled(False)
+        assert not engine.belts._asleep, (
+            "latching sleep off must clear the set immediately")
+        for _ in range(5):
+            engine.clock.request_step()
+            engine.clock.advance(0.0)
+        assert not engine.belts._asleep, (
+            "a latched-off tick re-slept segments -- an oracle timeline "
+            "built on this would stop being a full tick after one tick, "
+            "which is exactly how check_wakelist_safe.py went vacuous")
+        ok("sleeping latched off survives 5 ticks on a quiet board")
+
+        # And back on, so the latch is a toggle rather than a one-way door.
+        engine.belts.set_sleep_enabled(True)
+        for _ in range(5):
+            engine.clock.request_step()
+            engine.clock.advance(0.0)
+        assert engine.belts._asleep, (
+            "re-enabling sleep did not resume it")
+        ok(f"re-enabled, {len(engine.belts._asleep)} segment(s) asleep again")
+    finally:
+        # Global state: a scenario that left sleeping off would make every
+        # later one tick every segment, which is slower but -- worse -- would
+        # make a sleep assertion elsewhere fail for an unrelated reason.
+        engine.belts.set_sleep_enabled(True)

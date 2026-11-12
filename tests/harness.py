@@ -208,6 +208,11 @@ def reset():
     # The debug item feed is global state too: a scenario that leaves it on
     # would quietly fill every later scenario's belts.
     engine.debug_feed = None
+    # Sleeping latched off is global state with a nastier signature than most:
+    # every later scenario would tick every segment, which is merely slower,
+    # but any scenario *asserting* that something slept would then fail for a
+    # reason nowhere near itself.
+    engine.belts.set_sleep_enabled(True)
     for k in engine.belts.stats:
         engine.belts.stats[k] = 0
     for k in engine.gates.stats:
