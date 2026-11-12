@@ -12,7 +12,7 @@ Controls:
   shift+F       frame the whole board
   1-9, 0        select a toolbelt slot
   X             swap which toolbelt row the number keys address
-  ctrl+D        erase mode (drag a box); ctrl+shift+D cuts
+  ctrl+D        erase mode (drag a box); ctrl+X cuts
   Left-click    build with the active tool (on release, not press)
   R / shift+R   per-tool: belt path shape, or structure rotation
   Right-click   cancel a plan, or drag to erase

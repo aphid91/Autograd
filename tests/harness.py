@@ -256,10 +256,13 @@ def ctrl_key(key):
 
 
 def ctrl_shift_key(key):
-    """Tap a key with both ctrl and shift held -- ctrl+shift+D.
+    """Tap a key with both ctrl and shift held.
 
     Both modifiers have to be down on the frame the edge lands, which is why
-    this exists rather than nesting `ctrl_key` and `shift_key`.
+    this exists rather than nesting `ctrl_key` and `shift_key`. No binding
+    uses a ctrl+shift chord at the moment -- cut briefly did, before moving
+    back to `ctrl+X` -- but it sits alongside `ctrl_key` and `shift_key` as
+    the third of the three modifier forms a scenario might need.
     """
     fake["keys"].add(glfw.KEY_LEFT_CONTROL)
     fake["keys"].add(glfw.KEY_LEFT_SHIFT)
@@ -284,8 +287,13 @@ def enter_erase_mode():
 
 
 def enter_cut_mode():
-    """The cut variant of the erase chord. See `enter_erase_mode()`."""
-    ctrl_shift_key(glfw.KEY_D)
+    """The cut chord. See `enter_erase_mode()` for why these are named.
+
+    `ctrl+X` rather than a variant of the erase chord: cut keeps the standard
+    OS shortcut, so copy/paste/cut stay ctrl+C/ctrl+V/ctrl+X. It cannot
+    collide with the bare-`X` row swap, which is gated on *not* ctrl.
+    """
+    ctrl_key(glfw.KEY_X)
 
 
 def shift_key(key):

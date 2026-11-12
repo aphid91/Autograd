@@ -33,7 +33,7 @@ differences:
 - **A release erases and stays in the mode.** Copy mode's release ends the
   mode (you go to paste with what you caught); erasing is a repeated action,
   so the rectangle is a stroke rather than a commitment.
-- **`ctrl+shift+D` is a cut**: the same rectangle, captured as a stamp *before* the
+- **`ctrl+X` is a cut**: the same rectangle, captured as a stamp *before* the
   entities are deleted, then straight to paste mode holding it. That makes
   cut-then-place one continuous chain exactly as ctrl+C -> ctrl+V is, stash
   included -- `_stash()` refusing to overwrite is what keeps the player's
@@ -64,7 +64,7 @@ class Clipboard:
         self._has_stash = False
         #: True in erase mode when the rectangle should be *cut* -- captured
         #: as a stamp and then deleted -- rather than simply deleted. Set by
-        #: ctrl+shift+D and cleared when the mode ends, so a later plain stroke
+        #: ctrl+X and cleared when the mode ends, so a later plain stroke
         #: cannot inherit it.
         self.cutting = False
 
@@ -133,7 +133,7 @@ class Clipboard:
         return True
 
     def enter_erase(self, current_slot, cut=False):
-        """ctrl+D (or ctrl+shift+D for a cut). Stash the tool and select.
+        """ctrl+D (or ctrl+X for a cut). Stash the tool and select.
 
         `cut` is remembered on the mode rather than read per release, because
         the status line and the panel both need to say which of the two the

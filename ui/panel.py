@@ -886,7 +886,7 @@ class UI:
         imgui.text("ctrl+C: copy (drag a box)   ctrl+V: paste")
         imgui.text("  paste: click places, shift+click places what fits")
         imgui.text("  shift+scroll: older/newer copy")
-        imgui.text("ctrl+D: erase mode (drag a box)   ctrl+shift+D: cut")
+        imgui.text("ctrl+D: erase mode (drag a box)   ctrl+X: cut")
         imgui.text("Left-click: build with the active tool")
         imgui.text("R / shift+R: per-tool (belt shape, structure rotation)")
         imgui.text("Right-click: cancel plan / drag to erase")

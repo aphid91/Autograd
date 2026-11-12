@@ -214,7 +214,7 @@ class Intents:
         self.select_rect = None
         #: True on the frame a selection drag is released.
         self.commit_select = False
-        # ctrl+D / ctrl+shift+D: erase mode, and its cut variant. Separate intents
+        # ctrl+D / ctrl+X: erase mode and cut. Separate intents
         # rather than one with a flag, so the orchestrator's two calls read
         # as the two different requests they are.
         self.erase_mode = False
@@ -401,10 +401,32 @@ class InputManager:
 
         it = Intents()
 
+        # The two modifiers, read once and **before anything consults them**.
+        # Both are plain held state rather than edges, since several bindings
+        # below need to know whether one is down at the moment another key
+        # fires -- and the camera block needs ctrl, so this cannot sit after
+        # it.
+        ctrl = (self._key(glfw.KEY_LEFT_CONTROL)
+                or self._key(glfw.KEY_RIGHT_CONTROL))
+        shift = (self._key(glfw.KEY_LEFT_SHIFT)
+                 or self._key(glfw.KEY_RIGHT_SHIFT))
+
         # --- camera: held keys, scaled by dt ---
         # Q and E are no longer zoom -- scroll does that, and Q is the
         # pipette. Zoom has no key binding at all now.
-        if not want_kb:
+        #
+        # **Panning is suppressed while ctrl is held**, because `D` is both
+        # pan-east and half the ctrl+D erase chord. Without this, entering
+        # erase mode nudged the camera east for as long as the chord was
+        # held -- small, but it moved the board out from under a selection
+        # the player was about to drag, which is exactly the wrong moment.
+        #
+        # Suppressing the whole block rather than just `D` is deliberate: no
+        # ctrl chord in the game means "pan", so there is nothing to lose,
+        # and singling out `D` would leave ctrl+W / ctrl+S / ctrl+A panning
+        # for no stated reason. The cost is that holding ctrl mid-pan stops
+        # the pan, which is the correct reading -- a chord is being typed.
+        if not want_kb and not ctrl:
             if self._key(glfw.KEY_A):
                 it.pan_x -= 1.0
             if self._key(glfw.KEY_D):
@@ -420,14 +442,6 @@ class InputManager:
         escape = self._edge(glfw.KEY_ESCAPE, not want_kb)
         it.pipette = self._edge(glfw.KEY_Q, not want_kb)
 
-        # The two modifiers, read once. Both are plain held state rather than
-        # edges, since several bindings below need to know whether one is
-        # down at the moment another key fires.
-        ctrl = (self._key(glfw.KEY_LEFT_CONTROL)
-                or self._key(glfw.KEY_RIGHT_CONTROL))
-        shift = (self._key(glfw.KEY_LEFT_SHIFT)
-                 or self._key(glfw.KEY_RIGHT_SHIFT))
-
         # ctrl+R restarts the simulation, so the bare key keeps its per-tool
         # meaning and the modifier takes the rarer action -- the same split C
         # and V use. Must be subtracted from `cycle` rather than merely
@@ -440,22 +454,32 @@ class InputManager:
         it.copy_mode = c_key and ctrl
         it.paste_mode = v_key and ctrl
 
-        # ctrl+D / ctrl+shift+D: erase mode and its cut variant.
+        # ctrl+D erases; ctrl+X cuts.
         #
-        # These moved off `X` so the bare key could take the row swap, which
+        # Erase moved off `X` so the bare key could take the row swap, which
         # is the more frequent action -- the same trade `F` made when it took
-        # the bare key from frame-the-board. Erase keeps the two variants one
-        # modifier apart on one key rather than becoming two bindings.
+        # the bare key from frame-the-board. **Cut stayed on `ctrl+X`**: it
+        # is the standard OS shortcut, and keeping copy/paste/cut as
+        # ctrl+C/ctrl+V/ctrl+X matters more than keeping cut a modifier away
+        # from the erase it shares a gesture with. The two are still one
+        # mode with two entry points; only the keys stopped rhyming.
+        #
+        # `ctrl+X` cannot collide with the row swap because that is gated on
+        # **not** ctrl -- which is also what makes the old muscle memory
+        # safe rather than destructive.
         #
         # **`D` is also a pan key**, which is why erase is gated strictly on
-        # ctrl: a bare `D` must keep panning east. Note the pan block above
-        # reads `D` as *held state* and does not consult ctrl, so ctrl+D
-        # nudges the camera for the frame it is pressed. Harmless at one
-        # frame's worth of pan, and the alternative -- excluding ctrl there --
-        # would make a player who holds ctrl mid-pan stop dead.
+        # ctrl: a bare `D` must keep panning east. The camera block above
+        # suppresses panning entirely while ctrl is held, so the chord does
+        # not also drag the board east -- see the note there.
+        # `x_key` is read **once** here and used twice -- cut below and the
+        # row swap further down. `_edge()` consumes the press, so calling it
+        # again for the second meaning would always see False and silently
+        # kill whichever binding asked second.
         d_key = self._edge(glfw.KEY_D, not want_kb)
-        it.erase_mode = d_key and ctrl and not shift
-        it.cut_mode = d_key and ctrl and shift
+        x_key = self._edge(glfw.KEY_X, not want_kb)
+        it.erase_mode = d_key and ctrl
+        it.cut_mode = x_key and ctrl
 
         # --- simulation clock ---
         # Space pauses; '.' runs exactly one tick, which works whether or not
@@ -491,11 +515,10 @@ class InputManager:
         # action of the two -- the same trade that moved frame-the-board to
         # shift+F.
         #
-        # Gated on **not ctrl** so it cannot fire alongside a chord: X is
-        # otherwise free, but leaving the modifier out would make a stray
-        # ctrl+X (muscle memory from the old cut binding) silently swap rows
-        # instead of doing nothing.
-        x_key = self._edge(glfw.KEY_X, not want_kb)
+        # Gated on **not ctrl**, which is what lets `ctrl+X` keep its
+        # conventional meaning (cut, above) on the very same key. Without the
+        # modifier test the two would both fire and a cut would also swap the
+        # row the digits address.
         it.swap_rows = x_key and not ctrl
 
         # --- scroll: zoom, or walk the stamp history ---

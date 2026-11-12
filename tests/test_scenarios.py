@@ -1383,6 +1383,46 @@ def test_camera_pan_zoom():
         f"Q/E must not zoom any more: {z1} -> {cam.zoom}")
     ok("Q and E no longer touch the zoom")
 
+
+def test_ctrl_suppresses_the_camera_pan():
+    """A ctrl chord must not also drag the board.
+
+    `D` is both pan-east and half the ctrl+D erase chord, so entering erase
+    mode used to nudge the camera east for as long as the chord was held --
+    small, but it moved the board out from under a selection the player was
+    about to drag, which is the worst possible moment for it.
+
+    Asserted for every WASD key rather than just `D`: no ctrl chord in the
+    game means "pan", so the whole block is suppressed, and singling out `D`
+    would leave the others panning for no stated reason.
+    """
+    for key, name in ((glfw.KEY_D, "D"), (glfw.KEY_A, "A"),
+                      (glfw.KEY_W, "W"), (glfw.KEY_S, "S")):
+        # The bare key still pans, or the suppression would be hiding a
+        # broken binding rather than a fixed one.
+        before = cam.center.copy()
+        fake["keys"].add(key)
+        step(4)
+        fake["keys"].discard(key)
+        step()
+        assert not (cam.center == before).all(), (
+            f"bare {name} should still pan the camera")
+
+        before = cam.center.copy()
+        fake["keys"].add(glfw.KEY_LEFT_CONTROL)
+        fake["keys"].add(key)
+        step(4)
+        fake["keys"].discard(key)
+        fake["keys"].discard(glfw.KEY_LEFT_CONTROL)
+        step()
+        assert (cam.center == before).all(), (
+            f"ctrl+{name} must not pan: {before} -> {cam.center}")
+        # ctrl+D enters erase mode; leave it so the next key starts clean.
+        if orch.clipboard.active:
+            press_key(glfw.KEY_ESCAPE)
+    ok("ctrl suppressed the WASD pan, so ctrl+D does not drag the board")
+
+
 def test_imgui_capture_gating():
     """Imgui capture gating."""
     io = imgui.get_io()

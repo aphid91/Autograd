@@ -151,7 +151,7 @@ class Orchestrator:
         return True
 
     def _enter_erase(self, cut=False):
-        """ctrl+D / ctrl+shift+D: stash the tool and start a rectangle erase.
+        """ctrl+D / ctrl+X: stash the tool and start a rectangle erase.
 
         Entered the same way as copy mode and sharing its gesture, since the
         only difference is what the release does -- see core/clipboard.py.
@@ -1083,7 +1083,7 @@ class Orchestrator:
             else:
                 self._pipette(intents.cursor_cell, intents.cursor_in_world)
 
-        # ctrl+C / ctrl+V / ctrl+D / ctrl+shift+D, and the ways back out. Mutually
+        # ctrl+C / ctrl+V / ctrl+D / ctrl+X, and the ways back out. Mutually
         # exclusive: one key press cannot mean two modes.
         if intents.copy_mode:
             self._enter_copy()

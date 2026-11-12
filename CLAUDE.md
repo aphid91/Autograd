@@ -114,7 +114,7 @@ surfaced as one shuffle seed in twelve failing a pixel test.
 
 | Input | Action |
 |---|---|
-| `WASD` | pan |
+| `WASD` | pan (suppressed while `ctrl` is held — see below) |
 | `Q` | **pipette**: fill an empty hand from the board, or empty a full one |
 | Scroll | zoom, anchored at the cursor |
 | Left-drag | pan the camera |
@@ -126,7 +126,7 @@ surfaced as one shuffle seed in twelve failing a pixel test.
 | `ctrl+C` | copy mode — left-drag a selection box |
 | `ctrl+V` | paste mode, if anything has been copied |
 | `ctrl+D` | erase mode — left-drag a box to delete what it touched (annotations included, by bounding box) |
-| `ctrl+shift+D` | cut: the same box, captured as a stamp, then straight to paste |
+| `ctrl+X` | cut: the same box, captured as a stamp, then straight to paste |
 | shift+scroll | **paste mode**: walk the copy history (older / newer) |
 | Left-click | build with the active tool (fires on **release**); with an **empty hand**, inspect what is there |
 | `R` / `shift+R` | **per-tool**: belt path shape, or structure rotation; with an **empty hand**, turn what is under the cursor |
@@ -142,6 +142,25 @@ With a **note tool** held (see "Annotations"), left-drag draws or sizes a
 text box and right-drag is the brush eraser, so neither the camera pan nor
 the board erase is available — pan with `WASD` and scroll. `R` walks the
 width/size, `F` the colour.
+
+**`ctrl` suppresses the WASD pan.** `D` is both pan-east and half the
+`ctrl+D` erase chord, so entering erase mode used to nudge the camera east
+for as long as the chord was held — small, but it moved the board out from
+under a selection the player was about to drag, which is the worst moment
+for it. The whole block is suppressed rather than just `D`: no `ctrl` chord
+in the game means "pan", so there is nothing to lose, and singling out `D`
+would leave `ctrl+W`/`A`/`S` panning for no stated reason. The cost is that
+holding `ctrl` mid-pan stops the pan, which is the correct reading — a chord
+is being typed.
+
+**`X` and `ctrl+X` share a key**, split strictly on the modifier: bare `X`
+swaps the toolbar row, `ctrl+X` cuts. Cut kept the standard OS shortcut
+because `ctrl+C`/`ctrl+V`/`ctrl+X` reading as the conventional trio matters
+more than cut staying a modifier away from the erase it shares a gesture
+with. Two things make the sharing safe, and a test pins both: the row swap
+is gated on **not** `ctrl`, so a cut cannot also re-aim the number keys; and
+the key is read with a **single** `_edge()` call used twice, since `_edge()`
+consumes the press and asking again would hand the second caller `False`.
 
 `R` and `F` deliberately mean different things in different tools — the input
 manager reports only that they were pressed and the active builder decides.
@@ -491,7 +510,7 @@ threshold promotion, the live rectangle, the aborts — because only the
   rectangle over and leaves; erasing is a stroke you repeat, so the rectangle
   is not a commitment that ends the mode. Sharing the gesture machine makes
   it cheap to accidentally share the exit too, hence a test for exactly this.
-- **`ctrl+shift+D` is a cut**: the same rectangle, captured *before* the entities
+- **`ctrl+X` is a cut**: the same rectangle, captured *before* the entities
   are deleted, then straight to paste mode holding it. The stash survives the
   whole chain (`_stash()` refuses to overwrite), so cut → paste → `Esc` gives
   back the tool you held before the cut — same property as `ctrl+C` →

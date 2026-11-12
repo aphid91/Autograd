@@ -896,7 +896,7 @@ def test_cutting_notes_alone_takes_them_and_holds_them():
     assert len(_notes()) == 1, "pasting it back should restore one note"
     assert _notes().items[0].bounds()[0] > 35.0
     press_key(glfw.KEY_ESCAPE)
-    print("  OK: ctrl+shift+D cut a note on its own and pasted it back")
+    print("  OK: ctrl+X cut a note on its own and pasted it back")
 
 
 def test_pasting_a_stamp_places_its_notes():

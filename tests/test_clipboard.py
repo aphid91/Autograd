@@ -645,6 +645,44 @@ def test_erase_mode_takes_a_whole_structure_from_any_cell():
     ok("a rectangle clipping one cell erased the whole Sink")
 
 
+def test_x_means_two_things_split_by_ctrl():
+    """One key, two meanings -- and they must not both fire.
+
+    `X` is the toolbar row swap and `ctrl+X` is the cut, which is only safe
+    because the swap is gated on *not* ctrl. Without that gate a cut would
+    also re-aim the number keys, silently changing which tool the next digit
+    selects. The two are read from a single `_edge()` call for the same
+    reason: `_edge()` consumes the press, so asking twice would always give
+    the second caller False and kill whichever binding asked last.
+    """
+    engine.place_belt_path((20, 24), (23, 24))
+    engine.sync_segments()
+
+    # Bare X swaps the row and starts no mode.
+    row = orch.toolbelt.row
+    press_key(glfw.KEY_X)
+    assert orch.toolbelt.row != row, "bare X should swap the toolbar row"
+    assert not orch.clipboard.active, (
+        "bare X must not enter a clipboard mode")
+    press_key(glfw.KEY_X)
+    assert orch.toolbelt.row == row, "and swap back"
+
+    # ctrl+X cuts and leaves the row alone.
+    enter_cut_mode()
+    assert orch.clipboard.cutting, "ctrl+X should arm the cut"
+    assert orch.toolbelt.row == row, (
+        "ctrl+X must not also swap the row -- the swap is gated on not-ctrl")
+    press_key(glfw.KEY_ESCAPE)
+
+    # ctrl+D is the other entry to the same mode, without the cut.
+    enter_erase_mode()
+    assert orch.clipboard.erasing and not orch.clipboard.cutting, (
+        "ctrl+D should erase rather than cut")
+    assert orch.toolbelt.row == row
+    press_key(glfw.KEY_ESCAPE)
+    ok("X swaps the row, ctrl+X cuts, ctrl+D erases -- no collisions")
+
+
 def test_ctrl_x_cuts_into_paste_mode():
     """A cut captures before deleting, then hands you the stamp."""
     engine.place_belt_path((20, 20), (23, 20))
@@ -653,7 +691,7 @@ def test_ctrl_x_cuts_into_paste_mode():
 
     enter_cut_mode()
     assert orch.clipboard.mode == MODE_ERASE, orch.clipboard.mode
-    assert orch.clipboard.cutting, "ctrl+shift+D must arm the cut"
+    assert orch.clipboard.cutting, "ctrl+X must arm the cut"
 
     drag_cells((19, 19), (24, 21))
     assert _row_survivors(20, range(20, 24)) == [], (
@@ -661,7 +699,7 @@ def test_ctrl_x_cuts_into_paste_mode():
     assert orch.clipboard.mode == MODE_PASTE, orch.clipboard.mode
     s = orch.clipboard.stamp
     assert s is not None and len(s) == 4, s
-    ok("ctrl+shift+D captured four belts, deleted them, and went to paste mode")
+    ok("ctrl+X captured four belts, deleted them, and went to paste mode")
 
     # And it pastes back, which is the whole point of a cut.
     put_cursor_at_cell(21, 20)
