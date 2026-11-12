@@ -497,6 +497,46 @@ class Entity:
         w, h = cls.footprint_for(direction)
         return [(x + lx, y + ly) for lx in range(w) for ly in range(h)]
 
+    #: (class, direction, flipped) -> (inputs, outputs) at origin (0, 0).
+    #: Shared across every instance; see faces_for().
+    _faces_cache = {}
+
+    @classmethod
+    def faces_at_origin(cls, direction, flipped=False):
+        """`faces_for()` at origin (0, 0), memoised per (type, dir, flip).
+
+        The port layout is **class** data: it depends on the type, its facing
+        and its flip, and on nothing per-instance. Placement only translates
+        it, so the expensive half -- `place_local()`, which rotates four
+        bounding-box corners and takes two minima *per port* -- can be
+        computed once per orientation and reused by every instance forever.
+
+        That matters because the gate tick recomputes port geometry for every
+        gate on every tick, through `_output_faces()` and
+        `_connected_channels()`. On a board of 336 gates that was about 2ms a
+        tick of arithmetic whose answer had not changed since the machine was
+        placed.
+
+        Returns tuples rather than lists, so a caller cannot mutate the cached
+        entry and corrupt every later lookup.
+        """
+        key = (cls, direction, flipped)
+        hit = Entity._faces_cache.get(key)
+        if hit is not None:
+            return hit
+
+        def place(spec):
+            out = []
+            for (lx, ly, face) in spec:
+                rx, ry = cls.place_local(lx, ly, direction, flipped)
+                f = cell.flip_dir_y(face) if flipped else face
+                out.append(((rx, ry), cell.rotate_dir_ccw_n(f, direction)))
+            return tuple(out)
+
+        hit = (place(cls.INPUTS), place(cls.OUTPUTS))
+        Entity._faces_cache[key] = hit
+        return hit
+
     @classmethod
     def faces_for(cls, x, y, direction, flipped=False):
         """(inputs, outputs) in world space for a placement.
@@ -507,20 +547,16 @@ class Entity:
         pure duplication. If ports ever become per-instance configurable this
         is where that changes.
 
-        A cell and its faces must transform *together*: this applies the flip
-        then the rotation to both, which is what keeps a port on the outside
-        of the footprint at every orientation.
+        A cell and its faces must transform *together*: the flip is applied
+        then the rotation, to both, which is what keeps a port on the outside
+        of the footprint at every orientation. That work is done once per
+        orientation by `faces_at_origin()`; this only translates the result,
+        which is exact because a placement is a pure translation of the
+        layout at the origin.
         """
-        def place(spec):
-            out = []
-            for (lx, ly, face) in spec:
-                rx, ry = cls.place_local(lx, ly, direction, flipped)
-                if flipped:
-                    face = cell.flip_dir_y(face)
-                out.append(((x + rx, y + ry), cell.rotate_dir_ccw_n(face, direction)))
-            return out
-
-        return place(cls.INPUTS), place(cls.OUTPUTS)
+        ins, outs = cls.faces_at_origin(direction, flipped)
+        return ([((x + cx, y + cy), f) for ((cx, cy), f) in ins],
+                [((x + cx, y + cy), f) for ((cx, cy), f) in outs])
 
     @classmethod
     def face_masks_at(cls, lx, ly):

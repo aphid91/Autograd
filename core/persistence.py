@@ -161,6 +161,10 @@ def load(board, path, annotations=None):
     board._free_rows = [int(r) for r in data["free_rows"]]
     board._live_count = int(data["live_count"][0])
     board._frustrated = []
+    # Every row was just overwritten, so the cached live-row list describes
+    # the outgoing board. resize_entities() above invalidates it only when the
+    # table actually grew, which a same-capacity load does not.
+    board._rows_changed()
 
     if annotations is not None:
         # Cleared unconditionally, then filled from whatever the file has.

@@ -105,6 +105,8 @@ class Gameboard:
         self._next_row = 1
         self._free_rows = []
         self._live_count = 0
+        #: Cached live row indices, or None when stale. See live_rows().
+        self._live_rows = None
         # Cells carrying a frustration overlay. Tracked so they can be cleared
         # without scanning the board; they are not entities and own no row.
         self._frustrated = []
@@ -265,6 +267,9 @@ class Gameboard:
         if keep:
             grown[:old] = self.entities
         self.entities = grown
+        # `keep=False` discards every row, and even a growing copy changes
+        # which indices exist -- so the cached live list is stale either way.
+        self._rows_changed()
 
         # The SSBO is now the wrong size. Rebuild it here rather than leaving
         # a null buffer for someone else to notice -- growth can happen in the
@@ -286,6 +291,7 @@ class Gameboard:
         view = entity_cls(self, row)
         view.initialise(x, y, direction, **fields)
         self._live_count += 1
+        self._rows_changed()
         self.entities_dirty.add(row)
         self._stamp_footprint(view)
         return view
@@ -333,11 +339,42 @@ class Gameboard:
         self.entities_dirty.add(row)
         self._free_rows.append(row)
         self._live_count -= 1
+        self._rows_changed()
 
     def is_row_alive(self, row):
         if not 0 < row < self.capacity:
             return False
         return bool(self.entities[row, Entity.F_ALIVE])
+
+    def live_rows(self):
+        """Every live row index, ascending, as a tuple.
+
+        The entity table is sparse: a board with 3500 entities may sit in a
+        table of 8192 rows, and the free list means the live ones are not a
+        prefix. Anything iterating entities per *tick* must not walk the
+        capacity -- `GateSim.gates()` did, and at 8192 rows that alone cost
+        2.2ms a tick, more than thirty times the closed-form belt transport
+        it was feeding.
+
+        Derived from the `F_ALIVE` column rather than maintained as a parallel
+        set beside `_live_count`. There are four places a row's liveness
+        changes (spawn, spawn_cell_ghost, despawn, persistence.load), and a
+        set updated at each would be one more thing a new code path could
+        forget -- the hazard `on_grid_change` exists to avoid on the grid
+        side. The column *is* the truth, so a vectorised scan of it cannot
+        disagree with itself; it is cached and invalidated rather than
+        mirrored.
+        """
+        if self._live_rows is None:
+            alive = np.flatnonzero(self.entities[:, Entity.F_ALIVE])
+            # Row 0 is the reserved null entity and is never live, but filter
+            # it rather than assuming: a corrupt load must not yield it.
+            self._live_rows = tuple(int(r) for r in alive if r)
+        return self._live_rows
+
+    def _rows_changed(self):
+        """Drop the cached live-row list. Called wherever liveness changes."""
+        self._live_rows = None
 
     def view(self, row):
         """Bind a view of the right subclass to an existing row."""
@@ -386,6 +423,7 @@ class Gameboard:
         self.entities[row, Entity.F_W] = 1.0
         self.entities[row, Entity.F_H] = 1.0
         self._live_count += 1
+        self._rows_changed()
         self.entities_dirty.add(row)
         self.write_cell(
             x, y,

@@ -51,10 +51,6 @@ class Engine:
         #: erase drag touches many cells, and a rebuild per cell would be
         #: wasted work on state nothing has read yet.
         self._segments_stale = True
-        # Any grid write marks segments stale. Hooked at the board rather
-        # than at each call site here, so a new edit path cannot forget to
-        # invalidate -- see Gameboard._grid_changed().
-        self.board.on_grid_change = self.invalidate_segments
         # Belt transport: the closed form from docs/belt_report.md. Registered
         # on the belt phase, so it runs after the structure phase every tick --
         # see core/tick.py for why that order is what lets a gate fire every
@@ -63,6 +59,16 @@ class Engine:
         # Gates: the structure phase, plus the port pass that joins them to
         # belts. Registered on both phases -- see core/gates.py.
         self.gates = GateSim(self.board, self.segments, self.belts)
+        # Any grid write marks segments stale and drops the gate layer's
+        # cached connectivity. Hooked at the board rather than at each call
+        # site here, so a new edit path cannot forget to invalidate -- see
+        # Gameboard._grid_changed().
+        #
+        # Hooked *after* GateSim is built, not beside the SegmentIndex above:
+        # invalidate_segments() reaches through self.gates, so an earlier
+        # assignment would leave a window in which a grid write raises
+        # AttributeError.
+        self.board.on_grid_change = self.invalidate_segments
         self.clock.on_phase(PHASE_STRUCTURE, self._structure_phase)
         self.clock.on_phase(PHASE_BELT, self._belt_phase)
         # The GPU mirror of belt state. The fragment shader evaluates the
@@ -746,8 +752,16 @@ class Engine:
         idempotent: the rebuild itself happens once per frame in
         sync_segments(), so an erase drag over fifty cells still rebuilds
         once rather than fifty times.
+
+        Also drops the gate layer's cached output connectivity, which is
+        derived from the same two things a segment rebuild is -- the grid and
+        the segmentation -- and so goes stale at exactly the same moments.
+        Hanging it here rather than at each edit site is the same reasoning
+        that put the segment invalidation on `Gameboard.on_grid_change`: a new
+        edit path cannot forget it.
         """
         self._segments_stale = True
+        self.gates.invalidate_connectivity()
 
     def sync_segments(self):
         """Rebuild the segment index if anything invalidated it.

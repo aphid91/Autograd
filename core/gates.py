@@ -95,6 +95,7 @@ state and writes disjoint slots.
 """
 
 from core import cell
+from core.entity import Entity
 
 
 class GateSim:
@@ -112,23 +113,57 @@ class GateSim:
         self.stats = {"fired": 0, "blocked": 0, "starved": 0,
                       "drained": 0, "loaded": 0, "consumed": 0, "direct": 0,
                       "unconnected": 0, "destroyed": 0}
+        #: gate row -> connected output channels, for the current tick only.
+        #: See _connected_channels() for why a per-tick cache is sound.
+        self._drains_cache = {}
+        #: gate row -> ((world_cell, face, channel), ...). See _output_faces().
+        self._faces_cache = {}
+
+    def invalidate_connectivity(self):
+        """Drop the cached output connectivity and port geometry.
+
+        Called when the thing they are derived from changes: the grid (a
+        placement, an erase, an in-place turn) or the segmentation. Cheap and
+        idempotent.
+
+        Both caches are keyed by row, and a row is recycled by the free list,
+        so dropping them together on any grid change is what keeps a new
+        entity from inheriting the previous occupant's ports.
+        """
+        self._drains_cache.clear()
+        self._faces_cache.clear()
 
     # --- gate discovery ---------------------------------------------------
+    #: Types that are rows but not gates. Checked against the raw type column
+    #: before a view is built, so a belt-heavy board costs one array read per
+    #: row rather than a view object.
+    _NOT_A_GATE = frozenset(
+        (cell.TYPE_EMPTY, cell.TYPE_BELT, cell.TYPE_UNDER))
+
     def gates(self):
         """Every live structure on the board, as views.
 
         Scans the entity table rather than the grid: a structure occupies
         several cells but is one row, and firing is per entity.
+
+        **Iterates the live rows, not the capacity.** The table is sparse --
+        3500 entities can sit in 8192 rows -- and this runs twice per tick
+        (structure_phase and deliver_direct). Walking the capacity and
+        building a view per live row cost 2.2ms a tick on a mid-sized board,
+        against 0.06ms for the belt transport it exists to feed.
+
+        The type is read straight out of the entity array rather than through
+        a view, because most rows on a real board are *belts*: building a
+        view object to discover a row is not a gate is the bulk of the work
+        when 90% of rows are not. The view is constructed only for the rows
+        that survive the filter.
         """
         board = self.board
-        for row in range(1, board.capacity):
-            if not board.is_row_alive(row):
+        types = board.entities[:, Entity.F_TYPE]
+        for row in board.live_rows():
+            if int(types[row]) in self._NOT_A_GATE:
                 continue
             view = board.view(row)
-            t = view.type_id
-            if t == cell.TYPE_EMPTY or t == cell.TYPE_BELT \
-                    or t == cell.TYPE_UNDER:
-                continue
             if view.is_ghost:
                 continue
             yield view
@@ -404,6 +439,29 @@ class GateSim:
     def _connected_channels(self, gate):
         """Which of `gate`'s output channels have somewhere to send a result.
 
+        **Memoised for the tick.** The answer is a function of the grid and
+        the segmentation, and the docstring below already argues that both are
+        frozen for the whole phase -- the player cannot edit mid-tick. So the
+        same gate asked twice in one tick must get the same answer, and
+        computing it twice is waste: this was the single most expensive thing
+        in the tick (2.2ms across 336 gates), because it walks every output
+        face and probes the neighbouring cell, segment and entity row for
+        each.
+
+        The cache is cleared by `invalidate_connectivity()`, wired to the two
+        things that can change the answer: a grid write and a segment
+        rebuild. A stale entry would make a gate fire into a belt that is no
+        longer there, or refuse to fire into one that now is.
+        """
+        hit = self._drains_cache.get(gate.row)
+        if hit is None:
+            hit = self._compute_connected_channels(gate)
+            self._drains_cache[gate.row] = hit
+        return hit
+
+    def _compute_connected_channels(self, gate):
+        """The uncached computation. See _connected_channels().
+
         A channel counts as connected if *any* of its faces has a genuine
         counterpart on the other side: a belt, or another gate whose own input
         face points back at us. Per channel rather than per face because a
@@ -481,11 +539,28 @@ class GateSim:
 
     # --- port geometry ----------------------------------------------------
     def _output_faces(self, gate):
-        """[(world_cell, face_dir, channel)] for each of a gate's outputs."""
-        ox, oy = gate.origin
-        _ins, outs = gate.faces_for(ox, oy, gate.direction, gate.flipped)
-        return [(xy, face, gate.out_channel(i))
-                for i, (xy, face) in enumerate(outs)]
+        """[(world_cell, face_dir, channel)] for each of a gate's outputs.
+
+        Cached per gate row alongside the connectivity, and for the same
+        reason: a placed machine's output faces are a function of its type,
+        origin, facing and flip, none of which can change without a grid
+        write -- an in-place turn restamps, which is what makes that true.
+        So rebuilding this list for every gate on every tick, twice (the
+        structure phase and `deliver_direct`), recomputed an answer fixed
+        since the machine was placed.
+
+        Shares `invalidate_connectivity()` rather than carrying its own
+        invalidation hook, so there is one thing to call and one thing to
+        forget rather than two.
+        """
+        hit = self._faces_cache.get(gate.row)
+        if hit is None:
+            ox, oy = gate.origin
+            _ins, outs = gate.faces_for(ox, oy, gate.direction, gate.flipped)
+            hit = tuple((xy, face, gate.out_channel(i))
+                        for i, (xy, face) in enumerate(outs))
+            self._faces_cache[gate.row] = hit
+        return hit
 
     def _input_channel_for(self, gate, face, at=None):
         """Which input channel of `gate` accepts from `face`, or None.
@@ -507,7 +582,20 @@ class GateSim:
 
     # --- phase entry points -----------------------------------------------
     def set_tick(self, tick):
-        """The tick the phases are computing. Set by the engine each tick."""
+        """The tick the phases are computing. Set by the engine each tick.
+
+        Also expires the connectivity cache when the tick number moves on.
+        `invalidate_connectivity()` is the precise mechanism and is wired to
+        every edit path; this is the backstop, and it is what makes the cache
+        safe to reason about: an entry can never outlive the tick it was
+        computed in, so the worst a missed invalidation can cost is the
+        remainder of one tick rather than an indefinitely wrong answer.
+
+        Cheap enough to do unconditionally -- one dict clear against the
+        hundreds of neighbour probes it saves.
+        """
+        if tick != self._tick:
+            self.invalidate_connectivity()
         self._tick = tick
 
     _tick = 0
