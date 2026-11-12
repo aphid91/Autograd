@@ -127,6 +127,9 @@ class GateSim:
         #: (rows, n_in, n_out, strict) arrays for the prefilter, or None.
         #: See _gate_table().
         self._gate_table_cache = None
+        #: (downstream, upstream) gate row -> segments, or None. See
+        #: _segments_of_gate().
+        self._gate_segments = None
 
     def invalidate_connectivity(self):
         """Drop every cached derivation of the grid and the segmentation.
@@ -150,6 +153,7 @@ class GateSim:
         self._src_cache.clear()
         self._dst_cache.clear()
         self._gate_table_cache = None
+        self._gate_segments = None
 
     # --- gate discovery ---------------------------------------------------
     #: Types that are rows but not gates. Checked against the raw type column
@@ -293,6 +297,53 @@ class GateSim:
         # produced, so stats and any logging stay comparable.
         return rows[ready & has_room].tolist(), starved, blocked
 
+    # --- waking the belts a gate touches ----------------------------------
+    #
+    # A sleeping segment is only skippable while nothing can change it, and
+    # the two things that can are both gate events (see BeltSim's "sleeping"
+    # block):
+    #
+    #   - the gate **upstream** of a run puts something in a waiting zone, so
+    #     the run now has something to accept;
+    #   - the gate **downstream** frees an input channel, so a run that was
+    #     full and refused can now deliver.
+    #
+    # Both are edge-triggered from `structure_phase()`, the single place gate
+    # channels change. The reverse index is the inverse of the `_src_cache` /
+    # `_dst_cache` resolution -- gate row -> the segments on either side --
+    # and is built lazily from the same `seg.src` / `seg.dst` the forward
+    # direction uses, so the two cannot disagree about who is adjacent to
+    # whom.
+    def _segments_of_gate(self, row):
+        """(fed_by_this_gate, draining_into_this_gate) segment lists.
+
+        Built for every gate at once on first use, because a per-gate scan of
+        every segment would be the O(gates x segments) cost the wake list
+        exists to avoid.
+        """
+        if self._gate_segments is None:
+            downstream = {}
+            upstream = {}
+            for seg in self.index.segments.values():
+                src = self._src_cached(seg)
+                if src is not None:
+                    downstream.setdefault(src[0], []).append(seg)
+                dst = self._dst_cached(seg)
+                if dst is not None:
+                    upstream.setdefault(dst[0], []).append(seg)
+            self._gate_segments = (downstream, upstream)
+        downstream, upstream = self._gate_segments
+        return downstream.get(row, ()), upstream.get(row, ())
+
+    def _wake_around(self, row):
+        """Wake every segment adjacent to a gate that just changed state."""
+        downstream, upstream = self._segments_of_gate(row)
+        belts = self.belts
+        for seg in downstream:
+            belts.wake(seg)
+        for seg in upstream:
+            belts.wake(seg)
+
     def _rows_holding_output(self):
         """Gate rows with anything in a waiting zone, ascending.
 
@@ -358,6 +409,7 @@ class GateSim:
             n_in = gate.input_count()
             if n_in == 0:
                 if self._fire_generator(gate):
+                    self._wake_around(gate.row)
                     fired += 1
                 continue
 
@@ -401,6 +453,12 @@ class GateSim:
                     self.stats["destroyed"] += 1
                     continue
                 gate.set_output(i, value)
+            # This gate's channels changed, so the runs on either side of it
+            # may have work again -- a filled zone gives the downstream run
+            # something to accept, and a cleared input lets a backed-up
+            # upstream run deliver. Edge-triggered here because this is the
+            # one place gate channels change.
+            self._wake_around(gate.row)
             fired += 1
 
         self.stats["fired"] += fired
@@ -560,6 +618,11 @@ class GateSim:
                     continue
                 other.set_input(in_ch, gate.out_value(channel))
                 gate.clear_output(channel)
+                # Both gates' channels changed, so the runs on either side of
+                # either of them may have work again -- this is the same edge
+                # the structure phase raises, reached by the no-belt path.
+                self._wake_around(gate.row)
+                self._wake_around(other.row)
                 moved += 1
         self.stats["direct"] += moved
         return moved

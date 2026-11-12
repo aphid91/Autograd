@@ -24,7 +24,7 @@ from core import cell
 from core.belts import (
     DEFAULT_SPACING, DEFAULT_SPEED, UNIT, BeltSim, naive_tick,
 )
-from core.entity import Sink, Source
+from core.entity import Shear, Sink, Source
 
 from tests import harness
 from tests.harness import board, engine, ok, orch, step
@@ -669,3 +669,55 @@ def test_many_segments_tick_independently():
                 f"segment {seg.sid} got items from a neighbour")
     assert not sim.audit(25), sim.audit(25)
     ok(f"{len(fed)} fed segments filled, {10 - len(fed)} unfed stayed empty")
+
+
+def test_an_idle_run_sleeps_and_a_gate_firing_wakes_it():
+    """A run with nothing to do stops being ticked, and wakes when fed.
+
+    The sleep set is what makes a *computer* built out of these parts
+    affordable: one trace runs while thousands of memory runs sit idle, and on
+    a CPU-shaped board 1101 of 1101 segments were inert while the belt phase
+    spent 91% of its time proving it.
+
+    Sleeping is sound because an idle segment is a **fixed point** of
+    `tick_segment()` -- the anchor saturates at `L`, an empty ring cannot pop,
+    and an idle producer offers nothing. The dangerous half is waking: a
+    missed wake does not corrupt anything, it just silently stops a run, and
+    the error only compounds over the following ticks. So this asserts both
+    directions on the edge that matters -- a starved gate's output run
+    sleeping, then the gate firing into it.
+
+    `tools/check_wakelist_safe.py` is the exhaustive version (it diffs a
+    sleeping timeline against a fully-ticked one); this pins the one
+    transition so the suite fails without it.
+    """
+    harness.reset()
+    # A Shear with nothing feeding it: starved, so its output run goes idle.
+    sh = engine.place_structure(Shear, 8, 5)
+    engine.place_belt_path((10, 5), (15, 5))
+    engine.place_structure(Sink, 16, 5)
+    engine.sync_segments()
+
+    for _ in range(5):
+        engine.clock.request_step()
+        engine.clock.advance(0.0)
+
+    assert engine.belts._asleep, (
+        "a run fed by a starved gate should have gone to sleep; the belt "
+        "phase is ticking segments that cannot change")
+    slept = set(engine.belts._asleep)
+    ok(f"{len(slept)} idle segment(s) asleep after 5 quiet ticks")
+
+    # Feeding the gate must wake the run on the tick the gate fires.
+    for c in range(sh.input_count()):
+        sh.set_input(c, 2.0)
+    before_items = engine.belts.total_items()
+    engine.clock.request_step()
+    engine.clock.advance(0.0)
+
+    assert not (slept & set(engine.belts._asleep)), (
+        f"segments {sorted(slept)} stayed asleep after the gate feeding "
+        f"them fired -- a missing wake silently freezes a run")
+    assert engine.belts.total_items() > before_items, (
+        "the woken run took no item, so the wake arrived too late to matter")
+    ok("the gate firing woke its output run and delivered an item")

@@ -121,8 +121,14 @@ class BeltSim:
         self.spacing = int(spacing)
         if self.spacing < 1 or self.speed < 1:
             raise ValueError("speed and spacing must be positive")
-        #: Cumulative counters for the inspection panel.
-        self.stats = {"pushed": 0, "popped": 0, "ticks": 0}
+        #: Cumulative counters for the inspection panel. `asleep` is a
+        #: gauge rather than a total -- how many segments the last tick
+        #: skipped.
+        self.stats = {"pushed": 0, "popped": 0, "ticks": 0, "asleep": 0}
+        #: Segment ids currently at rest. See the "sleeping" block below.
+        #: Empty means "everything ticks", which is the pre-sleep behaviour
+        #: and so the safe default after any wholesale change.
+        self._asleep = set()
 
     # --- geometry --------------------------------------------------------
     def length_of(self, seg):
@@ -203,6 +209,11 @@ class BeltSim:
         if not self.has_room(seg, tick):
             return False
         self._push(seg, payload, tick)
+        # A seed is a push from outside the tick's offer/accept protocol, so
+        # it has to wake the run itself: seeding happens right after a
+        # rebuild, and the seeded run would otherwise be asleep from the
+        # first tick with an item on it that never moves.
+        self.wake(seg)
         return True
 
     # --- the tick --------------------------------------------------------
@@ -268,8 +279,87 @@ class BeltSim:
         # miss a seed, which does not come through this path at all.
         return popped, pushed
 
+    # --- sleeping ---------------------------------------------------------
+    #
+    # A segment at rest is a **fixed point of tick_segment()**, not merely
+    # "probably quiet", and that is what makes skipping it safe rather than a
+    # heuristic. Three facts combine:
+    #
+    #   - the anchor advance is `min(anchor + v, L)`, which saturates at `L`
+    #     and returns `L` for ever after;
+    #   - the pop needs `head != tail`, so an empty run never pops;
+    #   - the push needs `offer()` to yield a value, and an idle upstream gate
+    #     yields None.
+    #
+    # So two states are provably inert:
+    #
+    #   **empty, anchor saturated** -- a fresh or fully drained run.
+    #   **holding items with no room** -- the interesting one for a machine
+    #     built out of these parts: a run storing a value nobody is taking.
+    #     Its anchor has already stopped, `has_room()` is False so nothing
+    #     enters, and the only thing that could change it is the consumer
+    #     deciding to take -- which is the downstream gate's event, not the
+    #     segment's. Item positions freeze too, so the closed form keeps
+    #     describing it and the renderer needs no special case.
+    #
+    # This matters far more than the factory workload suggested. A *computer*
+    # built from these parts runs one trace through a sea of memory: measured
+    # on a CPU-shaped board, 1101 of 1101 segments were inert and the belt
+    # phase spent 0.83ms of 0.91ms proving it. See tools/probe_wakelist.py,
+    # which asserts both fixed points by brute force and reports the fraction.
+    #
+    # **Waking is edge-triggered, never polled.** Polling every segment for
+    # "should I wake?" is the cost being removed. Instead `wake()` is called
+    # by whatever *causes* a change: a gate filling a waiting zone, a gate
+    # draining an input, a seed, a rebuild. Missing a wake call stalls a run
+    # silently, so the set of callers is deliberately small and
+    # `tools/check_wakelist_safe.py` diffs an awake-only tick against ticking
+    # everything.
+    #
+    # It is also the GPU shape: the awake set is a compacted index buffer, and
+    # the sleep test is a per-segment predicate a compute pass can evaluate
+    # and compact. That is the same structure GateSim._candidate_rows() has.
+    def is_at_rest(self, seg, tick):
+        """Is this segment in a fixed point of `tick_segment()`?
+
+        Conservative: a False answer only costs a tick of work, while a wrong
+        True silently freezes a run. Both branches are the exact conditions
+        argued above, with no slack.
+        """
+        length = self.length_of(seg)
+        if seg.head == seg.tail:
+            return seg.anchor >= length
+        # Holding items: inert exactly while nothing can enter. The head
+        # reaching the end is the consumer's business and arrives as a wake.
+        return not self.has_room(seg, tick)
+
+    def wake(self, seg):
+        """Mark a segment as needing ticks again. Idempotent and cheap.
+
+        Called by the *cause* of a change rather than discovered by polling --
+        see the block comment above.
+        """
+        self._asleep.discard(seg.sid)
+
+    def wake_all(self):
+        """Wake every segment. Used after a rebuild or a wholesale change."""
+        self._asleep.clear()
+
+    def awake_segments(self):
+        """The segments a tick must visit, in segment-id order.
+
+        Id order rather than dict order so the traversal does not depend on
+        which runs happen to be awake -- the phase is designed to be
+        order-independent, and a varying order would turn any future order
+        dependence into a heisenbug.
+        """
+        segs = self.index.segments
+        if not self._asleep:
+            return [segs[sid] for sid in sorted(segs)]
+        return [segs[sid] for sid in sorted(segs) if sid not in self._asleep]
+
     def tick(self, tick, offer=None, accept=None, took=None):
-        """Advance every segment by one tick.
+        """Advance every awake segment by one tick.
 
         `offer` / `accept` / `took` are called per segment, so one set of
         callbacks can serve the whole board. Returns `(popped, pushed)`
@@ -279,13 +369,27 @@ class BeltSim:
         *nodes*, and nothing here touches a node. That independence is what
         makes this one compute dispatch later -- the loop below becomes
         `gl_GlobalInvocationID.x` and nothing else changes.
+
+        A segment that ticks without changing anything, and is in a fixed
+        point afterwards, goes to sleep and is skipped until something wakes
+        it. A segment is re-tested *after* its tick rather than before, so a
+        run always gets the tick that settles it -- testing first would need
+        the same arithmetic the tick does and save nothing.
         """
         popped = pushed = 0
-        for seg in self.index.segments.values():
+        asleep = self._asleep
+        for seg in self.awake_segments():
             p, q = self.tick_segment(seg, tick, offer, accept, took)
             popped += int(p)
             pushed += int(q)
+            # Nothing moved and the run is inert: stop visiting it. The
+            # `not (p or q)` guard is belt and braces -- a segment that just
+            # popped or pushed is not at rest by either test -- but it keeps
+            # "did work" and "is inert" from having to agree.
+            if not (p or q) and self.is_at_rest(seg, tick):
+                asleep.add(seg.sid)
         self.stats["ticks"] += 1
+        self.stats["asleep"] = len(asleep)
         return popped, pushed
 
     # --- inspection ------------------------------------------------------

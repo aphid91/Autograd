@@ -796,6 +796,11 @@ class Engine:
             return None
         self._segments_stale = False
         n = self.segments.rebuild()
+        # Every segment id has just been reassigned, so the sleep set refers
+        # to runs that no longer exist -- and an id handed to a *different*
+        # run would have it born asleep. Waking everything is the safe reset:
+        # a spuriously awake segment costs one tick and then sleeps again.
+        self.belts.wake_all()
         # Order matters: rebuild() first, so flush_material() resets the
         # anchors of the runs that now exist rather than the ones that just
         # stopped existing.
@@ -907,6 +912,11 @@ class Engine:
         for seg in self.segments.segments.values():
             seg.head = seg.tail = 0
             seg.anchor = self.belts.length_of(seg)
+        # Ring state changed from outside the tick. These runs are now empty
+        # with a saturated anchor, which *is* the sleep state -- but they may
+        # have been asleep holding items, and a producer upstream is probably
+        # still loaded, so let the next tick decide rather than assuming.
+        self.belts.wake_all()
 
     def flush_material(self):
         """Discard every item in flight, on belts *and* inside gates.
