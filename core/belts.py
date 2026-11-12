@@ -63,6 +63,8 @@ decompresses when it should not, reads as plausible motion. The oracle does
 not care what looks plausible.
 """
 
+from core.tick_profile import Profiler
+
 #: Fixed-point scale: positions, speeds and spacings are in UNIT-ths of a
 #: cell. See "Fixed point" above -- the pop test needs exact arithmetic.
 UNIT = 256
@@ -129,6 +131,10 @@ class BeltSim:
         #: Empty means "everything ticks", which is the pre-sleep behaviour
         #: and so the safe default after any wholesale change.
         self._asleep = set()
+        #: Per-tick timing, disarmed. `Engine` replaces it with the clock's,
+        #: for the same reason `GateSim.profiler` is assigned rather than
+        #: injected: diagnostics, not a dependency.
+        self.profiler = Profiler()
 
     # --- geometry --------------------------------------------------------
     def length_of(self, seg):
@@ -378,7 +384,17 @@ class BeltSim:
         """
         popped = pushed = 0
         asleep = self._asleep
-        for seg in self.awake_segments():
+        prof = self.profiler
+        # Building the awake list is timed apart from ticking it, because the
+        # two scale with different things and the wake list changed which one
+        # dominates. `schedule` is O(segments) -- it sorts every segment id on
+        # the board, asleep or not -- while `segments` is O(awake). On a
+        # CPU-shaped board where 99% sleeps, the scheduler deciding what to
+        # skip can cost more than the work it skipped, and only separating
+        # them shows that.
+        with prof.probe("belt/transport/schedule"):
+            due = self.awake_segments()
+        for seg in due:
             p, q = self.tick_segment(seg, tick, offer, accept, took)
             popped += int(p)
             pushed += int(q)

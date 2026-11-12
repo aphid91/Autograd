@@ -21,7 +21,16 @@ Controls:
   Delete        clear the board
   Space         pause / resume the simulation
   .             run exactly one tick (works while paused)
+
+Options:
+  --profile-ticks N   profile the first N ticks after the quicksave loads and
+                      print the breakdown, then carry on normally. The same
+                      measurement the panel's Profile button makes; this is
+                      for the common case of wanting it on the board that
+                      autoloads, without having to catch it by hand.
 """
+
+import argparse
 
 import glfw
 import moderngl
@@ -37,7 +46,17 @@ WINDOW_TITLE = "Gates"
 BOARD_W, BOARD_H = 512, 512
 
 
+def parse_args(argv=None):
+    p = argparse.ArgumentParser(description="Gates")
+    p.add_argument(
+        "--profile-ticks", type=int, default=0, metavar="N",
+        help="profile the first N ticks after load and dump the breakdown")
+    return p.parse_args(argv)
+
+
 def main():
+    args = parse_args()
+
     if not glfw.init():
         raise RuntimeError("Failed to initialise GLFW")
 
@@ -86,6 +105,15 @@ def main():
         print(loaded[1])
     else:
         orch.seed_demo()
+
+    # Armed *after* the board is loaded, so the sample is of the player's
+    # factory rather than of an empty board -- and after seed_demo() too, for
+    # the same reason. The first frame's segment rebuild therefore lands
+    # inside the sample, which is wanted: it is reported separately as an
+    # out-of-tick cost (see core/tick_profile.py) and is the one number that
+    # explains a stutter on load.
+    if args.profile_ticks > 0:
+        orch.engine.clock.profiler.arm(args.profile_ticks)
 
     last_wall = glfw.get_time()
 

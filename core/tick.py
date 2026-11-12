@@ -101,7 +101,24 @@ replaces the *bodies* of those callbacks with compute dispatches while the
 sequencing here stays exactly as it is. The barrier between phases is
 implicit now (one returns before the next is called) and becomes a real
 `glMemoryBarrier` later.
+
+
+Timing a tick
+-------------
+
+`Clock.profiler` is a `core.tick_profile.Profiler`, disarmed by default. The
+clock owns it for the same reason it owns the phase order: a tick is the unit
+being measured, and the clock is the only thing that knows when one begins and
+ends. Phase callbacks and the subsystems inside them reach for
+`clock.profiler.probe(path)`, which is a single attribute test while disarmed.
+
+Each registered callback is timed under its phase name automatically, so
+`structure` and `belt` need no probe of their own -- `_run_tick()` wraps them.
+Sub-phase probes inside a callback are the subsystem's business, since only it
+knows what its parts are.
 """
+
+from core.tick_profile import Profiler
 
 #: Simulation rate. One tick is one belt step at d == v.
 TICKS_PER_SEC = 10.0
@@ -147,6 +164,12 @@ class Clock:
         #: Ticks dropped to the catch-up cap, cumulative. A non-zero value
         #: means the sim is not keeping up with wall-clock.
         self.dropped_ticks = 0
+        #: Per-tick timing, disarmed. See core/tick_profile.py. Owned here
+        #: because the clock is what knows where a tick starts and stops.
+        self.profiler = Profiler()
+        #: Set by _run_tick() when the armed count runs out, so the frame loop
+        #: can dump without polling. Cleared by whoever acts on it.
+        self.profile_done = False
 
     # --- configuration ---------------------------------------------------
     @property
@@ -283,10 +306,27 @@ class Clock:
         `clock.tick` as the tick it is currently computing -- which is what
         the closed-form belt position expects when it stamps an item's
         entry tick.
+
+        Each callback is timed under its phase's name when the profiler is
+        armed. Done here rather than in the callbacks so a phase cannot be
+        added without being measured -- the same reasoning that hooks segment
+        invalidation at `Gameboard.write_cell()` rather than at each edit path.
         """
-        for phase in range(PHASE_COUNT):
-            for fn in self._phases[phase]:
-                fn()
+        prof = self.profiler
+        if not prof.armed:
+            for phase in range(PHASE_COUNT):
+                for fn in self._phases[phase]:
+                    fn()
+        else:
+            for phase in range(PHASE_COUNT):
+                name = PHASE_NAMES.get(phase, f"phase{phase}")
+                for fn in self._phases[phase]:
+                    with prof.probe(name):
+                        fn()
+            # Counted after the phases, so a tick is complete before it is
+            # counted and the last armed tick includes all of its own work.
+            if prof.count_tick():
+                self.profile_done = True
         self.tick += 1
 
     def reset(self):

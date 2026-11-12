@@ -18,7 +18,7 @@ class UIRequests:
                  "cycle_backward", "flip_tool", "quicksave", "quickload",
                  "toggle_pause", "step_tick", "tick_rate",
                  "segment_debug", "sleep_debug",
-                 "rebuild_segments", "audit_segments",
+                 "rebuild_segments", "audit_segments", "profile_ticks",
                  "debug_feed", "clear_items", "close_status",
                  "set_emit", "set_seed", "set_slot", "swap_rows",
                  "annotations_on", "set_note_text", "set_note_style",
@@ -44,6 +44,12 @@ class UIRequests:
         self.sleep_debug = None
         self.rebuild_segments = False
         self.audit_segments = False
+        #: Ticks to profile and dump to the console, 0 to stop a running
+        #: measurement, or None for no change. A *count* rather than a bool
+        #: because "measure the next 200 ticks" is the request -- an armed
+        #: profiler with no end is the one that gets forgotten about and
+        #: dilutes its own numbers with whatever the board does next.
+        self.profile_ticks = None
         #: New debug-feed value, `False` to disable it, or None for no change.
         #: Not just a float: None and "off" are different requests.
         self.debug_feed = None
@@ -111,6 +117,10 @@ class UI:
         self.show_segments = False
         #: Result of the last audit: None, or (problem_count, first_few).
         self.last_audit = None
+        #: How many ticks the Profile button asks for. Panel state rather than
+        #: a config entry: it is a knob for one measurement, not a preference
+        #: worth surviving a restart.
+        self.profile_ticks = 200
 
     # --- segment inspector ----------------------------------------------
     def draw_segment_inspector(self, orch, req):
@@ -342,6 +352,36 @@ class UI:
                 for line in sample:
                     imgui.text_wrapped(f"  {line}")
                 imgui.pop_style_color()
+
+        # --- tick profile ---
+        #
+        # The counterpart to tools/profile_tick.py, which measures a synthetic
+        # board. This measures *this* board, which is the only way to answer
+        # "why is my quicksave slow" -- a real factory's mix of saturated
+        # trace and sleeping memory is not a shape the synthetic boards
+        # reproduce. See core/tick_profile.py.
+        imgui.separator()
+        prof = engine.clock.profiler
+        if prof.armed:
+            left = prof.remaining
+            imgui.text(f"profiling... {prof.ticks} ticks"
+                       + (f", {left} to go" if left is not None else ""))
+            if imgui.button("Stop and dump"):
+                req.profile_ticks = 0
+        else:
+            if imgui.button(f"Profile {self.profile_ticks} ticks"):
+                req.profile_ticks = self.profile_ticks
+            imgui.same_line()
+            # A slider rather than a text box: the useful range is narrow and
+            # the choice is a trade the player should see. Too few ticks and
+            # one unlucky GC lands in the sample; too many and an edit halfway
+            # through mixes two different boards into one average.
+            _moved, self.profile_ticks = imgui.slider_int(
+                "##proficks", self.profile_ticks, 20, 2000)
+            imgui.text_disabled("prints a per-phase breakdown to the console")
+            if prof.last_report is not None:
+                n, per_tick = prof.last_report
+                imgui.text(f"last: {1e3 * per_tick:.3f}ms/tick over {n}")
 
         imgui.end()
 

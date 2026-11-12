@@ -71,6 +71,13 @@ class Engine:
         self.board.on_grid_change = self.invalidate_segments
         self.clock.on_phase(PHASE_STRUCTURE, self._structure_phase)
         self.clock.on_phase(PHASE_BELT, self._belt_phase)
+        # Point the subsystems' sub-phase probes at the clock's profiler --
+        # the one the player arms. Both ship a disarmed stand-in so they are
+        # constructible without a clock; this is the wiring that makes them
+        # report into the same tree. Assigned rather than passed in because
+        # the clock is wired to the phases here, not in their constructors.
+        self.belts.profiler = self.clock.profiler
+        self.gates.profiler = self.clock.profiler
         # The GPU mirror of belt state. The fragment shader evaluates the
         # closed form itself, so it needs head/tail/anchor and the rings --
         # see core/belt_device.py.
@@ -795,6 +802,19 @@ class Engine:
         if not self._segments_stale:
             return None
         self._segments_stale = False
+        # Timed as `rebuild`, a **root** beside the phases rather than a child
+        # of either. It is not part of a tick: it happens at most once a frame
+        # and only after an edit, so folding it into the tick tree would
+        # average an 88ms edit cost across every quiet tick and describe
+        # neither. It still belongs in the dump, because "why did placing that
+        # belt stutter" and "why is my tick slow" are the two questions a
+        # player has and only one of them is about the tick.
+        with self.clock.profiler.probe("rebuild"):
+            n = self._rebuild_segments()
+        return n
+
+    def _rebuild_segments(self):
+        """The rebuild itself. Split out only so `sync_segments()` can time it."""
         n = self.segments.rebuild()
         # Every segment id has just been reassigned, so the sleep set refers
         # to runs that no longer exist -- and an id handed to a *different*
@@ -966,9 +986,16 @@ class Engine:
         """
         tick = self.clock.tick
         self.gates.set_tick(tick)
+        prof = self.clock.profiler
 
         if self.debug_feed is None:
-            self.gates.tick_belts(tick)
+            # `transport` is the belt tick with the gate callbacks inside it,
+            # so it includes the port work by construction -- see tick_belts()
+            # on why that cannot be split out into passes around it. The
+            # callbacks carry their own probes for that reason: subdividing
+            # this number is the only way to see inside it.
+            with prof.probe("belt/transport"):
+                self.gates.tick_belts(tick)
         else:
             # The debug feed stands in for a Source/Sink pair on runs that
             # have neither, so transport can be exercised without building a
@@ -987,10 +1014,12 @@ class Engine:
                     return gates.accept_from(seg, payload)
                 return True
 
-            self.belts.tick(tick, offer=offer, accept=accept,
-                            took=gates.took_from)
+            with prof.probe("belt/transport"):
+                self.belts.tick(tick, offer=offer, accept=accept,
+                                took=gates.took_from)
 
-        self.gates.deliver_direct()
+        with prof.probe("belt/direct"):
+            self.gates.deliver_direct()
 
     def tick(self, dt):
         """Advance the simulation clock, running whatever ticks are due.

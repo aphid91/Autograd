@@ -15,6 +15,8 @@ import tempfile
 
 import glfw
 
+from core import cell
+from core.entity import Source
 from core.tick import MAX_CATCHUP_TICKS, PHASE_BELT, PHASE_STRUCTURE
 
 from tests import harness
@@ -249,3 +251,151 @@ def test_clock_does_not_disturb_building():
     assert placed == 6, f"expected a 6-cell run, got {placed}"
     assert clock.tick > 0, "the sim should have been running throughout"
     ok(f"built a 6-belt run with the sim running (tick {clock.tick})")
+
+
+# --- the tick profiler -----------------------------------------------------
+#
+# core/tick_profile.py self-checks the Profiler in isolation at import -- the
+# aggregation, the countdown, the out-of-tick split. These are the tests that
+# need the orchestrator, for the same reason the scenarios above do: that it
+# is actually wired into the frame loop, that the panel's request reaches it,
+# and that it costs nothing when off.
+
+def test_profiling_a_tick_names_both_phases():
+    """An armed profiler attributes a real tick to the phases that ran.
+
+    The claim worth pinning is not the timings -- those are machine-dependent
+    and would make this flaky -- but the *tree*: that both phases appear, and
+    that the sub-phase probes inside them nest underneath rather than landing
+    beside them. A probe whose path lost its prefix would still record time
+    and would silently stop being attributable to a phase.
+    """
+    clock = engine.clock
+    clock.set_rate(60.0)
+    # A Source feeding a run, so both phases have something to do: an empty
+    # board measures the structure phase firing nothing, which is a real
+    # measurement but not one that exercises the belt side.
+    engine.place_structure(Source, 2, 20, cell.DIR_PX)
+    for x in range(4, 14):
+        engine.place_belt(x, 20)
+    step()
+
+    prof = clock.profiler
+    prof.arm(5)
+    try:
+        for _ in range(5):
+            step()
+        assert not prof.armed, "5 armed ticks should have disarmed it"
+        assert prof.ticks == 5, prof.ticks
+        paths = set(prof.stats)
+        assert "structure" in paths and "belt" in paths, paths
+        # The sub-phases must be *children*, which is what the dump's
+        # indentation and the share column both depend on.
+        assert "structure/prefilter" in paths, paths
+        assert "belt/transport" in paths, paths
+        # A child cannot have taken longer than its parent -- it runs inside
+        # it. This is the cheapest check that the nesting is real rather than
+        # two unrelated probes that happen to share a name prefix.
+        assert (prof.stats["belt/transport"].total
+                <= prof.stats["belt"].total + 1e-9)
+        ok(f"5 ticks attributed across {len(paths)} paths: "
+           f"{sorted(paths)}")
+    finally:
+        prof.stop()
+
+
+def test_the_profiler_dumps_itself_when_its_count_runs_out():
+    """The countdown reaches the console without anyone polling it.
+
+    `Clock` sets `profile_done` and the orchestrator dumps, which is the
+    division the panel already follows -- the clock owns time and has no
+    opinion about where a report goes. The flag must be *consumed*, or the
+    breakdown would print on every frame after the sample ended.
+    """
+    clock = engine.clock
+    clock.set_rate(60.0)
+    engine.place_belt(20, 20)
+    step()
+
+    lines = []
+    real_dump = orch._dump_profile
+
+    def capture(eng):
+        lines.append(eng.clock.profiler.report("test"))
+
+    orch._dump_profile = capture
+    try:
+        clock.profiler.arm(3)
+        step(3)
+        assert len(lines) == 1, f"expected exactly one dump, got {len(lines)}"
+        text = "\n".join(lines[0])
+        assert "3 ticks" in text, text
+        assert not clock.profile_done, "the flag must be consumed, not latched"
+        # ...and it must not fire again on later frames.
+        step(5)
+        assert len(lines) == 1, (
+            f"the dump repeated on later frames: {len(lines)}")
+        ok("the armed count dumped exactly once and did not repeat")
+    finally:
+        orch._dump_profile = real_dump
+        clock.profiler.stop()
+
+
+def test_a_disarmed_profiler_records_nothing():
+    """Off by default, and off means off.
+
+    The simulation must not get slower for carrying a tool that measures how
+    fast it is, so a disarmed probe has to be a single attribute test that
+    records nothing at all. Asserting on the *stats* rather than on timing is
+    what makes this a real test rather than a benchmark: if a probe recorded
+    while disarmed it would show up here as a path that should not exist.
+    """
+    clock = engine.clock
+    clock.set_rate(60.0)
+    prof = clock.profiler
+    assert not prof.armed, "the profiler must start disarmed"
+    engine.place_structure(Source, 2, 20, cell.DIR_PX)
+    for x in range(4, 10):
+        engine.place_belt(x, 20)
+    step(10)
+    assert not prof.stats, f"a disarmed profiler recorded {sorted(prof.stats)}"
+    assert prof.ticks == 0, prof.ticks
+    assert not clock.profile_done
+    ok(f"10 ticks with the profiler off recorded nothing (tick {clock.tick})")
+
+
+def test_a_segment_rebuild_is_timed_outside_the_tick():
+    """An edit's rebuild is reported, but never averaged into a tick.
+
+    A rebuild is ~88ms on a large board and happens once per edit, so folding
+    it into the per-tick mean describes neither cost: divided by one tick it
+    claims the tick is 88ms, and divided by 200 it vanishes. It has to be
+    collected (it is the answer to "why did that placement stutter") and kept
+    out of the tick total (it is the answer to a different question).
+    """
+    clock = engine.clock
+    clock.set_rate(60.0)
+    prof = clock.profiler
+    prof.arm(None)
+    try:
+        # Place through the engine while armed, so sync_segments() rebuilds
+        # inside the sample.
+        for x in range(5, 15):
+            engine.place_belt(x, 25)
+        step(3)
+        assert "rebuild" in prof.stats, sorted(prof.stats)
+        assert prof.stats["rebuild"].count >= 1
+
+        report = "\n".join(prof.report("test"))
+        assert "not part of a tick" in report, report
+        # The share column must still sum to the phases alone. `structure`
+        # and `belt` are the only in-tick roots, so their shares are the
+        # whole of it -- a rebuild leaking in would push both well below.
+        shares = [float(ln.split("%")[0].split()[-1])
+                  for ln in report.splitlines()
+                  if ln.startswith(("structure ", "belt "))]
+        assert abs(sum(shares) - 100.0) < 0.5, (shares, report)
+        ok(f"a rebuild was timed ({prof.stats['rebuild'].count} of them) "
+           f"and left out of the tick total")
+    finally:
+        prof.stop()

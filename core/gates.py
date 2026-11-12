@@ -98,6 +98,7 @@ import numpy as np
 
 from core import cell
 from core.entity import MAX_CHANNELS, Entity
+from core.tick_profile import Profiler
 
 
 class GateSim:
@@ -130,6 +131,13 @@ class GateSim:
         #: (downstream, upstream) gate row -> segments, or None. See
         #: _segments_of_gate().
         self._gate_segments = None
+        #: Per-tick timing. A disarmed stand-in by default rather than None,
+        #: so every probe site is one shape and needs no guard; `Engine`
+        #: replaces it with the clock's, which is the one the player arms.
+        #: Not taken as a constructor argument because the gate layer is
+        #: constructed before the clock is wired to it in several tests, and
+        #: a profiler is diagnostics rather than a dependency.
+        self.profiler = Profiler()
 
     def invalidate_connectivity(self):
         """Drop every cached derivation of the grid and the segmentation.
@@ -389,10 +397,32 @@ class GateSim:
         rows come straight from the prefilter, which already knows them.
         """
         fired = 0
-        admit, pre_starved, pre_blocked = self._candidate_rows()
+        prof = self.profiler
+        # The two halves the prefilter work split this phase into, timed
+        # separately because that is the question it raises: the vectorised
+        # pass is meant to be a flat cost that buys away a per-gate one, so
+        # the useful number is the ratio between them. A board where `prefilter`
+        # dominates `fire` is one where the prefilter is admitting almost
+        # nothing -- working as intended -- and the reverse means the survivors
+        # are where the time is.
+        with prof.probe("structure/prefilter"):
+            admit, pre_starved, pre_blocked = self._candidate_rows()
         self.stats["starved"] += pre_starved
         self.stats["blocked"] += pre_blocked
         board = self.board
+        with prof.probe("structure/fire"):
+            fired = self._fire_admitted(admit, board)
+        self.stats["fired"] += fired
+        return fired
+
+    def _fire_admitted(self, admit, board):
+        """The per-gate half of the structure phase: fire what was admitted.
+
+        Split out of `structure_phase()` only so the prefilter and the per-gate
+        work can be timed apart (see the probes there). Every decision is
+        unchanged and still made here.
+        """
+        fired = 0
         for row in admit:
             # The gate table is rebuilt whenever the gate set changes, so a
             # row in it is live and real -- but a ghost can be committed or
@@ -461,7 +491,6 @@ class GateSim:
             self._wake_around(gate.row)
             fired += 1
 
-        self.stats["fired"] += fired
         return fired
 
     # --- the port callbacks, called from inside BeltSim.tick() ------------

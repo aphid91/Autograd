@@ -347,6 +347,27 @@ class Orchestrator:
         self._on_tool_changed()
         return True
 
+    def _dump_profile(self, engine):
+        """Print the tick breakdown to the console.
+
+        The orchestrator does this rather than the clock or the panel, for the
+        reason the whole chain runs this way: the clock owns *time* and should
+        have no opinion about where a report goes, and the panel only
+        *requests*. This is the layer that already applies UI requests to the
+        engine.
+
+        The board's shape is reported with it, because a timing without it is
+        not comparable to anything -- "0.4ms a tick" means one thing at 50
+        segments and another at 2000, and the sleeping fraction is the number
+        that explains the difference on a board built as a computer.
+        """
+        prof = engine.clock.profiler
+        total = engine.segments.count
+        asleep = engine.belts.stats.get("asleep", 0)
+        context = (f"{total} segments ({asleep} asleep), "
+                   f"{engine.board.live_count} entities")
+        prof.dump(context, rate_hz=engine.clock.ticks_per_sec)
+
     def _substitute(self, tool, plan):
         """Replace lined-up entities with the plan that matched them.
 
@@ -1341,6 +1362,19 @@ class Orchestrator:
             # them. Leaving those behind had them reappear on the belts a
             # tick later -- the same bug a network edit had.
             engine.flush_material()
+        if requests.profile_ticks is not None:
+            # Armed *here*, before the tick below, so the very next tick is
+            # measured rather than the one after -- a 20-tick sample would
+            # otherwise be 5% short and, worse, would miss the tick the player
+            # pressed the button on.
+            if requests.profile_ticks:
+                engine.clock.profiler.arm(requests.profile_ticks)
+            else:
+                # Stopping is also a request to see the result: the player
+                # pressed "stop and dump", and leaving them to find another
+                # button would be the only way to lose the measurement.
+                engine.clock.profiler.stop()
+                self._dump_profile(engine)
 
         # 7. simulation. After every player mutation, so a tick acts on the
         # board as just edited; before the device sync, so its effects are
@@ -1352,6 +1386,13 @@ class Orchestrator:
         # final shape matters.
         self.last_rebuild = engine.sync_segments()
         engine.tick(dt)
+        # The clock disarms itself when the requested count runs out and sets
+        # the flag; dumping here rather than inside the clock keeps the clock
+        # free of any opinion about where diagnostics go, the same division
+        # that has the panel only *request* a board change.
+        if engine.clock.profile_done:
+            engine.clock.profile_done = False
+            self._dump_profile(engine)
 
         # 8. device sync, then render
         self.ui.last_upload = engine.sync_to_device()

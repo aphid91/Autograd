@@ -185,6 +185,19 @@ def reset():
     # half a cell from where a whole-tick calculation expects it.
     engine.clock.set_rate(TICKS_PER_SEC)
     engine.clock.reset()
+    # An armed profiler is global state in the same way the rate is, and
+    # `clock.reset()` keeps it for the same reason (diagnostics, not
+    # timeline). Left armed it would print a breakdown in the middle of an
+    # unrelated scenario's output -- noise rather than a failure, which is
+    # worse, since it would read as part of whatever test was running.
+    #
+    # **Cleared, not merely stopped.** `stop()` keeps the stats so a dump can
+    # follow it, which is right for the player and wrong here: a later
+    # scenario asserting "a disarmed profiler recorded nothing" would see the
+    # previous one's paths and fail on a measurement it never took. Found
+    # exactly that way.
+    engine.clock.profiler.reset()
+    engine.clock.profile_done = False
     # The debug item feed is global state too: a scenario that leaves it on
     # would quietly fill every later scenario's belts.
     engine.debug_feed = None

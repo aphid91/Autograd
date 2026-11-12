@@ -70,6 +70,52 @@ and scheduling are kept honest. Run them by hand from `tools/`.
 | [tools/check_prefilter_safe.py](tools/check_prefilter_safe.py) | that the prefilter never excludes a gate the full path would fire, over ~58k gate-ticks of mixed machine types |
 | [tools/check_wakelist_safe.py](tools/check_wakelist_safe.py) | a sleeping timeline against a fully-ticked one, diffed every tick. Reports its sleep→wake transition count, because a run with none proves nothing |
 
+#### Profiling the board in front of you
+
+The tools above measure *synthetic* boards, which is right for justifying an
+optimisation — a known shape, a scale sweep, one cost isolated at a time.
+They cannot answer "why is **my quicksave** slow", because a real factory's
+mix of saturated trace and sleeping memory is not a shape they reproduce.
+
+[core/tick_profile.py](core/tick_profile.py) is the in-app counterpart.
+`Clock.profiler` is a `Profiler`, **disarmed by default**; the Segments panel
+has a `Profile N ticks` button and `app.py` takes `--profile-ticks N` to
+measure the board that autoloads. Either way the breakdown goes to the
+console.
+
+- **Timings are a tree, not a flat table.** "The belt phase took 0.5ms" is
+  what `tools/profile_tick.py` already reports; the useful follow-up is
+  *which part*. A probe names a slash-separated path (`belt/transport`) and
+  the dump indents by depth, sorted by total within each parent.
+- **`Clock._run_tick()` times each registered callback under its phase
+  name**, so a phase cannot be added without being measured — the same
+  reasoning that hooks segment invalidation at `Gameboard.write_cell()`
+  rather than at each edit path. Sub-phase probes are the subsystem's own
+  business, since only it knows what its parts are.
+- **The dump is a pre-order walk, not a sort.** Sorting flat by
+  `(depth, -total)` is the obvious shortcut and puts every grandchild under
+  whichever *sibling* sorted last — `belt/transport/schedule` rendered
+  beneath `belt/direct`, claiming the scheduler was part of the direct
+  deliveries. A plausible-looking lie is the worst kind of bug in a tool
+  whose entire output is an attribution.
+- **A segment rebuild is timed but kept out of the tick total**
+  (`OUT_OF_TICK`). It is ~88ms once per *edit*, so averaging it into a
+  per-tick mean describes neither cost: over one tick it claims the tick is
+  88ms, over 200 it vanishes. "Why is my tick slow" and "why did that
+  placement stutter" are two questions wanting the same timings presented
+  differently, so both are collected and reported apart.
+- **`stop()` and `reset()` differ**, and both halves matter: stopping keeps
+  the stats because "stop and dump" wants to see them, while a fresh start
+  must leave no trace — a disarmed profiler still holding paths looks exactly
+  like one that recorded while off. `harness.reset()` calls `reset()`, and a
+  test asserting "a disarmed profiler records nothing" is what found it.
+
+What it showed immediately, which is the argument for having it: on
+`cpu.npz` the belt phase is down to 24% of the tick and `structure/fire` is
+58%, so the wake list moved the bottleneck to the gates. And on a synthetic
+factory the *prefilter* was 73% — the vectorised pass meant to buy away a
+per-gate cost is now the floor. Neither is visible without the breakdown.
+
 **Each `check_*.py` is mutation-tested**, and that is not ceremony: the first
 `check_wakelist_safe.py` passed against four separate mutations because it
 was vacuous in two ways at once (see "A segment at rest is not ticked"). A
@@ -1519,6 +1565,36 @@ position depends on it, so it is correct by luck under today's spacing.
 `tools/probe_wakelist.py` therefore checks `is_at_rest()` against the
 definition (does an idle tick really change nothing?) rather than against
 observable behaviour, and that is the only thing that catches it.
+
+**The two fixed points are sound but not complete, and the gap is the common
+case.** `is_at_rest()` asks "can an item *enter*", never "will anything
+offer one" — so a run that is backed up but one item short of full stays
+awake for ever. Measured on `cpu.npz`: **37 of 466 runs awake, and all 37
+unchanged over 200 further ticks.** The whole awake set was being ticked for
+nothing.
+
+Two shapes produce it, and the second is the surprising one:
+
+- **Backed up, not quite full.** A blocked run sleeps only when an item sits
+  at position 0 — the entrance itself. One short of that, `has_room()` is
+  True and nothing in the predicate notices that the upstream gate is idle.
+  Capacity is `L/d + 1`, so a 3-cell run needs *four* items to qualify.
+- **One item parked at the far end of a long run.** A 47-cell run holding a
+  single item at position 47, dangling downstream so nobody will ever take
+  it, is as inert as anything on the board — and reads as 46 cells of free
+  space.
+
+The missing term is the producer. "Nothing can enter" is a property of the
+*run*; "nothing will be offered" is a property of the **upstream gate**,
+which is exactly the state the wake edges already track — `_wake_around()`
+fires when a gate fills a waiting zone, so a run whose source holds nothing
+could sleep and be woken by the existing edge with no new mechanism. The
+check would be `seg.src is None or not out_held(src)`, i.e. the same
+`offer_to()` the tick is about to call anyway. That is the natural next step
+and it is **not implemented** — note it would make the belt phase's sleep
+test depend on gate state, which is a tighter coupling than the current
+purely-local predicate, so it wants `tools/check_wakelist_safe.py` run
+against it rather than being assumed safe.
 
 **Waking is edge-triggered, never polled** — polling is the cost being
 removed. Only two things can change a sleeping run, and both are gate events:
