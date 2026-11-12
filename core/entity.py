@@ -179,9 +179,14 @@ class Entity:
     #: Glyph drawn centred on the footprint. One of the GLYPH_* names.
     GLYPH = "none"
 
-    # Exposed for Gameboard, which pokes these without building a view.
+    # Exposed for callers that read a row without building a view --
+    # Gameboard, which pokes these directly, and the gate tick's hot port
+    # callbacks, which read one float per segment per tick and cannot afford
+    # an object to do it (see GateSim._live_port).
     F_ALIVE = _F_ALIVE
     F_TYPE = _F_TYPE
+    F_ORIGIN_X = _F_ORIGIN_X
+    F_ORIGIN_Y = _F_ORIGIN_Y
     F_W = _F_W
     F_H = _F_H
     F_FLIPPED = _F_FLIPPED

@@ -1157,3 +1157,65 @@ def test_a_machine_placed_without_a_tool_still_works():
     _run(20)
     assert engine.gates.stats["consumed"] > 10, engine.gates.stats
     ok(f"a Sink consumed {engine.gates.stats['consumed']} items in 20 ticks")
+
+
+def test_the_port_callbacks_mark_the_rows_they_write():
+    """Each port callback marks the row it writes, so the GPU sees the change.
+
+    The three port callbacks (`offer_to`, `took_from`, `accept_from`) write
+    entity rows **directly** rather than through a view, because they run once
+    per segment per tick and building an `Entity` to set one float was the
+    bulk of the belt phase. A view's `_set()` marks `entities_dirty`; direct
+    array writes have to do it by hand.
+
+    Nothing else catches a missed mark. `to_device()` uploads only the dirty
+    row range, so the simulation stays perfectly correct while the GPU keeps
+    the previous tick's gate state -- and since the renderer draws waiting
+    zones and a Source's emit label out of those rows, the symptom is a
+    *stale picture of a working factory*.
+
+    **Each callback is driven on its own**, which is the only way to see it.
+    Running a whole tick and checking the range does not work: the structure
+    phase writes the same Source row through a view a phase earlier, so its
+    mark hides a missing one here. Both mutants passed a whole-tick version
+    of this test, which is how that was found.
+    """
+    src = engine.place_structure(Source, 7, 10)
+    src.emit_value = 2.5
+    engine.place_belt_path((9, 10), (13, 10))
+    sink = engine.place_structure(Sink, 14, 10)
+    engine.sync_segments()
+    _run(12)
+
+    seg = next(iter(engine.segments.segments.values()))
+    gates = engine.gates
+
+    # accept_from(): writes the downstream gate's input channel. Needs a free
+    # channel to write into, so clear whatever the last tick left.
+    dst = gates._dst_port(seg)
+    if dst is not None:
+        gate, ch = dst
+        gate.clear_input(ch)
+        board.entities_dirty.clear()
+        assert gates.accept_from(seg, 1.0), "the sink should have taken it"
+        assert not board.entities_dirty.empty, (
+            "accept_from() wrote an input channel without marking the row "
+            "dirty -- to_device() would not upload it")
+        lo, hi = board.entities_dirty.lo, board.entities_dirty.hi
+        assert lo <= gate.row < hi, (gate.row, lo, hi)
+        ok(f"accept_from marked row {gate.row}")
+
+    # took_from(): clears the upstream gate's waiting zone. Fill it first, so
+    # there is something for the call to clear.
+    srcp = gates._src_port(seg)
+    assert srcp is not None, "the run should be fed by the Source"
+    gate, ch = srcp
+    gate.set_output(ch, 3.0)
+    board.entities_dirty.clear()
+    gates.took_from(seg)
+    assert not board.entities_dirty.empty, (
+        "took_from() cleared a waiting zone without marking the row dirty "
+        "-- to_device() would not upload it")
+    lo, hi = board.entities_dirty.lo, board.entities_dirty.hi
+    assert lo <= gate.row < hi, (gate.row, lo, hi)
+    ok(f"took_from marked row {gate.row}")

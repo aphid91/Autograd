@@ -407,6 +407,46 @@ class GateSim:
         return fired
 
     # --- the port callbacks, called from inside BeltSim.tick() ------------
+    #
+    # These run once per segment per tick -- the hottest code in the belt
+    # phase -- and between them they need exactly four things out of an
+    # entity row: is an output zone held, its value, is an input channel
+    # held, and a write to either. All four are single floats at offsets
+    # fixed by the class.
+    #
+    # So the hot path reads the entity array directly instead of binding a
+    # view. `_bind()` was 0.44ms of a 0.55ms `_src_port()` -- building an
+    # `Entity` subclass instance, resolving its type and testing its ghost
+    # bit, to read one float. The *field offsets* still come from the class
+    # (`F_OUT_HELD` and friends are class attributes, and MAX_CHANNELS fixes
+    # the stride), so this is not a second copy of the layout; it is the same
+    # constants without the object.
+    #
+    # The liveness and ghost guards stay, because a row can be freed or a
+    # ghost committed between rebuilds -- that is exactly why the cache
+    # stores a row and not a view.
+    def _live_port(self, resolved):
+        """(row, channel) if that row is a live non-ghost gate, else None.
+
+        The shared preamble of the three callbacks, doing what `_bind()` does
+        but without constructing a view. The ghost test reads the same place
+        `Entity.is_ghost` reads -- the `.z` ghost bits of the cell at the
+        entity's origin -- because a row carries no ghost flag of its own.
+        """
+        if resolved is None:
+            return None
+        row, channel = resolved
+        ents = self.board.entities
+        if not 0 < row < ents.shape[0] or not ents[row, Entity.F_ALIVE]:
+            return None
+        ox = int(ents[row, Entity.F_ORIGIN_X])
+        oy = int(ents[row, Entity.F_ORIGIN_Y])
+        grid = self.board.grid
+        if 0 <= ox < self.board.width and 0 <= oy < self.board.height:
+            if cell.is_ghost(grid[oy, ox, cell.CH_Z]):
+                return None
+        return row, channel
+
     def offer_to(self, seg):
         """What the gate upstream of `seg` wants to put on it, or None.
 
@@ -415,13 +455,14 @@ class GateSim:
         this must not clear the waiting zone. `took_from()` does that once
         the push has actually happened.
         """
-        gate_port = self._src_port(seg)
-        if gate_port is None:
+        port = self._live_port(self._src_cached(seg))
+        if port is None:
             return None
-        gate, channel = gate_port
-        if not gate.out_held(channel):
+        row, channel = port
+        ents = self.board.entities
+        if not ents[row, Entity.F_OUT_HELD + channel]:
             return None
-        return gate.out_value(channel)
+        return float(ents[row, Entity.F_OUT_VALUE + channel])
 
     def took_from(self, seg):
         """Called after BeltSim actually pushed what offer_to() returned.
@@ -439,11 +480,14 @@ class GateSim:
         producer that can be asked speculatively -- a splitter choosing
         between two belts -- would make the distinction load-bearing at once.
         """
-        gate_port = self._src_port(seg)
-        if gate_port is None:
+        port = self._live_port(self._src_cached(seg))
+        if port is None:
             return
-        gate, channel = gate_port
-        gate.clear_output(channel)
+        row, channel = port
+        ents = self.board.entities
+        ents[row, Entity.F_OUT_VALUE + channel] = 0.0
+        ents[row, Entity.F_OUT_HELD + channel] = 0.0
+        self.board.entities_dirty.add(row)
         self.stats["drained"] += 1
 
     def accept_from(self, seg, payload):
@@ -453,13 +497,16 @@ class GateSim:
         returns True, or returns False to leave the item on the belt -- which
         is how a run backs up behind a gate that is not firing.
         """
-        gate_port = self._dst_port(seg)
-        if gate_port is None:
+        port = self._live_port(self._dst_cached(seg))
+        if port is None:
             return False
-        gate, channel = gate_port
-        if gate.in_held(channel):
+        row, channel = port
+        ents = self.board.entities
+        if ents[row, Entity.F_IN_HELD + channel]:
             return False
-        gate.set_input(channel, payload)
+        ents[row, Entity.F_IN_VALUE + channel] = float(payload)
+        ents[row, Entity.F_IN_HELD + channel] = 1.0
+        self.board.entities_dirty.add(row)
         self.stats["loaded"] += 1
         return True
 
@@ -539,21 +586,39 @@ class GateSim:
     # distinguishes "resolved to nothing" from "not yet asked".
     _UNRESOLVED = object()
 
-    def _src_port(self, seg):
-        """The (gate_view, out_channel) feeding this segment, or None."""
+    def _src_cached(self, seg):
+        """The cached (row, out_channel) feeding this segment, or None.
+
+        The raw cached pair, with no view bound and no liveness test -- what
+        the hot callbacks want, since they go on to read the row directly.
+        `_src_port()` is the view-returning form for everything else.
+        """
         hit = self._src_cache.get(seg.sid, self._UNRESOLVED)
         if hit is self._UNRESOLVED:
             hit = self._resolve_src(seg)
             self._src_cache[seg.sid] = hit
-        return self._bind(hit)
+        return hit
 
-    def _dst_port(self, seg):
-        """The (gate_view, in_channel) this segment drains into, or None."""
+    def _dst_cached(self, seg):
+        """The cached (row, in_channel) this segment drains into, or None."""
         hit = self._dst_cache.get(seg.sid, self._UNRESOLVED)
         if hit is self._UNRESOLVED:
             hit = self._resolve_dst(seg)
             self._dst_cache[seg.sid] = hit
-        return self._bind(hit)
+        return hit
+
+    def _src_port(self, seg):
+        """The (gate_view, out_channel) feeding this segment, or None.
+
+        The view-returning form, kept for `_face_has_consumer()` and the
+        tests: those compare gate identity rather than reading one float, so
+        a view is the right currency there.
+        """
+        return self._bind(self._src_cached(seg))
+
+    def _dst_port(self, seg):
+        """The (gate_view, in_channel) this segment drains into, or None."""
+        return self._bind(self._dst_cached(seg))
 
     def _bind(self, resolved):
         """A cached (row, channel) -> a live (view, channel), or None.
