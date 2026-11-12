@@ -69,6 +69,9 @@ STATE_ERASING = 2
 STATE_ARMED = 3      # left button down, not yet known to be click or drag
 STATE_PANNING = 4
 STATE_SELECTING = 5  # copy/erase: left-drag is drawing a selection rectangle
+STATE_NOTING = 6     # annotation tool: left-drag is drawing a stroke or box
+STATE_NOTE_ERASING = 7  # annotation tool: right-drag is the brush eraser
+STATE_NOTE_MOVING = 8   # empty hand: left-drag is moving the open text box
 
 STATE_NAMES = {
     STATE_IDLE: "Idle",
@@ -77,7 +80,23 @@ STATE_NAMES = {
     STATE_ARMED: "Armed",
     STATE_PANNING: "Panning",
     STATE_SELECTING: "Selecting",
+    STATE_NOTING: "Drawing a note",
+    STATE_NOTE_ERASING: "Erasing notes",
+    STATE_NOTE_MOVING: "Moving a note",
 }
+
+#: Annotation gesture kinds, passed to `poll()` by the orchestrator when an
+#: annotation tool is held. Mirrored here rather than imported for the same
+#: reason the clipboard modes are: this module is the input layer and depends
+#: on nothing in `core`.
+NOTE_NONE = 0
+NOTE_STROKE = 1   # freehand: left-drag draws, right-drag erases
+NOTE_BOX = 2      # text: left-drag sizes a box
+#: Empty hand, cursor over the text box the Status window has open: a
+#: left-drag moves that box instead of panning the camera. Not a tool -- the
+#: hand is empty -- which is why it is a separate gesture kind rather than a
+#: third annotation tool.
+NOTE_MOVE = 3
 
 # How far the cursor must move, in framebuffer pixels, before a held left
 # button counts as a camera drag rather than a click. Small enough that a
@@ -107,6 +126,10 @@ _EDGE_KEYS = (
     glfw.KEY_R, glfw.KEY_ESCAPE, glfw.KEY_F, glfw.KEY_F5, glfw.KEY_DELETE,
     glfw.KEY_SPACE, glfw.KEY_PERIOD, glfw.KEY_Q, glfw.KEY_C, glfw.KEY_V,
     glfw.KEY_X,
+    # D is both a pan key (held state, read directly) and the ctrl+D erase
+    # chord (an edge). Being in this table only gives it edge *tracking* --
+    # the pan block still reads it with `_key()` -- so the two coexist.
+    glfw.KEY_D,
 ) + tuple(_SLOT_KEYS)
 
 
@@ -123,6 +146,8 @@ class Intents:
         "copy_mode", "paste_mode", "exit_mode", "shift_held",
         "select_rect", "commit_select", "stamp_steps",
         "erase_mode", "cut_mode", "commit_erase", "swap_rows",
+        "cursor_world", "note_draw", "note_draw_end", "note_erase",
+        "note_box", "note_box_end", "note_move", "note_move_end",
     )
 
     def __init__(self):
@@ -152,7 +177,7 @@ class Intents:
         #: reports only which digit was pressed -- the same discipline that
         #: has it report `R` rather than what `R` means.
         self.select_slot = None
-        #: Tab: swap which row the number keys address.
+        #: X: swap which row the number keys address.
         self.swap_rows = False
         self.scroll_steps = 0.0    # scroll notches this frame
         self.scroll_at = None      # cursor position to anchor the zoom on
@@ -182,7 +207,7 @@ class Intents:
         self.select_rect = None
         #: True on the frame a selection drag is released.
         self.commit_select = False
-        # X / ctrl+X: erase mode, and its cut variant. Separate intents
+        # ctrl+D / ctrl+shift+D: erase mode, and its cut variant. Separate intents
         # rather than one with a flag, so the orchestrator's two calls read
         # as the two different requests they are.
         self.erase_mode = False
@@ -192,6 +217,40 @@ class Intents:
         self.commit_erase = False
         #: shift+scroll notches in paste mode: walk the stamp history.
         self.stamp_steps = 0.0
+
+        # --- annotations ---
+        # Annotations are the one feature that works in *continuous* world
+        # coordinates rather than cells, because a stroke is a freehand line
+        # and snapping it to the lattice would make a circle a staircase.
+        # So these carry world positions, and the cell-based `begin_plan` /
+        # `commit_plan` machine is bypassed entirely for them.
+        #: Cursor position in world units, as a float pair. Always reported,
+        #: since it costs one conversion that `cursor_cell` already does.
+        self.cursor_world = (0.0, 0.0)
+        #: World point to extend the in-progress stroke to, or None.
+        self.note_draw = None
+        #: True on the frame a stroke is finished (the button came up).
+        self.note_draw_end = False
+        #: World point for the brush eraser, or None. Right-drag on the draw
+        #: tool: deletes the stroke under the cursor as it sweeps.
+        self.note_erase = None
+        #: Live text-box rectangle as world coords (x0, y0, x1, y1), or None.
+        self.note_box = None
+        #: True on the frame a text-box drag is released.
+        self.note_box_end = False
+        #: World-space `(dx, dy)` to move the open text box by, or None. A
+        #: delta rather than a position, so the box keeps the offset it was
+        #: grabbed at instead of snapping its origin to the cursor.
+        self.note_move = None
+        #: True on the frame a move drag is released. The orchestrator uses
+        #: it to suppress the click the release would otherwise be: a drag
+        #: that ends over bare board must not then close the window.
+        self.note_move_end = False
+        # Note there is no separate "clicked an annotation" intent. An empty
+        # hand is click-based, so `commit_plan` already fires on a bare click
+        # and `cursor_world` says where -- the orchestrator checks annotations
+        # before entities there. Adding a second intent for the same press
+        # would mean two things to keep in step.
 
 
 class InputManager:
@@ -216,6 +275,18 @@ class InputManager:
         self._pan_last_px = None
         #: Cell a copy-mode selection drag started from, or None.
         self._select_anchor = None
+        #: World point an annotation gesture started from, or None. A float
+        #: pair rather than a cell: a text box is sized in world units so it
+        #: does not have to align to the grid.
+        self._note_anchor = None
+        #: True from the press that claims a text-box move until its release.
+        #: The claim has to be **latched** rather than re-derived per frame:
+        #: it comes from "is the cursor over the open box?", which the drag
+        #: itself falsifies as soon as the pointer outruns the box.
+        self._note_moving = False
+        #: World position of the last left-press, for anchoring a move at the
+        #: press rather than at wherever the threshold happened to be crossed.
+        self._press_world = (0.0, 0.0)
 
         self._prev_keys = {k: False for k in _EDGE_KEYS}
         self._prev_left = False
@@ -249,6 +320,17 @@ class InputManager:
             my *= fb_h / win_h
         return mx, my
 
+    def cursor_world_now(self):
+        """The cursor's world position, read fresh.
+
+        Exposed because the orchestrator has to decide *which gesture to
+        poll* before `poll()` has run and published `cursor_world` -- and
+        using the previous frame's position would misjudge the frame a press
+        lands on, which is exactly the frame that matters for arming a drag.
+        """
+        (cx, cy), frac = self._cursor_cell_frac()
+        return (cx + frac[0], cy + frac[1])
+
     def _cursor_cell_frac(self):
         """((cell_x, cell_y), (fx, fy)) for the cursor.
 
@@ -281,7 +363,7 @@ class InputManager:
         return fired
 
     # --- main poll ------------------------------------------------------
-    def poll(self, dt, board, drag_based=True, mode=0):
+    def poll(self, dt, board, drag_based=True, mode=0, note=NOTE_NONE):
         """Read input and return the frame's Intents.
 
         `drag_based` comes from the active tool: a belt needs press-move-click
@@ -292,6 +374,11 @@ class InputManager:
         a left-drag means -- in copy and erase modes it draws a selection
         rectangle instead of panning the camera -- so the gesture machine has
         to know.
+
+        `note` is NOTE_STROKE or NOTE_BOX when an annotation tool is held.
+        Those have their own continuous gesture (left draws, right erases) and
+        take both mouse buttons, so they bypass the cell-based plan machine
+        entirely. `NOTE_NONE` is every other tool and changes nothing.
         """
         io = imgui.get_io()
         want_kb = io.want_capture_keyboard
@@ -318,9 +405,13 @@ class InputManager:
         escape = self._edge(glfw.KEY_ESCAPE, not want_kb)
         it.pipette = self._edge(glfw.KEY_Q, not want_kb)
 
-        # ctrl+C / ctrl+V. Gated strictly on ctrl so bare C and V stay free.
+        # The two modifiers, read once. Both are plain held state rather than
+        # edges, since several bindings below need to know whether one is
+        # down at the moment another key fires.
         ctrl = (self._key(glfw.KEY_LEFT_CONTROL)
                 or self._key(glfw.KEY_RIGHT_CONTROL))
+        shift = (self._key(glfw.KEY_LEFT_SHIFT)
+                 or self._key(glfw.KEY_RIGHT_SHIFT))
 
         # ctrl+R restarts the simulation, so the bare key keeps its per-tool
         # meaning and the modifier takes the rarer action -- the same split C
@@ -334,13 +425,22 @@ class InputManager:
         it.copy_mode = c_key and ctrl
         it.paste_mode = v_key and ctrl
 
-        # X / ctrl+X: erase mode and its cut variant. Unlike C and V the bare
-        # key is bound here -- erasing is frequent enough to deserve it, the
-        # way F took the bare key from frame-the-board -- so the two are a
-        # modifier apart on the same key rather than two separate bindings.
-        x_key = self._edge(glfw.KEY_X, not want_kb)
-        it.erase_mode = x_key and not ctrl
-        it.cut_mode = x_key and ctrl
+        # ctrl+D / ctrl+shift+D: erase mode and its cut variant.
+        #
+        # These moved off `X` so the bare key could take the row swap, which
+        # is the more frequent action -- the same trade `F` made when it took
+        # the bare key from frame-the-board. Erase keeps the two variants one
+        # modifier apart on one key rather than becoming two bindings.
+        #
+        # **`D` is also a pan key**, which is why erase is gated strictly on
+        # ctrl: a bare `D` must keep panning east. Note the pan block above
+        # reads `D` as *held state* and does not consult ctrl, so ctrl+D
+        # nudges the camera for the frame it is pressed. Harmless at one
+        # frame's worth of pan, and the alternative -- excluding ctrl there --
+        # would make a player who holds ctrl mid-pan stop dead.
+        d_key = self._edge(glfw.KEY_D, not want_kb)
+        it.erase_mode = d_key and ctrl and not shift
+        it.cut_mode = d_key and ctrl and shift
 
         # --- simulation clock ---
         # Space pauses; '.' runs exactly one tick, which works whether or not
@@ -350,8 +450,6 @@ class InputManager:
         it.step_tick = self._edge(glfw.KEY_PERIOD, not want_kb)
 
         # R is per-tool; shift reverses whatever it means.
-        shift = (self._key(glfw.KEY_LEFT_SHIFT)
-                 or self._key(glfw.KEY_RIGHT_SHIFT))
         it.cycle_tool = cycle
         it.cycle_backward = shift
         # Reported as state, not as an edge: paste reads it at the moment of
@@ -373,10 +471,17 @@ class InputManager:
                 it.select_slot = (_ROW_SIZE - 1) if digit == 0 else digit - 1
                 break
 
-        # Tab swaps the active row. No modifier: it is frequent, and imgui
-        # only wants Tab while a text field has focus -- which `want_kb`
-        # already covers.
-        it.swap_rows = self._edge(glfw.KEY_TAB, not want_kb)
+        # X swaps the active row. It took the bare key from erase mode (now
+        # ctrl+D) because re-aiming the number keys is the more frequent
+        # action of the two -- the same trade that moved frame-the-board to
+        # shift+F.
+        #
+        # Gated on **not ctrl** so it cannot fire alongside a chord: X is
+        # otherwise free, but leaving the modifier out would make a stray
+        # ctrl+X (muscle memory from the old cut binding) silently swap rows
+        # instead of doing nothing.
+        x_key = self._edge(glfw.KEY_X, not want_kb)
+        it.swap_rows = x_key and not ctrl
 
         # --- scroll: zoom, or walk the stamp history ---
         # shift+scroll in paste mode is the history walk, Factorio-style, so
@@ -396,6 +501,11 @@ class InputManager:
         it.cursor_cell = (cx, cy)
         it.cursor_frac = frac
         it.cursor_in_world = not want_mouse and board.in_bounds(cx, cy)
+        # The same position in continuous world units. The cell and the
+        # fraction already encode it, but annotations want it unrounded and
+        # reassembling it at the call site would duplicate the convention.
+        wx, wy = cx + frac[0], cy + frac[1]
+        it.cursor_world = (wx, wy)
 
         left = glfw.get_mouse_button(self.window, glfw.MOUSE_BUTTON_LEFT) == glfw.PRESS
         right = glfw.get_mouse_button(self.window, glfw.MOUSE_BUTTON_RIGHT) == glfw.PRESS
@@ -411,6 +521,137 @@ class InputManager:
         # cursor happens to end up over a panel.
         if want_mouse:
             left_press = right_press = False
+
+        # --- dragging the open text box -----------------------------------
+        # An **empty-hand** gesture, so it cannot live in the tool branch
+        # below: the whole point is that the box the Status window has open
+        # can be repositioned without picking anything up.
+        #
+        # It goes through ARMED like the camera pan does, rather than moving
+        # on the press, because a press over that box is ambiguous in exactly
+        # the same way: it might be a click (which the empty hand uses to
+        # select, and which must still close the window when it lands on bare
+        # board) or a drag. Only past DRAG_THRESHOLD_PX does it become a
+        # move, and `note_move_end` then tells the orchestrator to suppress
+        # the click that the release would otherwise be read as.
+        # **The gesture is claimed on the press and held for its duration.**
+        # `note` comes from the orchestrator asking "is the cursor over the
+        # open box?", and that answer goes false as soon as the pointer
+        # outruns the box -- which on a fast drag is the very next frame,
+        # while still in ARMED. Re-deriving it per frame therefore handed the
+        # half-armed gesture to the generic machine, which promoted it to a
+        # camera pan: the box never moved at all.
+        #
+        # So the claim is latched. `_note_moving` is set when a press lands
+        # with NOTE_MOVE offered and cleared on release, and the branch runs
+        # on the latch rather than on the live hit test.
+        if self._note_moving or (note == NOTE_MOVE
+                                 and self.state == STATE_IDLE):
+            if escape:
+                self.state = STATE_IDLE
+                self._note_anchor = None
+                self._note_moving = False
+                return it
+
+            if self.state == STATE_NOTE_MOVING:
+                a = self._note_anchor
+                if a is not None:
+                    # A *delta* rather than an absolute position, so the box
+                    # keeps its grab offset: dragging from one corner must
+                    # not teleport the box's origin under the cursor.
+                    it.note_move = (wx - a[0], wy - a[1])
+                    self._note_anchor = (wx, wy)
+                if left_release:
+                    it.note_move_end = True
+                    self.state = STATE_IDLE
+                    self._note_anchor = None
+                    self._note_moving = False
+                return it
+            if self.state == STATE_ARMED:
+                moved = ((mx - self._press_px[0]) ** 2
+                         + (my - self._press_px[1]) ** 2) ** 0.5
+                if moved > DRAG_THRESHOLD_PX:
+                    self.state = STATE_NOTE_MOVING
+                    # Anchored at the *press*, not at the cursor's position
+                    # now: the frames spent crossing the threshold are part
+                    # of the drag, and dropping them would make the box lag
+                    # the pointer by the threshold on every grab.
+                    self._note_anchor = self._press_world
+                elif left_release:
+                    # A click, not a drag. Fall through to the normal
+                    # empty-hand handling so it still selects or dismisses.
+                    self.state = STATE_IDLE
+                    self._note_moving = False
+                    it.commit_plan = True
+                return it
+            if left_press:
+                self.state = STATE_ARMED
+                self._press_px = (mx, my)
+                self._press_cell = (cx, cy)
+                self._press_frac = frac
+                self._press_world = (wx, wy)
+                # Latch the claim. From here the branch runs on this flag
+                # rather than on the hit test, which the drag itself
+                # invalidates within a frame or two.
+                self._note_moving = True
+                return it
+            # No press over the box: fall through, so hovering it still
+            # previews and the other keys keep working.
+            self._note_moving = False
+
+        # --- annotation tools: their own continuous gesture ---------------
+        # Held *before* the clipboard modes are consulted, because an
+        # annotation tool is a toolbelt tool and a mode overrides the hand --
+        # so if a mode is running it has already won and `note` is NONE.
+        #
+        # This branch returns early and so suppresses both the camera's
+        # left-drag pan and the board's right-drag erase, exactly as copy and
+        # erase mode do. That is required rather than convenient: the spec is
+        # left-draws / right-erases, and those are the two buttons the camera
+        # and the eraser already wanted. Panning stays on WASD and the scroll
+        # wheel, which are untouched above.
+        if note != NOTE_NONE:
+            if escape:
+                # Abandon an in-flight stroke or box without committing it.
+                self.state = STATE_IDLE
+                self._note_anchor = None
+                it.cancel_plan = True
+                return it
+
+            if self.state == STATE_NOTING:
+                if note == NOTE_STROKE:
+                    # Every frame the button is held extends the stroke. The
+                    # store applies its own minimum-gap filter, so a slow drag
+                    # does not record a point per frame.
+                    it.note_draw = (wx, wy)
+                    if left_release:
+                        it.note_draw_end = True
+                        self.state = STATE_IDLE
+                else:
+                    a = self._note_anchor
+                    if a is not None:
+                        it.note_box = (a[0], a[1], wx, wy)
+                    if left_release:
+                        it.note_box_end = True
+                        self.state = STATE_IDLE
+                        self._note_anchor = None
+            elif self.state == STATE_NOTE_ERASING:
+                it.note_erase = (wx, wy)
+                if right_release:
+                    self.state = STATE_IDLE
+            else:
+                if left_press:
+                    self.state = STATE_NOTING
+                    self._note_anchor = (wx, wy)
+                    # A stroke starts recording immediately rather than after
+                    # the drag threshold: a dot is a legitimate mark, and
+                    # waiting would lose the first few pixels of every stroke.
+                    if note == NOTE_STROKE:
+                        it.note_draw = (wx, wy)
+                elif right_press:
+                    self.state = STATE_NOTE_ERASING
+                    it.note_erase = (wx, wy)
+            return it
 
         # --- copy and erase: one selection gesture machine ---
         # Left-drag is the selection rectangle, which means there is no camera
@@ -649,6 +890,11 @@ class InputManager:
         self._pending_commit = False
         self._pan_last_px = None
         self._select_anchor = None
+        # The annotation gestures' own state, including the latched move
+        # claim: a cancel that left it set would have the next left-press
+        # anywhere on the board drag whatever the Status window had open.
+        self._note_anchor = None
+        self._note_moving = False
 
 
 def _trace(a, b):

@@ -733,12 +733,30 @@ vec4 draw_items(ivec4 c, vec2 p, int travel, float px) {
     // This cell's centre as a distance along the run, in fixed point.
     float here = float(segment_offset(c.w)) * BELT_UNIT;
     vec2 axis = dir_vec(travel);
+
+    // Whether labels are legible at this zoom, decided once for the whole
+    // cell. Hoisted out of the scan loop because it also sizes `reach`
+    // below -- the same number cannot be re-asked per item.
+    float text = text_opacity(px);
+
     // How far along the run an item can be and still touch this cell. The
-    // number is allowed to spill past the disc rim, so the reach is set by
-    // whichever is wider -- the disc, or half the widest number the
-    // formatter can produce (NUM_MAX_CODES columns).
-    float text_half = float(NUM_MAX_CODES) * float(FONT_W) * ITEM_NUM_SIZE * 0.5;
-    float reach = (0.5 + max(ITEM_RADIUS, text_half)) * BELT_UNIT;
+    // number is allowed to spill past the disc rim, so when labels are drawn
+    // the reach is set by whichever is wider -- the disc, or half the widest
+    // number the formatter can produce (NUM_MAX_CODES columns).
+    //
+    // **Gated on the labels actually being drawn.** `text_half` is the
+    // worst-case string width, around 2 cells, against a disc radius of a
+    // fraction of one -- so paying it unconditionally widened the bisect
+    // bracket and ran the ITEM_SCAN loop far more often than needed, at
+    // every zoom level, for text that `text_opacity` had already faded to
+    // nothing. Zoomed out is exactly the case with the most items on screen,
+    // so this is where the cost was worst and the benefit nil.
+    float reach = (0.5 + ITEM_RADIUS) * BELT_UNIT;
+    if (text > 0.0) {
+        float text_half = float(NUM_MAX_CODES) * float(FONT_W)
+                        * ITEM_NUM_SIZE * 0.5;
+        reach = (0.5 + max(ITEM_RADIUS, text_half)) * BELT_UNIT;
+    }
 
     // Bisect for the smallest k whose position is within reach behind us.
     // Everything at smaller k is further forward and cannot touch this cell.
@@ -774,9 +792,10 @@ vec4 draw_items(ivec4 c, vec2 p, int travel, float px) {
         vec3 edge = (value > 0.0) ? COL_ITEM_POS : COL_ITEM_NEG;
         // Fill first, then the ring over it.
         vec3 col = mix(COL_ITEM_FILL, edge, cov.y);
-        // Then the number over both. Skipped entirely when zoomed out past
-        // legibility -- the ring still carries the sign there.
-        float text = text_opacity(px);
+        // Then the number over both. `text` was decided for the whole cell
+        // above: it is 0 when zoomed out past legibility, where the ring
+        // still carries the sign.
+        //
         // The number can spill past the rim, so its coverage is tracked
         // separately and unioned into the disc's: a pixel outside the disc
         // that a digit reaches must still be drawn, or the overhang would be

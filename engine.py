@@ -480,22 +480,32 @@ class Engine:
         return view
 
     # --- persistence -----------------------------------------------------
-    def save_board(self, path=None):
+    def save_board(self, path=None, annotations=None):
         """Quicksave. Clears the preview first, since ghosts are not board
-        state -- they belong to a gesture in flight."""
+        state -- they belong to a gesture in flight.
+
+        `annotations` is the orchestrator's `AnnotationStore`, saved inside
+        the same file. The engine does not own it -- annotations carry no
+        simulation state and never touch the grid -- so it is passed through
+        rather than held.
+        """
         path = path or persistence.DEFAULT_SAVE
         self.clear_ghosts()
-        return persistence.save(self.board, path)
+        return persistence.save(self.board, path, annotations=annotations)
 
-    def load_board(self, path=None):
+    def load_board(self, path=None, annotations=None):
         """Quickload, replacing everything. Returns the entity count.
 
         Any in-flight preview is dropped: its ghost rows index the *old*
         entity table and would dangle into the new one.
+
+        `annotations`, if given, is replaced from the file -- including being
+        emptied when the file has none, so the outgoing board's notes never
+        linger over the incoming one.
         """
         path = path or persistence.DEFAULT_SAVE
         self.clear_ghosts()
-        n = persistence.load(self.board, path)
+        n = persistence.load(self.board, path, annotations=annotations)
         self.ghost_rows.clear()
         self.preview_only_rows.clear()
         # A new board is a new timeline. Item positions are a closed-form

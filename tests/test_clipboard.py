@@ -22,8 +22,9 @@ from core.entity import Shear, Sink, Source, Underground
 from core.stamp import Stamp
 
 from tests import harness
-from tests.harness import (board, click, ctrl_key, drag_cells, drag_px, engine,
-                           fake, ok, orch, cam, press_key, put_cursor_at_cell,
+from tests.harness import (board, click, ctrl_key, drag_cells, drag_px,
+                           engine, enter_cut_mode, enter_erase_mode, fake, ok,
+                           orch, cam, press_key, put_cursor_at_cell,
                            real_cells_at, select_tool, step)
 
 
@@ -524,7 +525,7 @@ def test_x_enters_erase_mode_and_stashes_the_tool():
     """Bare X is erase mode; like copy, it gives the held tool back."""
     select_tool("Shear")
     assert orch.clipboard.mode == MODE_OFF
-    press_key(glfw.KEY_X)
+    enter_erase_mode()
     assert orch.clipboard.mode == MODE_ERASE, orch.clipboard.mode
     assert not orch.clipboard.cutting, "bare X is not a cut"
     assert orch.clipboard._has_stash
@@ -551,7 +552,7 @@ def test_an_erase_drag_deletes_what_the_rectangle_touched():
     engine.sync_segments()
     assert len(_row_survivors(10, range(10, 17))) == 7
 
-    press_key(glfw.KEY_X)
+    enter_erase_mode()
     drag_cells((11, 9), (13, 11))
 
     # The rectangle spans x=11..13, y=9..11, so the three cells of row 10
@@ -574,7 +575,7 @@ def test_erasing_a_rectangle_stays_in_erase_mode():
     select_tool("Belt")
     engine.place_belt_path((10, 10), (16, 10))
     engine.sync_segments()
-    press_key(glfw.KEY_X)
+    enter_erase_mode()
 
     drag_cells((11, 9), (12, 11))
     assert orch.clipboard.mode == MODE_ERASE, (
@@ -595,7 +596,7 @@ def test_erase_mode_leaves_no_stamp_behind():
     """A plain erase is a deletion, not a cut: nothing reaches the history."""
     engine.place_belt_path((10, 10), (14, 10))
     engine.sync_segments()
-    press_key(glfw.KEY_X)
+    enter_erase_mode()
     drag_cells((9, 9), (15, 11))
     assert _row_survivors(10, range(9, 16)) == [], (
         _row_survivors(10, range(9, 16)))
@@ -607,12 +608,12 @@ def test_erase_mode_leaves_no_stamp_behind():
 def test_escape_and_right_press_leave_erase_mode():
     """Both of copy mode's aborts work here too, since the machine is shared."""
     select_tool("Belt")
-    press_key(glfw.KEY_X)
+    enter_erase_mode()
     press_key(glfw.KEY_ESCAPE)
     assert orch.clipboard.mode == MODE_OFF, orch.clipboard.mode
     assert orch.toolbelt.active.name == "Belt"
 
-    press_key(glfw.KEY_X)
+    enter_erase_mode()
     assert orch.clipboard.mode == MODE_ERASE
     fake["right"] = True
     step()
@@ -633,7 +634,7 @@ def test_erase_mode_takes_a_whole_structure_from_any_cell():
     engine.sync_segments()
     assert all(not board.is_empty(*c) for c in sink_cells), "setup"
 
-    press_key(glfw.KEY_X)
+    enter_erase_mode()
     # A rectangle covering only the top-right cell of the four. It has to be
     # a real drag: a same-cell "drag" never passes DRAG_THRESHOLD_PX and so
     # is a click, which deliberately erases nothing.
@@ -650,9 +651,9 @@ def test_ctrl_x_cuts_into_paste_mode():
     engine.sync_segments()
     assert len(_row_survivors(20, range(20, 24))) == 4
 
-    ctrl_key(glfw.KEY_X)
+    enter_cut_mode()
     assert orch.clipboard.mode == MODE_ERASE, orch.clipboard.mode
-    assert orch.clipboard.cutting, "ctrl+X must arm the cut"
+    assert orch.clipboard.cutting, "ctrl+shift+D must arm the cut"
 
     drag_cells((19, 19), (24, 21))
     assert _row_survivors(20, range(20, 24)) == [], (
@@ -660,7 +661,7 @@ def test_ctrl_x_cuts_into_paste_mode():
     assert orch.clipboard.mode == MODE_PASTE, orch.clipboard.mode
     s = orch.clipboard.stamp
     assert s is not None and len(s) == 4, s
-    ok("ctrl+X captured four belts, deleted them, and went to paste mode")
+    ok("ctrl+shift+D captured four belts, deleted them, and went to paste mode")
 
     # And it pastes back, which is the whole point of a cut.
     put_cursor_at_cell(21, 20)
@@ -1060,7 +1061,7 @@ def test_a_cut_is_one_continuous_mode_chain():
     select_tool("Shear")
     engine.place_belt_path((20, 20), (22, 20))
     engine.sync_segments()
-    ctrl_key(glfw.KEY_X)
+    enter_cut_mode()
     drag_cells((19, 19), (23, 21))
     assert orch.clipboard.mode == MODE_PASTE
     press_key(glfw.KEY_ESCAPE)
@@ -1077,12 +1078,12 @@ def test_the_cut_flag_does_not_outlive_its_mode():
     invisible until the history filled with things they meant to delete.
     """
     select_tool("Belt")
-    ctrl_key(glfw.KEY_X)
+    enter_cut_mode()
     assert orch.clipboard.cutting
     press_key(glfw.KEY_ESCAPE)
     assert not orch.clipboard.cutting, "Esc must disarm the cut"
 
-    press_key(glfw.KEY_X)
+    enter_erase_mode()
     assert not orch.clipboard.cutting, "bare X after a cut must not cut"
     engine.place_belt_path((10, 10), (12, 10))
     engine.sync_segments()
@@ -1095,7 +1096,7 @@ def test_the_cut_flag_does_not_outlive_its_mode():
 def test_an_empty_cut_does_not_strand_you_in_paste_mode():
     """Cutting bare board catches nothing, so there is nothing to paste."""
     select_tool("Belt")
-    ctrl_key(glfw.KEY_X)
+    enter_cut_mode()
     drag_cells((40, 40), (44, 44))
     assert not orch.clipboard.history, "nothing should have been pushed"
     assert orch.clipboard.mode == MODE_ERASE, (
@@ -1113,8 +1114,8 @@ def test_selecting_a_tool_leaves_any_mode_holding_that_tool():
     just asked for, which is why `_select_slot()` drops the stash instead.
     """
     for enter, name in ((lambda: ctrl_key(glfw.KEY_C), "copy"),
-                        (lambda: press_key(glfw.KEY_X), "erase"),
-                        (lambda: ctrl_key(glfw.KEY_X), "cut")):
+                        (enter_erase_mode, "erase"),
+                        (enter_cut_mode, "cut")):
         harness.reset()
         select_tool("Shear")
         enter()

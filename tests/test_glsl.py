@@ -432,6 +432,52 @@ def test_probe_reach_spans_the_longest_footprint():
     ok(f"PROBE_REACH {_reach} spans the longest footprint ({_longest})")
 
 
+def test_the_item_scan_reach_is_gated_on_the_labels_being_drawn():
+    """`reach` must only pay for the text when the text is actually drawn.
+
+    The number is allowed to spill past the disc rim, so when labels are
+    visible the scan has to reach half the widest possible string -- about
+    2 cells, against a disc radius of a fifth of one. Paying that
+    unconditionally widened the bisect bracket and ran the ITEM_SCAN loop
+    far more often than needed at *every* zoom, including the zoomed-out
+    range where `text_opacity()` has already faded the labels to nothing and
+    the most items are on screen.
+
+    Pinned structurally rather than by timing: the win is a smaller scan
+    window, which no test here can observe directly, but "the wide reach is
+    inside a conditional on the text" is exactly the property that produces
+    it. Mutation-testing this is why it is worth stating -- removing the
+    guard leaves every pixel test passing.
+    """
+    body = _re.search(r"vec4 draw_items\(.*?\n\}", _src, _re.S)
+    assert body, "draw_items() not found in world.frag"
+    body = body.group(0)
+
+    # The wide reach must be reachable only under a text test.
+    wide = _re.search(
+        r"if\s*\(\s*text\s*>\s*0\.0\s*\)\s*\{[^}]*text_half[^}]*"
+        r"reach\s*=", body, _re.S)
+    assert wide, (
+        "the NUM_MAX_CODES-wide reach must sit inside an `if (text > 0.0)`, "
+        "or it is paid at every zoom for text that is not drawn")
+
+    # And the unconditional default must be the disc alone.
+    narrow = _re.search(
+        r"float\s+reach\s*=\s*\(\s*0\.5\s*\+\s*ITEM_RADIUS\s*\)", body)
+    assert narrow, (
+        "the default reach should be the disc's own extent, so a hidden "
+        "label costs nothing")
+
+    # text_opacity() has to be computed once for the cell rather than per
+    # item, since `reach` is decided before the scan loop begins.
+    assert body.count("text_opacity(") == 1, (
+        "text_opacity() should be evaluated once per cell, above the scan "
+        "loop that `reach` bounds")
+    assert body.index("text_opacity(") < body.index("ITEM_BISECT"), (
+        "the text decision must come before the bisect it sizes")
+    ok("the item scan's wide reach is gated on the labels being drawn")
+
+
 # --- the bitfield font and the number formatter ----------------------------
 # Text is drawn from a 6x8 bitfield generated out of core/font.py, and numbers
 # are formatted in GLSL from a policy that core/font.py also implements in

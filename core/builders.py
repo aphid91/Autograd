@@ -119,11 +119,16 @@ class Placement:
 class BuildPlan:
     """What a builder wants to do, before anything is committed."""
 
-    __slots__ = ("placements", "all_or_nothing")
+    __slots__ = ("placements", "all_or_nothing", "paste_origin", "stamp")
 
     def __init__(self, placements, all_or_nothing=False):
         self.placements = placements
         self.all_or_nothing = all_or_nothing
+        #: Where a paste landed, as `(ox, oy)`, and the stamp it came from.
+        #: Both None for every other builder -- only a paste has annotations
+        #: to carry, and only a paste knows the origin its own box chose.
+        self.paste_origin = None
+        self.stamp = None
 
     @property
     def frustrated_cells(self):
@@ -623,7 +628,14 @@ class PasteBuilder(EntityBuilder):
             mate = placements[entry.partner]
             p.under_partner = (mate.x, mate.y)
 
-        return BuildPlan(placements, all_or_nothing=not self.partial)
+        out = BuildPlan(placements, all_or_nothing=not self.partial)
+        # Where the stamp landed, so the commit path can place the stamp's
+        # annotations at the same origin. Carried on the plan rather than
+        # recomputed by the caller: `origin_for_cursor` depends on the
+        # stamp's box, and deriving it twice is two places to get it wrong.
+        out.paste_origin = (ox, oy)
+        out.stamp = stamp
+        return out
 
 
 class StampBuilder(PasteBuilder):
@@ -676,6 +688,114 @@ class StampBuilder(PasteBuilder):
         return True
 
 
+class AnnotationTool:
+    """Base for the annotation tools. **Not an EntityBuilder.**
+
+    Deliberately outside that hierarchy rather than a subclass with stubbed
+    methods. An `EntityBuilder` exists to turn a gesture into a `BuildPlan`
+    the engine previews and commits; these tools never produce one, never
+    touch the grid, and never spawn a row -- the orchestrator intercepts them
+    *before* the builder path, the same way a clipboard mode overrides the
+    held tool. Inheriting from `EntityBuilder` would mean carrying `plan()`,
+    `adopt()` and `entity_cls` as dead members and inviting a future caller
+    to treat one as placeable.
+
+    They are still **toolbelt tools**: they occupy a slot, they are selected
+    with a digit, and they are persisted by kind. So they implement the small
+    protocol the toolbelt and panel actually use -- `name`, `drag_based`,
+    `cycle()`, `flip()`, `status()` -- and nothing else.
+
+    `entity_cls` is `None`, which keeps the pipette honest: `Q` resolves a
+    board type to the slot whose tool claims it, and an annotation tool
+    claims no entity type, so `Q` can never land on one.
+    """
+
+    name = "annotation"
+    #: Both annotation tools are drag gestures (a stroke, or a box), but they
+    #: are driven by the orchestrator's own annotation branch rather than by
+    #: the input manager's plan machine, so this is reported for the panel's
+    #: benefit and not used to pick a gesture style.
+    drag_based = True
+    entity_cls = None
+
+    def __init__(self, colour=0, size=1):
+        #: Index into annotations.PALETTE.
+        self.colour = int(colour)
+        #: Index into STROKE_WIDTHS or TEXT_SIZES, depending on the subclass.
+        self.size = int(size)
+
+    def _size_count(self):
+        raise NotImplementedError
+
+    def cycle(self, backward=False):
+        """`R` walks the size/width list. Wraps, since it is a short ring."""
+        n = self._size_count()
+        self.size = (self.size + (-1 if backward else 1)) % n
+        return True
+
+    def flip(self):
+        """`F` walks the palette.
+
+        `F` means "mirror" on every other tool, which an annotation has no
+        notion of -- so rather than leave the key dead on the two tools whose
+        whole job is choosing a pen, it picks the colour. Same licence every
+        tool has to define `R` and `F` for itself (see CLAUDE.md: "R and F
+        deliberately mean different things in different tools").
+        """
+        from core.annotations import PALETTE
+        self.colour = (self.colour + 1) % len(PALETTE)
+        return True
+
+    def colour_name(self):
+        from core.annotations import PALETTE
+        i = max(0, min(len(PALETTE) - 1, self.colour))
+        return PALETTE[i][0]
+
+
+class DrawAnnotationTool(AnnotationTool):
+    """Freehand strokes: left-drag draws, right-drag erases.
+
+    The telestrator pen. Right-drag is a *brush* eraser rather than a
+    rectangle -- it deletes the stroke under the cursor as you sweep over it,
+    which is how erasing a scribble actually feels. The rectangle eraser is
+    the existing `X` mode, which now catches annotations too.
+    """
+
+    name = "Draw note"
+
+    def _size_count(self):
+        from core.annotations import STROKE_WIDTHS
+        return len(STROKE_WIDTHS)
+
+    def status(self):
+        from core.annotations import STROKE_WIDTHS
+        return (f"{self.colour_name()}, width "
+                f"{self.size + 1}/{len(STROKE_WIDTHS)}"
+                f"  —  drag to draw, right-drag to erase")
+
+
+class TextAnnotationTool(AnnotationTool):
+    """Text labels: left-drag sizes a box, which then opens for editing.
+
+    The drag sets the box and the Status window takes the text, because a
+    label is typed and the board is not a text field. A fresh box is created
+    empty and selected, so the window is already open on it the moment the
+    drag ends.
+    """
+
+    name = "Text note"
+
+    def _size_count(self):
+        from core.annotations import TEXT_SIZES
+        return len(TEXT_SIZES)
+
+    def status(self):
+        from core.annotations import TEXT_SIZES
+        return (f"{self.colour_name()}, size "
+                f"{self.size + 1}/{len(TEXT_SIZES)}"
+                f"  —  drag out a text box")
+
+
 #: The tool kinds a slot can hold, as `kind -> factory`. This is the registry
 #: the right-click type menu lists and the one the persisted layout names, so
 #: a kind string is a **compatibility surface**: it ends up in the player's
@@ -688,16 +808,27 @@ BUILDER_KINDS = {
     "belt": BeltBuilder,
     "raw_belt": RawBeltBuilder,
     "underground": UndergroundBuilder,
+    "draw_note": DrawAnnotationTool,
+    "text_note": TextAnnotationTool,
 }
 
+#: The annotation tools, for the orchestrator's "is this an annotation tool?"
+#: test. A tuple rather than a flag on the class so the check is one isinstance
+#: at the call site and cannot be accidentally inherited by a real builder.
+ANNOTATION_TOOLS = (DrawAnnotationTool, TextAnnotationTool)
 
-def make_builder(kind, type_name=None, stamp=None):
+
+def make_builder(kind, type_name=None, stamp=None, pen=None):
     """Build a tool from its serialised description, or None if unknown.
 
     Fails **softly** by design: this is fed by a hand-editable config file and
     by saved layouts that may name a machine a later version renamed. An
     unknown kind or type leaves the slot empty, which is a recoverable state
     the player can see, rather than refusing to start.
+
+    `pen` is the annotation tools' `(colour, size)` pair and is ignored by
+    every other kind -- an explicit parameter rather than smuggled through
+    `type_name`, so the signature says what each kind takes.
     """
     if kind == "structure":
         for c in STRUCTURES:
@@ -707,7 +838,33 @@ def make_builder(kind, type_name=None, stamp=None):
     if kind == "stamp":
         return StampBuilder(stamp) if stamp else None
     factory = BUILDER_KINDS.get(kind)
-    return factory() if factory else None
+    if factory is None:
+        return None
+    tool = factory()
+    if factory in ANNOTATION_TOOLS and pen is not None:
+        _apply_pen(tool, pen)
+    return tool
+
+
+def _apply_pen(tool, pen):
+    """Restore an annotation tool's `(colour, size)`, clamped to range.
+
+    Validated rather than trusted: this comes from a hand-editable file, and
+    an out-of-range index would otherwise reach the palette lookup. A bad
+    value leaves that field at its default, matching how every other field in
+    this module fails.
+    """
+    from core.annotations import PALETTE
+    if not isinstance(pen, (tuple, list)) or len(pen) < 2:
+        return
+    try:
+        tool.colour = int(pen[0]) % len(PALETTE)
+    except (TypeError, ValueError):
+        pass
+    try:
+        tool.size = max(0, int(pen[1])) % tool._size_count()
+    except (TypeError, ValueError):
+        pass
 
 
 def describe_builder(tool):
@@ -725,6 +882,15 @@ def describe_builder(tool):
                 "name": tool.name}
     if isinstance(tool, StructureBuilder):
         return {"kind": "structure", "type": tool.entity_cls.__name__}
+    if isinstance(tool, ANNOTATION_TOOLS):
+        # The pen settings travel with the slot. A player who put a red
+        # heading pen in slot 11 means that slot to stay a red heading pen,
+        # and re-deriving the defaults on restart would quietly reset it --
+        # the same reasoning that has a baked stamp persist its stamp.
+        kind = "draw_note" if isinstance(tool, DrawAnnotationTool) \
+            else "text_note"
+        return {"kind": kind, "colour": int(tool.colour),
+                "size": int(tool.size)}
     for kind, factory in BUILDER_KINDS.items():
         # Exact type, not isinstance: RawBeltBuilder and BeltBuilder are
         # siblings, but a subclass relationship among these would otherwise

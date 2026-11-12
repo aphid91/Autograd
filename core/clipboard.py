@@ -33,7 +33,7 @@ differences:
 - **A release erases and stays in the mode.** Copy mode's release ends the
   mode (you go to paste with what you caught); erasing is a repeated action,
   so the rectangle is a stroke rather than a commitment.
-- **`ctrl+X` is a cut**: the same rectangle, captured as a stamp *before* the
+- **`ctrl+shift+D` is a cut**: the same rectangle, captured as a stamp *before* the
   entities are deleted, then straight to paste mode holding it. That makes
   cut-then-place one continuous chain exactly as ctrl+C -> ctrl+V is, stash
   included -- `_stash()` refusing to overwrite is what keeps the player's
@@ -64,7 +64,7 @@ class Clipboard:
         self._has_stash = False
         #: True in erase mode when the rectangle should be *cut* -- captured
         #: as a stamp and then deleted -- rather than simply deleted. Set by
-        #: ctrl+X and cleared when the mode ends, so a later bare-X stroke
+        #: ctrl+shift+D and cleared when the mode ends, so a later plain stroke
         #: cannot inherit it.
         self.cutting = False
 
@@ -133,7 +133,7 @@ class Clipboard:
         return True
 
     def enter_erase(self, current_slot, cut=False):
-        """X (or ctrl+X for a cut). Stash the held tool and start selecting.
+        """ctrl+D (or ctrl+shift+D for a cut). Stash the tool and select.
 
         `cut` is remembered on the mode rather than read per release, because
         the status line and the panel both need to say which of the two the
@@ -223,7 +223,7 @@ class Clipboard:
         return self.history.replace_active(out)
 
 
-def capture(board, x0, y0, x1, y1, include_ghosts=False):
+def capture(board, x0, y0, x1, y1, include_ghosts=False, annotations=None):
     """Build a Stamp from every entity touching the rectangle.
 
     Touching, not contained: a structure with any cell inside the selection
@@ -236,6 +236,15 @@ def capture(board, x0, y0, x1, y1, include_ghosts=False):
     whatever happens to sit near the paste site. An end whose partner was
     outside the selection comes across unpaired, which is a legal thing to
     have on the board.
+
+    `annotations` is the live `AnnotationStore`, or None to capture entities
+    only. A note whose **bounding box** the rectangle touches comes along, so
+    copying a labelled block of a CPU reproduces its labels. The box and not
+    the ink, deliberately and for every annotation type: one stated rule beats
+    a per-type one the player has to learn by surprise, and for a short
+    underline or a label the box *is* the ink. (The brush eraser is the one
+    place real distance is used, because a point-vs-box test there would
+    delete a circle for passing near its empty middle.)
     """
     from core import cell as _cell
 
@@ -258,7 +267,20 @@ def capture(board, x0, y0, x1, y1, include_ghosts=False):
             seen.add(view.row)
             rows.append(view)
 
+    # Annotations are gathered in world coordinates and rebased below, once
+    # the entity box is known. Collected up front so the "nothing caught at
+    # all" test can account for them.
+    notes = []
+    if annotations is not None:
+        notes = [a.copy(None) for a in
+                 annotations.in_rect(lo_x, lo_y, hi_x + 1, hi_y + 1)]
+
     if not rows:
+        # No entities. Annotations alone do **not** make a stamp: `Stamp` is
+        # falsey without entries, so the orchestrator would treat this as an
+        # empty selection anyway -- returning the notes here would build a
+        # stamp that reads as empty while carrying data, which is a worse
+        # thing to have than neither.
         return Stamp()
 
     entries = []
@@ -292,5 +314,8 @@ def capture(board, x0, y0, x1, y1, include_ghosts=False):
         if partner_row and partner_row in row_to_index:
             entries[idx].partner = row_to_index[partner_row]
 
-    stamp = Stamp(entries)
+    stamp = Stamp(entries, notes)
+    # normalise() shifts entries and annotations by the same amount, so the
+    # notes only have to arrive in the *same frame* as the entries -- which
+    # they do, both being absolute board coordinates at this point.
     return stamp.normalise()

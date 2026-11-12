@@ -26,14 +26,24 @@ import os
 import glfw
 
 from core import config, persistence
-from core.builders import PasteBuilder, default_builders, make_builder
+from core.annotations import AnnotationStore, TextBox
+from core.builders import (ANNOTATION_TOOLS, DrawAnnotationTool, PasteBuilder,
+                           TextAnnotationTool, default_builders, make_builder)
 from core.clipboard import Clipboard, MODE_COPY, MODE_PASTE, capture
 from core.entity import Belt, Source
 from render.camera import Camera
 from engine import Engine
-from ui.input_manager import InputManager, STATE_PLANNING
+from ui.annotation_layer import AnnotationLayer
+from ui.input_manager import (InputManager, NOTE_BOX, NOTE_MOVE, NOTE_NONE,
+                              NOTE_STROKE, STATE_PLANNING)
 from core.toolbelt import Toolbelt
 from ui.panel import UI, UIRequests
+
+#: Smallest text box a drag may produce, in world cells. A click that barely
+#: moves would otherwise make a box too small to see or click again -- which,
+#: since a fresh box is empty, would be invisible litter on the board.
+MIN_BOX_W = 1.2
+MIN_BOX_H = 0.6
 
 
 class Orchestrator:
@@ -71,6 +81,29 @@ class Orchestrator:
         #: so erasing the inspected entity closes the window rather than
         #: reading a recycled row.
         self.inspect_row = None
+        #: Annotation the Status window is editing, as an **id**, or None.
+        #:
+        #: Parallel to `inspect_row` and for the same reason, but it cannot
+        #: share it: an annotation is not an entity and has no row, so
+        #: `is_row_alive()` has nothing to say about one. Ids are never reused
+        #: (see core/annotations.py), so a stale id reads as `None` rather
+        #: than as a different annotation -- the same safety `inspect_row`
+        #: gets from the row liveness check.
+        #:
+        #: At most one of the two is set; `_inspect_at()` clears the other.
+        self.inspect_note = None
+        #: Every stroke and label on the board. Not part of the Gameboard:
+        #: annotations are notes *about* a factory, carry no simulation state,
+        #: and live in continuous coordinates rather than cells.
+        self.annotations = AnnotationStore()
+        self.annotation_layer = AnnotationLayer()
+        #: The stroke currently being drawn, or None. Held here rather than in
+        #: the store so an abandoned gesture (Esc, or a tool change) leaves
+        #: nothing behind -- the same reason a ghost preview is not a real
+        #: entity until it commits.
+        self._live_stroke = None
+        #: Live text-box rectangle in world coords while dragging, or None.
+        self._note_box = None
         #: Segments rebuilt this frame, or None if the index was already
         #: current. Shown in the inspection panel.
         self.last_rebuild = None
@@ -118,7 +151,7 @@ class Orchestrator:
         return True
 
     def _enter_erase(self, cut=False):
-        """X / ctrl+X: stash the held tool and start a rectangle erase.
+        """ctrl+D / ctrl+shift+D: stash the tool and start a rectangle erase.
 
         Entered the same way as copy mode and sharing its gesture, since the
         only difference is what the release does -- see core/clipboard.py.
@@ -150,7 +183,8 @@ class Orchestrator:
 
         stamp = None
         if self.clipboard.cutting:
-            stamp = capture(self.engine.board, *rect)
+            stamp = capture(self.engine.board, *rect,
+                            annotations=self.annotations)
 
         x0, y0, x1, y1 = rect
         lo_x, hi_x = (x0, x1) if x0 <= x1 else (x1, x0)
@@ -160,6 +194,17 @@ class Orchestrator:
             for x in range(lo_x, hi_x + 1):
                 if self.engine.board.in_bounds(x, y):
                     erased += int(self.engine.erase(x, y))
+
+        # The rectangle takes annotations too, so `X` is one eraser rather
+        # than two the player has to choose between. Only when the layer is
+        # on: an invisible note must not be deleted by a rectangle drawn over
+        # where it happens to be. The cell rectangle is inclusive of both end
+        # cells, so in world terms it spans [lo, hi+1).
+        if self.annotation_layer.enabled:
+            erased += self.annotations.erase_rect(
+                lo_x, lo_y, hi_x + 1, hi_y + 1)
+            if self.inspected_note() is None:
+                self.inspect_note = None
 
         if stamp:
             # A cut becomes the active stamp and takes us to paste mode, so
@@ -379,7 +424,13 @@ class Orchestrator:
         paste mode, which is what makes copy-then-place one gesture.
         """
         self.select_rect = None
-        stamp = capture(self.engine.board, *rect) if rect else None
+        # Annotations ride along when the layer is on, so copying a labelled
+        # block of a CPU reproduces its labels (see `capture`). Passing the
+        # store only when the layer is enabled keeps a hidden note from
+        # silently joining a stamp.
+        notes = self.annotations if self.annotation_layer.enabled else None
+        stamp = (capture(self.engine.board, *rect, annotations=notes)
+                 if rect else None)
         if stamp is None or not stamp:
             self._end_mode(to_empty=False)
             return None
@@ -433,8 +484,185 @@ class Orchestrator:
         self._on_tool_changed()
         tool.adopt(entity)
 
-    def _inspect_at(self, cursor_cell):
-        """Open the Status window on the entity at `cursor_cell`, or close it.
+    # --- annotations -----------------------------------------------------
+    def _note_tool(self):
+        """The held annotation tool, or None if anything else is in charge.
+
+        **A clipboard mode wins outright.** `_active_tool()` only substitutes
+        the paste tool, because copy and erase mode express themselves through
+        the input manager's own selection branch rather than through a tool --
+        so asking it alone would still report the stashed annotation tool
+        while `X` was running, and the annotation branch (which returns early)
+        would eat the selection drag. The symptom was an erase rectangle
+        drawing a new stroke instead of deleting one.
+        """
+        if self.clipboard.active:
+            return None
+        tool = self._active_tool()
+        return tool if isinstance(tool, ANNOTATION_TOOLS) else None
+
+    def _note_gesture(self, cursor_world=None):
+        """Which annotation gesture the input manager should run.
+
+        A held tool decides first. With an **empty hand**, a cursor over the
+        text box the Status window has open means the move gesture instead --
+        dragging repositions the box rather than panning the camera.
+
+        That is gated on the window being open on *that* box rather than on
+        merely hovering any note, deliberately: a left-drag is the camera pan
+        everywhere else on the board, and silently stealing it wherever a
+        label happens to lie would make panning unreliable near annotations.
+        Having the window open is the player saying which box they are
+        working on.
+        """
+        tool = self._note_tool()
+        if isinstance(tool, DrawAnnotationTool):
+            return NOTE_STROKE
+        if isinstance(tool, TextAnnotationTool):
+            return NOTE_BOX
+        if tool is not None:
+            return NOTE_NONE
+        if (cursor_world is not None
+                and self.annotation_layer.enabled
+                and not self.clipboard.active
+                and self.toolbelt.empty_handed):
+            note = self.inspected_note()
+            # Text boxes only. A stroke has no handle worth grabbing -- its
+            # bbox is mostly empty space, so a drag starting "on" a circled
+            # region would move it from a point nowhere near its ink.
+            if isinstance(note, TextBox) and note.hit_point(*cursor_world):
+                return NOTE_MOVE
+        return NOTE_NONE
+
+    def _note_draw(self, point, tool):
+        """Extend (or start) the stroke being drawn."""
+        if self._live_stroke is None:
+            # Built detached from the store and added on release, so an
+            # abandoned stroke leaves nothing to clean up.
+            from core.annotations import Stroke
+            self._live_stroke = Stroke(None, [point], tool.colour, tool.size)
+            return
+        self._live_stroke.add_point(*point)
+
+    def _note_draw_end(self):
+        """Commit the in-flight stroke, if it has anything in it."""
+        stroke = self._live_stroke
+        self._live_stroke = None
+        if stroke is None or not stroke.points:
+            return None
+        return self.annotations.add(stroke)
+
+    def _note_box_end(self, rect, tool):
+        """Turn a released drag rectangle into a text box, and open it.
+
+        Creating one **selects it and opens the Status window**, because a
+        fresh box is empty: a label the player cannot find is litter, and the
+        window is where the text is typed. That is also why a too-small drag
+        is widened to a minimum rather than rejected -- a click that barely
+        moved still means "put a label here".
+        """
+        x0, y0, x1, y1 = rect
+        lo_x, hi_x = (x0, x1) if x0 <= x1 else (x1, x0)
+        lo_y, hi_y = (y0, y1) if y0 <= y1 else (y1, y0)
+        w = max(MIN_BOX_W, hi_x - lo_x)
+        h = max(MIN_BOX_H, hi_y - lo_y)
+        # The anchor is the box's top-left, and world +Y is up, so the stored
+        # y is the *high* edge (see TextBox.bounds()).
+        box = self.annotations.add_text(lo_x, lo_y + h, w, h, "",
+                                        tool.colour, tool.size)
+        # Opening the window on it is the other half of the gesture.
+        self.inspect_row = None
+        self.inspect_note = box.aid
+        return box
+
+    def _paste_annotations(self, plan):
+        """Add a pasted stamp's annotations to the live store.
+
+        Returns how many were added. Nothing happens for a plan with no
+        stamp -- every builder except a paste -- or when the annotation layer
+        is off, since placing notes the player cannot see would be litter
+        they have no way to find.
+        """
+        if plan is None or plan.stamp is None or plan.paste_origin is None:
+            return 0
+        if not self.annotation_layer.enabled:
+            return 0
+        notes = plan.stamp.place_annotations(*plan.paste_origin)
+        for a in notes:
+            self.annotations.add(a)
+        return len(notes)
+
+    def _move_note(self, aid, dx, dy):
+        """Shift an annotation by a world-space delta.
+
+        Guarded on the annotation still existing, like every other setter
+        here: the drag is driven from the previous frame's state and the box
+        could have been deleted in between (the Status window's own Delete
+        button, say, clicked mid-drag).
+        """
+        if dx == 0.0 and dy == 0.0:
+            return False
+        a = self.annotations.get(aid)
+        if a is None:
+            return False
+        a.translate(dx, dy)
+        self.annotations.revision += 1
+        return True
+
+    def _set_note_text(self, aid, text):
+        """Apply the Status window's text edit.
+
+        Guarded on the annotation still existing, for the same reason
+        `_set_emit` guards the row: a request is built from the previous
+        frame's state and the annotation could have been erased in between.
+        """
+        a = self.annotations.get(aid)
+        if a is None or not isinstance(a, TextBox):
+            return False
+        if a.text == text:
+            return False
+        a.text = text
+        self.annotations.revision += 1
+        return True
+
+    def _set_note_style(self, aid, colour=None, size=None):
+        """Apply a colour or size change from the Status window."""
+        a = self.annotations.get(aid)
+        if a is None:
+            return False
+        changed = False
+        if colour is not None and a.colour != colour:
+            a.colour = int(colour)
+            changed = True
+        if size is not None:
+            attr = "width" if hasattr(a, "width") else "size"
+            if getattr(a, attr) != size:
+                setattr(a, attr, int(size))
+                changed = True
+        if changed:
+            self.annotations.revision += 1
+        return changed
+
+    def _delete_note(self, aid):
+        """The Status window's Delete button."""
+        if self.annotations.remove(aid):
+            if self.inspect_note == aid:
+                self.inspect_note = None
+            return True
+        return False
+
+    def inspected_note(self):
+        """The annotation the Status window has open, or None.
+
+        Looked up per call rather than held, exactly as `inspected()` is: the
+        annotation may have been deleted by a brush stroke or a rectangle
+        erase since the window was opened, and a stale id must close the
+        window rather than resurrect anything.
+        """
+        return self.annotations.get(self.inspect_note)
+
+    def _inspect_at(self, cursor_cell, world=None):
+        """Open the Status window on whatever is at the cursor, or close it.
 
         The empty hand's one gesture. Clicking a structure inspects it;
         clicking bare board closes the window, which makes "click away to
@@ -443,12 +671,33 @@ class Orchestrator:
         Stores the **row** rather than the view, because a view must not
         outlive the frame it was made in -- see `inspect_row`.
 
+        **Annotations are checked first**, when `world` is given, because they
+        are drawn over the board: clicking a label has to reach the label
+        rather than the belt beneath it, or a note sitting on a factory would
+        be uneditable. Only when no annotation is hit does the click fall
+        through to the entity underneath -- so clicking bare board still
+        closes the window, and clicking a machine still inspects it.
+
+        The two selections are mutually exclusive: whichever is found clears
+        the other, so the Status window never has to decide which to show.
+
         Ghosts are skipped for the same reason the pipette skips them: a
         preview ghost can sit under the cursor, and inspecting it would open
         a window on an entity that is about to be despawned. An empty hand
         has no preview of its own, so this only matters on the frame a tool
         was just put down.
         """
+        if world is not None and self.annotation_layer.enabled:
+            # Only when the layer is on: an annotation that is not being
+            # drawn must not be clickable, or an invisible label would eat
+            # clicks meant for the factory.
+            hit = self.annotations.hit(world[0], world[1])
+            if hit is not None:
+                self.inspect_row = None
+                self.inspect_note = hit.aid
+                return
+
+        self.inspect_note = None
         if cursor_cell is None:
             self.inspect_row = None
             return
@@ -553,7 +802,8 @@ class Orchestrator:
     def _quicksave(self):
         """Save, returning (ok, message) for the panel to show."""
         try:
-            path = self.engine.save_board(self._save_path())
+            path = self.engine.save_board(self._save_path(),
+                                          annotations=self.annotations)
         except (persistence.SaveError, OSError) as exc:
             return (False, f"Save failed: {exc}")
         self.last_plan = None
@@ -567,14 +817,21 @@ class Orchestrator:
         if not os.path.exists(path):
             return None if quiet else (False, f"No save at {path}")
         try:
-            n = self.engine.load_board(path)
+            n = self.engine.load_board(path, annotations=self.annotations)
         except (persistence.SaveError, OSError) as exc:
             return (False, f"Load failed: {exc}")
         # The loaded board has nothing to do with the in-flight gesture.
         self.input.cancel()
         self.last_plan = None
         self._reset_tool_state()
-        return (True, f"Loaded {n} entities from {path}")
+        # The window may be open on an annotation the old board owned. The
+        # load re-assigned every id, so the held one is meaningless now.
+        self.inspect_note = None
+        self._live_stroke = None
+        self._note_box = None
+        notes = len(self.annotations)
+        extra = f", {notes} note{'s' if notes != 1 else ''}" if notes else ""
+        return (True, f"Loaded {n} entities{extra} from {path}")
 
     def autoload(self):
         """Quickload at startup if a save exists. Returns (ok, msg) or None."""
@@ -618,6 +875,7 @@ class Orchestrator:
             dt, board,
             drag_based=(tool_now.drag_based if tool_now else False),
             mode=self.clipboard.mode,
+            note=self._note_gesture(self.input.cursor_world_now()),
         )
         self.cursor_cell = intents.cursor_cell
 
@@ -636,6 +894,11 @@ class Orchestrator:
             self.camera.reload_shader()
         if intents.clear_board:
             engine.clear_board()
+            # Delete takes the notes with the factory. They describe a board,
+            # so leaving them over an empty one would be labels pointing at
+            # nothing -- and the player asked for a clean slate.
+            self.annotations.clear()
+            self.inspect_note = None
         if intents.toggle_pause:
             engine.clock.toggle_pause()
         if intents.step_tick:
@@ -643,12 +906,48 @@ class Orchestrator:
         if intents.reset_sim:
             engine.reset_sim()
 
+        # 2b. annotations. Their own gesture, resolved before the toolbelt and
+        # the build path because an annotation tool takes both mouse buttons
+        # and never produces a BuildPlan -- see core/builders.AnnotationTool.
+        note_tool = self._note_tool()
+        if note_tool is not None:
+            if intents.note_draw is not None:
+                self._note_draw(intents.note_draw, note_tool)
+            if intents.note_draw_end:
+                self._note_draw_end()
+            if intents.note_erase is not None:
+                self.annotations.erase_at(*intents.note_erase)
+                # A brush stroke can delete the annotation the window has
+                # open. `inspected_note()` already returns None for a dead id,
+                # so the window closes on its own -- but clearing the id here
+                # keeps the two from disagreeing for a frame.
+                if self.inspected_note() is None:
+                    self.inspect_note = None
+            self._note_box = intents.note_box
+            if intents.note_box_end and intents.note_box is not None:
+                self._note_box_end(intents.note_box, note_tool)
+                self._note_box = None
+            if intents.cancel_plan:
+                # Esc abandons an in-flight stroke without committing it.
+                self._live_stroke = None
+                self._note_box = None
+        else:
+            # Holding anything else drops an in-flight annotation gesture, the
+            # same way switching tools abandons a half-drawn belt run.
+            self._live_stroke = None
+            self._note_box = None
+
+        # Dragging the open text box. Outside the branch above because this
+        # is an **empty-hand** gesture -- there is no tool to be holding.
+        if intents.note_move is not None:
+            self._move_note(self.inspect_note, *intents.note_move)
+
         # 3. toolbelt selection. Changing tools drops any in-flight preview --
         # a half-drawn belt run means nothing to the structure tool.
         #
-        # Tab is handled first, so a digit pressed in the same frame addresses
+        # The row swap is handled first, so a digit pressed in the same frame
         # the row the player just swapped to. It deliberately does **not**
-        # touch the hand or any in-flight gesture: Tab re-aims the number keys
+        # touch the hand or any in-flight gesture: it re-aims the number keys
         # and nothing more, so tabbing mid-belt-run keeps the run.
         if intents.swap_rows:
             self.toolbelt.swap_rows()
@@ -664,7 +963,7 @@ class Orchestrator:
             else:
                 self._pipette(intents.cursor_cell, intents.cursor_in_world)
 
-        # ctrl+C / ctrl+V / X / ctrl+X, and the ways back out. Mutually
+        # ctrl+C / ctrl+V / ctrl+D / ctrl+shift+D, and the ways back out. Mutually
         # exclusive: one key press cannot mean two modes.
         if intents.copy_mode:
             self._enter_copy()
@@ -753,8 +1052,11 @@ class Orchestrator:
             # one gesture the empty hand has, and it is why the state is
             # distinct from "an empty slot is selected" -- see the note on
             # NO_SELECTION in CLAUDE.md.
-            self._inspect_at(intents.cursor_cell if intents.cursor_in_world
-                             else None)
+            # World coords as well as the cell, so a click can reach an
+            # annotation drawn over the board before the entity beneath it.
+            self._inspect_at(
+                intents.cursor_cell if intents.cursor_in_world else None,
+                intents.cursor_world if intents.cursor_in_world else None)
         elif intents.commit_plan:
             # A click-based tool has no PLANNING phase, so on the very first
             # frame the cursor is over the board there may be no preview yet.
@@ -793,6 +1095,11 @@ class Orchestrator:
                 # plan's own pairing goes in first and the engine's
                 # nearest-candidate search only handles what is left.
                 engine.commit_ghosts(engine.planned_under_pairs(plan))
+                # A pasted stamp brings its annotations. After the entities,
+                # so a partial paste that placed nothing still places no
+                # notes -- `buildable` being empty is what `blocked` already
+                # tested, so reaching here means something was built.
+                self._paste_annotations(plan)
                 self.last_plan = None
                 # Tools with multi-step state advance it here -- an
                 # underground alternates entrance/exit -- and only on a
@@ -858,6 +1165,19 @@ class Orchestrator:
             self.ui.last_save = self._quickload()
         if requests.close_status:
             self.inspect_row = None
+            self.inspect_note = None
+        if requests.annotations_on is not None:
+            self.annotation_layer.enabled = bool(requests.annotations_on)
+        if requests.set_note_text is not None:
+            self._set_note_text(*requests.set_note_text)
+        if requests.set_note_style is not None:
+            aid, colour, size = requests.set_note_style
+            self._set_note_style(aid, colour=colour, size=size)
+        if requests.delete_note is not None:
+            self._delete_note(requests.delete_note)
+        if requests.clear_notes:
+            self.annotations.clear()
+            self.inspect_note = None
         if requests.set_emit is not None:
             self._set_emit(*requests.set_emit)
         if requests.set_seed is not None:
@@ -906,6 +1226,22 @@ class Orchestrator:
         self.ui.last_upload = engine.sync_to_device()
         self.camera.render(viewport, engine.clock, engine.belt_device,
                            select_rect=self.select_rect)
+
+        # Annotations last: they are an imgui overlay, so they draw over the
+        # world pass by construction. `draw()` returns immediately when the
+        # layer is disabled -- before touching imgui or the store at all.
+        #
+        # `active` tracks `draw_ui` because both answer "is there an imgui
+        # frame?". A headless harness sets `draw_ui = False` and never calls
+        # `new_frame()`, and reaching for a draw list then takes the process
+        # down natively rather than raising.
+        self.annotation_layer.active = self.draw_ui
+        self.annotation_layer.draw(
+            self.annotations, self.camera, viewport,
+            in_progress=self._live_stroke,
+            drag_rect=self._note_box,
+            selected_id=self.inspect_note,
+        )
 
     def seed_demo(self):
         """A few belts so the board is not empty on first run."""

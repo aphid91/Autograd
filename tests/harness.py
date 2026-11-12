@@ -156,6 +156,21 @@ def reset():
     # what ran before it.
     orch.inspect_row = None
     orch.ui.save_name = ""
+    # Annotations are global state exactly as the board is, and for the same
+    # reasons: a scenario that left a note behind would have the next one's
+    # copy rectangle capture it into a stamp, or its `X` drag report an extra
+    # erase -- both of which look like a bug in whatever is being tested
+    # rather than leakage from a previous scenario. The selected note is
+    # cleared for the reason `inspect_row` is: a dangling id would have the
+    # Status window open on something the next scenario never created.
+    orch.annotations.clear()
+    orch.inspect_note = None
+    orch._live_stroke = None
+    orch._note_box = None
+    # The overlay is on by default in the app, so scenarios inherit that --
+    # a test that disabled it must not silently turn annotations off for
+    # everything after it, since the layer also gates clicking and copying.
+    orch.annotation_layer.enabled = True
     cam.center[:] = (BOARD / 2, BOARD / 2)
     cam.zoom = 16.0
     # The clock is global state like everything else here: a scenario that
@@ -240,6 +255,39 @@ def ctrl_key(key):
     step()
 
 
+def ctrl_shift_key(key):
+    """Tap a key with both ctrl and shift held -- ctrl+shift+D.
+
+    Both modifiers have to be down on the frame the edge lands, which is why
+    this exists rather than nesting `ctrl_key` and `shift_key`.
+    """
+    fake["keys"].add(glfw.KEY_LEFT_CONTROL)
+    fake["keys"].add(glfw.KEY_LEFT_SHIFT)
+    fake["keys"].add(key)
+    step()
+    fake["keys"].discard(key)
+    step()
+    fake["keys"].discard(glfw.KEY_LEFT_SHIFT)
+    fake["keys"].discard(glfw.KEY_LEFT_CONTROL)
+    step()
+
+
+def enter_erase_mode():
+    """The erase-mode chord, as one call.
+
+    Named rather than spelled out at thirty call sites, because the binding
+    has already moved once (bare `X` -> `ctrl+D`, when `X` took the row
+    swap). A scenario cares that it is *in erase mode*, not which keys got
+    it there.
+    """
+    ctrl_key(glfw.KEY_D)
+
+
+def enter_cut_mode():
+    """The cut variant of the erase chord. See `enter_erase_mode()`."""
+    ctrl_shift_key(glfw.KEY_D)
+
+
 def shift_key(key):
     """Tap a key with shift held -- shift+R, shift+F.
 
@@ -277,6 +325,46 @@ def drag_cells(a, b, steps=3):
     step()
 
 
+def install_tool(kind, slot, type_name=None):
+    """Put a tool kind into a slot and select it, as the type menu would.
+
+    Goes through `Orchestrator._set_slot()` -- the same path the panel's
+    right-click menu uses -- rather than assigning the slot directly, so the
+    resolution from a *kind string* to a built tool is exercised too. Needed
+    for the annotation tools in particular: they are deliberately not in the
+    default layout, so a scenario has to put one on the bar before it can
+    hold one.
+
+    Returns the tool now in that slot.
+    """
+    assert orch._set_slot(slot, kind, type_name), (
+        f"could not put {kind!r} in slot {slot}")
+    tool = orch.toolbelt.slots[slot]
+    select_tool(tool.name)
+    return tool
+
+
+def drag_world(a, b, steps=4, button="left"):
+    """Drag between two *world* points, through the real cursor and button.
+
+    The continuous counterpart to `drag_cells()`, for the annotation tools:
+    a stroke is a freehand line in world units and a text box is sized in
+    them, so a cell-granular drag cannot express either. `button="right"`
+    runs the same path for the brush eraser.
+    """
+    key = "left" if button == "left" else "right"
+    put_cursor_at(*a)
+    step()
+    fake[key] = True
+    step()
+    for i in range(1, steps + 1):
+        t = i / steps
+        put_cursor_at(a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t)
+        step()
+    fake[key] = False
+    step()
+
+
 def real_cells_at(y, xs):
     """Cells in row `y` holding a *real* (non-ghost) entity.
 
@@ -303,7 +391,7 @@ def press_key(key, frames=1):
 
 
 def select_tool(name):
-    """Press the keys that select the named tool, Tab included if needed.
+    """Press the keys that select the named tool, the row swap if needed.
 
     By name rather than by digit: the slot order shifts whenever a tool is
     added, and every scenario cares about *which tool*, never which key
@@ -313,19 +401,21 @@ def select_tool(name):
     Goes through the **real keys** rather than calling `Toolbelt.select()`,
     deliberately: a scenario asking for a tool should exercise the same path
     the player uses, so a break in digit mapping or row swapping surfaces
-    here rather than only in the one test that covers it directly.
+    here rather than only in the one test that covers it directly. That is
+    also why the row swap is pressed as `X` rather than called -- the binding
+    moved off Tab, and a scenario needing row 2 should fail if it breaks.
     """
     idx = next(i for i, s in enumerate(orch.toolbelt.slots)
                if s is not None and s.name == name)
     row, col = idx // ROW_SIZE, idx % ROW_SIZE
-    # Tab until the tool's row is the one the digits address. A loop rather
-    # than a single press so this still works if ROW_COUNT ever grows.
+    # Swap rows until the tool's row is the one the digits address. A loop
+    # rather than a single press so this still works if ROW_COUNT ever grows.
     for _ in range(ROW_COUNT):
         if orch.toolbelt.row == row:
             break
-        press_key(glfw.KEY_TAB)
+        press_key(glfw.KEY_X)
     assert orch.toolbelt.row == row, (
-        f"could not tab to row {row} holding {name}")
+        f"could not reach row {row} holding {name}")
     digit = 0 if col == ROW_SIZE - 1 else col + 1
     key = next(k for k, d in _SLOT_DIGITS.items() if d == digit)
     press_key(key)

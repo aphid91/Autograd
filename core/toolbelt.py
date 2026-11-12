@@ -1,6 +1,6 @@
 """Toolbelt: the Factorio-style slot bar. At most one tool is active.
 
-**Two rows of ten.** The number keys address the *active* row and `Tab` swaps
+**Two rows of ten.** The number keys address the *active* row and `X` swaps
 which row that is, so twenty tools are reachable with one modifier-free key
 each. The rows are a view onto one flat `slots` list -- row `r` owns indices
 `r*ROW_SIZE .. (r+1)*ROW_SIZE`, and `selected` is an index into that flat list
@@ -8,7 +8,7 @@ rather than a (row, column) pair. That matters at every call site: a stashed
 slot, a persisted layout and `select_tool_for()`'s answer are all one integer,
 and none of them has to agree with the orchestrator about which row is up.
 
-`Tab` therefore changes which digits reach which tools **without changing what
+`X` therefore changes which digits reach which tools **without changing what
 is held.** Swapping rows mid-gesture would otherwise be a silent tool change.
 
 **The default state is an empty hand**, and it is a real state rather than
@@ -58,12 +58,12 @@ class Toolbelt:
         return self.row * ROW_SIZE
 
     def swap_rows(self):
-        """Tab: make the other row the one the number keys address.
+        """X: make the other row the one the number keys address.
 
         **Holds nothing and drops nothing.** The hand keeps whatever it has,
         even when that tool now sits on the inactive row -- a row swap is a
         change of *addressing*, not of state, and silently clearing the hand
-        (or jumping to the same column in the new row) would make Tab a
+        (or jumping to the same column in the new row) would make the swap a
         destructive key mid-gesture.
         """
         self.row = (self.row + 1) % ROW_COUNT

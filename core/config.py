@@ -132,7 +132,13 @@ def toolbar_from_data(data, slot_count):
         if kind == "stamp":
             stamp = stamp_from_data(item.get("stamp"))
         name = item.get("name")
-        tool = make_builder(kind, type_name=item.get("type"), stamp=stamp)
+        # The annotation tools carry a pen (colour, width/size). Absent for
+        # every other kind, and `make_builder` ignores it there.
+        pen = None
+        if "colour" in item or "size" in item:
+            pen = (item.get("colour", 0), item.get("size", 1))
+        tool = make_builder(kind, type_name=item.get("type"), stamp=stamp,
+                            pen=pen)
         if tool is not None and kind == "stamp" and isinstance(name, str):
             # A baked stamp's name is the only label the player can have
             # chosen, so it is worth carrying back rather than regenerating

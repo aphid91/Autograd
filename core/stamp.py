@@ -128,12 +128,31 @@ def mirror_orientation(entity_cls, direction, flipped):
 
 
 class Stamp:
-    """A group of entities captured together, transformable as one unit."""
+    """A group of entities captured together, transformable as one unit.
 
-    __slots__ = ("entries",)
+    May also carry **annotations** (`core/annotations.py`): a copy rectangle
+    that touches a note's bounding box takes the note along, so copying a
+    labelled block of a CPU reproduces the labels with it. They are held in a
+    separate list rather than as entries because they are a different kind of
+    thing -- continuous world coordinates, no cells, no orientation, no row --
+    and `place()` stays entity-only so every existing caller is unaffected.
 
-    def __init__(self, entries=()):
+    **Annotations do not decide whether a stamp is empty.** `__bool__` and
+    `__len__` still report entities only, so a selection catching nothing but
+    a stray label is "nothing copied" and leaves the player in their tool.
+    Treating a lone annotation as a paste-able stamp would mean a sloppy drag
+    across a note silently replacing what the player had in hand.
+    """
+
+    __slots__ = ("entries", "annotations")
+
+    def __init__(self, entries=(), annotations=()):
         self.entries = list(entries)
+        #: Annotation objects whose coordinates are **relative to the stamp's
+        #: box origin**, in cells -- the same frame the entries' `dx`/`dy` use,
+        #: so `normalise()` and `place()` treat both alike. They carry no id;
+        #: one is assigned when a paste adds them to the live store.
+        self.annotations = list(annotations)
 
     def __len__(self):
         return len(self.entries)
@@ -165,11 +184,19 @@ class Stamp:
         Called after each transform so a stamp's offsets stay non-negative
         and its box is always anchored at the origin. That keeps `place()` a
         plain translation.
+
+        Annotations shift by the same amount, so a label keeps its position
+        relative to the machines it describes. They deliberately do **not**
+        contribute to `bounds()`, so a note hanging outside the entities does
+        not move the box and change where the paste cursor sits -- the box is
+        the factory's, and the notes ride along.
         """
         lo_x, lo_y, _w, _h = self.bounds()
         for e in self.entries:
             e.dx -= lo_x
             e.dy -= lo_y
+        for a in self.annotations:
+            a.translate(-lo_x, -lo_y)
         return self
 
     def centre_offset(self):
@@ -201,7 +228,8 @@ class Stamp:
         new origin.
         """
         turns = 3 if backward else 1
-        out = Stamp([e.copy() for e in self.entries])
+        out = Stamp([e.copy() for e in self.entries],
+                    [a.copy(None) for a in self.annotations])
         for e in out.entries:
             for _ in range(turns):
                 # Rotate every cell the entity covers, CCW to match
@@ -210,6 +238,17 @@ class Stamp:
                 e.direction = cell.rotate_dir(e.direction, cw=False)
                 e.dx = min(px for (px, _py) in pts)
                 e.dy = min(py for (_px, py) in pts)
+        # Annotations turn about the stamp's box, measured *before* the
+        # entries moved -- so from `self`, not `out`. The turn is applied one
+        # quarter at a time because each one swaps the box extent, and the
+        # next quarter has to rotate about the new shape. All annotations
+        # share that box, so the outer loop is the turn and the inner the
+        # annotations.
+        _x, _y, bw, bh = self.bounds()
+        for _ in range(turns):
+            for a in out.annotations:
+                a.rotate_in_box(bw, bh)
+            bw, bh = bh, bw
         return out.normalise()
 
     def mirrored(self):
@@ -221,7 +260,8 @@ class Stamp:
         lower-left corner, so reflecting a 2-wide body about the axis moves
         which of its cells is leftmost.
         """
-        out = Stamp([e.copy() for e in self.entries])
+        out = Stamp([e.copy() for e in self.entries],
+                    [a.copy(None) for a in self.annotations])
         for e in out.entries:
             # Reflect the footprint's cell span, not the bare origin: a
             # w-wide body occupying [dx, dx+w) reflects to (-dx-w, -dx], so
@@ -230,12 +270,33 @@ class Stamp:
             e.dx = -(e.dx + w - 1)
             e.direction, e.flipped = mirror_orientation(
                 e.entity_cls, e.direction, e.flipped)
+        # Reflected about the same axis the entries were, so a label stays
+        # over its machines. Text itself is never mirrored -- see
+        # TextBox.mirror_in_box().
+        _x, _y, bw, _bh = self.bounds()
+        for a in out.annotations:
+            a.mirror_in_box(bw)
         return out.normalise()
 
     # --- placement -------------------------------------------------------
     def place(self, ox, oy):
         """[(entry, origin_x, origin_y)] for a paste with the box at (ox, oy)."""
         return [(e, ox + e.dx, oy + e.dy) for e in self.entries]
+
+    def place_annotations(self, ox, oy):
+        """Fresh annotation objects translated to a paste at (ox, oy).
+
+        Copies, so the stamp's own annotations are never handed to the live
+        store -- pasting twice must give two independent labels, and a later
+        edit to one must not change the stamp it came from. Ids are left for
+        `AnnotationStore.add()` to assign.
+        """
+        out = []
+        for a in self.annotations:
+            c = a.copy(None)
+            c.translate(ox, oy)
+            out.append(c)
+        return out
 
     def origin_for_cursor(self, cx, cy):
         """Box origin for a paste centred on the cursor cell."""

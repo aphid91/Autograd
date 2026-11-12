@@ -3,6 +3,7 @@
 from imgui_bundle import imgui
 
 from core import cell, persistence
+from core.annotations import TextBox
 from core.belts import UNIT
 from core.entity import Belt, Source
 from ui.input_manager import STATE_NAMES
@@ -18,7 +19,9 @@ class UIRequests:
                  "toggle_pause", "step_tick", "tick_rate",
                  "segment_debug", "rebuild_segments", "audit_segments",
                  "debug_feed", "clear_items", "close_status",
-                 "set_emit", "set_seed", "set_slot", "swap_rows")
+                 "set_emit", "set_seed", "set_slot", "swap_rows",
+                 "annotations_on", "set_note_text", "set_note_style",
+                 "delete_note", "clear_notes")
 
     def __init__(self):
         self.reload_shader = False
@@ -65,8 +68,22 @@ class UIRequests:
         #: lets the "stamp" kind reach for the live clipboard, something the
         #: panel has no business doing.
         self.set_slot = None
-        #: Tab's equivalent as a button: swap which row the digits address.
+        #: X's equivalent as a button: swap which row the digits address.
         self.swap_rows = False
+        #: New state for the annotation overlay, or None for no change.
+        #: `False` and `None` are different requests, hence not a plain bool.
+        self.annotations_on = None
+        #: `(aid, text)` from the Status window's text field, or None. An id
+        #: rather than the annotation itself, for the same reason `set_emit`
+        #: carries a row: the panel never mutates, and an object held across
+        #: the request boundary could have been deleted in between.
+        self.set_note_text = None
+        #: `(aid, colour_or_None, size_or_None)` for a style change, or None.
+        self.set_note_style = None
+        #: Annotation id to delete, or None. The Status window's Delete.
+        self.delete_note = None
+        #: True when the panel's "Clear all notes" button was pressed.
+        self.clear_notes = False
 
 
 class UI:
@@ -399,7 +416,7 @@ class UI:
         if imgui.begin("##toolbelt", None, flags):
             # The active row is drawn **on top**, so "the row the number keys
             # address" is always the one nearest the status line and the
-            # board. Tab therefore visibly exchanges the two rows rather than
+            # board. X therefore visibly exchanges the two rows rather than
             # just moving a highlight, which is what the key is named for.
             for r in (belt.row, (belt.row + 1) % ROW_COUNT):
                 active_row = (r == belt.row)
@@ -441,7 +458,7 @@ class UI:
                     if imgui.button(f"{digit}\n{label}##slot{i}",
                                     imgui.ImVec2(slot, slot)):
                         # A clicked button knows its own flat index, so it
-                        # selects across rows without needing Tab first.
+                        # selects across rows without needing the swap first.
                         req.select_slot = i
                     imgui.pop_style_color(2)
 
@@ -489,13 +506,110 @@ class UI:
             # Tab's equivalent, plus the hint that right-click customises a
             # slot -- neither is discoverable from the bar alone.
             imgui.same_line()
-            if imgui.small_button(f"Tab: row {belt.row + 1}"):
+            if imgui.small_button(f"X: row {belt.row + 1}"):
                 req.swap_rows = True
             imgui.same_line()
             imgui.text_disabled("  (right-click a slot to change it)")
         imgui.end()
         if tinted:
             imgui.pop_style_color()
+
+    # --- annotation status ----------------------------------------------
+    def draw_note_status(self, orch, req):
+        """Edit the selected annotation: its text, its style, or delete it.
+
+        Reached two ways, and they are the same window on purpose: creating a
+        text box opens it (so the empty box can be typed into immediately),
+        and clicking an existing annotation with an empty hand reopens it.
+
+        Like every other panel here it only **requests** -- the orchestrator
+        owns the store. Note the text field is the one place in this file
+        where imgui reports a change per keystroke and that is exactly what
+        is wanted: a label should update as it is typed, and unlike a seed or
+        an emit value there is nothing expensive behind it.
+        """
+        from core.annotations import PALETTE, STROKE_WIDTHS, TEXT_SIZES
+
+        note = orch.inspected_note()
+        if note is None:
+            # Deleted while the window was open -- by a brush stroke, a
+            # rectangle erase, or a board load. Same resolution as a dead
+            # entity row: close rather than guess.
+            req.close_status = True
+            return
+
+        expanded, keep_open = imgui.begin("Status", True)
+        if not keep_open:
+            req.close_status = True
+        if not expanded:
+            imgui.end()
+            return
+
+        is_text = isinstance(note, TextBox)
+        x0, y0, x1, y1 = note.bounds()
+        imgui.text(f"{'Text note' if is_text else 'Drawn note'}  #{note.aid}")
+        imgui.text(f"at ({x0:.1f}, {y0:.1f})  "
+                   f"{x1 - x0:.1f} x {y1 - y0:.1f} cells")
+        if not is_text:
+            imgui.text(f"{len(note.points)} points")
+
+        if not orch.annotation_layer.enabled:
+            imgui.push_style_color(imgui.Col_.text, imgui.ImVec4(1, .8, .3, 1))
+            imgui.text_wrapped("Notes are hidden -- tick Show notes to see "
+                               "this one.")
+            imgui.pop_style_color()
+
+        imgui.separator()
+        if is_text:
+            imgui.text_unformatted("Text")
+            imgui.set_next_item_width(260)
+            # multiline would be nicer for a paragraph, but a label is a
+            # label: one line keeps the box and the text agreeing about how
+            # much room they need.
+            changed, value = imgui.input_text("##note_text", note.text)
+            if changed:
+                req.set_note_text = (note.aid, value)
+            imgui.text_disabled("shown on the board at this box")
+
+        # --- style ---
+        imgui.separator()
+        imgui.text_unformatted("Colour")
+        # Swatches rather than a picker: the palette is fixed (see
+        # core/annotations.PALETTE) so a readable diagram stays readable.
+        for i, (cname, rgb) in enumerate(PALETTE):
+            if i:
+                imgui.same_line()
+            imgui.push_style_color(imgui.Col_.button, imgui.ImVec4(*rgb, 1.0))
+            imgui.push_style_color(imgui.Col_.button_hovered,
+                                   imgui.ImVec4(*rgb, 0.8))
+            imgui.push_style_color(imgui.Col_.button_active,
+                                   imgui.ImVec4(*rgb, 1.0))
+            mark = "*" if i == note.colour else " "
+            if imgui.button(f"{mark}##notecol{i}", imgui.ImVec2(26, 22)):
+                req.set_note_style = (note.aid, i, None)
+            imgui.pop_style_color(3)
+            if imgui.is_item_hovered():
+                imgui.set_tooltip(cname)
+
+        imgui.separator()
+        sizes = TEXT_SIZES if is_text else STROKE_WIDTHS
+        current = note.size if is_text else note.width
+        imgui.text_unformatted("Size" if is_text else "Width")
+        for i in range(len(sizes)):
+            if i:
+                imgui.same_line()
+            label = f"{i + 1}{'*' if i == current else ''}##notesize{i}"
+            if imgui.button(label, imgui.ImVec2(32, 22)):
+                req.set_note_style = (note.aid, None, i)
+
+        imgui.separator()
+        imgui.push_style_color(imgui.Col_.button, imgui.ImVec4(.5, .15, .15, 1))
+        imgui.push_style_color(imgui.Col_.button_hovered,
+                               imgui.ImVec4(.65, .2, .2, 1))
+        if imgui.button("Delete note"):
+            req.delete_note = note.aid
+        imgui.pop_style_color(2)
+        imgui.end()
 
     # --- status window --------------------------------------------------
     def draw_status(self, orch, req):
@@ -512,6 +626,14 @@ class UI:
         which is otherwise only visible in the segment inspector. A Source is
         the one type with a setting so far.
         """
+        # An annotation takes the window when one is selected. The two are
+        # mutually exclusive (see Orchestrator._inspect_at), so this is a
+        # branch rather than a merge, and the annotation case is checked first
+        # because it is the one the player just created.
+        if orch.inspect_note is not None:
+            self.draw_note_status(orch, req)
+            return
+
         entity = orch.inspected()
         if entity is None:
             # The row died -- erased, or overwritten -- while the window was
@@ -601,7 +723,7 @@ class UI:
         self.draw_toolbelt(orch, req)
         if self.show_segments:
             self.draw_segment_inspector(orch, req)
-        if orch.inspect_row is not None:
+        if orch.inspect_row is not None or orch.inspect_note is not None:
             self.draw_status(orch, req)
 
         imgui.begin("Gates")
@@ -658,6 +780,26 @@ class UI:
                 imgui.text("       placement blocked")
                 imgui.pop_style_color()
         imgui.text(f"Ghost rows: {len(engine.ghost_rows)}")
+
+        imgui.separator()
+        imgui.text_unformatted("Notes")
+        layer = orch.annotation_layer
+        changed, on = imgui.checkbox("Show notes", layer.enabled)
+        if changed:
+            req.annotations_on = on
+        if layer.enabled:
+            imgui.text(f"{len(orch.annotations)} on the board"
+                       f"   ({layer.drawn} drawn)")
+            if imgui.button("Clear all notes"):
+                req.clear_notes = True
+            imgui.text_disabled("right-click a slot to add a note tool")
+        else:
+            # Said explicitly, because a disabled layer also stops notes
+            # being clickable, copied and rectangle-erased -- so a player who
+            # has forgotten the checkbox would otherwise think they had lost
+            # their annotations.
+            imgui.text_disabled(f"{len(orch.annotations)} hidden"
+                                "  (not drawn, clickable or copied)")
 
         imgui.separator()
         imgui.text_unformatted("Camera")
@@ -739,12 +881,12 @@ class UI:
         imgui.text_unformatted("Controls")
         imgui.text("WASD pan    scroll: zoom    shift+F frame")
         imgui.text("Left-drag: pan the camera")
-        imgui.text("1-9,0: select tool")
+        imgui.text("1-9,0: select tool    X: swap toolbar row")
         imgui.text("Q: pick up what's under the cursor / empty the hand")
         imgui.text("ctrl+C: copy (drag a box)   ctrl+V: paste")
         imgui.text("  paste: click places, shift+click places what fits")
         imgui.text("  shift+scroll: older/newer copy")
-        imgui.text("X: erase mode (drag a box)   ctrl+X: cut")
+        imgui.text("ctrl+D: erase mode (drag a box)   ctrl+shift+D: cut")
         imgui.text("Left-click: build with the active tool")
         imgui.text("R / shift+R: per-tool (belt shape, structure rotation)")
         imgui.text("Right-click: cancel plan / drag to erase")

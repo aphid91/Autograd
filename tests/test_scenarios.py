@@ -239,16 +239,16 @@ def test_toolbelt_selection():
     assert orch.toolbelt.row == 0, orch.toolbelt.row
     ok(f"key 0 selected column 10 of row 1 ({tenth.name})")
 
-    # Row 2 is reachable only through Tab, and reaching it must not disturb
+    # Row 2 is reachable only through the row swap, and reaching it must not disturb
     # what the other row holds. Swap and Sink live there in the default
-    # layout, which is the case that would silently fail if Tab were broken:
+    # layout, which is the case that would silently fail if the swap broke:
     # `select_tool` would land on row 1's tool of the same column.
     row2 = [s for s in orch.toolbelt.slots[ROW_SIZE:] if s is not None]
     assert row2, "the default layout should put tools on row 2"
     select_tool(row2[0].name)
     assert orch.toolbelt.row == 1, orch.toolbelt.row
     assert orch.toolbelt.selected >= ROW_SIZE, orch.toolbelt.selected
-    ok(f"Tab reached row 2 and a digit selected {row2[0].name}")
+    ok(f"X reached row 2 and a digit selected {row2[0].name}")
 
     # Key 0 has to respect the row like every other digit -- see
     # `_DIGIT_0_KEY`. Checked on row 2, where "column 10 of the active row"
@@ -260,13 +260,13 @@ def test_toolbelt_selection():
         f"last slot of row 2")
     ok("key 0 addressed the active row like the other digits")
 
-    # And Tab is purely an addressing change: it must not alter the hand.
+    # And the swap is purely an addressing change: it must not alter the hand.
     held = orch.toolbelt.selected
-    press_key(glfw.KEY_TAB)
-    assert orch.toolbelt.row == 0, "Tab should have swapped back"
+    press_key(glfw.KEY_X)
+    assert orch.toolbelt.row == 0, "X should have swapped back"
     assert orch.toolbelt.selected == held, (
-        f"Tab changed the held slot from {held} to {orch.toolbelt.selected}")
-    ok("Tab re-aimed the digits without changing what was held")
+        f"the row swap changed the held slot from {held} to {orch.toolbelt.selected}")
+    ok("X re-aimed the digits without changing what was held")
 
     select_tool("Belt")
     assert orch.toolbelt.active.name == "Belt"

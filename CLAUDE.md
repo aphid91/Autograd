@@ -52,6 +52,7 @@ There is no pytest/linter configured.
 | [tests/test_clipboard.py](tests/test_clipboard.py) | the copy/paste/erase mode machine, and matched-stamp substitution, driven through the fake mouse and keyboard |
 | [tests/test_inspect.py](tests/test_inspect.py) | the Status window, the per-Source emit value, the per-belt seed, the save filename box, the persisted toolbar |
 | [tests/test_turn.py](tests/test_turn.py) | the empty hand's R/F: the footprint invariant, the settings that must survive an in-place turn, the underground reversal, and ctrl+R's restart |
+| [tests/test_annotations.py](tests/test_annotations.py) | the note overlay: the draw/erase gestures, the text-box flow, what the Show-notes flag gates, and how notes travel through copy, paste and saves |
 
 **Scenarios are independent.** `harness.reset()` clears the board, camera,
 input state and toolbelt before each one, so a failure names the scenario
@@ -86,10 +87,16 @@ left-over active row would have every digit land on the wrong tool. Restoring
 the defaults is also what keeps the harness independent of the player's
 persisted bar: it never loads one, and now it cannot acquire one either.
 
-`select_tool()` **tabs to reach row 2** and goes through the real keys rather
-than calling `Toolbelt.select()`, so a break in the digit map or the row swap
-surfaces in whichever scenario asked for a row-2 tool rather than only in the
-one test that covers rows directly.
+`select_tool()` **presses the row swap to reach row 2** and goes through the
+real keys rather than calling `Toolbelt.select()`, so a break in the digit map
+or the row swap surfaces in whichever scenario asked for a row-2 tool rather
+than only in the one test that covers rows directly.
+
+Modes that are reached by a **chord** get a named helper —
+`enter_erase_mode()` / `enter_cut_mode()` rather than
+`ctrl_key(glfw.KEY_D)` spelled out at thirty call sites. That binding has
+already moved once (bare `X` → `ctrl+D`, when `X` took the row swap), and a
+scenario cares that it is *in erase mode*, not which keys got it there.
 
 **Beware exact float multiples when asserting tick counts.** `0.3 // 0.1` is
 2, not 3, so a single `advance()` spanning several periods runs an unreliable
@@ -114,12 +121,12 @@ surfaced as one shuffle seed in twelve failing a pixel test.
 | `F` | **per-tool**: flip (mirror) the held structure; with an **empty hand**, mirror what is under the cursor |
 | `shift+F` | frame the whole board |
 | `1`-`9`, `0` | select a slot in the **active** toolbelt row |
-| `Tab` | swap which toolbelt row the number keys address |
+| `X` | swap which toolbelt row the number keys address |
 | Right-click a slot | the **type menu**: put any tool in that slot |
 | `ctrl+C` | copy mode — left-drag a selection box |
 | `ctrl+V` | paste mode, if anything has been copied |
-| `X` | erase mode — left-drag a box to delete what it touched |
-| `ctrl+X` | cut: the same box, captured as a stamp, then straight to paste |
+| `ctrl+D` | erase mode — left-drag a box to delete what it touched (annotations included, by bounding box) |
+| `ctrl+shift+D` | cut: the same box, captured as a stamp, then straight to paste |
 | shift+scroll | **paste mode**: walk the copy history (older / newer) |
 | Left-click | build with the active tool (fires on **release**); with an **empty hand**, inspect what is there |
 | `R` / `shift+R` | **per-tool**: belt path shape, or structure rotation; with an **empty hand**, turn what is under the cursor |
@@ -130,6 +137,11 @@ surfaced as one shuffle seed in twelve failing a pixel test.
 | `Space` | pause / resume the simulation |
 | `.` | run exactly one tick (works while paused) |
 | `ctrl+R` | restart the simulation: tick back to 0, every item discarded |
+
+With a **note tool** held (see "Annotations"), left-drag draws or sizes a
+text box and right-drag is the brush eraser, so neither the camera pan nor
+the board erase is available — pan with `WASD` and scroll. `R` walks the
+width/size, `F` the colour.
 
 `R` and `F` deliberately mean different things in different tools — the input
 manager reports only that they were pressed and the active builder decides.
@@ -320,8 +332,10 @@ stated rather than discovered.
 ### Two rows, and a customisable bar
 
 The toolbelt is **two rows of ten**. The number keys address the *active* row
-and `Tab` swaps which one that is, so twenty tools are each one modifier-free
-key away.
+and `X` swaps which one that is, so twenty tools are each one modifier-free
+key away. `X` took the bare key from erase mode (now `ctrl+D`) because
+re-aiming the digits is much the more frequent action — the same trade that
+sent frame-the-board to `shift+F`.
 
 **The rows are a view onto one flat list.** Row `r` owns indices
 `r*ROW_SIZE .. (r+1)*ROW_SIZE`, and `selected` is an index into that flat
@@ -330,10 +344,10 @@ stashed slot, a persisted layout and `select_tool_for()`'s answer are all one
 integer, and none of them has to agree with the orchestrator about which row
 is up.
 
-**`Tab` changes addressing, not state.** The hand keeps whatever it holds,
+**The row swap changes addressing, not state.** The hand keeps whatever it holds,
 even when that tool is now on the inactive row, and any in-flight gesture
 survives. Clearing the hand (or jumping to the same column in the new row)
-would make `Tab` destructive mid-belt-run. The panel draws the active row on
+would make it destructive mid-belt-run. The panel draws the active row on
 *top* so the swap is visible as an exchange rather than a moved highlight,
 and dims the inactive row's digits since they are not live.
 
@@ -341,7 +355,7 @@ and dims the inactive row's digits since they are not live.
 reports which digit was pressed and `Orchestrator._select_column()` adds the
 active row's offset — the same division of labour that has input report `R`
 rather than what `R` means. A panel button already knows its own row, so it
-selects across rows without needing `Tab` first. Key `0` is the one digit
+selects across rows without needing the swap first. Key `0` is the one digit
 with its own branch in that map (it means column 9), which makes it the one
 that can quietly keep addressing row 1 while 1–9 follow the swap; tested
 separately for exactly that reason.
@@ -469,7 +483,7 @@ with nothing to paste.
 
 #### Erase mode is copy's gesture with a different consequence
 
-`X` enters it and it reuses the whole selection machine — arming, the
+`ctrl+D` enters it and it reuses the whole selection machine — arming, the
 threshold promotion, the live rectangle, the aborts — because only the
 *release* differs. Two differences, both load-bearing:
 
@@ -477,7 +491,7 @@ threshold promotion, the live rectangle, the aborts — because only the
   rectangle over and leaves; erasing is a stroke you repeat, so the rectangle
   is not a commitment that ends the mode. Sharing the gesture machine makes
   it cheap to accidentally share the exit too, hence a test for exactly this.
-- **`ctrl+X` is a cut**: the same rectangle, captured *before* the entities
+- **`ctrl+shift+D` is a cut**: the same rectangle, captured *before* the entities
   are deleted, then straight to paste mode holding it. The stash survives the
   whole chain (`_stash()` refuses to overwrite), so cut → paste → `Esc` gives
   back the tool you held before the cut — same property as `ctrl+C` →
@@ -549,6 +563,13 @@ up the whole screen. Pinned by framebuffer-readback tests in
 [tests/test_item_render.py](tests/test_item_render.py), the only place that
 can tell a drawn rectangle from an undrawn one.
 
+`harness.reset()` also clears the **annotation store**, the selected note and
+any in-flight stroke, for the same class of reason: a note left behind would
+have the next scenario's copy rectangle capture it into a stamp or its `X`
+drag report an extra erase, both of which look like a bug in whatever is
+under test. It restores `Show notes` to on, since that flag gates clicking
+and copying as well as drawing.
+
 `harness.reset()` clears the mode, the stash and the history. Without it a
 scenario that left paste mode on would hand the next one a different gesture
 machine, and a leftover stamp would make a paste test pass for the wrong
@@ -562,6 +583,15 @@ the save tests somewhere unexpected.
 Clicking the board with an empty hand opens **Status** on whatever entity is
 there; clicking bare board closes it. That is the whole interaction, and the
 click-away dismissal is why bare board is not simply ignored.
+
+**An annotation under the cursor wins the click**, because notes draw over
+the board — a label sitting on a factory has to be reachable or it could
+never be edited. Only when no note is hit does the click fall through to the
+entity beneath, so bare board still closes the window. The window itself
+branches on `inspect_note` vs `inspect_row`, never both.
+
+With a text box open, a **drag** inside it moves the box rather than panning
+— see "Dragging the open text box".
 
 The orchestrator holds `inspect_row` — a **row, not a view**. Views must never
 outlive the frame they were made in, since a row can be freed and handed to an
@@ -703,6 +733,212 @@ through a save, for the same reasons the emit value does; `Placement.seed`
 defaults to `None` so a freshly drawn run does not inherit a copied seed —
 which would otherwise have every later belt quietly injecting items.
 
+### Annotations: notes on the board
+
+A telestrator layer for labelling a factory — freehand strokes and text
+boxes, drawn over the world. [core/annotations.py](core/annotations.py) holds
+the model, [ui/annotation_layer.py](ui/annotation_layer.py) draws it, and the
+two tools live in `builders.BUILDER_KINDS` alongside the real ones.
+
+**They are not entities, and could not be.** Three independent reasons, each
+fatal on its own:
+
+- **Sub-cell and overlapping.** A circle round a region crosses forty cells
+  and two notes routinely want the same one; a grid cell holds exactly one
+  entity id in `.x`. Same wall frustration hit, which is why that is an
+  overlay in `.z`.
+- **They carry data no row can hold** — a colour, a thickness, a string.
+  `ENTITY_STRIDE` is sized by the gate block and widening it invalidates
+  every save (see "A belt cell can seed its run", which paid exactly that).
+- **Continuous coordinates.** A stroke point is a world position, so snapping
+  to the lattice would make a circle a staircase.
+
+So they are a side table with stable integer ids, and **nothing in
+`core/cell.py` or `core/entity.py` changed to add them**.
+
+**Ids are handles, not indices.** Deleting one never renumbers the others and
+an id is never reused, which is what makes it safe for the Status window to
+hold one across frames — the same hazard `inspect_row` documents, with the
+same resolution: a stale id reads as `None` rather than as somebody else's
+note. Hence `inspect_note` beside `inspect_row`, at most one set, rather than
+one field trying to mean both.
+
+#### Why imgui, and not the world shader
+
+Annotations are mostly *labels*, and the shader's text is a 6×8 bitfield
+font: blocky by design, uppercase-only — a fine machine readout and poor
+prose. imgui already has a proportional font with kerning and lowercase.
+
+What made it viable is that imgui-bundle 1.92 bakes glyphs **dynamically per
+size**. Measured in this venv: 1000 labels at 1000 *distinct* sizes cost the
+same as 1000 at one size (~0.5 ms), and a 120-frame continuous zoom sweep
+with 300 labels ran at 0.18 ms mean / 0.47 ms worst. Sizing text by zoom —
+the thing a world-space label needs — is therefore free. An older imgui,
+which baked one atlas font per size, would have thrashed the atlas every
+frame and made this unusable.
+
+Two costs, accepted:
+
+- **They draw over everything.** imgui renders after the world pass, so a
+  note cannot be occluded or sit under an item disc. Correct layering for a
+  telestrator mark anyway.
+- **The framebuffer-readback tests cannot see them.** They are tested
+  through the model and the projection instead, which is a weaker *visual*
+  guarantee and a stronger *semantic* one: a test asserts the exact string,
+  not a glyph-shape match.
+
+#### `active` is not `enabled`
+
+Two flags, and collapsing them breaks one case or the other:
+
+- **`enabled`** is the player's Show-notes checkbox, and `draw()` returns on
+  it before any imgui call, store iteration or projection — so an unchecked
+  box costs one bool test, the same guarantee the segment inspector's window
+  guard gives. Pinned by handing `draw()` a camera whose `world_to_screen`
+  raises.
+- **`active`** is "is there an imgui frame at all", tracked from
+  `Orchestrator.draw_ui`. The headless harness builds a real Orchestrator
+  with no imgui backend and never calls `new_frame()`, and
+  `imgui.get_foreground_draw_list()` outside a frame **takes the process down
+  natively** — no exception, no traceback, a silent exit 0 that reads exactly
+  like "no tests matched". It deliberately does not gate the *model*, so
+  every annotation behaviour except the pixels is testable headlessly.
+
+#### Hiding is not just visual
+
+`enabled` also gates clicking, copying and rectangle-erasing. An invisible
+note that still ate clicks or joined stamps would be worse than one that is
+simply off, so the panel says so explicitly when the box is unticked — a
+player who has forgotten it would otherwise think the notes were lost.
+
+#### Two eraser rules, deliberately different
+
+- **The brush** (right-drag on the draw tool) tests real distance to the
+  ink. A bbox test would delete a circle for passing near its empty middle.
+- **The `X` rectangle** tests the **bounding box**, for every type. Circling
+  a whole ALU therefore gives a large mostly-empty square that a rectangle
+  clipping any corner of will take. That is the chosen trade: one rule
+  stated once beats a per-type rule learned by surprise, and for a short
+  underline or a label the box *is* the ink.
+
+A test pins each, because a suite exercising only one would miss the other's
+rule entirely.
+
+#### Dragging the open text box
+
+With the Status window open on a text box and an **empty hand**, a left-drag
+starting inside that box moves it instead of panning the camera. Not a tool
+gesture — the hand is empty — so it is a third `note` kind (`NOTE_MOVE`)
+rather than a third annotation tool.
+
+Four decisions, each of which had an obvious wrong alternative:
+
+- **Having the window open is what claims the gesture**, not merely hovering
+  a note. Left-drag is the camera pan everywhere else, and stealing it
+  wherever a label happens to lie would make panning unreliable across an
+  annotated board. Opening the window is the player naming the box they are
+  working on.
+- **Text boxes only.** A stroke's bbox is mostly empty space, so a drag
+  starting "on" a circled region would grab it from a point nowhere near its
+  ink.
+- **It goes through `STATE_ARMED`**, because a press over the box is
+  ambiguous in exactly the way a press anywhere else is: click or drag. Only
+  past `DRAG_THRESHOLD_PX` does it become a move, so a plain click still
+  selects and a click on bare board still dismisses.
+- **The move is a delta, anchored at the press.** A delta so the box keeps
+  its grab offset rather than teleporting its origin under the cursor; and
+  anchored at the *press* rather than at the threshold crossing, so the
+  frames spent crossing the threshold are part of the drag. Anchoring at the
+  crossing left the box lagging the pointer by the threshold on every grab —
+  the test asserts the delta is exact to 1e-6 for precisely that reason.
+
+**The claim has to be latched, not re-derived per frame.** This is the
+subtle one and it was a live bug. `note` comes from the orchestrator asking
+"is the cursor over the open box?", and a drag falsifies that within a frame
+or two — the pointer outruns the box. Re-deriving it each frame handed the
+half-armed gesture back to the generic machine, which promoted it to a camera
+pan, and **the box never moved at all**. So `_note_moving` is set by the
+press that claims the gesture and cleared on release, and the branch runs on
+the flag. `InputManager.cancel()` clears it too, or a cancel mid-drag would
+leave the next left-press anywhere on the board dragging the open box.
+
+`cursor_world_now()` exists because the orchestrator must decide *which
+gesture to poll* before `poll()` has published `cursor_world` — and last
+frame's position misjudges the frame a press lands on, which is the only
+frame that matters for arming.
+
+#### Notes travel with a stamp, and text stays upright
+
+A copy rectangle touching a note's bbox takes the note
+(`capture(..., annotations=...)`), so copying a labelled block reproduces its
+labels. They ride in `Stamp.annotations`, separate from `entries` because
+they are a different kind of thing — no cells, no orientation, no row — which
+is what leaves `place()` entity-only and every existing caller unaffected.
+
+Three rules, each load-bearing:
+
+- **A note alone does not make a stamp.** `Stamp.__bool__` still counts
+  entities only, so a sloppy drag across a stray label reads as an empty
+  selection and leaves the player in their tool rather than in a paste mode.
+- **Notes do not contribute to `bounds()`.** A label hanging outside the
+  machines must not move the box and change where the paste cursor sits.
+  They shift with `normalise()` regardless, so a label keeps its position
+  relative to what it describes.
+- **Position transforms; glyphs never do.** A rotated stamp moves its labels
+  with their machines and leaves the text readable — the same rule the
+  Source emit label already follows ("The label does not rotate with the
+  facing"). Mirrored text is simply broken, so the mirror reflects position
+  only. The observable form is that a turn must not swap a text box's `w`/`h`
+  — and four quarter turns must be the identity, which is what separates a
+  real rotation from a drift that compounds.
+
+#### They ship inside the save
+
+Not a sidecar: a note is about a particular factory, so loading a different
+board must bring that board's notes and leave none of the previous one's
+floating over it. One file also means a save cannot be separated from its
+annotations by being moved.
+
+Stored as a **JSON string in a 0-d array** rather than more numpy — the other
+arrays are bulk numeric data `.npz` is right for, while this is a handful of
+short records with strings in them.
+
+**No `FORMAT_VERSION` bump.** The key is absent from the load's `missing`
+check, so every save written before this loads as having no notes — which is
+every save in existence. The load clears the store *before* reading, which is
+what makes that case correct rather than leaving the outgoing board's notes
+over the incoming one. A corrupt blob costs the notes and keeps the factory,
+since the factory is the irreplaceable half.
+
+#### The tools are not builders
+
+`AnnotationTool` is deliberately outside the `EntityBuilder` hierarchy rather
+than a subclass with stubbed methods: it never produces a `BuildPlan`, never
+touches the grid, and never spawns a row. It implements only the small
+protocol the toolbelt and panel actually use. `entity_cls` is `None`, which
+is what keeps `Q` from ever resolving a board type onto one.
+
+`R` walks the width/size and **`F` walks the palette** — `F` means "mirror"
+on every other tool, which a note has no notion of, so rather than leave the
+key dead on the two tools whose whole job is choosing a pen it picks the
+colour. The pen persists with the slot, like a baked stamp's stamp.
+
+Neither is in the default layout; right-click a slot to add one.
+
+**A clipboard mode wins outright over an annotation tool.**
+`_note_tool()` checks `clipboard.active` before `_active_tool()`, because
+that accessor only substitutes the *paste* tool — copy and erase mode express
+themselves through the input manager's selection branch instead. Asking
+`_active_tool()` alone still reported the stashed annotation tool while `X`
+was running, and the annotation branch (which returns early) ate the
+selection drag: the symptom was an erase rectangle *drawing a new stroke*
+instead of deleting one.
+
+**Both mouse buttons are spoken for**, so the branch returns early and
+suppresses the camera's left-drag pan and the board's right-drag erase —
+exactly as copy and erase mode already do. Panning stays on WASD and
+scroll-zoom.
+
 ### Persistent UI preferences
 
 [core/config.py](core/config.py) holds a flat JSON file of panel state that
@@ -777,6 +1013,8 @@ everything else is grouped by layer.
 | [core/font.py](core/font.py) | the 6×8 bitfield font, and the reference number formatter |
 | [core/persistence.py](core/persistence.py) | save/load the board to a single `.npz` (`.w` zeroed — derived) |
 | [core/config.py](core/config.py) | persistent panel preferences (quicksave filename, toolbar layout), loaded only by `app.py` |
+| [core/annotations.py](core/annotations.py) | strokes and text labels: the side table, its ids, and the hit rules |
+| [ui/annotation_layer.py](ui/annotation_layer.py) | draws annotations through imgui's draw lists; the only place they become pixels |
 | [core/toolbelt.py](core/toolbelt.py) | two rows of ten slots, one active tool, one active row |
 | [core/tick.py](core/tick.py) | the simulation clock: tick counter, fixed timestep, phase order |
 | [core/segments.py](core/segments.py) | belt runs coalesced into the O(1) simulation unit; derived from the grid |
@@ -1540,6 +1778,22 @@ segment, indexed by segment id) plus a flat item arena carved by prefix sum
 over `cap`. Not one packed struct — std430 alignment for mixed-type structs
 is a reliable source of silent corruption. Bindings 1/2/3, pinned against
 `render/camera.py` by a test.
+
+**The scan's `reach` is gated on the labels being drawn.** A number may spill
+past the disc rim, so when labels are visible the scan has to reach half the
+widest string the formatter can produce — about 2 cells, against
+`ITEM_RADIUS`'s 0.22. Paying that unconditionally widened the bisect bracket
+and ran the `ITEM_SCAN` loop far more often than needed at *every* zoom,
+including the whole range below ~18 px/cell where `text_opacity()` has
+already faded the labels to nothing — which is precisely where the most items
+are on screen. Gated, the hidden-label case is **3.5× narrower**.
+
+`text_opacity()` is therefore evaluated once for the cell, above the loop,
+rather than per item: it decides `reach` before the bisect begins. Pinned
+structurally in `tests/test_glsl.py` rather than by timing, because the win
+is a smaller scan window that no test here can observe — and
+mutation-testing shows the pixel tests do not notice the guard's removal at
+all.
 
 **Finding which items cover a pixel is by bisection over `k`.** A pixel knows
 its segment and offset from `.w`; the items that could reach it are found by
@@ -2325,7 +2579,7 @@ bugs:
   `ROW_SIZE` — and `selected` is a flat index into all of them. Empty slots
   are selectable and simply have no active tool. Switching tools cancels any
   in-flight gesture and its preview — a half-drawn belt run means nothing to
-  the structure tool. `Tab` is the exception: it re-aims the number keys and
+  the structure tool. The row swap (`X`) is the exception: it re-aims the keys and
   deliberately disturbs neither the hand nor the gesture.
 - Scroll is event-based, so `InputManager` installs a glfw scroll callback and
   **chains to imgui's**; dropping the previous callback would break scrolling
@@ -2362,10 +2616,17 @@ run rather than being seen to enter or leave a machine — deliberate for now);
 **int and bool item types** (the storage is float32 throughout, as designed;
 nothing yet reinterprets it — though the formatter would need a policy per
 type, since `trim` and `sig` mean nothing for a bool);
-**lowercase and a general text layer** (the font is uppercase-only, and the
-only callers are the item labels and a Source's value — a machine wanting a
-*name* on its body, or a tooltip, would want a string-drawing entry point
-rather than the number-shaped one `sd_number()` provides);
+**lowercase and a general text layer in the *shader*** (the bitfield font is
+uppercase-only, and its only callers are the item labels and a Source's
+value — a machine wanting a *name* on its body would want a string-drawing
+entry point rather than the number-shaped one `sd_number()` provides. The
+annotation layer now covers arbitrary text with a real font, so the open
+question is narrower than it was: whether the *structure* labels should move
+to imgui too. The investigation says they are a good candidate — tens of
+them, already world-aligned rather than rotated with the facing — while the
+**item** labels should stay in the shader, since a saturated board at max
+zoom would put thousands on screen and `text_opacity()` already fades them
+out instead);
 **incremental segment rebuild** (currently whole-board on any real edit;
 the inspector reports rebuild counts so there is a number to point at before
 anyone optimises it);

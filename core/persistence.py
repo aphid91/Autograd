@@ -17,6 +17,8 @@ rather than guessing, since a misread entity table produces entities that
 look valid and behave wrongly.
 """
 
+import json
+
 import numpy as np
 
 from core import cell
@@ -34,12 +36,23 @@ class SaveError(Exception):
     """A save file could not be read, or does not fit this board."""
 
 
-def save(board, path):
+def save(board, path, annotations=None):
     """Write `board` to `path`. Returns the path written.
 
     The caller is responsible for clearing ghosts first; this asserts rather
     than silently persisting them, because a file containing ghost rows would
     reload as a board with phantom entities nobody placed.
+
+    `annotations` is an `AnnotationStore`, or None. They ship *inside* the
+    save rather than in a sidecar: a note is about a particular factory, so
+    loading a different board must bring that board's notes and leave none of
+    the previous one's floating over it. One file also means a save cannot be
+    separated from its annotations by being moved or renamed.
+
+    Stored as a JSON string in a 0-d array, not as more numpy. The arrays
+    above are bulk numeric data that `.npz` is exactly right for; this is a
+    handful of short records with strings in them, and keeping it readable
+    (and trivially versionable) beats packing it into parallel arrays.
     """
     ghosts = int((cell.ghost_state_arr(board.grid[:, :, cell.CH_Z])
                   != cell.GHOST_NONE).sum())
@@ -56,12 +69,18 @@ def save(board, path):
     saved_grid = board.grid.copy()
     saved_grid[:, :, cell.CH_W] = 0
 
+    notes = "[]" if annotations is None else json.dumps(annotations.to_data())
+
     np.savez_compressed(
         path,
         version=np.array([FORMAT_VERSION], dtype=np.int32),
         size=np.array([board.width, board.height], dtype=np.int32),
         grid=saved_grid,
         entities=board.entities,
+        # Not in the `missing` check on load: a file written before
+        # annotations existed has no such key, and that must read as "no
+        # annotations" rather than as a corrupt save.
+        annotations=np.array(notes),
         # The allocator is part of the state: entity ids are embedded in grid
         # cells, so the free list and the high-water mark have to come back
         # exactly or a later spawn could hand out a row that is still in use.
@@ -72,12 +91,19 @@ def save(board, path):
     return path
 
 
-def load(board, path):
+def load(board, path, annotations=None):
     """Replace `board`'s contents from `path`. Returns the number of entities.
 
     The board is mutated in place rather than replaced, because the device
     resources (grid texture, entity SSBO) are bound to it and everything
     upstream holds a reference.
+
+    `annotations`, if given, is replaced from the file's own set -- cleared
+    first, so loading a board whose file has no annotations leaves none of the
+    previous board's behind. **A file written before annotations existed loads
+    as having none**, which is why the key is absent from the `missing` check
+    rather than required: every save in existence predates this field, and
+    refusing them would be a format break for no reason.
     """
     # np.load on an .npz is lazy and keeps the file open, which on Windows
     # leaves it locked against the next save. Read everything out and close.
@@ -135,6 +161,21 @@ def load(board, path):
     board._free_rows = [int(r) for r in data["free_rows"]]
     board._live_count = int(data["live_count"][0])
     board._frustrated = []
+
+    if annotations is not None:
+        # Cleared unconditionally, then filled from whatever the file has.
+        # An older save has no `annotations` key at all, and the clear is what
+        # makes that case correct: the new board gets no notes rather than
+        # inheriting the outgoing board's.
+        annotations.clear()
+        raw = data.get("annotations")
+        if raw is not None:
+            try:
+                annotations.load_data(json.loads(str(raw)))
+            except (ValueError, TypeError):
+                # A corrupt annotation blob costs the notes, not the board.
+                # The factory is the irreplaceable half.
+                pass
 
     board.mark_all_dirty()
     return board._live_count
