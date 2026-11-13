@@ -211,6 +211,11 @@ class GateSim:
         #: against it (see `gate_device.compare_against_cpu`) until it is
         #: carrying the work.
         self.device = None
+        #: The belt phase's compute form, beside the gate one. Also None
+        #: without a context, and also additive: `tick_belts()` is still the
+        #: reference and what `belt_compute.compare_against_cpu()` checks
+        #: against.
+        self.belt_compute = None
         #: The gate classes, parallel to `state.rows`. Kept because the
         #: device's geometry packing needs the *class* and views are not
         #: safe to hold across frames.
@@ -1626,17 +1631,27 @@ class GateSim:
         self._gate_table_cache = None
 
     # --- the compute form -------------------------------------------------
-    def create_device_resources(self, ctx):
-        """Compile the structure-phase kernel and size its buffers.
+    def create_device_resources(self, ctx, belt_device=None):
+        """Compile the compute kernels and size their buffers.
 
-        Optional: with no device the CPU phase runs exactly as before, which
+        Optional: with no device the CPU phases run exactly as before, which
         is how every headless test and the whole existing suite behave. The
         device is additive until it is proven, and `compare_against_cpu()`
         is what proves it.
+
+        `belt_device` is the renderer's `BeltDevice`, passed in rather than
+        made here because the belt kernel **borrows its buffers** -- see the
+        binding note in render/compute.py. Without it only the gate kernels
+        are built, which is the whole feature for a caller that has no
+        renderer.
         """
+        from core.belt_compute import BeltCompute
         from core.gate_device import GateDevice
         self._gate_table()
         self.device = GateDevice(ctx, self.state)
+        if belt_device is not None:
+            self.belt_compute = BeltCompute(
+                ctx, self.index, self.belts, self, belt_device)
         self.sync_device()
         return self.device
 
@@ -1657,6 +1672,8 @@ class GateSim:
                 self._connected_channels(self.board.view(row))
         self.device.rebuild(self._gate_types, self.board,
                             edges=self._direct_edges())
+        if self.belt_compute is not None:
+            self.belt_compute.rebuild(self.state)
 
     # --- structure phase --------------------------------------------------
     def structure_phase(self):

@@ -65,6 +65,27 @@ GATE_OUT_HELD_BINDING = 7
 GATE_GEOM_BINDING = 8
 GATE_KONST_BINDING = 9
 GATE_EDGE_BINDING = 10
+#: The belt phase reuses the **render pass's** segment bindings *and its
+#: buffers*. Not a saving -- a requirement, twice over.
+#:
+#: `belt_tick.comp` includes common.glsl, which already declares those
+#: blocks, and GLSL refuses to let one buffer variable belong to two
+#: interface blocks: the compiler stating the design rule. And with the
+#: bindings shared, two *buffers* on them would be a silent race -- whichever
+#: was bound last wins, so the kernel would advance one copy while the
+#: renderer drew the other. That is exactly what happened on the first
+#: attempt: the kernel's writes landed in a buffer nothing read, and the
+#: anchor appeared never to advance.
+#:
+#: So `BeltCompute` borrows `BeltDevice`'s buffers rather than making its
+#: own. One copy, one binding, shared by the pass that advances a run and
+#: the shader that draws it -- which also means a residency run leaves the
+#: renderer's state already correct, with nothing to copy across.
+BELT_SEG_I_BINDING = 1
+BELT_SEG_F_BINDING = 2
+BELT_ITEM_BINDING = 3
+#: The one thing the renderer never needs: each end's resolved port.
+BELT_PORT_BINDING = 14
 
 #: Threads per work group. 64 is one wavefront on AMD and two warps on
 #: NVIDIA, which keeps a partly-filled group cheap -- the gate count is a few

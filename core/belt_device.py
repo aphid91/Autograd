@@ -261,6 +261,29 @@ class BeltDevice:
         self.seg_f_buffer.write(np.ascontiguousarray(self.seg_f))
         self.item_buffer.write(np.ascontiguousarray(self.items))
 
+    def download(self):
+        """Device -> host, for the three mutable arrays.
+
+        The counterpart of `_upload()`, and the opposite direction from
+        everything else here: this class was written to *feed* the renderer,
+        but the compute tick writes the same buffers, so the host copy has
+        to be refreshable from them. See core/belt_compute.py -- it borrows
+        these buffers rather than keeping a second set, which is what makes
+        one copy authoritative instead of two racing on one binding.
+
+        **This stalls**, like every readback. Callers go through
+        `BeltCompute.readback()`, which is the deliberate act of asking.
+        """
+        if self._ctx is None:
+            return
+        for buf, arr in ((self.seg_i_buffer, self.seg_i),
+                         (self.seg_f_buffer, self.seg_f),
+                         (self.item_buffer, self.items)):
+            if buf is None:
+                continue
+            raw = np.frombuffer(buf.read(), dtype=arr.dtype)
+            arr[...] = raw[:arr.size].reshape(arr.shape)
+
     def bind(self, seg_i_binding, seg_f_binding, item_binding):
         """Bind the three buffers to their storage-buffer slots."""
         if self.seg_i_buffer is None:

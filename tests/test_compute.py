@@ -36,7 +36,7 @@ def _with_device():
     """Build the gate device on the shared context. Returns the GateSim."""
     gates = engine.gates
     if gates.device is None:
-        gates.create_device_resources(harness.ctx)
+        gates.create_device_resources(harness.ctx, engine.belt_device)
     else:
         gates.sync_device()
     return gates
@@ -434,6 +434,95 @@ def test_a_loaded_destination_refuses_the_handoff():
     assert st.in_held[d_slot, d_ch] <= 0.0, (
         "an empty source zone still loaded the destination lane")
     ok("a loaded lane refuses the hand-off, and an empty zone offers none")
+
+
+def test_belt_transport_agrees_with_the_cpu():
+    """The belt phase both ways, on a run with material actually moving.
+
+    The CPU closed form is the reference here rather than `naive_tick()`
+    directly, because the closed form is itself oracle-checked over 600
+    randomised configurations in tests/test_belts.py. Chaining the two keeps
+    each comparison about one thing.
+    """
+    from core import belt_compute
+
+    harness.reset()
+    src = engine.place_structure(Source, 3, 10)
+    src.emit_value = 2.5
+    engine.place_belt_path((5, 10), (14, 10))
+    engine.place_structure(Sink, 16, 10)
+    engine.sync_segments()
+    gates = _with_device()
+
+    # Let the run fill, so the comparison covers a belt carrying items
+    # rather than an empty one -- an empty run agrees trivially.
+    _run(12)
+    total = engine.belts.total_items()
+    assert total > 0, "nothing reached the belt; the fixture is vacuous"
+
+    problems = belt_compute.compare_against_cpu(engine, ticks=1)
+    assert not problems, "\n".join(problems)
+    ok(f"belt transport agrees with the CPU with {total} items in flight")
+
+
+def test_belt_transport_agrees_over_many_ticks():
+    """...and keeps agreeing, which single-tick parity does not imply.
+
+    A one-tick comparison cannot see an error that only appears once a run
+    saturates and the packed term of the `min` starts binding -- which is
+    the half of the closed form most likely to be subtly wrong. Ten ticks
+    with a blocked consumer gets there.
+    """
+    from core import belt_compute
+
+    harness.reset()
+    src = engine.place_structure(Source, 3, 10)
+    src.emit_value = -1.5
+    engine.place_belt_path((5, 10), (9, 10))
+    engine.sync_segments()
+    _run(8)
+    gates = _with_device()
+
+    problems = belt_compute.compare_against_cpu(engine, ticks=10)
+    assert not problems, "\n".join(problems)
+    seg = next(iter(engine.segments.segments.values()))
+    assert seg.count > 0, "the run emptied; nothing was compared"
+    ok(f"belt transport agrees over 10 ticks, {seg.count} items packed")
+
+
+def test_the_belt_kernel_pops_into_a_gate():
+    """A run delivering into a gate's input lane, on the GPU.
+
+    The pop is the half of the kernel that writes *gate* state, so it is
+    where the belt and gate dispatches meet -- and it is the one that found
+    a real bug. The belt kernel reads `in_held` to decide whether the gate
+    will take the head item, but `BeltCompute.run()` originally bound only
+    the segment buffers, leaving bindings 4-7 as whatever bound last. The
+    kernel read a stale lane, popped into a channel that was actually full,
+    and the symptom was the belt layer disagreeing about a *pop* -- which
+    reads as a transport bug and was a binding bug.
+
+    Worth a dedicated fixture for that reason: the two broader comparisons
+    either side of this one both passed throughout, because neither has a
+    run delivering into an already-loaded gate lane.
+    """
+    from core import belt_compute
+
+    harness.reset()
+    src = engine.place_structure(Source, 3, 10)
+    src.emit_value = 7.5
+    engine.place_belt_path((5, 10), (10, 10))
+    engine.place_structure(Sink, 11, 10)
+    engine.sync_segments()
+    _run(10)
+    gates = _with_device()
+
+    seg = next(iter(engine.segments.segments.values()))
+    assert gates._dst_cached(seg) is not None, (
+        "the run does not resolve to a gate; the fixture is vacuous")
+    problems = belt_compute.compare_against_cpu(engine, ticks=6)
+    assert not problems, "\n".join(problems)
+    ok("the belt kernel pops into a gate lane in step with the CPU")
 
 
 def test_the_geometry_block_tracks_an_edit():

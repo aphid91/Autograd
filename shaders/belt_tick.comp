@@ -1,0 +1,171 @@
+#version 430
+
+// Belt transport, as a dispatch: one thread per segment.
+//
+// The GPU form of BeltSim.tick(). docs/belt_report.md's whole point is that
+// a run ticks in O(1) however many items are on it -- `head`, `tail` and
+// `anchor` are the only mutable state, and nothing per-item is written after
+// the item enters. So a segment is a handful of scalars and a thread per
+// segment is the natural shape; the report says as much ("the loop below
+// becomes gl_GlobalInvocationID.x and nothing else changes").
+//
+// Segments are independent
+// ------------------------
+// The report's only shared state is at the *nodes*, and transport touches no
+// node: `offer()` and `accept()` read and write gate channels, which live in
+// the gate SoA arrays, and each (gate, channel) pair has exactly one segment
+// on it -- a port face has one neighbour. So two segments can never write
+// the same lane, and the dispatch needs no atomics even though many threads
+// touch gate state.
+//
+// Tick order is load-bearing
+// --------------------------
+// advance-anchor -> pop -> push, exactly as the report requires and exactly
+// as `tick_segment()` does it. The pop's correctness depends on it: `A == L`
+// holds before the pop, so setting `A = L - d` after `head++` leaves every
+// remaining item's packed position unchanged and nothing jumps. Reordering
+// these three blocks is the mutation `tests/test_belts.py`'s oracle catches
+// immediately, and it is why the gate work happens *inside* this sequence
+// rather than in passes around it.
+
+#include "common.glsl"
+
+layout(local_size_x = 64) in;
+
+// Gate channel state, shared with the firing kernel -- the belt phase's
+// producer and consumer are gate waiting zones and input lanes.
+layout(std430, binding = 4) buffer InValue  { float in_value[]; };
+layout(std430, binding = 5) buffer InHeld   { float in_held[]; };
+layout(std430, binding = 6) buffer OutValue { float out_value[]; };
+layout(std430, binding = 7) buffer OutHeld  { float out_held[]; };
+
+// The segment record and the item arena come from common.glsl, at the same
+// bindings the renderer reads (1/2/3). **Shared deliberately**: the kernel
+// that advances a run and the fragment shader that draws it then cannot
+// disagree about the record's shape, which is the same argument that has
+// `item_position()` and `BeltSim.position_of()` pinned together. It also
+// means a residency run leaves the renderer's buffers already correct --
+// there is nothing to copy across before drawing.
+//
+// Note the int record has a *two*-ivec4 stride (the second carries the sleep
+// flag for the overlay), so every access goes through common.glsl's
+// seg_head()/seg_tail()/... accessors rather than indexing `seg_i` directly.
+
+// Each end's resolved port, in *slot* space, or -1 for a dangling end:
+//   .x  src gate slot   .y  src out channel
+//   .z  dst gate slot   .w  dst in channel
+layout(std430, binding = 14) buffer Ports { ivec4 seg_ports[]; };
+
+uniform int segment_count;
+uniform int sim_tick;
+
+// Where item `k` is at `tick`, in fixed point. The closed form, and a second
+// implementation of BeltSim.position_of() -- pinned against it by
+// tests/test_glsl.py, exactly as `item_position()` in common.glsl is.
+float belt_position(int sid, int k, int tick) {
+    ivec4 si = seg_core(sid);
+    vec4 sf = seg_f[sid];
+    int slot = k % si.w;
+    float age = float(tick - int(items[si.z + slot].x));
+    // Cap the age so a long-settled item cannot overflow the product; any
+    // position past the end is clamped by the min below anyway.
+    float max_age = sf.y / sf.z + 1.0;
+    age = min(age, max_age);
+    float unblocked = age * sf.z;
+    // `packed` is a GLSL reserved word and produces a bare "unexpected '='"
+    // with no mention of the keyword -- see the note in CLAUDE.md.
+    float clumped = sf.x - float(k - si.x) * sf.w;
+    return min(unblocked, clumped);
+}
+
+bool belt_has_room(int sid, int tick) {
+    ivec4 si = seg_core(sid);
+    if (si.x == si.y) return true;   // empty
+    return belt_position(sid, si.y - 1, tick) >= seg_f[sid].w;
+}
+
+void main() {
+    int sid = int(gl_GlobalInvocationID.x);
+    if (sid >= segment_count) return;
+
+    ivec4 si = seg_core(sid);
+    vec4 sf = seg_f[sid];
+    // Segment ids index these arrays directly, so a gap in the id space is
+    // a zeroed record rather than a shifted one. cap == 0 means "no segment
+    // here" -- and it is also the modulus below, so this guard is required
+    // rather than tidy.
+    if (si.w == 0) return;
+
+    int head = si.x;
+    int tail = si.y;
+    int base = si.z;
+    int cap = si.w;
+    float anchor = sf.x;
+    float length = sf.y;
+    float speed = sf.z;
+    float spacing = sf.w;
+    ivec4 ports = seg_ports[sid];
+
+    // 1. The packed front advances until it reaches the end. Every item
+    //    taking the packed value moves with it, which is how a whole clump
+    //    advances without being touched individually.
+    anchor = min(anchor + speed, length);
+    // **Write the whole vec4, never a single component.** `seg_f[sid].x = v`
+    // on an std430 buffer silently did nothing here -- `seg_i` took its
+    // component writes and `seg_f` did not, so the run popped while its
+    // anchor stayed put, which reads exactly like a transport bug. Writing
+    // the vector is one store either way.
+    seg_f[sid] = vec4(anchor, length, speed, spacing);
+
+    // 2. Consume. The head must be *exactly* at the end -- the test that
+    //    needs fixed point, since float drift would eventually miss it and
+    //    stall a belt permanently with an item a hair short.
+    if (head != tail) {
+        if (belt_position(sid, head, sim_tick) == length) {
+            bool taken = false;
+            if (ports.z >= 0) {
+                uint lane = uint(ports.z) * uint(MAX_CHANNELS) + uint(ports.w);
+                // The gate takes it only if that lane is free; otherwise the
+                // item stays on the belt, which is how a run backs up behind
+                // a gate that is not firing.
+                if (in_held[lane] <= 0.0) {
+                    in_value[lane] = items[base + (head % cap)].y;
+                    in_held[lane] = 1.0;
+                    taken = true;
+                }
+            }
+            if (taken) {
+                head += 1;
+                // The new head's packed slot is one spacing back, which
+                // leaves every remaining item's packed position unchanged so
+                // nothing jumps. Clamped at 0 because the report's bare
+                // `L - d` assumes L >= d, which a short run can violate.
+                anchor = max(0.0, length - spacing);
+                seg_f[sid] = vec4(anchor, length, speed, spacing);
+                seg_i[sid * 2] = ivec4(head, tail, base, cap);
+            }
+        }
+    }
+
+    // 3. Produce. There is room once the last item has moved a full spacing
+    //    clear of the entrance. Note the room test comes *first*: a full
+    //    belt is never even offered an item, so the producer keeps it as the
+    //    back-pressure signal the next structure phase reads.
+    if (ports.x >= 0) {
+        // Re-read: the pop above may have changed head/anchor, and room
+        // depends on both.
+        si = seg_core(sid);
+        if (belt_has_room(sid, sim_tick)) {
+            uint zone = uint(ports.x) * uint(MAX_CHANNELS) + uint(ports.y);
+            if (out_held[zone] > 0.0) {
+                int slot = si.y % cap;
+                items[base + slot] = vec2(float(sim_tick), out_value[zone]);
+                seg_i[sid * 2] = ivec4(si.x, si.y + 1, base, cap);
+                // Only now has the producer actually parted with it --
+                // offering is not committing.
+                out_value[zone] = 0.0;
+                out_held[zone] = 0.0;
+            }
+        }
+    }
+}
