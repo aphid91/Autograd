@@ -165,6 +165,7 @@ import numpy as np
 
 from core import cell
 from core.entity import MAX_CHANNELS, Entity, Source
+from core.gate_state import GateState
 from core.tick_profile import Profiler
 
 
@@ -198,6 +199,10 @@ class GateSim:
         #: (rows, n_in, n_out, strict) arrays for the prefilter, or None.
         #: See _gate_table().
         self._gate_table_cache = None
+        #: The gate-dense SoA mirror of the channel columns. Rebuilt by
+        #: `_gate_table()` from the same walk, so the two cannot disagree
+        #: about the population. See core/gate_state.py.
+        self.state = GateState(board)
         #: (downstream, upstream) gate row -> segments, or None. See
         #: _segments_of_gate().
         self._gate_segments = None
@@ -499,6 +504,7 @@ class GateSim:
 
         folded, _inputs = self._folds()
         rows, n_in, n_out, strict = [], [], [], []
+        type_id = []
         for gate in self.gates():
             if gate.row in folded:
                 continue
@@ -506,10 +512,16 @@ class GateSim:
             rows.append(gate.row)
             n_in.append(gate.input_count())
             n_out.append(gate.output_count())
+            type_id.append(cls.TYPE_ID)
             # FIRE_ANY needs one fed channel; FIRE_ALL needs all of them.
             # FIRE_SELECT (and any type overriding inputs_ready()) is not
             # expressible as an occupancy count, so it is never filtered out.
             strict.append(cls.FIRE_RULE == cls.FIRE_ALL)
+
+        # The SoA mirror is built from the same walk, so it cannot disagree
+        # with the prefilter about which rows are gates -- the same
+        # one-authority argument `_build_direct()` settles for adjacency.
+        self.state.build(rows, n_in, n_out, type_id)
 
         table = (np.asarray(rows, dtype=np.int64),
                  np.asarray(n_in, dtype=np.int64),
@@ -572,16 +584,23 @@ class GateSim:
             s, b = self._sleeping_stats()
             return [], s, b
 
-        blk = self.board.entities[rows]
-        held = blk[:, Entity.F_IN_HELD:Entity.F_IN_HELD + MAX_CHANNELS] > 0.0
-        free = blk[:, Entity.F_OUT_HELD:Entity.F_OUT_HELD + MAX_CHANNELS] \
-            <= 0.0
+        # **Read the SoA mirror, not the entity table.** The old form was
+        # `entities[rows]`, a fancy-index gather materialising a full
+        # 28-float row per gate to read the 8 channel columns this pass
+        # actually uses. Here each quantity is one contiguous
+        # `(gates, MAX_CHANNELS)` block, so the read is dense in exactly the
+        # values being tested -- which is the whole argument for the mirror
+        # (see core/gate_state.py) and the shape a coalesced GPU read needs.
+        state = self.state
+        slots = state.slot_of[rows]
+        held = state.in_held[slots] > 0.0
+        free = state.out_held[slots] <= 0.0
 
         # Mask the channel columns a type does not declare, so an unused slot
-        # cannot be mistaken for an unfed one (or a free zone).
-        lanes = np.arange(MAX_CHANNELS)
-        in_used = lanes[None, :] < n_in[:, None]
-        out_used = lanes[None, :] < n_out[:, None]
+        # cannot be mistaken for an unfed one (or a free zone). Precomputed
+        # per edit on the mirror rather than rebuilt from `arange` each tick.
+        in_used = state.in_used[slots]
+        out_used = state.out_used[slots]
 
         n_fed = (held & in_used).sum(1)
         # A type with no inputs is vacuously ready -- that is what lets a
@@ -1549,6 +1568,21 @@ class GateSim:
         set would be a strictly redundant filter over a mask that already
         excludes it. Adding one would also make two places responsible for
         the same exclusion, and they could then disagree.
+
+        **This reads the entity table rather than the SoA mirror**, and that
+        is deliberate rather than an omission. It is called from the belt
+        phase, after `_fire_admitted()` has written results through views
+        straight to `Gameboard.entities` -- so the mirror loaded at the top of
+        the structure phase is stale by the time this runs. The mirror's
+        contract is that exactly one copy is authoritative at a time (see
+        core/gate_state.py), and outside the prefilter's window that copy is
+        the table.
+
+        Reading the mirror here would be the drift the contract exists to
+        prevent, and it would be silent: a gate whose zone filled this tick
+        would simply not be offered to its neighbour, which looks like back
+        pressure. The fix when the whole phase moves to the mirror is to move
+        the write side too, not to widen the read.
         """
         rows, _n_in, _n_out, _strict = self._gate_table()
         if not len(rows):
@@ -1590,7 +1624,19 @@ class GateSim:
         # dominates `fire` is one where the prefilter is admitting almost
         # nothing -- working as intended -- and the reverse means the survivors
         # are where the time is.
+        # Load the SoA mirror before anything reads it. **The window the
+        # mirror is authoritative in is this call and no wider** (see
+        # core/gate_state.py): the per-gate path below still writes through
+        # views to `Gameboard.entities`, so the mirror is refreshed here, read
+        # by the prefilter, and never written back -- there is exactly one
+        # writer at any moment, which is the whole safety argument for keeping
+        # a second copy at all.
+        #
+        # `_gate_table()` builds the mirror's layout, so it must be called
+        # first; `_candidate_rows()` does that as its first act.
         with prof.probe("structure/prefilter"):
+            self._gate_table()
+            self.state.sync_from_rows()
             admit, pre_starved, pre_blocked = self._candidate_rows()
         self.stats["starved"] += pre_starved
         self.stats["blocked"] += pre_blocked
