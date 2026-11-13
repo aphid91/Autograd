@@ -68,7 +68,7 @@ and scheduling are kept honest. Run them by hand from `tools/`.
 | [tools/probe_wakelist.py](tools/probe_wakelist.py) | whether an idle segment is provably a no-op (both fixed points, by brute force), and what fraction of a CPU-shaped board is asleep |
 | [tools/check_cache_coherence.py](tools/check_cache_coherence.py) | the four `GateSim` caches against freshly-computed answers, after each of 150 random edits. Catches the row/segment-id recycling hazard |
 | [tools/check_prefilter_safe.py](tools/check_prefilter_safe.py) | that the prefilter never excludes a gate the full path would fire, over ~58k gate-ticks of mixed machine types |
-| [tools/check_wakelist_safe.py](tools/check_wakelist_safe.py) | a sleeping timeline against a fully-ticked one, diffed every tick, **per sleeping layer** (`SLEEPERS`). Reports a sleep→wake transition count for each, because a layer with none proves nothing — and a combined count would let busy belts vouch for a gate layer that never woke |
+| [tools/check_wakelist_safe.py](tools/check_wakelist_safe.py) | a sleeping timeline against a fully-ticked one, diffed every tick, **per sleeping layer** (`SLEEPERS`). Reports a sleep→wake transition count for each, plus the tier-two gate-sleep grants, because a layer with none proves nothing — and a combined count would let busy belts vouch for a gate layer that never woke. Also asserts `lying_sleepers()`: no sleeping gate may fail its own predicate, which the diff cannot see |
 | [tools/check_folding_safe.py](tools/check_folding_safe.py) | a constant-folded timeline against an unfolded one. **Not** a state diff — folding runs one tick ahead for ever, so it compares the destroy *rate* tick by tick, that the cumulative lead *settles*, and the set of values each gate ever holds. Reports the folded count so a vacuous run is visible |
 
 #### Profiling the board in front of you
@@ -2008,6 +2008,88 @@ since the constant lives on its *neighbour's* channel. A green tint in the
 overlay was considered and dropped: `.z` has one spare bit, but using it means
 a restamp on every fold change plus a GLSL mirror plus a pixel test, which is
 a lot of machinery for a debug colour.
+
+#### Gate sleep is built, correct, and switched off
+
+`GateSim` sleeps gates on two tiers, and `_sleep_enabled` defaults to
+**False**. Not because it is broken — `tools/check_wakelist_safe.py` agrees at
+every tick with both tiers exercised — but because it is a net loss on every
+real board:
+
+| | baseline | folding | folding + gate sleep |
+|---|---|---|---|
+| cpu.npz | 9.13 ms | **7.17 ms** | 7.66 ms |
+| noram.npz | 12.95 ms | **10.98 ms** | 11.29 ms |
+| Ram2.npz | 13.12 ms | **12.29 ms** | 12.40 ms |
+| ram.npz | 3.43 ms | **2.93 ms** | 3.10 ms |
+
+**The two tiers.** Tier one sleeps a gate holding *nothing*. Tier two —
+the better predicate — sleeps a **partially fed** gate when every *missing*
+input lane is fed by a belt segment that is both empty and at rest: no
+material can reach it, so its readiness cannot change. That is the common
+shape on a computer, and it roughly doubles the sleeping population (on
+cpu.npz, 211 partially-fed rows of 537, of which 123 are provably stuck).
+
+**It removes real work and the bookkeeping costs more.** On cpu.npz with 207
+of 537 gates asleep, `structure/fire` falls 4.06 → 3.35 ms — the predicate
+working exactly as intended — while `structure/prefilter` rises 1.35 → 2.32 ms
+deciding *which* 207.
+
+**The reason is the workload, and three attempts at the accounting establish
+it.** The sleep set is large and stable in *size* but never still: 203 asleep
+on cpu.npz with **6 gates changing state every tick** and only 1 tick in 100
+unchanged (Ram2: 495 asleep, 11.3 churn, 0 ticks unchanged). So:
+
+- Updating the set after a whole-table pass adds cost and removes none — the
+  sleep set never shrinks the prefilter's own work.
+- Slicing the table by the awake set *first* is the fix `probe_batch_prefilter`
+  would predict ("slicing buys 60×"), and it was **worse** (prefilter
+  2.32 → 2.69 ms): `np.isin` is O(table) to avoid O(awake) work, and the awake
+  set is ~40% of the table.
+- Memoising the slice on a generation counter gets **0 cache hits in 150
+  ticks**, because of the churn above.
+
+A running factory does not hold still long enough for a gate scheduler to
+amortise. What is missing is a representation where "which gates are awake" is
+cheap to maintain under churn — most likely the compacted index buffer the GPU
+port wants, where the set is rebuilt by a parallel predicate pass each tick
+rather than edited incrementally. The mechanism is kept because the hard parts
+all work: the predicate, the feeder index, the wake edges and the differential
+check. Flip the flag to measure it again.
+
+Two things the mechanism taught that outlive the flag:
+
+- **The vectorised wake backstop had to go.** It read `to_wake = ~inert`
+  ("anything holding something must be awake"), which tier two falsifies — a
+  partially-fed gate sleeps *while* holding an input — so it would have woken
+  every tier-two sleeper the tick after it slept and made the tier a silent
+  no-op. Not wrong, just useless, which is worse: the measurements would have
+  shown no gain with no visible cause.
+- **A sleeping gate must wake when its feeder stops resting**, not merely when
+  the item arrives. `_wake_around()` now wakes the gate downstream of each run
+  it wakes. Nothing *breaks* without it — `accept_from()` is the edge that
+  matters for delivery — but the gate spends the transit asleep on a claim
+  that is already false, and `check_wakelist_safe.py`'s new `lying_sleepers()`
+  invariant fails on exactly that: **0 violations with the edge, 4 without**,
+  while the differential diff passes either way.
+
+The differential checker needed two new fixture rows, and both were found by
+instrumenting rather than by reading: tier two granted **zero** sleeps on the
+old board (its partially-fed gates were hand-fed, so the missing lane had no
+feeding segment), and the `holds_items` guard was never the one that refused
+(every non-empty feeder was also awake and not at rest). The counts are now
+reported per run so a vacuous one is visible.
+
+Two guards in `_starved_on_sleeping_belts()` are **provably redundant and
+kept**, which is recorded so neither is mistaken for load-bearing: the
+`seg.tail != seg.head` test (a run at rest holding items has already delivered
+into the lane, so a held lane never reaches the loop — brute-forced over run
+lengths 1–5 × 120 ticks, zero instances) and the `is_at_rest()` call itself
+(for an *empty* run it adds only the anchor clause, which cannot matter to a
+gate). The first is kept because the argument runs through two other objects'
+invariants and the cost of being wrong is a silent stall; the second because
+"the feeder is at rest" is the stated claim, and spelling it "is empty" would
+be a second weaker rule that happens to coincide.
 
 #### Two mechanisms the second gate vocabulary needed
 

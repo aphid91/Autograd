@@ -179,6 +179,8 @@ class GateSim:
         #: (downstream, upstream) gate row -> segments, or None. See
         #: _segments_of_gate().
         self._gate_segments = None
+        #: (row, channel) -> feeding segment, or None. See _feeders().
+        self._feeder_map = None
         #: Constant folding, or None when not yet derived. See _folds().
         #: `folded_sources` is the set of Source rows that no longer tick;
         #: `folded_inputs` is [(row, channel, value)] to hold permanently.
@@ -190,9 +192,45 @@ class GateSim:
         #: Empty means "every gate is visited", the pre-sleep behaviour and so
         #: the safe default after any wholesale change.
         self._asleep = set()
-        #: False disables gate sleeping outright, for
-        #: `tools/check_wakelist_safe.py`. See set_sleep_enabled().
-        self._sleep_enabled = True
+        #: **Gate sleeping is off by default, on measurement.** It is correct
+        #: -- `tools/check_wakelist_safe.py` agrees at every tick, with both
+        #: tiers exercised -- and it is a net *loss* on every real board:
+        #:
+        #:                 baseline   folding   folding+gate sleep
+        #:   cpu.npz        9.13ms     7.17ms      7.66ms
+        #:   noram.npz     12.95ms    10.98ms     11.29ms
+        #:   Ram2.npz      13.12ms    12.29ms     12.40ms
+        #:   ram.npz        3.43ms     2.93ms      3.10ms
+        #:
+        #: It genuinely removes work -- `structure/fire` falls 4.06 -> 3.35ms
+        #: on cpu.npz with 207 of 537 gates asleep -- and the bookkeeping to
+        #: decide *which* 207 costs more than that: `structure/prefilter`
+        #: rises 1.35 -> 2.32ms.
+        #:
+        #: The reason is the workload, not the implementation, and three
+        #: attempts at the accounting establish it. The sleep set is big and
+        #: stable in *size* but never still: on cpu.npz 203 gates are asleep
+        #: yet 6 change state every tick, with only 1 tick in 100 unchanged
+        #: (Ram2: 495 asleep, 11.3 churn, 0 ticks unchanged). So the awake
+        #: slice cannot be memoised -- measured at **0 cache hits in 150
+        #: ticks** -- and the per-gate tier-two test runs ~186 times a tick
+        #: however it is narrowed. A running factory simply does not hold
+        #: still long enough for a gate scheduler to amortise.
+        #:
+        #: Kept rather than deleted, because the mechanism is the part that
+        #: was hard: the predicate, the wake edges, the feeder index and the
+        #: differential check all work and are all tested. What is missing is
+        #: a representation in which "which gates are awake" is cheap to
+        #: maintain under churn -- most likely the same compacted index buffer
+        #: the GPU port wants, where the set is rebuilt by a parallel
+        #: predicate pass rather than edited incrementally. Flip this to True
+        #: to measure it again.
+        self._sleep_enabled = False
+        #: Bumped by every mutation of `_asleep`, so the awake slice below can
+        #: be memoised across ticks. See _awake_slice() / _sleep_changed().
+        self._sleep_gen = 0
+        #: ((table id, sleep gen), sliced table) or None. See _awake_slice().
+        self._awake_cache = None
         #: Per-tick timing. A disarmed stand-in by default rather than None,
         #: so every probe site is one shape and needs no guard; `Engine`
         #: replaces it with the clock's, which is the one the player arms.
@@ -224,6 +262,11 @@ class GateSim:
         self._dst_cache.clear()
         self._gate_table_cache = None
         self._gate_segments = None
+        # The feeder map is the inverse of `_dst_cache`, so it dies with it --
+        # and it must, because it holds segment *objects* and a rebuild
+        # recycles segment ids. A stale entry would have a gate sleeping on a
+        # run that no longer exists.
+        self._feeder_map = None
         # **Constant folding is deliberately NOT dropped here**, which is the
         # one exception among the derivations above and needs stating because
         # it looks like an omission.
@@ -255,7 +298,7 @@ class GateSim:
         # document, with a silent-freeze consequence instead of a wrong-port
         # one: rows are recycled by the free list, so a new machine could
         # inherit the previous occupant's sleep.
-        self._asleep.clear()
+        self._wake_rows(tuple(self._asleep))
 
     def invalidate_board(self):
         """A real edit: drop the per-tick caches **and** the constant fold.
@@ -390,9 +433,49 @@ class GateSim:
         the prefilter would silently empty two stats the panel and three tests
         read, which is a behaviour change dressed as an optimisation.
         """
-        rows, n_in, n_out, strict = self._gate_table()
-        if not len(rows):
+        all_rows, all_n_in, all_n_out, all_strict = self._gate_table()
+        if not len(all_rows):
             return [], 0, 0
+
+        # **The sleep set slices the table, and it has to.** For a long time
+        # it did not: every vectorised quantity below was computed over the
+        # whole table and the sleep set was updated afterwards, so sleeping
+        # *added* bookkeeping and removed no work from this pass. Measured on
+        # cpu.npz with 207 of 537 gates asleep: `fire` fell 4.06 -> 3.35ms
+        # (the sleep set working) while `prefilter` rose 1.35 -> 2.32ms (the
+        # bookkeeping), for a net 3% *loss*. The mechanism was sound and the
+        # accounting was not.
+        #
+        # Slicing first is the same lesson `tools/probe_batch_prefilter.py`
+        # already recorded one layer down -- sorting rows buys ~15% while
+        # slicing buys 60x -- and it is what makes a sleeping gate cost
+        # nothing rather than cost less.
+        #
+        # `starved` and `blocked` are the one thing that cannot be sliced
+        # away: they are observable stats that three tests and the panel read,
+        # and a sleeping gate is still starved or blocked. So the skipped
+        # rows' contribution is credited from the *reason they slept*, which
+        # is known without re-deriving it -- see `_sleeping_stats`.
+        # **The slice is memoised against the sleep set's identity**, not
+        # recomputed per tick, and that is the difference between a win and a
+        # loss. The obvious version -- `np.isin(all_rows, sleeping)` every
+        # tick -- is O(table) work to avoid O(awake) work, and since the awake
+        # set is ~40% of the table on cpu.npz it loses: prefilter went 2.32 ->
+        # 2.69ms and the tick 7.08 -> 8.17ms, *worse* than not slicing at all.
+        #
+        # A sleep set changes only when a gate sleeps or an edge wakes one, so
+        # a generation counter bumped at those points is enough to reuse the
+        # slice across every tick in between -- which on a quiet board is all
+        # of them. That is the same reasoning as every other cache here: the
+        # answer is a function of something that changes on an event, so it is
+        # computed on the event and not on the tick.
+        rows, n_in, n_out, strict = self._awake_slice(
+            all_rows, all_n_in, all_n_out, all_strict)
+        if not len(rows):
+            # Everything is asleep, which is the whole point on a quiet
+            # board. The stats still have to be credited.
+            s, b = self._sleeping_stats()
+            return [], s, b
 
         blk = self.board.entities[rows]
         held = blk[:, Entity.F_IN_HELD:Entity.F_IN_HELD + MAX_CHANNELS] > 0.0
@@ -417,6 +500,13 @@ class GateSim:
         # per-gate path would have reported it in.
         starved = int((~ready).sum())
         blocked = int((ready & ~has_room).sum())
+        # The sleeping rows were not examined above, but they are still
+        # starved or blocked and the stats must say so -- see the slicing
+        # comment. Credited from the recorded reason rather than re-derived,
+        # which would mean reading the rows this pass exists to skip.
+        sleep_starved, sleep_blocked = self._sleeping_stats()
+        starved += sleep_starved
+        blocked += sleep_blocked
         # A **list in ascending row order**, not a set: the phase iterates
         # this directly, and a set's order varies with hash layout. The phase
         # is designed to be order-independent (that is the whole point of the
@@ -457,26 +547,77 @@ class GateSim:
         # `ready` is True for a generator, which holds nothing and must still
         # fire, so the exclusion is load-bearing for exactly that case.)
         to_sleep = inert & ~awake
-        # Gates to wake: anything now holding something. Belt-and-braces over
-        # the explicit wake edges at `accept_from()` / `took_from()` /
-        # `deliver_direct()` -- those are what make sleeping *correct*, and
-        # this is a cheap backstop against one being missed, since a stale
-        # sleep set is a silent freeze rather than a visible error. Costs one
-        # more vectorised set operation, not a loop.
-        to_wake = ~inert
 
-        if asleep:
-            asleep.difference_update(rows[to_wake].tolist())
-        asleep.update(rows[to_sleep].tolist())
+        # --- tier two: a partially-fed gate whose missing lanes cannot fill --
+        #
+        # The predicate above only sleeps a gate holding *nothing*, which
+        # leaves the common case awake (211 of 537 rows on cpu.npz). This tier
+        # adds the gate waiting on a lane whose belt is empty and at rest; see
+        # the "sleeping a partially-fed gate" block for the argument.
+        #
+        # **The candidate set is narrowed in numpy first, and that is what
+        # makes a per-gate test affordable here.** The lesson from the 4.9x
+        # regression above is not "never loop" but "never loop over the whole
+        # table": the rows reaching the Python test below hold an input, hold
+        # no output, and are not admitted. Sleeping rows are already gone --
+        # the table was sliced by the sleep set at the top -- so a gate is
+        # tested once on the tick it goes quiet and then costs nothing until
+        # something wakes it. The steady-state cost is the gates that keep
+        # waking, not the population.
+        #
+        # Output-holding rows are excluded for the same reason tier one
+        # excludes them: a waiting zone drains by somebody else's event. It is
+        # also what makes `_sleeping_stats()` exact.
+        # Both tiers collect into one list and sleep in a single call, so the
+        # generation is bumped once per tick rather than once per gate.
+        newly_asleep = []
+        maybe = holds_in & ~holds_out & ~awake & ~to_sleep
+        if maybe.any():
+            n_in_list = n_in.tolist()
+            for i in np.flatnonzero(maybe).tolist():
+                if self._starved_on_sleeping_belts(
+                        int(rows[i]), n_in_list[i], held[i]):
+                    newly_asleep.append(int(rows[i]))
+        # **There is no longer a vectorised wake backstop, and its removal is
+        # forced rather than chosen.** It used to read `to_wake = ~inert`:
+        # anything holding something must be awake, since a tier-one sleeper
+        # holds nothing. Two separate things killed it.
+        #
+        # Tier two made it *wrong as a backstop*: a partially-fed gate sleeps
+        # while holding an input, so `~inert` would have woken every tier-two
+        # sleeper the tick after it slept, making the whole tier a no-op --
+        # not incorrect, merely useless, which is worse, because the
+        # measurements would have shown no gain with no visible reason.
+        #
+        # Slicing the table by the sleep set made it *impossible*: the rows
+        # reaching this point are the awake ones, so nothing here can observe
+        # a sleeping gate at all, let alone wake it. That is the price of the
+        # slice, and it is the right trade -- a backstop that costs a
+        # whole-table pass to guard against a missed edge is the same bargain
+        # polling would be.
+        #
+        # So the explicit edges carry the whole weight now:
+        #
+        #   accept_from()     a belt loads an input   -> discards the row
+        #   took_from()       a belt drains a zone    -> discards the row
+        #   deliver_direct()  a neighbour hands over  -> discards both rows
+        #   _wake_around()    a feeder stops resting  -> discards downstream
+        #   flush_material()  a wholesale reset       -> wake_all_gates()
+        #   invalidate_board() an edit                -> clears the set
+        #
+        # That list is closed, and `tools/check_wakelist_safe.py` is what
+        # holds it to account: `lying_sleepers()` fails the run if any
+        # sleeping gate's own predicate has stopped holding, which is exactly
+        # the state a missed edge produces and the thing the backstop used to
+        # paper over. Measured: 0 violations with the `_wake_around()` edge,
+        # 4 without it.
+        newly_asleep.extend(rows[to_sleep].tolist())
+        self._sleep_rows(newly_asleep)
         self.stats["gates_asleep"] = len(asleep)
 
-        # **`admit` needs no filtering against the sleep set**, which is the
-        # part that makes this cheap. `to_sleep` excludes admitted rows and
-        # `to_wake` covers everything holding anything, so a row cannot be
-        # both admitted and asleep after this pass -- the two masks partition
-        # the table between them. Re-filtering `admit` would put a Python
-        # membership test per admitted gate back into the pass, which is the
-        # cost just removed.
+        # **`admit` needs no filtering against the sleep set.** The table was
+        # already sliced to the awake rows above, and both tiers exclude
+        # `awake`, so a row cannot be both admitted and asleep.
         return admit.tolist(), starved, blocked
 
     # --- waking the belts a gate touches ----------------------------------
@@ -532,11 +673,35 @@ class GateSim:
         what is *adjacent to* a row, so `_wake_around(other.row)` reads like
         it wakes `other` and does not. That exact misreading left a
         directly-fed gate unwoken -- see the comment in `deliver_direct()`.
+
+        **It does, however, wake the gate at the far end of each downstream
+        run**, which is the wake edge tier-two gate sleep rests on. A gate
+        sleeping because its input belt was empty and at rest has to wake when
+        that belt can deliver again, and the moment that becomes true is
+        exactly this one: this gate has just filled a waiting zone, so the run
+        it feeds is no longer at rest. Waking the run alone is not enough --
+        the run will carry the item along and call `accept_from()`, which
+        wakes the receiver, but only `d/v` ticks later; until then the
+        receiver is asleep on a claim ("my feeder is at rest") that stopped
+        being true on this tick.
+
+        Nothing *breaks* without it, since `accept_from()` is the edge that
+        matters for delivery -- but the receiver would spend the transit
+        asleep while its own predicate was false, and a sleep set that
+        disagrees with its own predicate is the state every checker here is
+        designed to catch.
         """
         downstream, upstream = self._segments_of_gate(row)
         belts = self.belts
+        asleep = self._asleep
         for seg in downstream:
             belts.wake(seg)
+            # The gate this run drains into, if any. `_dst_cached()` is the
+            # same resolution the forward path uses, so the two cannot
+            # disagree about who is downstream of what.
+            dst = self._dst_cached(seg)
+            if dst is not None:
+                self._wake_one(dst[0])
         for seg in upstream:
             belts.wake(seg)
 
@@ -648,13 +813,237 @@ class GateSim:
         # awake for unrelated reasons. Dropping the test is what exposed it.
         return True
 
+    # --- sleeping a partially-fed gate ------------------------------------
+    #
+    # The predicate above sleeps a gate only when it holds *nothing*. That is
+    # sound but leaves the common case awake: a gate with some inputs and not
+    # all of them, waiting on a lane whose belt is empty and asleep. Measured
+    # at the end of 60 ticks, after constant folding:
+    #
+    #            partially fed   of those, provably stuck
+    #   cpu.npz        211                123
+    #   noram.npz      319                186
+    #   Ram2.npz       239                163
+    #
+    # So this roughly doubles the sleeping population, and it is the shape a
+    # computer actually has: a gate part-way through assembling its operands,
+    # waiting on a memory read that is not coming this tick.
+    #
+    # **It is a proof, not a prediction.** The claim is narrow: if every
+    # *unfed* declared input channel is fed by a belt segment that is both
+    # **empty** and **at rest**, then no material can reach this gate's
+    # missing lanes, so its readiness cannot change -- whatever its fire rule
+    # is. Three things have to hold, and each is checked rather than assumed:
+    #
+    #   - **empty**, not merely asleep. A sleeping run that *holds* items is
+    #     the RAM fixed point, and its head is at the end waiting to be taken
+    #     -- by this very gate. Sleeping on that would be the deadlock.
+    #   - **at rest**, not merely empty. An empty run with an unsaturated
+    #     anchor, or one whose producer is loaded, will deliver shortly.
+    #     `BeltSim.is_at_rest()` is the single authority and is already
+    #     brute-force checked against its own definition by
+    #     `tools/probe_wakelist.py`.
+    #   - **every** unfed channel, and a channel with no segment at all
+    #     disqualifies the gate. A directly-fed lane can be written by
+    #     `deliver_direct()` with no belt involved, and a dangling lane is
+    #     never fed by anything -- but both are decided by connectivity, which
+    #     is the Python work being skipped, so the conservative answer is to
+    #     stay awake.
+    #
+    # **The wake edges already cover it**, which is why this needs no new
+    # mechanism. A sleeping belt cannot deliver, and the moment it can it was
+    # woken by `_wake_around()` from the gate upstream of it -- and the same
+    # call wakes the segments either side of this gate. The one edge that is
+    # genuinely new is the belt waking *this* gate, and `accept_from()`
+    # already discards the row it loads.
+    #
+    # The feeder map is built per **edit**, not per tick: it is the inverse of
+    # `_dst_cache` and changes only when the segmentation does. Deriving it
+    # per tick would be the O(gates x segments) scan the wake list exists to
+    # avoid -- the probe that produced the numbers above did exactly that and
+    # took longer than the phase it was measuring.
+    def _feeders(self):
+        """(row, channel) -> the segment id feeding it, built per edit.
+
+        The inverse of `_dst_cached()`, over every segment at once. Shares
+        `_gate_segments`' invalidation because it is derived from the same
+        `seg.dst` resolution.
+        """
+        if self._feeder_map is None:
+            feeders = {}
+            for seg in self.index.segments.values():
+                dst = self._dst_cached(seg)
+                if dst is not None:
+                    # One segment per (row, channel): a port face has exactly
+                    # one neighbour, so a second would be a resolution bug.
+                    feeders[dst] = seg
+            self._feeder_map = feeders
+        return self._feeder_map
+
+    def _starved_on_sleeping_belts(self, row, n_in, held_in):
+        """Is every unfed input of this gate fed by an empty, resting run?
+
+        The partially-fed sleep test. See the block comment above for the
+        argument; this is only the mechanics.
+
+        Returns False the moment any unfed channel could still be fed, which
+        is the conservative direction: a wrong False costs a tick of work, a
+        wrong True freezes the gate for ever.
+        """
+        feeders = self._feeders()
+        belts = self.belts
+        tick = self._tick
+        for ch in range(n_in):
+            if held_in[ch]:
+                continue
+            seg = feeders.get((row, ch))
+            if seg is None:
+                # No belt feeds this lane: either a direct neighbour writes it
+                # (deliver_direct, which this gate's sleep must not outlive)
+                # or it dangles. Both need connectivity to tell apart, so stay
+                # awake.
+                return False
+            if seg.tail != seg.head:
+                # Holding items -- the RAM fixed point, whose head sits at the
+                # end waiting to be taken by this very gate. Sleeping on that
+                # would be the deadlock the block comment names.
+                #
+                # **Redundant given the `is_at_rest()` test below, and kept
+                # anyway.** Mutation-testing shows removing it passes, and the
+                # reason is structural rather than lucky: a run at rest
+                # holding items has its head at the end and no room, and the
+                # belt tick that put it there had already called
+                # `accept_from()` -- so the lane it feeds is *held*, and a
+                # held lane never reaches this loop. Brute-forced over run
+                # lengths 1-5 and 120 ticks each: zero instances of
+                # (non-empty, at rest, downstream lane unfed).
+                #
+                # It stays because that argument runs through two other
+                # objects' invariants, and the cost of being wrong is a
+                # silent permanent stall. One integer comparison is the right
+                # price for not having to re-derive it.
+                return False
+            if not belts.is_at_rest(seg, tick):
+                # **Also redundant today, and for a reason worth recording
+                # rather than rediscovering.** By this line the run is known
+                # *empty*, and for an empty run `is_at_rest()` adds exactly
+                # one thing: that the anchor has saturated. That cannot
+                # matter to this gate -- an empty run delivers nothing
+                # whatever its anchor, because delivery needs a push and a
+                # push needs the producer to offer. Verified both ways: the
+                # mutation removing this line passes the differential check,
+                # and a sweep over run lengths 1-6 for 150 ticks found zero
+                # runs that were empty-but-not-at-rest with the lane they
+                # feed unfed.
+                #
+                # Kept because it is the *stated* predicate. "The feeding run
+                # is at rest" is the claim this sleep rests on, and spelling
+                # it as "is empty" would be a second, weaker rule that
+                # happens to coincide -- and would silently stop coinciding
+                # the moment `is_at_rest()` grows a term. `BeltSim` owns what
+                # "at rest" means; this asks rather than re-deriving.
+                return False
+        return True
+
+    # The sleep set is mutated from eleven places -- two phases, three port
+    # callbacks, the wake edges, the latches and the invalidation -- and the
+    # memoised slice above is only correct if *every* one of them bumps the
+    # generation. Rather than trust eleven call sites, the mutations go
+    # through these three methods, and `_asleep` is never written directly.
+    #
+    # The failure a missed bump produces is quiet in the dangerous direction:
+    # a stale slice that still contains a row which has since gone to sleep
+    # merely wastes a tick, but one that *omits* a row an edge has just woken
+    # stops ticking it indefinitely. That asymmetry is why this is a wrapper
+    # rather than a convention.
+    def _sleep_rows(self, rows):
+        """Put these rows to sleep."""
+        before = len(self._asleep)
+        self._asleep.update(rows)
+        if len(self._asleep) != before:
+            self._sleep_gen += 1
+
+    def _wake_rows(self, rows):
+        """Wake these rows. Cheaper than it looks: usually a one-element hit."""
+        asleep = self._asleep
+        if not asleep:
+            return
+        before = len(asleep)
+        asleep.difference_update(rows)
+        if len(asleep) != before:
+            self._sleep_gen += 1
+
+    def _wake_one(self, row):
+        """Wake a single row. The hot form, used by the port callbacks."""
+        asleep = self._asleep
+        if asleep and row in asleep:
+            asleep.discard(row)
+            self._sleep_gen += 1
+
+    def _awake_slice(self, rows, n_in, n_out, strict):
+        """The gate table restricted to the rows not asleep, memoised.
+
+        Keyed on `(gate table identity, sleep generation)`: the table is
+        rebuilt per edit and the generation is bumped by every mutation of the
+        sleep set, so a quiet board reuses one slice indefinitely. See the
+        call site for the measurement that forced this -- recomputing the mask
+        per tick is slower than not slicing at all.
+        """
+        if not self._sleep_enabled or not self._asleep:
+            return rows, n_in, n_out, strict
+        key = (id(rows), self._sleep_gen)
+        if self._awake_cache is not None and self._awake_cache[0] == key:
+            return self._awake_cache[1]
+        asleep = self._asleep
+        mask = ~np.isin(rows, np.fromiter(
+            asleep, dtype=np.int64, count=len(asleep)))
+        sliced = (rows[mask], n_in[mask], n_out[mask], strict[mask])
+        self._awake_cache = (key, sliced)
+        return sliced
+
+    def _sleep_changed(self):
+        """Invalidate the awake slice. Called by every sleep-set mutation.
+
+        A plain counter rather than a dirty flag, because the cache key has to
+        distinguish "changed and changed back" from "unchanged" -- a set that
+        loses one row and gains another has the same length and would
+        otherwise look identical.
+        """
+        self._sleep_gen += 1
+
+    def _sleeping_stats(self):
+        """(starved, blocked) to credit for the gates this tick skipped.
+
+        **Every sleeping gate is starved, never blocked**, and that falls out
+        of both tiers' predicates rather than being an approximation:
+
+          - tier one sleeps a gate holding *nothing*, which cannot be blocked
+            (blocked means a waiting zone is occupied) and is unready unless
+            it has no inputs at all -- and a generator is `ready`, so it is
+            admitted and never slept.
+          - tier two excludes `holds_out` explicitly, for exactly this reason
+            among others, and requires a *missing* input lane. So it is
+            unready too.
+
+        `_gate_is_inert()` and the tier-two mask are the two places that can
+        add to the sleep set, and both exclude `awake`, so a sleeping row
+        would have been counted `starved` by the full pass. One number, no
+        per-row bookkeeping, and it is exact rather than close.
+
+        A self-check in the differential tool would be the place to pin this
+        if either predicate ever admits an output-holding gate.
+        """
+        if not self._sleep_enabled:
+            return 0, 0
+        return len(self._asleep), 0
+
     def wake_gate(self, row):
         """Mark a gate as needing ticks again. Idempotent and cheap."""
-        self._asleep.discard(row)
+        self._wake_one(row)
 
     def wake_all_gates(self):
         """Wake every gate. Used after a rebuild or a wholesale change."""
-        self._asleep.clear()
+        self._wake_rows(tuple(self._asleep))
 
     def set_sleep_enabled(self, on):
         """Turn gate sleeping off entirely, for a differential check.
@@ -666,7 +1055,10 @@ class GateSim:
         """
         self._sleep_enabled = bool(on)
         if not self._sleep_enabled:
-            self._asleep.clear()
+            self._wake_rows(tuple(self._asleep))
+        # The slice is keyed on the generation, not on the latch, so flipping
+        # the latch has to invalidate it explicitly.
+        self._awake_cache = None
         return self._sleep_enabled
 
     def _rows_holding_output(self):
@@ -916,7 +1308,7 @@ class GateSim:
         # this is the hottest code in the belt phase, and the belts on either
         # side are awake by construction here -- *this* callback only runs
         # from inside an awake segment's own tick.
-        self._asleep.discard(row)
+        self._wake_one(row)
 
     def accept_from(self, seg, payload):
         """Can the gate downstream of `seg` take its head item?
@@ -940,7 +1332,7 @@ class GateSim:
         # has to wake: the belt layer is the only thing that can hand it
         # material without a gate event. Same one-`discard` reasoning as
         # `took_from()`.
-        self._asleep.discard(row)
+        self._wake_one(row)
         return True
 
     def tick_belts(self, tick):
@@ -1013,8 +1405,8 @@ class GateSim:
                 # direct neighbour to be asleep -- which kept the receiver
                 # awake for an unrelated reason and made the missing wake
                 # invisible. Removing that redundant test is what exposed it.
-                self._asleep.discard(gate.row)
-                self._asleep.discard(other.row)
+                self._wake_one(gate.row)
+                self._wake_one(other.row)
                 moved += 1
         self.stats["direct"] += moved
         return moved

@@ -635,6 +635,59 @@ def test_a_folded_source_feeds_its_neighbour_without_a_direct_hop():
        f"hops and {engine.gates.stats['consumed']} consumed")
 
 
+def test_gate_sleep_still_works_when_switched_on():
+    """Gate sleeping is off by default, so something must still exercise it.
+
+    It is off on measurement, not because it is broken (see the comment on
+    `GateSim._sleep_enabled` for the numbers). A mechanism parked behind a
+    disabled flag rots silently, and the thing that would rot here is the
+    *predicate* -- the wake edges are still live because the belts use the
+    same `_wake_around()`.
+
+    `tools/check_wakelist_safe.py` is the real guard and enables both layers
+    explicitly. This is the cheap version that runs in CI: tier one sleeps an
+    idle gate, tier two sleeps a partially-fed one whose missing lane is on an
+    empty resting run, and feeding the gate wakes it.
+    """
+    gates = engine.gates
+    try:
+        gates.set_sleep_enabled(True)
+        # Tier one: a lone Shear, fed nothing, holding nothing.
+        idle = engine.place_structure(Shear, 10, 10)
+        engine.sync_segments()
+        _run(2)
+        assert idle.row in gates._asleep, (
+            f"an idle gate should sleep: {sorted(gates._asleep)}")
+
+        # Feeding it must wake it, through the same path a belt would use.
+        idle.set_input(0, 1.0)
+        gates.wake_gate(idle.row)
+        assert idle.row not in gates._asleep
+        _run(1)
+
+        # Tier two: a Shear with channel 0 held by a folded Source and
+        # channel 1 fed by a run whose producer is a starved gate, so the run
+        # stays empty and goes to rest.
+        part = engine.place_structure(Shear, 10, 20)
+        engine.place_structure(Source, 10, 21, direction=cell.DIR_NY)
+        engine.place_structure(Shear, 2, 20)       # a starved producer
+        for x in range(4, 10):
+            engine.place_belt(x, 20, cell.DIR_PX)
+        engine.sync_segments()
+        _run(4)
+        assert part.in_held(0), "the folded Source should hold channel 0"
+        assert not part.in_held(1), "channel 1 should still be empty"
+        assert part.row in gates._asleep, (
+            "a partially-fed gate whose missing lane is on an empty resting "
+            f"run should sleep: asleep={sorted(gates._asleep)}")
+        ok(f"gate sleep works when enabled: tier one and tier two both slept "
+           f"({len(gates._asleep)} asleep)")
+    finally:
+        # Back to the shipped default, or every later scenario runs with a
+        # scheduler the app does not use.
+        gates.set_sleep_enabled(False)
+
+
 def test_a_folded_source_is_not_ticked_at_all():
     """The saving, pinned: a folded Source leaves the firing set.
 

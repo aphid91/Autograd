@@ -100,6 +100,7 @@ from core.gameboard import GRID_CHANNELS  # noqa: E402
 BOARD = 256
 board = harness.board
 engine = harness.engine
+gates = engine.gates
 
 MACHINES = (Shear, Route, Merge, Reciprocal, Max, Floor, Swap, Sink)
 
@@ -296,6 +297,103 @@ def build(rng, runs=12, run_len=34):
             board.spawn(Shear, 5, y, cell.DIR_PX)
         y += 4
 
+    # Two rows for **tier-two gate sleep**: a gate waiting on a lane whose
+    # belt is empty and at rest. That is the whole population the second tier
+    # exists for, and the fixture had *none* of it -- instrumenting
+    # `_starved_on_sleeping_belts()` showed **zero** grants over 80 ticks, so
+    # the check was green on a board that never reached the new code. The
+    # partially-fed gates it did have were fed by `main()` by hand, so their
+    # missing lane had no feeding segment at all and the predicate correctly
+    # refused.
+    #
+    # The shape needs a belt that **stays empty**: a run whose own producer is
+    # a starved gate rather than a Source. So this is
+    #
+    #     Shear A (starved, fed only by main()) -> run -> Shear B's x lane
+    #     Source -> run -> Shear B's y lane
+    #
+    # B therefore sits with y fed and x missing, its x-feeding run empty and
+    # at rest until main() happens to feed A -- which is the wake edge, and
+    # the thing worth diffing.
+    for _ in range(2):
+        if y + 6 >= board.height:
+            break
+        # A, the starved producer. Nothing feeds it but main().
+        if all(board.is_empty(cx, cy)
+               for (cx, cy) in Shear.cells_for(2, y, cell.DIR_PX, False)):
+            board.spawn(Shear, 2, y, cell.DIR_PX)
+            # A's +X output at (3,y) -> a run into B's -X input.
+            for x in range(4, 10):
+                if board.is_empty(x, y):
+                    board.spawn(Belt, x, y, cell.DIR_PX)
+            if all(board.is_empty(cx, cy)
+                   for (cx, cy) in Shear.cells_for(10, y, cell.DIR_PX,
+                                                   False)):
+                board.spawn(Shear, 10, y, cell.DIR_PX)
+                # B's +Y input at (10,y) takes from (10,y+1): a Source there
+                # facing -Y keeps that lane fed, so B is *partially* fed.
+                if all(board.is_empty(cx, cy) for (cx, cy)
+                       in Source.cells_for(10, y + 1, cell.DIR_NY, False)):
+                    board.spawn(Source, 10, y + 1, cell.DIR_NY)
+                # Somewhere for B's results to go, so it is not output-blocked
+                # (a blocked gate is excluded from tier two and would make
+                # this row vacuous for a second reason).
+                for x in range(12, 18):
+                    if board.is_empty(x, y):
+                        board.spawn(Belt, x, y, cell.DIR_PX)
+        y += 4
+
+    # Two rows for the **RAM fixed point feeding a partially-fed gate**, which
+    # is the one shape that can make tier-two sleep a *deadlock* rather than
+    # merely a waste.
+    #
+    # A run that is full and at rest has its head sitting at the end waiting
+    # to be taken -- by the very gate deciding whether to sleep. If that gate
+    # sleeps, it never takes it, so the run stays at rest, so the gate stays
+    # asleep: a mutual fixed point that no edge will ever break, and the
+    # factory simply stops. `_starved_on_sleeping_belts()` refuses on
+    # `seg.tail != seg.head` precisely to prevent it.
+    #
+    # Measuring showed that guard was **untested**: on the rows above, every
+    # run that held items was also *awake and not at rest*, so the
+    # `is_at_rest()` check refused first and removing the holds-items check
+    # changed nothing. 22 refusals, all of them `(asleep=False, at_rest=False)`.
+    # So the shape has to be built deliberately:
+    #
+    #     Source -> short run (fills, goes to rest) -> Shear's channel 1
+    #     a folded Source abutted onto                 Shear's channel 0
+    #
+    # **Channel 0 has to be *fed*, not merely absent.** The predicate returns
+    # on the *first* disqualifying channel, so a Shear with both lanes missing
+    # refuses on channel 0 having no feeder and never looks at the full run at
+    # all -- which is what the first attempt at this row did, leaving the
+    # holds-items guard still untested. A folded Source abutting channel 0
+    # holds it permanently fed, so channel 1 is the only missing lane and the
+    # full, resting run is the thing the predicate actually has to judge.
+    for _ in range(2):
+        if y + 4 >= board.height:
+            break
+        if board.is_empty(0, y):
+            board.spawn(Source, 0, y, cell.DIR_PX)
+        for x in range(2, 5):
+            if board.is_empty(x, y):
+                board.spawn(Belt, x, y, cell.DIR_PX)
+        if all(board.is_empty(cx, cy)
+               for (cx, cy) in Shear.cells_for(5, y, cell.DIR_PX, False)):
+            board.spawn(Shear, 5, y, cell.DIR_PX)
+            # Channel 0 takes from (5, y+1): a Source there facing -Y abuts
+            # it, folds, and holds the lane fed for ever.
+            if all(board.is_empty(cx, cy) for (cx, cy)
+                   in Source.cells_for(5, y + 1, cell.DIR_NY, False)):
+                board.spawn(Source, 5, y + 1, cell.DIR_NY)
+            # Somewhere for results to go, so the gate is not output-blocked
+            # (which would exclude it from tier two for an unrelated reason
+            # and make the row vacuous a second time).
+            for x in range(7, 12):
+                if board.is_empty(x, y):
+                    board.spawn(Belt, x, y, cell.DIR_PX)
+        y += 4
+
     # Two rows of gates that **abut with no belt between them**, which is the
     # `deliver_direct()` path and its own wake edge. The fixture had none of
     # this -- zero gates with a direct gate neighbour, zero direct deliveries
@@ -350,6 +448,60 @@ def build(rng, runs=12, run_len=34):
 def starved_gates():
     """Live gates with at least one input, for the random feeder below."""
     return [g for g in engine.gates.gates() if g.input_count() > 0]
+
+
+def lying_sleepers():
+    """Tier-two sleepers whose own predicate no longer holds.
+
+    [(row, channel, segment id)] for each sleeping, partially-fed gate with a
+    missing lane whose feeding run is *not* an empty resting run -- i.e. a
+    gate asleep on a claim that has stopped being true.
+
+    **This is strictly stronger than the differential diff**, and that is why
+    it exists. A gate sleeping on a stale claim is still woken by
+    `accept_from()` when the item eventually reaches it, so the simulation is
+    unaffected and both timelines agree -- the diff cannot see it. What is
+    broken is that the scheduler is holding a conclusion its own premise no
+    longer supports, which is a missed wake that happens not to matter yet.
+    The next term added to the predicate is what would make it matter, and by
+    then the cause would be a hundred ticks upstream of the symptom.
+
+    It is also the only thing that makes the downstream-gate wake in
+    `GateSim._wake_around()` testable: measured at 0 violations with that
+    edge and 4 without, over 200 ticks, while the diff passes either way.
+
+    Tier *one* is deliberately not checked here. Its claim is "I hold
+    nothing", which the wake edges re-establish by construction, and a
+    one-phase-stale sleep decision is normal there (see
+    `mutual_sleep_instances()` on exactly that transient).
+    """
+    out = []
+    gs = engine.gates
+    belts = engine.belts
+    feeders = gs._feeders()
+    for row in sorted(gs._asleep):
+        if not board.is_row_alive(row):
+            continue
+        view = board.view(row)
+        n_in = view.input_count()
+        if not n_in:
+            continue
+        held = [view.in_held(c) for c in range(n_in)]
+        if not any(held):
+            continue        # tier one: a different claim, checked elsewhere
+        for ch in range(n_in):
+            if held[ch]:
+                continue
+            seg = feeders.get((row, ch))
+            if seg is None:
+                # No belt feeds it, so tier two never granted this sleep --
+                # it must have come from somewhere else. Not this check's
+                # business.
+                continue
+            if seg.tail != seg.head or not belts.is_at_rest(seg, gs._tick):
+                out.append((row, ch, seg.sid))
+                break
+    return out
 
 
 def mutual_sleep_instances():
@@ -417,6 +569,24 @@ def main():
     wake_edges = {sl.name: 0 for sl in SLEEPERS}
     slept_by_layer = {sl.name: 0 for sl in SLEEPERS}
 
+    #: Tier-two gate sleeps granted (a partially-fed gate whose missing lanes
+    #: are fed by empty, resting runs). Counted and reported because the sleep
+    #: set alone cannot distinguish "tier two never fired" from "tier two is
+    #: safe" -- and it really did never fire: the fixture had no gate of that
+    #: shape at all until the rows above were added, so this check was green
+    #: on a board that never reached the new predicate. Reported for the same
+    #: reason the per-layer wake counts are.
+    tier2 = {"n": 0}
+    _real_tier2 = gates._starved_on_sleeping_belts
+
+    def _counting_tier2(row, n_in, held_in):
+        granted = _real_tier2(row, n_in, held_in)
+        if granted:
+            tier2["n"] += 1
+        return granted
+
+    gates._starved_on_sleeping_belts = _counting_tier2
+
     def run_one_tick(at_tick):
         """One tick at a fixed tick number, from whatever is loaded."""
         engine.clock.tick = at_tick
@@ -465,6 +635,26 @@ def main():
         # Checked here, while the engine still holds the timeline under
         # test's state -- after the oracle tick below it holds the oracle's,
         # and the oracle has no sleep set to inspect.
+        # Does every tier-two sleeper still *satisfy* its own predicate? The
+        # differential comparison cannot ask this: a gate sleeping on a stale
+        # claim is still woken by `accept_from()` when the item finally
+        # arrives, so behaviour is unchanged and the timelines agree. What is
+        # wrong is that the sleep set and the predicate disagree, which is a
+        # missed wake that happens not to matter *yet* -- and the next term
+        # added to the predicate is what would make it matter.
+        #
+        # This is what makes the downstream-gate wake in `_wake_around()`
+        # testable. Measured: 0 violations with that edge, 4 without it over
+        # 200 ticks. The differential check alone passes either way.
+        lying = lying_sleepers()
+        if lying:
+            problems.append((t, [
+                f"STALE SLEEP: gate {row} is asleep but its missing lane "
+                f"ch{ch} is fed by segment {sid}, which is not an empty "
+                f"resting run" for (row, ch, sid) in lying[:4]]))
+            sleep_state = snapshot()
+            break
+
         stuck = mutual_sleep_instances()
         if stuck:
             problems.append((t, [
@@ -518,6 +708,15 @@ def main():
               f"mean {mean:.1f} asleep at tick start")
         if not n:
             vacuous.append(sl.name)
+    # Tier-two gate sleep separately, because the gate layer's wake count
+    # above cannot distinguish the two tiers: tier one alone produces
+    # thousands of transitions, so a tier two that never fired once is
+    # invisible in that number. It really was zero before the fixture gained
+    # a gate of the right shape.
+    print(f"  gates: {tier2['n']} tier-two sleeps granted "
+          f"(partially fed, missing lanes on resting runs)")
+    if not tier2["n"]:
+        vacuous.append("gates tier two")
     for name in vacuous:
         print(f"  WARNING: nothing in '{name}' ever woke, so this run did "
               f"not exercise its wake edges at all")
