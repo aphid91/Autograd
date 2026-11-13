@@ -928,7 +928,20 @@ class Engine:
         them as it was. Re-deriving makes ctrl+R the player's recovery from
         anything stale, which is what they reach for it expecting.
         """
+        # **`sync_segments()`, not just `invalidate_segments()`.** The latter
+        # only *marks* stale; the rebuild happens at the frame's sync point.
+        # So flushing and seeding here ran against the **old** segmentation,
+        # and the rebuild that followed reassigned every id underneath them --
+        # which is exactly the Force-rebuild button's behaviour minus the
+        # ordering, and why that button worked where ctrl+R did not.
+        #
+        # The symptom was garbage values on belts and machines appearing
+        # unconnected: the seeds landed in rings that were about to be
+        # recarved, and the port resolutions the flush had just cleared were
+        # re-derived a frame later from a device copy packed against the
+        # previous slot assignment.
         self.invalidate_segments()
+        self.sync_segments()
         self.flush_material()
         self.clock.reset()
         # Re-seed against the new timeline: seed_segments() dates its pushes
