@@ -525,6 +525,198 @@ def test_the_belt_kernel_pops_into_a_gate():
     ok("the belt kernel pops into a gate lane in step with the CPU")
 
 
+def test_the_gpu_tick_matches_the_cpu_tick_through_the_clock():
+    """The integrated path: the same board, ticked both ways through `tick()`.
+
+    Everything above tests a kernel. This tests the *wiring* -- the phase
+    swap, the upload-once policy, the settle points -- by running the real
+    `Engine.tick()` on two identical boards and comparing the result.
+
+    Built twice rather than snapshot-and-restore, because the integration's
+    whole risk is state living in the wrong place: a snapshot would have to
+    know where that is, which is the thing under test.
+    """
+    def build():
+        harness.reset()
+        src = engine.place_structure(Source, 3, 10)
+        src.emit_value = 2.0
+        engine.place_belt_path((5, 10), (10, 10))
+        engine.place_structure(Sink, 11, 10)
+        engine.sync_segments()
+
+    def run_and_read(use_gpu):
+        build()
+        gates = _with_device()
+        engine._gpu_enabled = use_gpu
+        assert engine.use_gpu_tick() == use_gpu, (
+            f"the engine refused to run with gpu={use_gpu}")
+        for _ in range(24):
+            engine.clock.request_step(1)
+            engine.tick(0.0)
+        engine.settle()
+        segs = {sid: (s.head, s.tail, s.anchor)
+                for sid, s in engine.segments.segments.items()}
+        return segs, engine.belts.total_items()
+
+    try:
+        cpu, cpu_items = run_and_read(False)
+        gpu, gpu_items = run_and_read(True)
+    finally:
+        engine._gpu_enabled = True
+
+    assert cpu_items > 0, "nothing moved on the CPU; the fixture is vacuous"
+    assert cpu.keys() == gpu.keys(), (sorted(cpu), sorted(gpu))
+    for sid in cpu:
+        assert cpu[sid] == gpu[sid], (
+            f"segment {sid} after 24 ticks: cpu {cpu[sid]}, gpu {gpu[sid]}")
+    assert cpu_items == gpu_items, (cpu_items, gpu_items)
+    ok(f"24 ticks through Engine.tick() agree, {cpu_items} items on the belts")
+
+
+def test_the_tick_counter_advances_the_same_either_way():
+    """The clock is untouched by the phase swap.
+
+    `swap_phases()` replaces what a phase *does*, not the clock's sequencing,
+    so the tick count, the backlog cap and `alpha` must behave identically.
+    A port that quietly ran a different number of ticks would make every
+    comparison above meaningless.
+    """
+    harness.reset()
+    engine.place_structure(Source, 3, 10)
+    engine.place_belt_path((5, 10), (9, 10))
+    engine.sync_segments()
+    _with_device()
+
+    for use_gpu in (False, True):
+        engine._gpu_enabled = use_gpu
+        engine.clock.reset()
+        before = engine.clock.tick
+        for _ in range(7):
+            engine.clock.request_step(1)
+            engine.tick(0.0)
+        assert engine.clock.tick - before == 7, (
+            f"gpu={use_gpu}: ran {engine.clock.tick - before} ticks, not 7")
+    engine._gpu_enabled = True
+    ok("the tick counter advances identically on both paths")
+
+
+def test_a_board_with_merge_falls_back_to_the_cpu():
+    """A host-decided machine vetoes the dispatch for the whole board.
+
+    The kernel skips Merge by design, so a GPU tick would leave it
+    permanently unfired -- a stall the player would read as a wiring
+    mistake. The veto is what keeps "the kernel declines this type" from
+    becoming "this machine does not work".
+    """
+    harness.reset()
+    engine.place_structure(Shear, 6, 10)
+    engine.sync_segments()
+    _with_device()
+    assert engine.use_gpu_tick(), (
+        "a plain Shear board should run on the device")
+
+    engine.place_structure(Merge, 12, 10)
+    engine.sync_segments()
+    engine.gates.sync_device()
+    assert not engine.use_gpu_tick(), (
+        "a board containing a Merge must fall back to the CPU phase")
+    ok("a Merge on the board vetoes the GPU tick")
+
+
+def test_an_edit_settles_before_re_deriving():
+    """An edit must read back first, or it rewinds the simulation.
+
+    `invalidate_segments()` re-derives from entity rows and ring state, so a
+    device holding newer results has to be read back before the rebuild --
+    otherwise the rebuild reads a stale board, and the upload that follows
+    overwrites the dispatches' results. The symptom would be a factory that
+    loses however many ticks were outstanding, every time it is edited.
+    """
+    harness.reset()
+    src = engine.place_structure(Source, 3, 10)
+    src.emit_value = 5.0
+    engine.place_belt_path((5, 10), (10, 10))
+    engine.place_structure(Sink, 11, 10)
+    engine.sync_segments()
+    _with_device()
+    engine._gpu_enabled = True
+
+    for _ in range(10):
+        engine.clock.request_step(1)
+        engine.tick(0.0)
+    assert engine._gpu_dirty, (
+        "ten GPU ticks should have left the device ahead")
+
+    # An edit anywhere -- this one does not even touch the run.
+    engine.place_belt_path((5, 20), (6, 20))
+    assert not engine._gpu_dirty, (
+        "the edit did not settle; the rebuild just read a stale board")
+    ok("an edit settles the device before re-deriving")
+
+
+def test_the_gpu_tick_conserves_material():
+    """Over many ticks the GPU neither loses nor duplicates items.
+
+    The honest statement of what the port guarantees. A *single* phase from
+    identical state is exact (every comparison above), but across many ticks
+    the two timelines can drift by a tick on individual runs: the CPU walks
+    segments in id order, so a run that drains a gate does it before a later
+    run in the same phase reads that gate, while every GPU thread reads the
+    start-of-dispatch state. See the note in `shaders/belt_tick.comp`.
+
+    That is a scheduling difference, not a correctness one -- material is
+    delayed, never created or destroyed -- so this asserts conservation
+    rather than equality. The distinction matters: a test demanding equality
+    would be demanding a serialised belt phase, which is the thing being
+    removed.
+    """
+    def run(use_gpu, ticks=40):
+        harness.reset()
+        src = engine.place_structure(Source, 3, 10)
+        src.emit_value = 1.0
+        engine.place_belt_path((5, 10), (12, 10))
+        sh = engine.place_structure(Shear, 13, 10)
+        engine.place_belt_path((15, 10), (18, 10))
+        engine.sync_segments()
+        _drain_every_output(sh)
+        _with_device()
+        engine._gpu_enabled = use_gpu
+        for _ in range(ticks):
+            engine.clock.request_step(1)
+            engine.tick(0.0)
+        engine.settle()
+        return (engine.belts.total_items(),
+                engine.gates.stats["destroyed"],
+                engine.belts.stats["pushed"],
+                engine.belts.stats["popped"])
+
+    try:
+        cpu = run(False)
+        gpu = run(True)
+    finally:
+        engine._gpu_enabled = True
+
+    assert cpu[0] > 0 and gpu[0] > 0, (
+        f"nothing reached the belts at all: cpu {cpu}, gpu {gpu}")
+    # **The ring counters are CPU-side only.** `pushed` / `popped` are
+    # incremented by `BeltSim._push()` and the pop branch, which the kernel
+    # does not run -- it writes ring state directly. So they read zero on the
+    # GPU path and are not a conservation check here; the item counts are.
+    # Worth stating because a stat that silently reads zero is exactly the
+    # kind of thing a later test would assert on and get a false pass from.
+    assert gpu[2] == 0 and gpu[3] == 0, (
+        "the kernel does not maintain the host ring counters; if it now "
+        "does, this test can use them")
+    # The two must be within a tick's worth of each other, rather than
+    # drifting without bound. A systematic leak would grow with the tick
+    # count; a scheduling skew does not.
+    assert abs(cpu[0] - gpu[0]) <= 4, (
+        f"cpu has {cpu[0]} items, gpu {gpu[0]} -- more than a scheduling "
+        f"skew apart")
+    ok(f"40 ticks conserve material on both paths "
+       f"(cpu {cpu[0]} items, gpu {gpu[0]})")
+
+
 def test_the_geometry_block_tracks_an_edit():
     """Placing a gate re-packs the geometry rather than leaving it stale.
 

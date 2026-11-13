@@ -299,6 +299,46 @@ class Clock:
         self.last_ticks = ran
         return ran
 
+    def phases_are_only(self, structure, belt):
+        """Are these the *only* callbacks registered, one per phase?
+
+        Asked by the compute path before it swaps the phase lists: anything
+        else registered would not run, and a phase callback is how a test or
+        a profiling tool watches the tick. Answering here rather than having
+        the engine inspect `_phases` keeps the list private.
+        """
+        return (self._phases[PHASE_STRUCTURE] == [structure]
+                and self._phases[PHASE_BELT] == [belt]
+                and all(not self._phases[p] for p in range(PHASE_COUNT)
+                        if p not in (PHASE_STRUCTURE, PHASE_BELT)))
+
+    def swap_phases(self, structure, belt):
+        """Temporarily replace the phase callbacks. Returns what to restore.
+
+        For the compute path, which substitutes a dispatch for each phase's
+        *body* while leaving the clock's sequencing -- the backlog cap, the
+        tick counter, `alpha` -- exactly as it is. That is the substitution
+        this module's docstring predicted, and doing it here rather than by
+        bypassing `advance()` is what keeps the two timelines comparable: the
+        tick count, the profiler's counting and `request_step()` behave
+        identically whichever path runs.
+
+        Deliberately **not** `off_phase()` + `on_phase()`: the engine's belt
+        transport lives on `PHASE_BELT` and a blanket clear silently stops
+        the simulation for everything that shares this clock (see
+        `harness.reset()`, which asserts against exactly that). This swaps
+        the whole list and hands it back, so the restore cannot be partial.
+        """
+        saved = [list(p) for p in self._phases]
+        self._phases[PHASE_STRUCTURE] = [structure]
+        self._phases[PHASE_BELT] = [belt]
+        return saved
+
+    def restore_phases(self, saved):
+        """Put back what `swap_phases()` replaced."""
+        for i, phase in enumerate(saved):
+            self._phases[i] = list(phase)
+
     def _run_tick(self):
         """One tick: every phase in order, then the counter.
 

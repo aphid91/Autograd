@@ -1655,6 +1655,29 @@ class GateSim:
         self.sync_device()
         return self.device
 
+    def has_host_decided_gates(self):
+        """Is any live gate one the firing kernel declines to decide?
+
+        `FIRE_SELECT` types -- and anything overriding `inputs_ready()` or
+        `consumed()` -- are skipped by the kernel rather than guessed at (see
+        `gate_device.geometry_for`). That is right for the kernel and means
+        the *board* needs the CPU phase: one Merge and the GPU tick would
+        leave it permanently unfired, which is a stall the player would read
+        as a wiring mistake.
+
+        Derived from the packed geometry rather than re-walking the types, so
+        there is one authority on which gates the kernel handles and the
+        answer cannot drift from what was uploaded.
+        """
+        if self.device is None:
+            return False
+        from core.gate_device import FLAG_HOST_DECIDES
+        n = len(self.state.rows)
+        if not n:
+            return False
+        flags = self.device.geom[:n, 3]
+        return bool((flags & FLAG_HOST_DECIDES).any())
+
     def sync_device(self):
         """Re-pack the device's per-edit geometry. Call after an edit.
 

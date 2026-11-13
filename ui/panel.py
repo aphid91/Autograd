@@ -394,6 +394,27 @@ class UI:
         folded = len(engine.gates.folded_sources())
         if folded:
             imgui.text(f"folded Sources: {folded}")
+
+        # The compute path. A readout *and* a switch, because the whole point
+        # of keeping the CPU implementation is that the two can be compared
+        # on the same running board -- flip it and watch whether anything
+        # changes. Says why it is unavailable rather than just going quiet:
+        # "the GPU tick is off" and "this board cannot use it" are different
+        # things to learn, and the second is the interesting one.
+        if engine.gpu_ready():
+            _changed, engine._gpu_enabled = imgui.checkbox(
+                "GPU tick", engine._gpu_enabled)
+            if engine._gpu_enabled and not engine.use_gpu_tick():
+                if engine.debug_feed is not None:
+                    imgui.text_disabled("  (CPU: the debug feed has no kernel)")
+                elif engine.gates.has_host_decided_gates():
+                    imgui.text_disabled(
+                        "  (CPU: a machine on this board decides on the host)")
+                else:
+                    imgui.text_disabled("  (CPU: a phase callback is hooked)")
+        elif engine.gpu_error:
+            imgui.text_disabled("GPU tick unavailable:")
+            imgui.text_disabled(f"  {engine.gpu_error[:60]}")
         if imgui.button("Force rebuild"):
             req.rebuild_segments = True
         imgui.same_line()

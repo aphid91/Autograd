@@ -282,6 +282,14 @@ def test_profiling_a_tick_names_both_phases():
 
     prof = clock.profiler
     prof.arm(5)
+    # **The CPU path explicitly.** This test is about *its* probe tree --
+    # `structure/prefilter`, `belt/transport` -- which the dispatch path does
+    # not have and should not fake: it has no prefilter, by design, and its
+    # time goes somewhere else entirely. Leaving it to whichever path happened
+    # to be available would make the assertions below depend on whether a GL
+    # context existed.
+    was_gpu = engine._gpu_enabled
+    engine._gpu_enabled = False
     try:
         for _ in range(5):
             step()
@@ -302,6 +310,7 @@ def test_profiling_a_tick_names_both_phases():
            f"{sorted(paths)}")
     finally:
         prof.stop()
+        engine._gpu_enabled = was_gpu
 
 
 def test_the_profiler_dumps_itself_when_its_count_runs_out():

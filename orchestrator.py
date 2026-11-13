@@ -913,6 +913,28 @@ class Orchestrator:
         board.restamp(view)
         self.engine.invalidate_segments()
 
+    def _needs_host_state(self):
+        """Does anything this frame read simulation state off the host?
+
+        The readback predicate -- see the comment at the device sync. Kept
+        narrow and listed explicitly rather than defaulting to True, because
+        the default costs 1.16ms a frame on a real board and buys nothing for
+        the common case of watching a factory run.
+
+        Correctness does not rest on this: every *edit* and every save calls
+        `Engine.settle()` itself, so a wrong answer here can only make the
+        waiting-zone overlay a frame stale, never corrupt the simulation.
+        """
+        # The Status window reads an entity's channels, and the segment
+        # inspector reads ring contents and runs audits.
+        if self.inspect_row is not None or self.ui.show_segments:
+            return True
+        # An armed profiler is measuring the tick; a dump that reported GPU
+        # ticks without their readback would describe a cost nobody pays.
+        if self.engine.clock.profiler.armed:
+            return True
+        return False
+
     def inspected(self):
         """A fresh view of the inspected entity, or None.
 
@@ -1402,6 +1424,37 @@ class Orchestrator:
             self._dump_profile(engine)
 
         # 8. device sync, then render
+        #
+        # **The readback is conditional, because it is the expensive thing.**
+        # Measured on ram.npz: the dispatches are 0.031ms a tick and the round
+        # trip is 1.16ms, so settling every frame makes the GPU path *slower*
+        # than the CPU one at 1 tick/frame -- the opposite of the point.
+        #
+        # Belt state never needs it: the kernel writes the very buffers the
+        # renderer reads (see core/belt_compute.py), so the picture is already
+        # current. Gate *channels* are the exception -- they live in the gate
+        # layer's SoA arrays while the shader draws waiting zones out of the
+        # entity SSBO, which is packed from host rows -- and the only thing
+        # that shows is an occupied zone, which is visible solely while a gate
+        # is back-pressured.
+        #
+        # So: settle when something on the host actually reads simulation
+        # state this frame (a window is open, a request came in), and
+        # otherwise leave the device ahead. `Engine.settle()` is still called
+        # by every *edit*, every save and every flush, so correctness never
+        # depends on this decision -- only how fresh the gate overlay looks.
+        #
+        # **The sharp edge this leaves is reads that go straight to the
+        # simulation objects.** `engine.belts.total_items()` and friends read
+        # the host's segment objects, which are now whatever the last
+        # readback left behind. `Engine.live_items()` is the asking form that
+        # settles first; anything reporting a count should use it. The
+        # distinction is the same one `_gpu_dirty` names -- the device is
+        # authoritative until someone asks -- and it is why the flag is
+        # checked rather than hidden behind a property that would settle on
+        # every incidental access, including from inside the tick.
+        if self._needs_host_state():
+            engine.settle()
         self.ui.last_upload = engine.sync_to_device()
         self.camera.render(viewport, engine.clock, engine.belt_device,
                            select_rect=self.select_rect)

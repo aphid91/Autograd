@@ -88,6 +88,21 @@ class Engine:
         #: transport can be watched on a real board before the gate layer
         #: lands; None disables it entirely.
         self.debug_feed = None
+        #: True while the device holds simulation state the host has not read
+        #: back. See the "GPU tick" block below -- this is the inverted dirty
+        #: flag, marking what the *CPU* must be told about.
+        self._gpu_dirty = False
+        #: True when `settle()` ran this frame, so the belt buffers are the
+        #: device's own current copy and must not be re-packed from the host.
+        #: Distinct from `_gpu_dirty`, which is already clear by then --
+        #: see `sync_to_device()`.
+        self._gpu_settled_this_frame = False
+        #: Player-facing switch for the compute path, so the CPU and GPU
+        #: timelines can be compared in the running app. On when a device
+        #: exists; the panel exposes it.
+        self._gpu_enabled = True
+        #: Why the compute path is unavailable, if it failed to build.
+        self.gpu_error = None
         # Ghost rows that will become real on commit.
         self.ghost_rows = []
         # Ghost rows that exist only to show the player what *would* fit, from
@@ -503,6 +518,11 @@ class Engine:
         rather than held.
         """
         path = path or persistence.DEFAULT_SAVE
+        # A save serialises entity rows and ring state, so the host's copy
+        # has to be the current one -- otherwise the file records the board
+        # as it was before however many ticks are still outstanding on the
+        # device.
+        self.settle()
         self.clear_ghosts()
         return persistence.save(self.board, path, annotations=annotations)
 
@@ -775,6 +795,17 @@ class Engine:
         and this method, reached by every path that changes what a run looks
         like, is the one place that is true of.
         """
+        # **Bring the host level before anything re-derives from it.** An
+        # edit rebuilds segments and re-resolves ports from entity rows and
+        # ring state, so a device that is ahead has to be read back first --
+        # otherwise the rebuild reads a stale board and the dispatches'
+        # results are then overwritten by the upload that follows, silently
+        # rewinding the simulation by however many ticks were outstanding.
+        #
+        # Here rather than at each edit site for the same reason the
+        # invalidation itself is here: this is the one method every real edit
+        # goes through, so a new edit path cannot forget it.
+        self.settle()
         self._segments_stale = True
         self.gates.invalidate_board()
 
@@ -819,6 +850,20 @@ class Engine:
         # player has and only one of them is about the tick.
         with self.clock.profiler.probe("rebuild"):
             n = self._rebuild_segments()
+        # **Re-pack the device's per-edit state, here and nowhere else.**
+        # Everything the kernels need that is not row or ring state -- the
+        # gate slot assignment, the geometry word, the drains mask, the
+        # direct edge list, the segment port table -- is derived from the
+        # grid and the segmentation, so it goes stale at exactly the moment
+        # a rebuild happens and is correct again the moment one finishes.
+        #
+        # Missing this is silent and total: `_gate_table()` is cached, so a
+        # device built before the first placement keeps an *empty* gate table
+        # for ever. Every dispatch then runs over zero gates and the factory
+        # simply never starts, with no error anywhere -- which is exactly how
+        # it presented ("the Source should have filled the run").
+        if self.gates.device is not None:
+            self.gates.sync_device()
         return n
 
     def _rebuild_segments(self):
@@ -944,6 +989,9 @@ class Engine:
         initial state from docs/belt_report.md. Distinct from a rebuild: the
         runs survive, only what is on them is discarded.
         """
+        # Writing ring state from the host, so the device must not be left
+        # holding a newer copy to upload over the top of it.
+        self.settle()
         for seg in self.segments.segments.values():
             seg.head = seg.tail = 0
             seg.anchor = self.belts.length_of(seg)
@@ -975,7 +1023,14 @@ class Engine:
         honest version of "start fresh", and it is the same bargain an edit
         to the belt network already makes (see "An edit drops the items on
         the segments it touches").
+
+        **Settles first**, like every other host-side write to simulation
+        state. `clear_items()` does too, but this also zeroes gate channels
+        through entity rows, and a device left holding newer ones would
+        upload them back over the top on the next tick -- so a ctrl+R would
+        appear to clear the board and then refill it from nowhere.
         """
+        self.settle()
         self.clear_items()
         for gate in self.gates.gates():
             for c in range(gate.input_count()):
@@ -1055,18 +1110,226 @@ class Engine:
         Called once per frame by the orchestrator, after all player mutation
         and before the device sync -- so a tick's effects reach the GPU in the
         same frame they happen.
+
+        **The clock still owns time.** When the compute path is live the
+        phases are dispatches rather than Python calls, but `Clock.advance()`
+        decides how many ticks are due, caps the backlog and keeps `alpha`;
+        none of that moves to the device. The phase callbacks are swapped out
+        for the duration rather than the clock being bypassed, so the tick
+        count, the profiler's tick counting and `request_step()` all behave
+        identically either way -- which is what lets the two timelines be
+        compared by flipping one switch.
         """
-        return self.clock.advance(dt)
+        if not self.use_gpu_tick():
+            # The host may be ahead-of or behind the device; either way the
+            # CPU phases read entity rows and rings, so level them first.
+            self.settle()
+            return self.clock.advance(dt)
+        return self._advance_on_device(dt)
+
+    def _advance_on_device(self, dt):
+        """`Clock.advance()` with the phase bodies replaced by dispatches.
+
+        The clock's own sequencing is untouched -- see `tick()`. What changes
+        is what a phase *does*, which is exactly the substitution core/tick.py
+        predicted: "the GPU port replaces the bodies of those callbacks with
+        compute dispatches while the sequencing stays as it is".
+        """
+        clock = self.clock
+        pending = []
+
+        prof = clock.profiler
+
+        def structure():
+            # Collect rather than dispatch, so one `advance()` spanning
+            # several ticks issues them as one batch below. Dispatching here
+            # would still be correct and would cost a bind per phase.
+            #
+            # The probes are named to match the CPU path's sub-phases, so a
+            # profile dump describes the same tree either way and the two can
+            # be compared line for line. `dispatch` is where the time goes
+            # instead of `prefilter` + `fire`, which is the honest shape:
+            # there is no prefilter, by design.
+            with prof.probe("structure/dispatch"):
+                pending.append(clock.tick)
+
+        def belt():
+            with prof.probe("belt/dispatch"):
+                pass
+
+        saved = clock.swap_phases(structure, belt)
+        try:
+            ran = clock.advance(dt)
+        finally:
+            clock.restore_phases(saved)
+        if pending:
+            # `pending` holds the tick number each dispatch computes, taken
+            # *inside* the phase -- the clock has already moved on by the
+            # time we get here, so reading `clock.tick` now would date every
+            # item an `advance()`-worth too late. Item position is a closed
+            # form over the tick counter, so that is a real error and not an
+            # off-by-one in bookkeeping.
+            self._gpu_tick(len(pending), start=pending[0])
+        return ran
+
+    # --- the GPU tick ----------------------------------------------------
+    #
+    # The whole tick -- fire, direct hand-off, belt transport -- runs as three
+    # compute dispatches when a device is available. See "The tick on the GPU"
+    # in CLAUDE.md for the measurements and the traps; this is the policy
+    # layer, which is the part the kernels cannot decide for themselves.
+    #
+    # **Residency is the point, so the readback is the thing to get right.**
+    # A readback stalls on every dispatch that touched the buffers, so doing
+    # it per tick would throw away the entire gain -- the dispatches are ~10us
+    # and a round trip is far more. But host state cannot simply be allowed to
+    # rot either: the Status window reads entity rows, the segment inspector
+    # reads rings, a save serialises both, and an edit re-derives from them.
+    #
+    # The rule is therefore: **the GPU owns the state between a sync and the
+    # next thing that needs the host's copy.** `_gpu_dirty` says the device is
+    # ahead, and `settle()` is the single place that brings the host level.
+    # Everything that reads host simulation state calls it; nothing else has
+    # to know the GPU exists.
+    #
+    # What does *not* need it is the renderer, which is the whole reason the
+    # belt kernel borrows `BeltDevice`'s buffers: the pass that advances a run
+    # and the shader that draws it share one copy, so a frame is correct with
+    # no round trip at all.
+    def live_items(self):
+        """Every item currently on a belt, with the host's copy made current.
+
+        `BeltSim.total_items()` reads the segment objects directly, which is
+        right for the simulation and wrong for a caller that just wants to
+        know what is on the board: with the compute path running, those
+        objects are whatever the last readback left behind.
+
+        So this is the *asking* form, and it settles. Anything reporting,
+        asserting or displaying an item count wants this; the tick itself
+        does not and must not, since settling per tick is the cost the whole
+        design avoids.
+        """
+        self.settle()
+        return self.belts.total_items()
+
+    def gpu_ready(self):
+        """Is the compute path built and usable?"""
+        return (self.gates.device is not None
+                and self.gates.belt_compute is not None)
+
+    def use_gpu_tick(self):
+        """Should the tick run as dispatches this frame?
+
+        Separate from `gpu_ready()` because being *able* to is not the same
+        as being *allowed* to. Two things veto it, and both are cases where
+        the CPU path is the only correct one rather than merely the slower
+        one:
+
+        - **The debug feed.** It stands in for gates on dangling runs and
+          lives in a Python closure; there is no kernel for it. It is a
+          diagnostic, so falling back is right.
+        - **Host-decided machines.** Merge's readiness depends on the values
+          held and it consumes only the selected lane, which the opcode set
+          deliberately does not express (see `FLAG_HOST_DECIDES`). A board
+          with one needs the CPU phase, or that machine silently never fires.
+        """
+        if not self.gpu_ready() or not self._gpu_enabled:
+            return False
+        if self.debug_feed is not None:
+            return False
+        # **Someone else has registered a phase callback.** The dispatch path
+        # swaps the phase lists wholesale, so anything else on them would
+        # simply not run -- and a phase callback is how a test or a tool
+        # observes the tick (see "A scenario that registers a phase callback"
+        # in CLAUDE.md). Silently dropping it would make the observer wrong
+        # about a simulation that was otherwise fine, which is worse than
+        # running on the CPU.
+        if not self.clock.phases_are_only(self._structure_phase,
+                                          self._belt_phase):
+            return False
+        return not self.gates.has_host_decided_gates()
+
+    def _gpu_tick(self, ticks=1, start=None):
+        """Run `ticks` whole ticks on the device. The host is left stale.
+
+        Uploads only on the first tick after the host last touched the state,
+        so a run of a thousand ticks is one upload, a thousand dispatch pairs
+        and no readback -- which is the shape the whole port exists for.
+
+        `start` is the tick number the first dispatch computes.
+        """
+        gates = self.gates
+        if not self._gpu_dirty:
+            # The host is authoritative, so push it up before the GPU takes
+            # over. After this the direction of authority is reversed until
+            # `settle()`.
+            gates.state.sync_from_rows()
+            gates.device.upload()
+            gates.belt_compute.upload()
+            self._gpu_dirty = True
+        if start is None:
+            start = self.clock.tick
+        for i in range(ticks):
+            gates.device.run(1)
+            gates.belt_compute.run(start + i, 1)
+
+    def settle(self):
+        """Bring the host's copy level with the device. Idempotent.
+
+        The single readback point. Called by anything that reads simulation
+        state off the host -- an edit, a save, the inspector, the Status
+        window -- so no caller has to know whether a dispatch ran.
+
+        Cheap when nothing is outstanding, which is what makes it safe to
+        call liberally: the flag is the whole guard.
+        """
+        if not self._gpu_dirty:
+            return False
+        gates = self.gates
+        gates.belt_compute.readback()
+        gates.device.readback()
+        gates.state.flush()
+        self._gpu_dirty = False
+        self._gpu_settled_this_frame = True
+        return True
 
     # --- device ---------------------------------------------------------
     def create_device_resources(self, ctx):
         self.board.create_device_resources(ctx)
         self.belt_device.create_device_resources(ctx)
+        # The compute path is additive: if the kernels fail to build, the
+        # simulation keeps running on the CPU exactly as before. A broken
+        # shader should cost the speed-up, not the game.
+        try:
+            self.gates.create_device_resources(ctx, self.belt_device)
+        except Exception as exc:            # pragma: no cover - driver-specific
+            self.gpu_error = str(exc)
+            self.gates.device = None
+            self.gates.belt_compute = None
 
     def sync_to_device(self):
-        """Upload whatever is dirty. Called once per frame by the orchestrator."""
-        # Belt state goes up unconditionally: head/tail/anchor change on
-        # nearly every tick of every segment, so tracking which moved would
-        # cost more than the few KB the upload takes.
-        self.belt_device.sync()
+        """Upload whatever is dirty. Called once per frame by the orchestrator.
+
+        **The belt upload is skipped while the device is ahead**, and that is
+        the single most important line in the integration. `BeltDevice.sync()`
+        re-packs the SSBOs from the *host's* segment objects, so running it
+        after a dispatch would overwrite the GPU's results with the state the
+        host last saw -- rewinding the simulation by however many ticks were
+        outstanding, every frame, silently. The symptom is a factory that
+        looks alive but never progresses.
+
+        Skipping it is not a compromise: the belt kernel writes the very
+        buffers the renderer reads (see core/belt_compute.py), so they are
+        already current. There is nothing to upload because the data never
+        left the device.
+        """
+        # Belt state goes up unconditionally *unless the device already has
+        # it*. Two ways it can: dispatches are outstanding (`_gpu_dirty`), or
+        # they were read back earlier this very frame
+        # (`_gpu_settled_this_frame`) and the buffers are still the device's
+        # own current copy. Either way re-packing from the host is at best a
+        # no-op and at worst a rewind of however many ticks were in flight.
+        if not (self._gpu_dirty or self._gpu_settled_this_frame):
+            self.belt_device.sync()
+        self._gpu_settled_this_frame = False
         return self.board.to_device()

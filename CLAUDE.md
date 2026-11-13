@@ -3578,6 +3578,57 @@ line of code. Wrong or missing, it corrupts state *silently and
 intermittently*, which is why it is one named function rather than a line
 repeated at each dispatch site.
 
+### It is wired into the frame loop, behind a switch
+
+`Engine.tick()` dispatches when it can and falls back when it cannot.
+`Clock.swap_phases()` replaces what a phase *does* while leaving the clock's
+own sequencing alone — the backlog cap, the tick counter, `alpha` — which is
+exactly the substitution core/tick.py predicted, and is what keeps the two
+timelines comparable by flipping one checkbox in the panel.
+
+**Three things veto the dispatch**, and each is a case where the CPU path is
+the only correct one rather than merely the slower one: the **debug feed**
+(a Python closure with no kernel), a **host-decided machine** on the board
+(Merge — see below), and **another phase callback being registered** (a test
+or tool watching the tick, which a wholesale phase swap would silently drop).
+
+**The readback is conditional, and that is the whole integration.** Measured
+on ram.npz: the dispatches are 0.031 ms a tick and the round trip is
+1.16 ms, so settling every frame makes the GPU path *slower* than the CPU
+one at 1 tick/frame. It settles only when something on the host actually
+reads simulation state — a window is open, a profiler is armed — plus every
+edit, save and flush, which call `Engine.settle()` themselves. Correctness
+never rests on the per-frame decision; only how fresh the waiting-zone
+overlay looks. Result: **2.23 → 0.042 ms/frame on ram.npz, 53×**.
+
+The sharp edge this leaves: reads that go straight to the simulation objects
+(`engine.belts.total_items()`) see whatever the last readback left behind.
+`Engine.live_items()` is the asking form that settles first, and anything
+reporting a count should use it.
+
+#### The GPU and CPU reach different equilibria, and that is not a bug
+
+On ram.npz after 300 ticks the CPU settles at ~780 items on the belts and
+the GPU at 213. Both are **stable** — neither leaks — and a single phase
+from identical state is exact, which is what every test in
+tests/test_compute.py compares.
+
+The cause is **intra-phase visibility**. The CPU walks segments in id order,
+so a run that drains a gate's waiting zone does it *before* a later run in
+the same phase reads that gate; 114 of 197 gates on ram.npz sit between two
+runs. Every GPU thread reads the state as it was at the start of the
+dispatch, so a gate drained by one run still looks loaded to another until
+the next tick. Material is delayed, never created or destroyed.
+
+Neither order is "correct": the CPU's is id order, which a rebuild
+reassigns arbitrarily. Making them match would mean serialising the belt
+phase, which is the thing being removed. So the guarantee the port actually
+offers is **conservation, not equality**, and
+`test_the_gpu_tick_conserves_material` is what states it.
+
+This is the one place the two timelines can drift, and anybody comparing
+them needs to expect it.
+
 ### What was deliberately not ported
 
 - **The prefilter and both sleep tiers.** They exist to avoid per-gate

@@ -558,9 +558,17 @@ def test_debug_feed_defers_to_real_gates():
     Asserted by running the same chain with and without the feed and
     comparing: it is the *difference* that matters, not the item count --
     a Source legitimately fills the belt either way.
+
+    **Both halves are pinned to the CPU path.** The feed is a Python closure
+    with no kernel, so it vetoes the dispatch (see `Engine.use_gpu_tick()`);
+    without pinning, the feed-off run would go to the GPU and the feed-on run
+    to the CPU, and this would be comparing two implementations rather than
+    two feed settings. The feed is a diagnostic for the CPU path, so that is
+    the path to test it on.
     """
     def run(feed):
         harness.reset()
+        engine._gpu_enabled = False
         engine.place_structure(Source, 7, 5)
         engine.place_belt_path((9, 5), (14, 5))
         engine.place_structure(Sink, 15, 5)
@@ -575,6 +583,7 @@ def test_debug_feed_defers_to_real_gates():
                     engine.gates.stats["consumed"])
         finally:
             engine.debug_feed = None
+            engine._gpu_enabled = True
 
     without = run(None)
     with_feed = run(-1.0)

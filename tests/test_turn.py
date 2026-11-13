@@ -688,7 +688,11 @@ def test_ctrl_r_resets_the_tick_and_clears_the_items():
     step(20)
 
     assert engine.clock.tick > 0, "the clock should have run"
-    items = sum(s.count for s in engine.segments.segments.values())
+    # `live_items()` rather than summing the segment objects: with the
+    # compute path running those hold whatever the last readback left, and
+    # a frame only settles when something on the host needs the state. The
+    # asking form is what makes a count current -- see Engine.live_items().
+    items = engine.live_items()
     assert items > 0, "the Source should have filled the run"
     live = board.live_count
 

@@ -70,10 +70,18 @@ def geometry_for(state, types):
         # condition -- FIRE_SELECT is how a type announces it, but a type
         # that overrode `consumed()` without declaring it would otherwise
         # have its unused lane silently eaten.
+        #
+        # **`OPS` is tested against the output count, not for truthiness.**
+        # An empty `OPS` is the correct and complete table for a type with no
+        # outputs -- Sink declares none and destroys what arrives -- so
+        # `not cls.OPS` reads that as "unsupported" and hands the commonest
+        # consumer on any board back to the CPU, vetoing the dispatch for the
+        # whole board. The real condition is a table that does not describe
+        # every channel.
         if (cls.FIRE_RULE == cls.FIRE_SELECT
                 or cls.inputs_ready is not Entity.inputs_ready
                 or cls.consumed is not Entity.consumed
-                or not cls.OPS):
+                or len(cls.OPS) != cls.out_channels()):
             flags |= FLAG_HOST_DECIDES
         for c in range(MAX_CHANNELS):
             if state.drains[i, c]:
