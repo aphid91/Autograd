@@ -206,6 +206,10 @@ class GateSim:
         #: (row, channel) -> (upstream row, out channel), or None. The
         #: belt-less counterpart of `_feeder_map`. See _direct_feeders().
         self._direct_map = None
+        #: (src_row, src_chan, dst_row, dst_chan) arrays, or None. The
+        #: forward form of `_direct_map`, and what `deliver_direct()`
+        #: iterates. See _direct_edges().
+        self._direct_edges_cache = None
         #: upstream row -> [downstream rows], the forward direction of
         #: `_direct_map`, or None. See _direct_downstream().
         self._direct_down = None
@@ -397,6 +401,11 @@ class GateSim:
         # one -- and the two disagreeing is exactly the silent-stall shape.
         self._direct_map = None
         self._direct_down = None
+        # The edge list comes out of the same walk as `_direct_map`, so the
+        # two must die together or `deliver_direct()` would move material
+        # along the old adjacency while the sleep predicate consulted the new
+        # one -- the silent-stall shape named just above, from the other side.
+        self._direct_edges_cache = None
         # The gate table excludes folded rows, so dropping the fold without
         # dropping the table would leave a folded Source missing from the
         # firing set with nothing holding its constant.
@@ -1043,33 +1052,97 @@ class GateSim:
         lookup below is one dict hit per missing lane with no search. A lane
         has exactly one upstream source (a port face has exactly one
         neighbour), which is what makes that key unique.
+
+        Derived from `_direct_edges()` rather than from its own grid walk, so
+        the map and the edge list `deliver_direct()` iterates cannot disagree
+        about who feeds whom -- the same one-authority argument
+        `_face_has_consumer()` settles for connectivity.
         """
         if self._direct_map is None:
-            direct = {}
-            for gate in self.gates():
-                for (xy, face, channel) in self._output_faces(gate):
-                    step = cell.DIR_STEPS[face]
-                    nx, ny = xy[0] + step[0], xy[1] + step[1]
-                    if not self.board.in_bounds(nx, ny):
-                        continue
-                    # A belt here is the segment path's business -- that lane
-                    # is in `_feeders()`, not this map. Mirrors the identical
-                    # skip in `deliver_direct()`.
-                    if self.index.at(nx, ny) is not None:
-                        continue
-                    row = self.board.entity_id_at(nx, ny)
-                    if not row or not self.board.is_row_alive(row):
-                        continue
-                    other = self.board.view(row)
-                    if other.row == gate.row or other.is_ghost:
-                        continue
-                    back = (face + 2) % 4
-                    in_ch = self._input_channel_for(other, back, at=(nx, ny))
-                    if in_ch is None:
-                        continue
-                    direct[(other.row, in_ch)] = (gate.row, channel)
-            self._direct_map = direct
+            self._build_direct()
         return self._direct_map
+
+    # --- the direct edge list ---------------------------------------------
+    #
+    # `deliver_direct()` used to rediscover the gate-to-gate adjacency every
+    # tick: for every gate holding an output, walk its faces, probe the
+    # neighbouring cell, build a view, ask which input channel faces back.
+    # That is a grid-shaped search for an answer fixed at the last edit, and
+    # it measured 5.7-12.6% of the tick -- the largest line in the belt phase.
+    #
+    # It is also the one place in the tick that **writes another entity's
+    # row**, which makes its shape a correctness question and not only a
+    # speed one. Expressed as a search, the disjointness argument is a claim
+    # about geometry ("a port face has exactly one neighbour") that has to be
+    # re-established by reading the loop. Expressed as an edge list, it is a
+    # property of the data: one entry per receiving lane, so a kernel with one
+    # thread per edge writes disjoint slots by construction.
+    #
+    # That is the GPU shape. The transfer becomes one dispatch over a flat
+    # array with no neighbour probing, no view construction and no grid reads
+    # at all -- every term resolved once per edit and uploaded.
+    #
+    # Four parallel arrays rather than a list of tuples, for the same reason
+    # `BeltDevice` keeps two parallel vectors rather than a packed struct:
+    # this is what gets uploaded, and SoA is both the coherent layout and the
+    # one with no alignment ambiguity.
+    def _direct_edges(self):
+        """The gate-to-gate transfers, as four parallel arrays.
+
+        `(src_row, src_chan, dst_row, dst_chan)`, one entry per receiving
+        lane. Everything `deliver_direct()` needs to move a value, with no
+        geometry left to resolve.
+
+        Derived once per edit. Both this and `_direct_feeders()`' inverse map
+        come out of a single walk, so there is one authority on the adjacency
+        and one thing to invalidate.
+        """
+        if self._direct_edges_cache is None:
+            self._build_direct()
+        return self._direct_edges_cache
+
+    def _build_direct(self):
+        """Walk the board once and build both direct-adjacency derivations.
+
+        The walk is the expensive half (a view and a neighbour probe per
+        output face), so it is paid once and feeds both the forward edge list
+        and the reverse lane map.
+        """
+        src_row, src_ch, dst_row, dst_ch = [], [], [], []
+        direct = {}
+        for gate in self.gates():
+            for (xy, face, channel) in self._output_faces(gate):
+                step = cell.DIR_STEPS[face]
+                nx, ny = xy[0] + step[0], xy[1] + step[1]
+                if not self.board.in_bounds(nx, ny):
+                    continue
+                # A belt there is the segment path's business -- that lane
+                # is in `_feeders()`, not this map. Mirrors the identical
+                # skip the old `deliver_direct()` walk made.
+                if self.index.at(nx, ny) is not None:
+                    continue
+                row = self.board.entity_id_at(nx, ny)
+                if not row or not self.board.is_row_alive(row):
+                    continue
+                other = self.board.view(row)
+                if other.row == gate.row or other.is_ghost:
+                    continue
+                back = (face + 2) % 4
+                in_ch = self._input_channel_for(other, back, at=(nx, ny))
+                if in_ch is None:
+                    continue
+                direct[(other.row, in_ch)] = (gate.row, channel)
+                src_row.append(gate.row)
+                src_ch.append(channel)
+                dst_row.append(other.row)
+                dst_ch.append(in_ch)
+        self._direct_map = direct
+        self._direct_edges_cache = (
+            np.asarray(src_row, dtype=np.int64),
+            np.asarray(src_ch, dtype=np.int64),
+            np.asarray(dst_row, dtype=np.int64),
+            np.asarray(dst_ch, dtype=np.int64),
+        )
 
     def _starved_on_sleeping_belts(self, row, n_in, held_in):
         """Is every unfed input of this gate fed by an empty, resting run?
@@ -1758,59 +1831,70 @@ class GateSim:
         Contention is not a concern even though several gates write inputs
         here -- a port face has exactly one neighbour, so each (gate,
         channel) pair has one upstream source and the writes are disjoint.
+        **That is now a property of the data rather than of this loop**: the
+        edge list has one entry per receiving lane, so the disjointness holds
+        however the entries are visited. See `_direct_edges()`.
+
+        The geometry is resolved once per edit, so what remains here is the
+        transfer itself: read a held zone, write the far lane, clear the
+        zone. Every term is a row-and-column index, which is what makes this
+        a dispatch over a flat array later rather than a grid search.
         """
-        moved = 0
-        for row in self._rows_holding_output():
-            if not self.board.is_row_alive(row):
-                continue
-            gate = self.board.view(row)
-            if gate.is_ghost:
-                continue
-            for (xy, face, channel) in self._output_faces(gate):
-                if not gate.out_held(channel):
-                    continue
-                step = cell.DIR_STEPS[face]
-                nx, ny = xy[0] + step[0], xy[1] + step[1]
-                if not self.board.in_bounds(nx, ny):
-                    continue
-                # A belt there is the segment path's business, not ours.
-                if self.index.at(nx, ny) is not None:
-                    continue
-                row = self.board.entity_id_at(nx, ny)
-                if not row or not self.board.is_row_alive(row):
-                    continue
-                other = self.board.view(row)
-                if other.row == gate.row or other.is_ghost:
-                    continue
-                back = (face + 2) % 4
-                in_ch = self._input_channel_for(other, back, at=(nx, ny))
-                if in_ch is None or other.in_held(in_ch):
-                    continue
-                other.set_input(in_ch, gate.out_value(channel))
-                gate.clear_output(channel)
-                # Both gates' channels changed, so the runs on either side of
-                # either of them may have work again -- this is the same edge
-                # the structure phase raises, reached by the no-belt path.
-                self._wake_around(gate.row)
-                self._wake_around(other.row)
-                # **And the two gates themselves**, which the line above does
-                # not do. `_wake_around(row)` wakes what is *adjacent to*
-                # `row`, never `row` itself -- right for the structure phase
-                # (a gate that just fired is plainly awake) and wrong here,
-                # because this is the one path that writes *another* gate's
-                # input channel directly. So the receiver has new material and
-                # nothing has told it.
-                #
-                # This was a real hole, found by mutation-testing the sleep
-                # predicate rather than the wake: `_wake_around(other.row)`
-                # *reads* as "wake other", so the gap survived review. It was
-                # masked by an earlier predicate that also required every
-                # direct neighbour to be asleep -- which kept the receiver
-                # awake for an unrelated reason and made the missing wake
-                # invisible. Removing that redundant test is what exposed it.
-                self._wake_one(gate.row)
-                self._wake_one(other.row)
-                moved += 1
+        src_row, src_ch, dst_row, dst_ch = self._direct_edges()
+        if not len(src_row):
+            return 0
+
+        ents = self.board.entities
+        # Gather the whole edge list at once: which sources are holding, and
+        # which destinations have a free lane. Both are the vectorised form
+        # of the two `continue`s the per-face walk made, and together they
+        # pick out exactly the edges that will move something.
+        held = ents[src_row, Entity.F_OUT_HELD + src_ch] > 0.0
+        free = ents[dst_row, Entity.F_IN_HELD + dst_ch] <= 0.0
+        live = held & free
+        if not live.any():
+            return 0
+
+        s_row = src_row[live]
+        s_ch = src_ch[live]
+        d_row = dst_row[live]
+        d_ch = dst_ch[live]
+
+        # The transfer. Disjoint by construction on the destination side (one
+        # edge per lane), and on the source side a zone feeds at most one
+        # direct neighbour, so neither gather aliases.
+        values = ents[s_row, Entity.F_OUT_VALUE + s_ch]
+        ents[d_row, Entity.F_IN_VALUE + d_ch] = values
+        ents[d_row, Entity.F_IN_HELD + d_ch] = 1.0
+        ents[s_row, Entity.F_OUT_VALUE + s_ch] = 0.0
+        ents[s_row, Entity.F_OUT_HELD + s_ch] = 0.0
+
+        dirty = self.board.entities_dirty
+        touched = set(s_row.tolist()) | set(d_row.tolist())
+        for row in touched:
+            dirty.add(row)
+            # Both gates' channels changed, so the runs on either side of
+            # either of them may have work again -- this is the same edge
+            # the structure phase raises, reached by the no-belt path.
+            self._wake_around(row)
+            # **And the two gates themselves**, which the line above does
+            # not do. `_wake_around(row)` wakes what is *adjacent to*
+            # `row`, never `row` itself -- right for the structure phase
+            # (a gate that just fired is plainly awake) and wrong here,
+            # because this is the one path that writes *another* gate's
+            # input channel directly. So the receiver has new material and
+            # nothing has told it.
+            #
+            # This was a real hole, found by mutation-testing the sleep
+            # predicate rather than the wake: `_wake_around(other.row)`
+            # *reads* as "wake other", so the gap survived review. It was
+            # masked by an earlier predicate that also required every
+            # direct neighbour to be asleep -- which kept the receiver
+            # awake for an unrelated reason and made the missing wake
+            # invisible. Removing that redundant test is what exposed it.
+            self._wake_one(row)
+
+        moved = int(live.sum())
         self.stats["direct"] += moved
         return moved
 
