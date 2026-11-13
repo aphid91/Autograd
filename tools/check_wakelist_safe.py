@@ -94,7 +94,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from tests import harness  # noqa: E402
 from core import cell  # noqa: E402
 from core.entity import (  # noqa: E402
-    Belt, Floor, Max, Merge, Reciprocal, Route, Shear, Sink, Source, Swap)
+    Belt, Entity, Floor, Max, Merge, Reciprocal, Route, Shear, Sink, Source,
+    Swap)
 from core.gameboard import GRID_CHANNELS  # noqa: E402
 
 BOARD = 256
@@ -180,13 +181,30 @@ def snapshot():
     fields, which is what makes this cover gate sleep for free: a gate that
     wrongly slept leaves an input channel or a waiting zone holding what the
     oracle consumed, and that is a row that differs.
+
+    **`F_ASLEEP` is zeroed out of the copy**, and it is the one field that
+    has to be. It is a diagnostic the gate layer publishes for the
+    SLEEP_DEBUG overlay, written only while sleeping is *on* -- so the
+    sleeping timeline carries it and the latched-off oracle never does, and
+    every tick would diverge on it. That is the field reporting the
+    difference this tool exists to permit, not a difference in what the
+    board computes.
+
+    Zeroing rather than slicing the column out, so the array keeps its shape
+    and the row indices in a divergence report still mean what they say.
+    Note this is exactly the wholesale-copy habit paying off in the awkward
+    direction: copying everything is what makes a new *simulation* field
+    covered automatically, and the price is that a new *diagnostic* one has
+    to be excluded here by hand.
     """
     segs = {}
     for sid, s in engine.segments.segments.items():
         segs[sid] = (s.head, s.tail, s.anchor,
                      tuple(s.enter_tick) if s.enter_tick is not None else (),
                      tuple(s.payload) if s.payload is not None else ())
-    return segs, board.entities.copy(), tuple(sl.asleep() for sl in SLEEPERS)
+    ents = board.entities.copy()
+    ents[:, Entity.F_ASLEEP] = 0.0
+    return segs, ents, tuple(sl.asleep() for sl in SLEEPERS)
 
 
 def restore(snap):
@@ -423,6 +441,56 @@ def build(rng, runs=12, run_len=34):
             board.spawn(Sink, x, y, cell.DIR_PX)
         y += 4
 
+    # Two rows for the **direct-fed missing lane**, which is tier two's
+    # gate-to-gate clause (`_direct_lane_is_quiet`). The rows above do not
+    # reach it, and the reason is worth recording because it looks as though
+    # they should: a `Source` abutting a gate **folds**, so the lane it feeds
+    # reads as permanently *held* and is therefore never a *missing* lane at
+    # all. Instrumented over 250 ticks on the previous fixture: 634 calls into
+    # the clause, every one of them a dangling lane, and **zero** with a real
+    # direct feeder. The clause was entirely untested.
+    #
+    # What it needs is a direct feeder that is a **real gate** -- one whose
+    # output zone genuinely empties and fills, so the predicate's claim ("the
+    # upstream zone is empty, so nothing can arrive this tick") is sometimes
+    # true and sometimes false:
+    #
+    #     Shear A (starved, fed only by main()) -> abuts -> Shear B channel 0
+    #     folded Source                         -> abuts -> Shear B channel 1
+    #
+    # So B's channel 1 is held for ever by the fold, channel 0 is the only
+    # missing lane, and the thing the predicate has to judge is A's output
+    # zone. When main() feeds A, A fires and fills that zone -- which must
+    # wake B through `_wake_around()`'s direct-downstream edge, the one new
+    # wake this clause relies on.
+    #
+    # B also needs somewhere to put results, or it is output-blocked and
+    # excluded from tier two for an unrelated reason -- the same vacuity trap
+    # the rows above document twice.
+    for _ in range(2):
+        if y + 3 >= board.height:
+            break
+        # A, at x=1: starved, so its zone is empty until main() feeds it.
+        a_cells = Shear.cells_for(1, y, cell.DIR_PX, False)
+        if not all(board.is_empty(cx, cy) for (cx, cy) in a_cells):
+            y += 4
+            continue
+        board.spawn(Shear, 1, y, cell.DIR_PX)
+        # B, abutting A's +X output face with no belt between.
+        bx = 1 + Shear.FOOTPRINT[0]
+        b_cells = Shear.cells_for(bx, y, cell.DIR_PX, False)
+        if all(board.is_empty(cx, cy) for (cx, cy) in b_cells):
+            board.spawn(Shear, bx, y, cell.DIR_PX)
+            # B's channel 1 held for ever by a folded Source below it.
+            if all(board.is_empty(cx, cy) for (cx, cy)
+                   in Source.cells_for(bx, y + 1, cell.DIR_NY, False)):
+                board.spawn(Source, bx, y + 1, cell.DIR_NY)
+            # An outlet for B.
+            for x in range(bx + Shear.FOOTPRINT[0], bx + 6):
+                if board.is_empty(x, y):
+                    board.spawn(Belt, x, y, cell.DIR_PX)
+        y += 4
+
     # The rest: a starved machine feeding a run that will sleep, with a Sink
     # at the far end so the run has a real consumer to deliver to.
     for _ in range(runs):
@@ -453,9 +521,13 @@ def starved_gates():
 def lying_sleepers():
     """Tier-two sleepers whose own predicate no longer holds.
 
-    [(row, channel, segment id)] for each sleeping, partially-fed gate with a
-    missing lane whose feeding run is *not* an empty resting run -- i.e. a
-    gate asleep on a claim that has stopped being true.
+    [(row, channel, description)] for each sleeping, partially-fed gate with
+    a missing lane whose feeder no longer supports the sleep -- i.e. a gate
+    asleep on a claim that has stopped being true. Both of tier two's clauses
+    are covered, since each has its own premise to go stale:
+
+      - a **belt**-fed lane claims the feeding run is an empty resting run;
+      - a **directly**-fed lane claims the upstream output zone is empty.
 
     **This is strictly stronger than the differential diff**, and that is why
     it exists. A gate sleeping on a stale claim is still woken by
@@ -494,12 +566,33 @@ def lying_sleepers():
                 continue
             seg = feeders.get((row, ch))
             if seg is None:
-                # No belt feeds it, so tier two never granted this sleep --
-                # it must have come from somewhere else. Not this check's
-                # business.
+                # No belt feeds it, so the sleep came from the gate-to-gate
+                # clause, whose claim is "the upstream output zone is empty".
+                # **That has to be checked here too**, and leaving it out was
+                # a real blind spot rather than a tidy omission: with it
+                # missing, removing the direct-downstream wake from
+                # `_wake_around()` passed this whole tool -- the diff cannot
+                # see a stale sleep (see the docstring) and this was the only
+                # thing that could.
+                #
+                # A lane with no direct feeder either is not this clause's
+                # doing, so it is skipped exactly as before.
+                direct = gs._direct_feeders().get((row, ch))
+                if direct is None:
+                    continue
+                up_row, up_ch = direct
+                if not board.is_row_alive(up_row):
+                    continue
+                if board.view(up_row).out_held(up_ch):
+                    # The upstream zone has filled, so this gate is asleep on
+                    # a premise that is no longer true: the neighbour can hand
+                    # it material on the coming belt phase.
+                    out.append((row, ch, f"direct from row {up_row}"))
+                    break
                 continue
             if seg.tail != seg.head or not belts.is_at_rest(seg, gs._tick):
-                out.append((row, ch, seg.sid))
+                out.append((row, ch,
+                            f"segment {seg.sid} (not an empty resting run)"))
                 break
     return out
 
@@ -587,6 +680,33 @@ def main():
 
     gates._starved_on_sleeping_belts = _counting_tier2
 
+    #: Grants from tier two's **gate-to-gate** clause, counted separately
+    #: from the tier-two total above. It has to be separate: the belt clause
+    #: grants plentifully, so a combined number cannot distinguish "the
+    #: direct clause works" from "the direct clause never fired once and the
+    #: belts covered for it". That is the same reasoning as the per-layer
+    #: wake counts, one level further in -- and it is not hypothetical, since
+    #: instrumenting the previous fixture found 634 calls and **zero** grants.
+    #:
+    #: `grant` is the interesting number. `dangling` counts the calls that
+    #: refused for want of any feeder at all, which is the case that must
+    #: *not* grant (see `_direct_lane_is_quiet`), so a run with grants but no
+    #: dangling calls has not exercised the refusal either.
+    direct = {"grant": 0, "refuse": 0, "dangling": 0}
+    _real_direct = gates._direct_lane_is_quiet
+
+    def _counting_direct(row, channel):
+        quiet = _real_direct(row, channel)
+        if gates._direct_feeders().get((row, channel)) is None:
+            direct["dangling"] += 1
+        elif quiet:
+            direct["grant"] += 1
+        else:
+            direct["refuse"] += 1
+        return quiet
+
+    gates._direct_lane_is_quiet = _counting_direct
+
     def run_one_tick(at_tick):
         """One tick at a fixed tick number, from whatever is loaded."""
         engine.clock.tick = at_tick
@@ -650,8 +770,8 @@ def main():
         if lying:
             problems.append((t, [
                 f"STALE SLEEP: gate {row} is asleep but its missing lane "
-                f"ch{ch} is fed by segment {sid}, which is not an empty "
-                f"resting run" for (row, ch, sid) in lying[:4]]))
+                f"ch{ch} is fed by {src}, whose premise no longer holds"
+                for (row, ch, src) in lying[:4]]))
             sleep_state = snapshot()
             break
 
@@ -717,6 +837,11 @@ def main():
           f"(partially fed, missing lanes on resting runs)")
     if not tier2["n"]:
         vacuous.append("gates tier two")
+    print(f"  gates: tier-two direct clause {direct['grant']} granted, "
+          f"{direct['refuse']} refused on a loaded zone, "
+          f"{direct['dangling']} refused as dangling")
+    if not direct["grant"]:
+        vacuous.append("gates tier two direct clause")
     for name in vacuous:
         print(f"  WARNING: nothing in '{name}' ever woke, so this run did "
               f"not exercise its wake edges at all")

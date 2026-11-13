@@ -1954,6 +1954,30 @@ Four things make it safe, and each had an obvious wrong alternative:
   five runs on the test fixture permanently empty — mutation-tested, and it is
   the mutation the first version of the checker missed. Dangling faces are
   fine: a dangling output is already destroyed at fire time.
+- **"A belt on an output" means one the face can actually deposit onto**,
+  which is narrower than "a belt is adjacent" and was conflated with it at
+  first. A segment takes from exactly one port (`take_dir()`), so a face
+  pressed against a run that named a *different* port is a face that can
+  never push an item — a discard point exactly like an empty cell, and so
+  not a reason to refuse the fold. `_face_has_consumer()` decides, which is
+  the same authority `_connected_channels()` uses for which zones can block
+  a fire; asking it in both places is what keeps the two rules from
+  drifting. Nearly **doubled** the folded population, because a Source
+  tucked under a passing run is the common shape on a dense board:
+
+  | board | folded before | after | tick before | after |
+  |---|---|---|---|---|
+  | cpu.npz | 133 / 285 | **242** | 8.58 ms | **6.38 ms** |
+  | noram.npz | 143 / 325 | **264** | 11.57 ms | **8.94 ms** |
+  | Ram2.npz | 108 / 188 | **157** | 13.24 ms | **12.23 ms** |
+  | ram.npz | 32 / 84 | **63** | 3.85 ms | **3.01 ms** |
+
+  Pinned by `test_a_belt_a_face_cannot_reach_does_not_block_the_fold`, whose
+  fixture is the one that isolates it: a run owned by *another* Source
+  passing over both of our Source's `+Y` faces. The obvious fixture does
+  not work — a run laid along the top of the machine has its tail against
+  one of those faces, so that port genuinely owns it and the fold must
+  still be refused, which is the paired test's case.
 - **A dangling-only Source does not fold.** It emits nowhere, so there is
   nothing to hold, and leaving it unfolded keeps it reported as `unconnected`
   exactly as before. `test_a_dangling_generator_stays_inert` catches this.
@@ -2009,10 +2033,10 @@ overlay was considered and dropped: `.z` has one spare bit, but using it means
 a restamp on every fold change plus a GLSL mirror plus a pixel test, which is
 a lot of machinery for a debug colour.
 
-#### Gate sleep is built, correct, and switched off
+#### Gate sleep is built and correct, and still costs more than it saves
 
-`GateSim` sleeps gates on two tiers, and `_sleep_enabled` defaults to
-**False**. Not because it is broken — `tools/check_wakelist_safe.py` agrees at
+`GateSim` sleeps gates on two tiers, and `_sleep_enabled` is the switch.
+Not because it is broken — `tools/check_wakelist_safe.py` agrees at
 every tick with both tiers exercised — but because it is a net loss on every
 real board:
 
@@ -2023,17 +2047,168 @@ real board:
 | Ram2.npz | 13.12 ms | **12.29 ms** | 12.40 ms |
 | ram.npz | 3.43 ms | **2.93 ms** | 3.10 ms |
 
+Re-measured after the folding fix above (which leaves fewer gates for a
+scheduler to skip), and the verdict is unchanged — sleep is still the slower
+column: cpu 6.15 → 6.38 ms, noram 8.49 → 8.94, Ram2 11.30 → 12.23, ram
+2.88 → 3.01.
+
+**Why so few gates sleep in practice**, measured on cpu.npz after 60 ticks
+with the fold widened: of 428 table rows, 196 are asleep and 232 awake — but
+only **2** of those awake rows hold nothing (tier one has essentially
+nothing left to find), while **95** are partially fed. Of those 95, tier two
+would sleep only 16. The refusals break down as **64 `no_feeder_segment`**
+and 15 `feeder_holds_items`, and `feeder_not_at_rest` never fires at all.
+
+The dominant refusal is therefore the missing-lane-with-no-segment case, and
+classifying those 64 shows **61 are direct gate-to-gate lanes** and only 3
+genuinely dangle. So the single biggest gap in gate sleep is not belts at
+all: it is that a lane written by `deliver_direct()` has no segment to prove
+quiet. **That gap is now closed** — see "A directly-fed lane" below.
+
 **The two tiers.** Tier one sleeps a gate holding *nothing*. Tier two —
 the better predicate — sleeps a **partially fed** gate when every *missing*
-input lane is fed by a belt segment that is both empty and at rest: no
-material can reach it, so its readiness cannot change. That is the common
-shape on a computer, and it roughly doubles the sleeping population (on
-cpu.npz, 211 partially-fed rows of 537, of which 123 are provably stuck).
+input lane is provably unable to fill. A lane qualifies two ways: a belt
+segment that is both empty and at rest, or a **directly abutting gate whose
+output zone is empty**. That is the common shape on a computer, and it
+roughly doubles the sleeping population (on cpu.npz, 211 partially-fed rows
+of 537, of which 123 are provably stuck).
+
+#### A directly-fed lane can prove itself quiet too
+
+The gate-to-gate half of tier two, and the bigger half on a real board. The
+claim is as narrow as the belt one: if a missing lane has no feeding segment
+and the gate whose output face points into it holds nothing in that output
+channel, then `deliver_direct()` cannot write the lane on the coming belt
+phase, so readiness cannot change this tick.
+
+- **`out_held` is the whole test**, because it is the precondition of the
+  only code path that can feed us — `deliver_direct()` writes a lane only
+  under `if not gate.out_held(channel)`. So this is a reading of *data*, not
+  a prediction about what the neighbour will do.
+- **It deliberately does not ask whether the neighbour is asleep.** That was
+  the tempting formulation and is strictly worse: "my feeder is asleep" is a
+  claim about another scheduler's conclusion, so two gates could each sleep
+  on the other's sleep. "My feeder's zone is empty" cannot be mutually
+  self-supporting — a zone is empty or it is not.
+- **A lane with no direct feeder at all is refused, not granted**, and
+  getting that backwards is the mistake this made first. The reasoning that
+  fails is seductive: such a lane dangles, so nothing can *ever* feed it, so
+  sleep. Every step is true and it proves too much — a `FIRE_ALL` gate with
+  a permanently unfed lane never fires at all, so sleeping it strands
+  whatever its *other* lanes hold. `check_wakelist_safe.py` caught it within
+  7 ticks as `MUTUAL SLEEP: gate 71 is asleep while segment 3 feeding it
+  holds 4 items`. The stall is genuine and predates the clause (the gate
+  never fires either way, so the differential diff passes with the clause
+  neutered), but sleeping the gate converts a live stall into one the
+  scheduler asserts is permanent. Two further reasons the same answer is
+  required, neither visible from the predicate: **`FIRE_ANY`** (a Sink's
+  unfed lane says nothing about its readiness) and **`inputs_ready()` being
+  overridable**, which is what `FIRE_SELECT` names.
+
+**Two per-edit indexes**, `_direct_feeders()` keyed on the receiving lane and
+`_direct_downstream()` its inverse for the wake edge. Both are **excluded
+from `invalidate_connectivity()`** and dropped by `invalidate_board()`
+instead, for exactly the reason constant folding is: that method runs once a
+tick as a backstop, and these are whole-board walks over every gate's output
+faces. Wiring them into it measured **58 rebuilds over 50 ticks** on cpu.npz
+— more than once a tick — and took the tick from 6.8 to 12.3 ms. An
+edit-time derivation dropped per tick is a per-tick cost, which is the
+opposite of the point. `tools/check_cache_coherence.py` checks the index
+against a fresh one after every edit, since the recycling hazard is the same
+as the four caches beside it with a worse consequence: not a wrong port, but
+a gate sleeping on a claim about whichever machine now owns that row.
+
+**The wake edge is defensive rather than load-bearing, and measurement says
+so** — recorded because the belt analogue *is* load-bearing (0 violations
+with it, 4 without) and the symmetry invites assuming the same. It is not
+the same, because the backstop is one phase away rather than `d/v` ticks
+away: the producer fires in the **structure** phase, and `deliver_direct()`
+runs in the **belt** phase of the same tick and wakes both rows itself.
+Mutation-tested — removing the edge passes the whole differential tool, and
+instrumenting shows `deliver_direct()` picking up exactly the slack, **35
+wakes equal to the 35 grants the clause made**. Kept so the scheduler is
+correct because each cause raises its own edge, not because another
+subsystem happens to run later in the same tick.
+
+**Known coverage gap, stated rather than discovered later.** The checker
+reports the clause's refusals, and "refused on a loaded zone" is **0** on
+its fixture — so the `out_held` line is never the one that refuses, and
+mutating it to `return True` passes. The reason is benign and is the wake
+edge above: a producer that fills its zone wakes this gate in the same
+breath, so the predicate is never *asked* about a loaded zone. The dangling
+refusal, by contrast, is pinned. Forcing the other state would need a
+producer that fills a zone without raising a wake, which nothing on a real
+board does.
+
+**It needs no barrier inside a phase, which is what makes it
+dispatchable.** Worth settling before writing such a predicate, because a
+rule needing same-phase ordering cannot be a parallel pass. The two-phase
+split already provides it: the predicate is evaluated in the **structure**
+phase, and the only writer of a direct lane — `deliver_direct()` — runs in
+the **belt** phase. So it reads `F_OUT_HELD` as it stood at the end of the
+previous tick, across the phase barrier, exactly as the belt clause reads
+`head`/`tail`/`anchor` before the belt phase touches them. Neither is a
+same-phase read of a value another invocation is writing.
+
+Two properties follow:
+
+- **Read-only on shared state.** Each invocation reads other rows'
+  `F_OUT_HELD` and writes only its own sleep flag — many readers, one
+  writer per slot, so the result is independent of invocation order.
+- **One hop, not a transitive closure.** It asks about the *immediate*
+  upstream zone and never about that gate's own sleep state, so there is no
+  chain to iterate to a fixed point. The "my feeder is asleep" formulation
+  would have needed either multiple passes per tick or a race-prone single
+  pass — another reason reading data beats reading conclusions.
+
+The index is the part not yet GPU-shaped: a dict keyed on `(row, channel)`.
+It is per-edit, so off the hot path, and the device form is a flat
+`int32[rows * MAX_CHANNELS]` of packed `(row, channel)` with a sentinel —
+a gather, which `tools/probe_batch_prefilter.py` already measured as
+negligible (scattered gathers are 0.5% of the tick). The shape ports
+mechanically; only the container changes.
+
+**The fixture had to be built deliberately, twice over.** The checker
+granted **zero** direct sleeps before it gained a row of the right shape:
+instrumenting found 634 calls into the clause, every one a dangling lane.
+The trap is that a `Source` abutting a gate **folds**, so the lane it feeds
+reads as permanently *held* and is never a *missing* lane at all — the
+direct feeder has to be a real gate whose zone empties and fills. Same for
+`check_cache_coherence.py`, whose board was entirely
+Source→belt→Shear→belt with no two gates touching, so the index stayed `{}`
+and compared equal to a fresh `{}` however stale the invalidation was; and
+even with an abutting row added, uniformly-spread edits touched it only
+**2 times in 120**, so the edits are now weighted and aimed at the gates'
+own columns and the pair is re-seeded when churn destroys it.
 
 **It removes real work and the bookkeeping costs more.** On cpu.npz with 207
 of 537 gates asleep, `structure/fire` falls 4.06 → 3.35 ms — the predicate
 working exactly as intended — while `structure/prefilter` rises 1.35 → 2.32 ms
 deciding *which* 207.
+
+An in-app profile of a 466-segment board (427 runs asleep, 2852 entities)
+with both tiers on shows the same shape, and is the clearest statement of
+the problem:
+
+```
+structure                  86.6%   4.786ms
+  prefilter                41.7%   2.306ms
+  fire                     40.4%   2.233ms
+  publish_sleep             2.0%   0.113ms
+belt                       13.4%   0.740ms
+  direct                    9.5%   0.524ms
+  transport                 3.9%   0.213ms
+tick total                100.0%   5.526ms
+```
+
+**`prefilter` now exceeds `fire`.** The pass that exists to decide *which*
+gates to look at costs more than looking at them, which is the whole case
+against the current representation — and note `publish_sleep` (the overlay
+flag, pure diagnostics) is only 2.0%, so it is not what tips the balance.
+`belt/direct` at 9.5% against `transport`'s 3.9% is the other number worth
+keeping: `deliver_direct()` is now the more expensive half of the belt
+phase, which is consistent with direct hops being the common topology and is
+what makes the direct-lane clause worth having.
 
 **The reason is the workload, and three attempts at the accounting establish
 it.** The sleep set is large and stable in *size* but never still: 203 asleep
@@ -2464,13 +2639,61 @@ while staying internally consistent. Two tools, both free when off:
   rule, like `item_position()` beside `BeltSim.position_of()`, and pinned the
   same way.
 
-  A **gate** body uses a deliberately weaker test: does it hold anything on
-  any channel. That is a necessary condition the prefilter shares, not the
-  full readiness predicate — the type's fire rule and its connectivity live
-  in Python and in the entity class, and mirroring them into GLSL is the
-  thing generated tables exist to avoid (it has already caused two
-  "GLSL disagrees with Python" bugs). Holding nothing is also the question a
-  player reading the board actually wants answered.
+  A **gate** body reads a published flag (`Entity.F_ASLEEP`) rather than
+  re-deriving anything, which is the one place the overlay is asymmetric with
+  the belt half above — and the asymmetry is forced. A segment's rest
+  condition is a short expression over values the renderer already has, so
+  re-deriving it is cheap and stays honest. A gate's depends on the type's
+  fire rule, its connectivity, and (for tier two) on the state of the
+  segments feeding each *missing* lane; mirroring that into GLSL would be a
+  large second copy of a rule that has already caused two "GLSL disagrees
+  with Python" bugs.
+
+  **The first version guessed from occupancy — "a gate holding nothing is
+  asleep" — and that was wrong in the worst direction.** It is a faithful
+  reading of tier one, whose predicate *is* "holds nothing". Tier two sleeps
+  a **partially fed** gate, i.e. one that holds an input, so every tier-two
+  sleeper rendered **amber**: asleep, and drawn as awake. The single
+  population gate sleep was extended to catch was the one population the
+  overlay could not show, which is why gate sleep looked like a no-op in the
+  running app. Pinned by
+  `test_the_overlay_draws_a_partially_fed_sleeper_as_asleep`, and
+  mutation-tested — restoring the occupancy guess fails that test and no
+  other, so the bug really was invisible to the rest of the suite.
+
+  Three things about the flag:
+
+  - **It squats on a free row slot, not a `.z` bit.** `.z`'s ghost field is
+    full, and a bit there would need a `restamp()` on every sleep transition
+    (6–11 gates a tick) against a field the SSBO upload already carries.
+    Gate state ends at slot 24 and the belt seed takes 24–25, so slot 26 is
+    spare *at the current stride* — which matters because widening
+    `ENTITY_STRIDE` invalidates every save file. Self-checks in
+    `core/entity.py` pin that it sits past the gate block and clear of
+    `Belt.F_SEED_ON`/`F_SEED_VALUE`.
+  - **It is published once per structure phase, not per mutation.** The three
+    sleep-set mutators are hot — `_wake_one()` runs from every port callback,
+    inside the belt tick — so writing the array there would charge the
+    simulation for a diagnostic on its hottest path. A frame shows one answer
+    per tick anyway. Costs ~0.2–0.45 ms/tick on the real boards, and only
+    when gate sleep is on.
+  - **It is a diagnostic, never the authority.** `GateSim._asleep` is.
+    `tools/check_wakelist_safe.py` therefore **zeroes the column** out of its
+    entity snapshot: it is written only while sleeping is on, so the sleeping
+    timeline carries it and the latched-off oracle never does, and every tick
+    would diverge on the field reporting the very difference the tool exists
+    to permit. That is the wholesale-copy habit paying off in the awkward
+    direction — copying every row is what covers a new *simulation* field for
+    free, and the price is that a new *diagnostic* one must be excluded by
+    hand.
+
+  The panel reports `gates asleep: n/total` **separately** from the belt
+  ratio, and says so explicitly when the scheduler is switched off. Summing
+  the two would let a quiet memory field vouch for a gate layer that never
+  sleeps — the same reason `check_wakelist_safe.py` counts transitions per
+  layer. Before this there was no gate readout at all: `gates_asleep` was
+  tracked and never displayed, so between that and the wrong overlay the
+  feature was indistinguishable from a no-op in the running app.
 
   **Two checkboxes mask the families independently** — `report belts` and
   `report gates`, unticking one forcing it to read asleep. Belts and gates

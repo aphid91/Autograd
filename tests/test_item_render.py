@@ -27,7 +27,7 @@ surrounding grey washes the hue below any sensible threshold.
 import numpy as np
 
 from core import cell, font
-from core.entity import Source
+from core.entity import Belt, Shear, Source
 from core.belts import UNIT
 
 from tests import harness
@@ -1740,6 +1740,88 @@ def test_the_sleep_masks_isolate_belts_from_gates():
         ok(f"belt amber {belt_shown.astype(int)} -> masked "
            f"{belt_hidden.astype(int)}; gate {gate_shown.astype(int)} -> "
            f"masked {gate_hidden.astype(int)}")
+    finally:
+        cam.set_define("SLEEP_DEBUG", was)
+        cam.sleep_show_belts = True
+        cam.sleep_show_gates = True
+
+
+def test_the_overlay_draws_a_partially_fed_sleeper_as_asleep():
+    """A tier-two sleeper must read blue, which the overlay used to deny.
+
+    This is the bug the overlay's first version had, and it mattered because
+    it hid the exact population gate sleep was extended to catch. The gate
+    half of the overlay guessed from *occupancy* -- "a gate holding nothing
+    is asleep" -- which is a faithful reading of tier one. Tier two sleeps a
+    **partially fed** gate, i.e. one that holds an input, so every tier-two
+    sleeper rendered amber: asleep, and drawn as awake.
+
+    So the overlay now reads a flag the gate layer publishes
+    (`Entity.F_ASLEEP`) rather than re-deriving anything, and this pins the
+    case that distinguishes the two. A board with only tier-one sleepers
+    renders identically either way, which is why the fixture has to be the
+    awkward one.
+
+    The shape is the checker's tier-two fixture, and the critical detail is
+    that the belt feeding the missing lane must have a **starved gate** at
+    its tail rather than a Source: a Source either folds into its neighbour
+    or keeps producing, and in both cases the run never stays empty.
+    """
+    was = "SLEEP_DEBUG" in cam.defines
+    try:
+        y = 20
+        # A, the starved producer: nothing feeds it, so it never emits and the
+        # run below stays empty for ever.
+        board.spawn(Shear, 2, y, cell.DIR_PX)
+        for x in range(4, 10):
+            board.spawn(Belt, x, y, cell.DIR_PX)
+        # B, the gate under test: its -X lane is fed by that empty run.
+        b = board.spawn(Shear, 10, y, cell.DIR_PX)
+        # ...while its +Y lane is kept fed from above, so B is *partially*
+        # fed rather than holding nothing (which would be tier one).
+        board.spawn(Source, 10, y + 1, cell.DIR_NY)
+        # Somewhere for B's results to go, so it is not output-blocked -- a
+        # blocked gate is excluded from tier two and the fixture would be
+        # vacuous for an unrelated reason.
+        for x in range(12, 18):
+            board.spawn(Belt, x, y, cell.DIR_PX)
+        engine.invalidate_segments()
+        engine.sync_segments()
+
+        _at_whole_tick()
+        for _ in range(8):
+            engine.clock.request_step()
+            engine.clock.advance(0.0)
+
+        gates = engine.gates
+        # The simulation's own view, asserted before any pixel is sampled:
+        # without this a blue-on-blue comparison would pass whatever the
+        # shader did, which is the vacuity trap the mask test already
+        # documents.
+        assert gates._sleep_enabled, (
+            "gate sleeping must be on for this test to mean anything")
+        assert b.row in gates._asleep, (
+            f"the fixture is wrong: B should be asleep, sleep set is "
+            f"{sorted(gates._asleep)}")
+        held = engine.board.view(b.row)
+        assert any(held.in_held(c) for c in range(held.input_count())), (
+            "and it must be asleep while *holding* an input -- that is what "
+            "makes it a tier-two sleeper rather than a tier-one one, and the "
+            "only case that tells the two overlay implementations apart")
+
+        assert cam.set_define("SLEEP_DEBUG", True), cam.compile_error
+        assert cam.compile_error is None, cam.compile_error
+        cam.center[:] = (10.0, float(y))
+        cam.zoom = 22.0
+        cam.sleep_show_belts = True
+        cam.sleep_show_gates = True
+
+        gx, gy = b.origin
+        shown = _mean_rgb(_render(), gx, gy)
+        assert _is_cold(shown), (
+            f"a partially-fed sleeping gate must render blue, got {shown} -- "
+            f"the overlay is reporting it awake while the scheduler skips it")
+        ok(f"a tier-two sleeper rendered asleep {shown.astype(int)}")
     finally:
         cam.set_define("SLEEP_DEBUG", was)
         cam.sleep_show_belts = True

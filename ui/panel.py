@@ -362,8 +362,30 @@ class UI:
         asleep = engine.belts.stats.get("asleep", 0)
         total = index.count
         if total:
-            imgui.text(f"asleep: {asleep}/{total} "
+            imgui.text(f"belts asleep: {asleep}/{total} "
                        f"({100.0 * asleep / total:.0f}%)")
+        # **The gate ratio, separately, because the two schedulers are
+        # different and a combined number would hide either one.** Belts and
+        # gates sleep on unrelated predicates, so summing them would let a
+        # quiet memory field vouch for a gate layer that never sleeps at all
+        # -- the same reason `check_wakelist_safe.py` reports its transition
+        # counts per layer rather than as a total.
+        #
+        # Worth having at all because gate sleep was previously invisible in
+        # the running app: `gates_asleep` was tracked and never displayed, and
+        # the overlay guessed at the set rather than reading it. With no
+        # readout and a wrong overlay there was no way to tell the feature
+        # from a no-op.
+        gate_total = len(engine.gates._gate_table()[0])
+        if gate_total:
+            gates_asleep = engine.gates.stats.get("gates_asleep", 0)
+            imgui.text(f"gates asleep: {gates_asleep}/{gate_total} "
+                       f"({100.0 * gates_asleep / gate_total:.0f}%)")
+            if not engine.gates._sleep_enabled:
+                # Otherwise a flat 0/428 reads as "nothing can sleep on this
+                # board" rather than "the scheduler is switched off", which
+                # are very different things to learn from a debug panel.
+                imgui.text_disabled("  (gate sleeping is switched off)")
         # Folded Sources, beside the sleep ratio because it is the same
         # question -- how much of the board is the tick not visiting -- for
         # the one population sleeping can never reach. A generator fires every

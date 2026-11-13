@@ -231,6 +231,11 @@ def type_constants():
         # has no input channels, and if F_EMIT ever moves (it must, if Source
         # gains an input) a hand-written alias would silently read a channel.
         f"const int F_EMIT = {Source.F_EMIT};",
+        # The SLEEP_DEBUG overlay draws the *real* gate sleep set rather than
+        # guessing from occupancy. Generated like the rest: it squats on a
+        # spare slot past the gate block, so a hand-written offset would go
+        # stale the moment the stride changes.
+        f"const int F_ASLEEP = {Entity.F_ASLEEP};",
         f"const int TYPE_EMPTY = {cell.TYPE_EMPTY};",
     ]
     for tid, name in sorted(cell.TYPE_NAMES.items()):

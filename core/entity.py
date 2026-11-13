@@ -212,6 +212,26 @@ class Entity:
     F_OUT_HELD = _COMMON_FIELDS + 3 * MAX_CHANNELS
     _GATE_FIELDS_END = _COMMON_FIELDS + 4 * MAX_CHANNELS
 
+    #: **Diagnostic only: is this gate currently in `GateSim._asleep`?**
+    #: Written by the gate layer each structure phase purely so the
+    #: SLEEP_DEBUG overlay can draw the *real* sleep set instead of guessing
+    #: at it. Nothing in the simulation reads it, and it is deliberately not
+    #: the authority -- `GateSim._asleep` is.
+    #:
+    #: It lives here rather than in a `.z` bit for two reasons. A `.z` bit
+    #: would need a `restamp()` on every sleep transition (6-11 gates a tick
+    #: on a real board, against a field the SSBO upload already carries), and
+    #: `.z`'s ghost field is full. And it squats on a **free** slot rather
+    #: than widening the row: gate state ends at `_GATE_FIELDS_END` (24) and
+    #: the belt seed takes 24-25, so 26 is spare at the current stride. That
+    #: matters because widening the stride invalidates every save file.
+    #:
+    #: Aliasing onto the belt-seed block is safe in the one direction that
+    #: counts -- a belt is never a gate, so nothing writes both -- but it is
+    #: still an alias, so the self-check below pins that this sits past the
+    #: gate block and clear of `Belt.F_SEED_VALUE`.
+    F_ASLEEP = _GATE_FIELDS_END + 2
+
     #: Which channel each declared port face belongs to. Defaults to one
     #: channel per face, in declaration order, which is what every
     #: arithmetic machine wants. Sink overrides it to fold its eight
@@ -1648,6 +1668,21 @@ def _self_check():
     assert Belt.F_SEED_VALUE < ENTITY_STRIDE, (
         f"seed value at {Belt.F_SEED_VALUE} is past the {ENTITY_STRIDE}-slot "
         f"row")
+
+    # --- the gate sleep diagnostic flag -----------------------------------
+    # Same reasoning as the seed above, one slot further on: past the gate
+    # block (so it cannot alias a channel), inside the stride (so it needs no
+    # save-invalidating widening), and clear of the belt seed. The last is the
+    # one that would bite -- a belt is never a gate, so nothing writes both,
+    # but an overlap would still be a silent two-writers bug if that ever
+    # changed.
+    assert Entity.F_ASLEEP >= Entity._GATE_FIELDS_END, (
+        "the sleep flag must not alias the gate channel block")
+    assert Entity.F_ASLEEP < ENTITY_STRIDE, (
+        f"sleep flag at {Entity.F_ASLEEP} is past the {ENTITY_STRIDE}-slot "
+        f"row")
+    assert Entity.F_ASLEEP not in (Belt.F_SEED_ON, Belt.F_SEED_VALUE), (
+        "the sleep flag must not alias a belt's seed")
 
     blt = _view(Belt)
     # A zeroed row reads as "not seeded", which is the right default: a belt

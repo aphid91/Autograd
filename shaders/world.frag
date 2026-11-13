@@ -1305,25 +1305,27 @@ void main() {
                         || segment_at_rest(sid, sim_tick);
                 known = true;
             } else if (is_structure(type)) {
-                // A gate is "awake" when it holds anything -- a fed input or
-                // a waiting result. That is deliberately *not* the full
-                // prefilter predicate (which also needs the type's fire rule
-                // and its connectivity): those live in Python and in the
-                // entity class, and duplicating them here would be a second
-                // copy of a rule that has already caused two
-                // GLSL-disagrees-with-Python bugs. Holding nothing is the
-                // necessary condition the prefilter shares, and it is the
-                // one a player reading the board actually wants.
-                bool holds = false;
-                if (sleep_show_gates != 0) {
-                    int row = cell_id(c.x);
-                    for (int ch = 0; ch < MAX_CHANNELS; ++ch) {
-                        if (gate_in_held(row, ch) || gate_out_held(row, ch)) {
-                            holds = true;
-                        }
-                    }
-                }
-                resting = !holds;
+                // **The real sleep set, read from the row** -- see
+                // `gate_asleep()` in common.glsl for why this one is
+                // published rather than re-derived in GLSL.
+                //
+                // This used to guess from occupancy ("a gate holding nothing
+                // is asleep"), which was defensible while tier one was the
+                // only tier: that predicate *is* "holds nothing". Tier two
+                // broke it in the worst direction -- a partially-fed gate
+                // sleeps while holding an input, so the guess painted every
+                // tier-two sleeper **amber**, and the one population the
+                // overlay existed to reveal was the one it could not show.
+                //
+                // With sleeping switched off the flag is never written and
+                // stays 0, so every gate reads awake -- which is exactly
+                // right, because every gate is then visited.
+                // Masked off -> report asleep, so the gates drop to a flat
+                // blue field and only the belts carry amber. Same contract as
+                // the belt mask above: the mask decides whether to *ask*,
+                // never what the answer is.
+                resting = (sleep_show_gates == 0)
+                        || gate_asleep(cell_id(c.x));
                 known = true;
             }
             if (known) {

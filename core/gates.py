@@ -128,6 +128,28 @@ Three things make it safe:
   value arrives one hop later and its zone can be held. Folding that would
   change behaviour. Other faces may dangle freely -- a dangling output is
   already discarded at fire time, so it was never carrying anything.
+
+  **"On a belt" means a belt the face can actually deposit onto**, which is
+  narrower than "a belt is adjacent" and was originally conflated with it.
+  A segment takes from exactly one port (`take_dir()`), so a multi-port
+  machine can have a face pressed against a run that named a *different*
+  port as its source -- and that face can never push an item. It is a
+  discard point exactly like an empty cell, so it must not block the fold.
+  `_face_has_consumer()` is the authority, the same one `_connected_channels()`
+  uses to decide which zones can block a fire; asking it here is what keeps
+  the two rules from drifting.
+
+  Treating adjacency as connection refused the fold on a large, entirely
+  real population -- a Source tucked under a passing run. Measured:
+
+                 folded before   after      tick before   after
+    cpu.npz        133 of 285     242         8.58ms      6.38ms
+    noram.npz      143 of 325     264        11.57ms      8.94ms
+    Ram2.npz       108 of 188     157        13.24ms     12.23ms
+    ram.npz         32 of  84      63         3.85ms      3.01ms
+
+  Nearly a doubling of the folded population, because the losing-face shape
+  is the common one on a board dense enough for runs to pass over machines.
 - **It is derived state with the same invalidation condition as the four
   caches above**, so it is dropped by `invalidate_connectivity()` and nothing
   new has to be remembered on an edit.
@@ -181,6 +203,12 @@ class GateSim:
         self._gate_segments = None
         #: (row, channel) -> feeding segment, or None. See _feeders().
         self._feeder_map = None
+        #: (row, channel) -> (upstream row, out channel), or None. The
+        #: belt-less counterpart of `_feeder_map`. See _direct_feeders().
+        self._direct_map = None
+        #: upstream row -> [downstream rows], the forward direction of
+        #: `_direct_map`, or None. See _direct_downstream().
+        self._direct_down = None
         #: Constant folding, or None when not yet derived. See _folds().
         #: `folded_sources` is the set of Source rows that no longer tick;
         #: `folded_inputs` is [(row, channel, value)] to hold permanently.
@@ -192,15 +220,26 @@ class GateSim:
         #: Empty means "every gate is visited", the pre-sleep behaviour and so
         #: the safe default after any wholesale change.
         self._asleep = set()
-        #: **Gate sleeping is off by default, on measurement.** It is correct
-        #: -- `tools/check_wakelist_safe.py` agrees at every tick, with both
-        #: tiers exercised -- and it is a net *loss* on every real board:
+        #: **Gate sleeping is a measured net loss, and this flag is what
+        #: switches it off.** It is correct -- `tools/check_wakelist_safe.py`
+        #: agrees at every tick, with both tiers exercised -- and it still
+        #: costs more than it saves on every real board:
         #:
         #:                 baseline   folding   folding+gate sleep
         #:   cpu.npz        9.13ms     7.17ms      7.66ms
         #:   noram.npz     12.95ms    10.98ms     11.29ms
         #:   Ram2.npz      13.12ms    12.29ms     12.40ms
         #:   ram.npz        3.43ms     2.93ms      3.10ms
+        #:
+        #: Re-measured after the folding fix above widened the fold (so there
+        #: are fewer gates left for a scheduler to skip), and the verdict is
+        #: unchanged -- sleep is still the slower column:
+        #:
+        #:                 folding   folding+gate sleep
+        #:   cpu.npz        6.15ms      6.38ms
+        #:   noram.npz      8.49ms      8.94ms
+        #:   Ram2.npz      11.30ms     12.23ms
+        #:   ram.npz        2.88ms      3.01ms
         #:
         #: It genuinely removes work -- `structure/fire` falls 4.06 -> 3.35ms
         #: on cpu.npz with 207 of 537 gates asleep -- and the bookkeeping to
@@ -225,7 +264,7 @@ class GateSim:
         #: the GPU port wants, where the set is rebuilt by a parallel
         #: predicate pass rather than edited incrementally. Flip this to True
         #: to measure it again.
-        self._sleep_enabled = False
+        self._sleep_enabled = True
         #: Bumped by every mutation of `_asleep`, so the awake slice below can
         #: be memoised across ticks. See _awake_slice() / _sleep_changed().
         self._sleep_gen = 0
@@ -267,6 +306,21 @@ class GateSim:
         # recycles segment ids. A stale entry would have a gate sleeping on a
         # run that no longer exists.
         self._feeder_map = None
+        # **The direct-feeder index is deliberately NOT dropped here**, for
+        # exactly the reason the constant fold below is not, and it paid the
+        # same price before being moved: `set_tick()` calls this once per tick
+        # as a backstop, and the index is a whole-board walk over every gate's
+        # output faces. Measured when it was wired here: **58 rebuilds over 50
+        # ticks** on cpu.npz -- more than once a tick -- and the tick went
+        # 6.83 -> 12.27ms. An edit-time derivation dropped per tick is a
+        # per-tick cost, which is the opposite of the point.
+        #
+        # It is dropped by `invalidate_board()` instead, the edit-time entry
+        # point every real edit routes through. The recycling hazard the four
+        # caches above document still applies -- it holds *rows*, which the
+        # free list reuses, and it is derived from port geometry an in-place
+        # turn changes -- so it must die on an edit; it just must not die on a
+        # tick.
         # **Constant folding is deliberately NOT dropped here**, which is the
         # one exception among the derivations above and needs stating because
         # it looks like an omission.
@@ -311,6 +365,14 @@ class GateSim:
         """
         self.invalidate_connectivity()
         self._drop_folding()
+        # The direct-feeder index and its inverse, for the same reason the
+        # fold is here rather than in `invalidate_connectivity()`: both are
+        # whole-board walks that must survive the per-tick backstop and die on
+        # a real edit. The two directions go together, or the wake edge would
+        # point at the old adjacency while the sleep predicate used the new
+        # one -- and the two disagreeing is exactly the silent-stall shape.
+        self._direct_map = None
+        self._direct_down = None
         # The gate table excludes folded rows, so dropping the fold without
         # dropping the table would leave a folded Source missing from the
         # firing set with nothing holding its constant.
@@ -704,6 +766,53 @@ class GateSim:
                 self._wake_one(dst[0])
         for seg in upstream:
             belts.wake(seg)
+        # **And the gates directly downstream, with no belt between** -- the
+        # companion to the `dst` wake above, for tier two's gate-to-gate
+        # clause: a neighbour sleeping because *our* output zone was empty
+        # should wake the moment we fill it, which is now.
+        #
+        # **This one is defensive rather than load-bearing, and measurement
+        # says so** -- recorded because the belt analogue above *is*
+        # load-bearing (0 violations with it, 4 without) and the symmetry
+        # invites assuming the same here. It is not the same, because the
+        # backstop sits one phase away rather than `d/v` ticks away:
+        #
+        #   this fire is in the **structure** phase;
+        #   `deliver_direct()` runs in the **belt** phase of the same tick,
+        #   moves the value, and `_wake_one()`s both rows itself.
+        #
+        # So the receiver is awake again before the tick ends either way, and
+        # it is never asleep on a false premise *across a tick boundary* --
+        # which is the only thing `lying_sleepers()` can sample, since it runs
+        # after the full tick. Mutation-tested: removing these two lines
+        # passes the whole differential tool, and instrumenting shows
+        # `deliver_direct()` picking up exactly the slack -- **35 wakes, equal
+        # to the 35 grants the direct clause made**.
+        #
+        # Kept for the same reason `took_from()`'s split is kept: the
+        # scheduler should be correct because each cause raises its own edge,
+        # not because another subsystem happens to run later in the same tick.
+        # A future reordering of the phases, or a direct delivery that became
+        # conditional, would make it load-bearing with no other change.
+        for down_row in self._direct_downstream(row):
+            self._wake_one(down_row)
+
+    def _direct_downstream(self, row):
+        """Gate rows this gate feeds directly, with no belt between.
+
+        The forward direction of `_direct_feeders()`, inverted once per edit
+        and cached beside it. A per-call walk of the output faces would be
+        the O(faces) scan on every fire that the indexes exist to avoid --
+        and `_wake_around()` runs for every gate that fires, which is the
+        hottest caller there is for this.
+        """
+        if self._direct_down is None:
+            down = {}
+            for (dst_row, _ch), (src_row, _c) in \
+                    self._direct_feeders().items():
+                down.setdefault(src_row, []).append(dst_row)
+            self._direct_down = down
+        return self._direct_down.get(row, ())
 
     # --- sleeping gates ---------------------------------------------------
     #
@@ -880,6 +989,64 @@ class GateSim:
             self._feeder_map = feeders
         return self._feeder_map
 
+    # --- the direct feeder index ------------------------------------------
+    #
+    # The belt feeder map above answers "which run fills this lane". This is
+    # the same question for the lanes no run fills: a gate abutting another
+    # with no belt between them, which `deliver_direct()` serves.
+    #
+    # **It is the dominant gap in tier two, by a wide margin.** Measured on
+    # cpu.npz after 60 ticks, of the 95 awake partially-fed gates, tier two
+    # refused 64 for `seg is None` -- and classifying those 64 shows **61 are
+    # direct gate-to-gate lanes** and only 3 genuinely dangle. On a computer
+    # most short hops are direct rather than belted, so the belt-only
+    # predicate was blind to the common shape.
+    #
+    # Same invalidation as `_feeders()` and for the same reason: it is derived
+    # from the grid and the port geometry, both of which change only on an
+    # edit, and it holds *rows*, which the free list recycles.
+    def _direct_feeders(self):
+        """(row, channel) -> (upstream row, upstream out channel), per edit.
+
+        The inverse of `deliver_direct()`'s neighbour walk: for each gate
+        input lane with no belt on it, which gate's output face points back.
+
+        Built for every gate at once rather than per candidate, because a
+        per-gate version is the O(gates x faces) scan per tick that the wake
+        list exists to avoid -- the same argument `_feeders()` records.
+
+        **Keyed on the receiving lane, not the producing face**, so the
+        lookup below is one dict hit per missing lane with no search. A lane
+        has exactly one upstream source (a port face has exactly one
+        neighbour), which is what makes that key unique.
+        """
+        if self._direct_map is None:
+            direct = {}
+            for gate in self.gates():
+                for (xy, face, channel) in self._output_faces(gate):
+                    step = cell.DIR_STEPS[face]
+                    nx, ny = xy[0] + step[0], xy[1] + step[1]
+                    if not self.board.in_bounds(nx, ny):
+                        continue
+                    # A belt here is the segment path's business -- that lane
+                    # is in `_feeders()`, not this map. Mirrors the identical
+                    # skip in `deliver_direct()`.
+                    if self.index.at(nx, ny) is not None:
+                        continue
+                    row = self.board.entity_id_at(nx, ny)
+                    if not row or not self.board.is_row_alive(row):
+                        continue
+                    other = self.board.view(row)
+                    if other.row == gate.row or other.is_ghost:
+                        continue
+                    back = (face + 2) % 4
+                    in_ch = self._input_channel_for(other, back, at=(nx, ny))
+                    if in_ch is None:
+                        continue
+                    direct[(other.row, in_ch)] = (gate.row, channel)
+            self._direct_map = direct
+        return self._direct_map
+
     def _starved_on_sleeping_belts(self, row, n_in, held_in):
         """Is every unfed input of this gate fed by an empty, resting run?
 
@@ -898,11 +1065,14 @@ class GateSim:
                 continue
             seg = feeders.get((row, ch))
             if seg is None:
-                # No belt feeds this lane: either a direct neighbour writes it
-                # (deliver_direct, which this gate's sleep must not outlive)
-                # or it dangles. Both need connectivity to tell apart, so stay
-                # awake.
-                return False
+                # No belt feeds this lane, so it is fed by a direct neighbour
+                # or it dangles. Only the first can grant a sleep, and only
+                # while that neighbour's output zone is empty -- a dangling
+                # lane is refused, which is the opposite of what it looks
+                # like it should be. See `_direct_lane_is_quiet()`.
+                if not self._direct_lane_is_quiet(row, ch):
+                    return False
+                continue
             if seg.tail != seg.head:
                 # Holding items -- the RAM fixed point, whose head sits at the
                 # end waiting to be taken by this very gate. Sleeping on that
@@ -945,6 +1115,146 @@ class GateSim:
                 return False
         return True
 
+    # --- a lane fed by a neighbouring gate, not a belt ---------------------
+    #
+    # The third case of a missing input lane, and the one tier two originally
+    # refused outright. The claim is as narrow as the belt one:
+    #
+    #   if a lane has no feeding segment, and the gate whose output face
+    #   points into it is **holding nothing in that output channel**, then
+    #   `deliver_direct()` cannot write this lane on the coming belt phase,
+    #   so this gate's readiness cannot change this tick.
+    #
+    # **Why `out_held` is the whole test.** `deliver_direct()` writes a lane
+    # only under `if not gate.out_held(channel): continue`. So an empty
+    # upstream zone is not a prediction about what the neighbour will do --
+    # it is the precondition of the only code path that can feed us, read
+    # from the row. The neighbour may well fire this tick and fill that zone;
+    # that fire raises `_wake_around()`, and `deliver_direct()` already
+    # `_wake_one()`s both rows when it moves a value. Both edges exist.
+    #
+    # **It does not require the neighbour to be asleep**, which was the
+    # tempting formulation and is strictly worse. "My feeder is asleep" is a
+    # claim about another scheduler's conclusion, so two gates could each
+    # sleep on the other's sleep -- the mutual-sleep fixed point the block
+    # comment above names, and sound only if a wake edge is guaranteed to
+    # break it. "My feeder's zone is empty" is a claim about *data*, which
+    # cannot be mutually self-supporting: a zone is empty or it is not.
+    # Composition stays accidental rather than load-bearing.
+    #
+    #
+    # Translating to the GPU
+    # ----------------------
+    #
+    # This is the question worth settling before the predicate is written,
+    # because a rule that needs a barrier *inside* a phase cannot be a
+    # parallel pass. It does not need one, and the reason is the two-phase
+    # split that already exists:
+    #
+    #   - the predicate is evaluated in the **structure** phase;
+    #   - the only writer of a direct lane, `deliver_direct()`, runs in the
+    #     **belt** phase.
+    #
+    # So it reads `F_OUT_HELD` as it stood at the end of the previous tick,
+    # across the phase barrier -- exactly as the belt clause reads
+    # `head`/`tail`/`anchor` before the belt phase touches them. Neither is a
+    # same-phase read of a value another invocation is writing, which is the
+    # only thing that would need ordering.
+    #
+    # Two properties follow, and they are what make it dispatchable:
+    #
+    #   - **Read-only on shared state.** Every invocation reads other rows'
+    #     `F_OUT_HELD` and writes only its own sleep flag. Many-readers,
+    #     one-writer-per-slot, so there is no contention and the result is
+    #     independent of invocation order -- the report's determinism recipe.
+    #   - **One hop, not a transitive closure.** The predicate asks about the
+    #     *immediate* upstream zone and never about that gate's own sleep
+    #     state, so there is no chain to iterate to a fixed point. A
+    #     transitive version ("my feeder is asleep, whose feeder is
+    #     asleep...") would need either multiple passes per tick or a
+    #     race-prone single pass, and is precisely what reading data instead
+    #     of conclusions avoids.
+    #
+    # The index itself is the part that is *not* GPU-shaped yet: a Python
+    # dict keyed on `(row, channel)`. It is derived per edit, so it is not on
+    # the hot path, and the natural device form is a flat
+    # `int32[rows * MAX_CHANNELS]` of packed `(upstream row, channel)` with a
+    # sentinel for "no direct feeder" -- a gather, which is the one access
+    # pattern `tools/probe_batch_prefilter.py` already measured as
+    # negligible (scattered gathers are 0.5% of the tick). So the shape ports
+    # mechanically; only the container changes.
+    def _direct_lane_is_quiet(self, row, channel):
+        """Can no direct neighbour feed this lane this tick?
+
+        See the block comment above for the safety and GPU arguments.
+
+        **A lane with no direct feeder at all is refused, not granted**, and
+        getting that backwards is the one mistake this method has already
+        made. The reasoning that fails is seductive: such a lane dangles --
+        no belt, no neighbouring output face -- so nothing can *ever* feed
+        it, so it can never change this gate's readiness, so sleep. Every
+        step is true and the conclusion is still wrong, because it proves too
+        much: a `FIRE_ALL` gate with a permanently unfed lane will never fire
+        *at all*, so sleeping it strands whatever its other lanes are
+        holding, for ever.
+
+        `tools/check_wakelist_safe.py` caught exactly that as
+        `MUTUAL SLEEP: gate 71 is asleep while segment 3 feeding it holds 4
+        item(s)`. The stall is genuine and **predates this clause** -- the
+        gate never fires either way, so nothing observable changed and the
+        differential diff passes with the clause neutered -- but sleeping the
+        gate converts a live stall into one the scheduler asserts is
+        permanent, and the deadlock invariant is right to refuse that
+        distinction. A board can be edited; "this lane dangles" is a fact
+        about the board, not about the simulation.
+
+        Two further reasons the dangling case cannot be granted here, both
+        fatal on their own and neither visible from this method:
+
+        - **`FIRE_ANY`.** A Sink destroys whatever arrives, so an unfed lane
+          says nothing about its readiness. It is excluded today only
+          because holding any lane makes it `ready`, so the prefilter admits
+          it and `~awake` keeps it out of the tier-two candidate set
+          entirely. That is load-bearing and accidental -- it rests on
+          another mask's behaviour rather than on anything stated here.
+        - **`inputs_ready()` is overridable**, which is what `FIRE_SELECT`
+          names. The scheduler deliberately does not mirror those rules (see
+          `_gate_is_inert`), so it cannot know which lanes a given type
+          actually requires.
+
+        So the quiet answer is only ever given about a lane with a *known
+        upstream producer whose zone is observably empty*. That is a claim
+        about data for one tick, which is the only kind this predicate is
+        entitled to make.
+        """
+        feeder = self._direct_feeders().get((row, channel))
+        if feeder is None:
+            return False
+        up_row, up_channel = feeder
+        ents = self.board.entities
+        if not 0 < up_row < ents.shape[0] or not ents[up_row, Entity.F_ALIVE]:
+            # The index is rebuilt per edit, so this should not happen -- but
+            # a dead row cannot hold anything either way, and guessing "quiet"
+            # on a row we cannot read is the unsafe direction.
+            return False
+        # **Known gap in the coverage, stated rather than discovered later.**
+        # `check_wakelist_safe.py` reports this clause's refusals, and the
+        # "refused on a loaded zone" count is **0** on its fixture -- so this
+        # line is never the one that refuses, and mutating it to `return True`
+        # passes the whole tool. The reason is benign and is the same thing
+        # the `_wake_around()` comment records: a producer that fills its zone
+        # fires in the structure phase and wakes this gate in the same breath,
+        # so the predicate is never *asked* about a loaded zone.
+        #
+        # It is kept because it is the stated premise -- exactly the argument
+        # for keeping the two redundant guards in
+        # `_starved_on_sleeping_belts()`. Forcing a fixture into the state
+        # would need a producer that fills a zone *without* raising a wake,
+        # which nothing on a real board does. The dangling refusal above, by
+        # contrast, **is** pinned: mutating it to `return True` is caught
+        # within 7 ticks as a MUTUAL SLEEP deadlock.
+        return not ents[up_row, Entity.F_OUT_HELD + up_channel]
+
     # The sleep set is mutated from eleven places -- two phases, three port
     # callbacks, the wake edges, the latches and the invalidation -- and the
     # memoised slice above is only correct if *every* one of them bumps the
@@ -979,6 +1289,45 @@ class GateSim:
         if asleep and row in asleep:
             asleep.discard(row)
             self._sleep_gen += 1
+
+    def _publish_sleep(self):
+        """Mirror the sleep set into `F_ASLEEP` for the SLEEP_DEBUG overlay.
+
+        **Once per structure phase, not per mutation.** The three mutators
+        above are hot -- `_wake_one()` runs from every port callback, inside
+        the belt tick -- so writing the array there would charge the
+        simulation for a diagnostic on its hottest path. A frame can only
+        show one answer per tick anyway, so the end of the phase is both the
+        cheapest place and the only one that matters.
+
+        Written over the **gate table** rather than the whole entity array:
+        belts are most rows on a real board and none of them is a gate, so
+        zeroing them would be a large write to say something already true.
+        That does mean a row leaving the table (an erase) keeps its last
+        value, which is harmless -- the cell is gone, so nothing samples it --
+        and a *recycled* row is handled because `invalidate_board()` clears
+        the table and the set together.
+
+        Skipped entirely when sleeping is off, so the flag reads 0 everywhere
+        and the overlay falls back to exactly the pre-sleep picture.
+        """
+        rows, _n_in, _n_out, _strict = self._gate_table()
+        if not len(rows):
+            return
+        ents = self.board.entities
+        asleep = self._asleep
+        if asleep:
+            flags = np.isin(rows, np.fromiter(
+                asleep, dtype=np.int64, count=len(asleep)))
+            ents[rows, Entity.F_ASLEEP] = flags.astype(np.float32)
+        else:
+            ents[rows, Entity.F_ASLEEP] = 0.0
+        # `entities_dirty` is a **union range**, not a set, so one
+        # `add_range()` over the table's extent is both the correct call and
+        # cheaper than adding each row -- the upload is one contiguous write
+        # either way, and the gate rows are scattered through the table.
+        self.board.entities_dirty.add_range(
+            int(rows[0]), int(rows[-1]) + 1)
 
     def _awake_slice(self, rows, n_in, n_out, strict):
         """The gate table restricted to the rows not asleep, memoised.
@@ -1139,6 +1488,11 @@ class GateSim:
         # momentarily unfed between the phase's start and the refill, which
         # any future reader of mid-phase state would see.
         self._assert_folded(self._folds()[1])
+        # Publish the sleep set for the overlay, last, so it describes the
+        # state the frame will actually render rather than a mid-phase one.
+        if self._sleep_enabled:
+            with prof.probe("structure/publish_sleep"):
+                self._publish_sleep()
         self.stats["fired"] += fired
         return fired
 
@@ -1717,13 +2071,27 @@ class GateSim:
         """[(row, channel, value)] if `gate` is a foldable Source, else None.
 
         Foldable means: a generator whose output faces reach at least one gate
-        input and **no belt at all**. One belt makes it a real producer whose
-        rate that belt regulates, so folding it would change behaviour; see the
-        module docstring.
+        input and **no belt it can actually deposit onto**. One such belt makes
+        it a real producer whose rate that belt regulates, so folding it would
+        change behaviour; see the module docstring.
 
         Dangling faces are ignored rather than disqualifying, per the design:
         a dangling output is already destroyed at fire time, so it carries
         nothing a fold could lose.
+
+        **A belt a face merely *touches* is a dangling face, not a belt.** A
+        multi-port machine can have two faces against one run and a segment
+        takes from exactly one of them (`take_dir()`); the loser can never
+        push an item, so it is a discard point exactly like an empty cell.
+        Treating any adjacent belt as disqualifying refused the fold on a
+        whole class of real Source -- the one whose spare face happens to sit
+        beside a run it does not own -- and refused it for a connection that
+        does not exist. `_face_has_consumer()` is the authority on which it
+        is, because the face *direction* alone cannot tell two ports of the
+        same gate apart; it resolves the gate **cell** adjacent to the tail,
+        which can. Asking it here is also what keeps this rule and the one
+        `_connected_channels()` enforces from drifting apart: the set of faces
+        that can block a fold is now exactly the set that can block a fire.
         """
         if gate.input_count() != 0 or not isinstance(gate, Source):
             return None
@@ -1733,12 +2101,19 @@ class GateSim:
             nx, ny = xy[0] + step[0], xy[1] + step[1]
             if not self.board.in_bounds(nx, ny):
                 continue
-            # A belt on any face disqualifies the whole machine, not just that
-            # face: the Source is then a producer that has to be ticked, and a
-            # half-folded one would emit on the belt while its folded channel
-            # also stood permanently fed.
+            # A belt this face can really deposit onto disqualifies the whole
+            # machine, not just that face: the Source is then a producer that
+            # has to be ticked, and a half-folded one would emit on the belt
+            # while its folded channel also stood permanently fed.
+            #
+            # A run the face only *abuts* is not that. `_face_has_consumer()`
+            # decides, per the docstring -- False here means the segment named
+            # a different port, so this face can never push and is a discard
+            # point like any dangling one.
             if self.index.at(nx, ny) is not None:
-                return None
+                if self._face_has_consumer(gate, xy, face):
+                    return None
+                continue
             row = self.board.entity_id_at(nx, ny)
             if not row or not self.board.is_row_alive(row):
                 continue

@@ -134,6 +134,24 @@ bool gate_in_held(int row, int c) {
     return ent_field(row, F_IN_HELD + c) != 0.0;
 }
 
+// Is this gate in the scheduler's sleep set? Unlike `segment_at_rest()`, this
+// is **not** a second implementation of a Python predicate -- it reads a flag
+// the gate layer publishes once per structure phase.
+//
+// That asymmetry is deliberate. A segment's rest condition is a short
+// expression over values the renderer already has (`head`, `tail`, `anchor`),
+// so re-deriving it costs nothing and stays honest. A gate's is not: it
+// depends on the type's fire rule, its connectivity, and -- for the
+// partially-fed tier -- on the state of the segments feeding each missing
+// lane. Mirroring that into GLSL would be a large second copy of a rule that
+// has already caused two "GLSL disagrees with Python" bugs, and the
+// partially-fed tier is precisely the case the old occupancy guess got
+// backwards: such a gate sleeps *while holding an input*, so "holds
+// something" painted it awake.
+bool gate_asleep(int row) {
+    return ent_field(row, F_ASLEEP) != 0.0;
+}
+
 // Where item `k` of a segment sits at `tick + alpha`, in fixed point.
 //
 // `tick` and `alpha` stay separate rather than arriving as one float: the

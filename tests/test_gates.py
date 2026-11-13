@@ -21,6 +21,18 @@ from tests import harness
 from tests.harness import board, engine, ok, step
 
 
+#: The shipped value of `_sleep_enabled`, sampled from a real `GateSim` at
+#: import rather than hardcoded. The two tests that switch gate sleeping on
+#: have to put it back, and spelling the restore as `False` made them wrong
+#: the moment the default changed -- every later scenario would then run with
+#: a scheduler the app does not use, which is the kind of cross-scenario leak
+#: `harness.reset()` exists to prevent.
+#:
+#: Sampled from the instance because the flag is set in `__init__`, not as a
+#: class attribute, so there is nothing on the class to read.
+_SHIPPED_GATE_SLEEP = engine.gates._sleep_enabled
+
+
 def _run(ticks):
     """Advance the simulation by whole ticks, with no wall-clock involved."""
     for _ in range(ticks):
@@ -685,7 +697,78 @@ def test_gate_sleep_still_works_when_switched_on():
     finally:
         # Back to the shipped default, or every later scenario runs with a
         # scheduler the app does not use.
-        gates.set_sleep_enabled(False)
+        gates.set_sleep_enabled(_SHIPPED_GATE_SLEEP)
+
+
+def test_a_gate_sleeps_on_a_directly_fed_lane_too():
+    """Tier two's gate-to-gate clause: a missing lane fed by a quiet neighbour.
+
+    The belt clause only covers a lane a *segment* feeds, which left the
+    dominant case awake. Measured on cpu.npz after 60 ticks: of 95 awake
+    partially-fed gates, 64 were refused for having no feeding segment -- and
+    **61 of those 64 were direct gate-to-gate lanes**, not dangling ones. On a
+    computer most short hops abut rather than run a belt, so the belt-only
+    predicate was blind to the common shape.
+
+    The fixture is the one that isolates it, and the awkward part is that the
+    direct feeder must be a **real gate**: a Source abutting a gate *folds*,
+    so the lane it feeds reads as permanently held and is never a missing lane
+    at all. That is why this needs a starved Shear upstream rather than the
+    obvious Source.
+    """
+    gates = engine.gates
+    try:
+        gates.set_sleep_enabled(True)
+        # A: starved, so its output zone stays empty -- the premise the sleep
+        # rests on.
+        a = engine.place_structure(Shear, 2, 30)
+        # B: abuts A's +X output face, no belt between.
+        b = engine.place_structure(Shear, 4, 30)
+        # B's channel 1 held for ever by a folded Source, so channel 0 (the
+        # directly-fed one) is the only *missing* lane.
+        engine.place_structure(Source, 4, 31, direction=cell.DIR_NY)
+        # An outlet, or B is output-blocked and excluded for another reason.
+        for x in range(6, 11):
+            engine.place_belt(x, 30, cell.DIR_PX)
+        engine.sync_segments()
+        _run(4)
+
+        # **Which lane A feeds comes from the index, not from a literal.**
+        # Both the receiving channel and the upstream one are port geometry
+        # (a Shear takes x on +Y and y on -X, and emits on +X and -Y), so
+        # hardcoding either would make this a test of the port tables rather
+        # than of the scheduler -- and it is easy to get backwards: the
+        # abutting Source feeds channel 0 and A feeds channel 1, which is the
+        # opposite of the obvious guess.
+        direct = gates._direct_feeders()
+        lanes = [ch for ((r, ch), (up, _c)) in direct.items()
+                 if r == b.row and up == a.row]
+        assert len(lanes) == 1, (
+            f"the fixture is wrong unless A directly feeds exactly one of "
+            f"B's lanes: {direct}")
+        lane = lanes[0]
+        up_channel = direct[(b.row, lane)][1]
+        assert not b.in_held(lane), (
+            f"the directly-fed lane must be the *missing* one, or tier two "
+            f"never judges it: held="
+            f"{[b.in_held(c) for c in range(b.input_count())]}")
+        assert any(b.in_held(c) for c in range(b.input_count())), (
+            "and B must hold something, or this is a tier-one sleep instead")
+        assert not a.out_held(up_channel), (
+            "A's zone must be empty, or the sleep is correctly refused")
+        assert b.row in gates._asleep, (
+            f"a gate whose only missing lane is fed by a neighbour holding "
+            f"nothing should sleep: asleep={sorted(gates._asleep)}")
+
+        # And filling A's zone must wake B, or it sleeps through its own
+        # premise becoming false.
+        a.set_output(up_channel, 5.0)
+        gates._wake_around(a.row)
+        assert b.row not in gates._asleep, (
+            "filling the upstream zone must wake the gate it feeds")
+        ok("a gate slept on a directly-fed lane and woke when it filled")
+    finally:
+        gates.set_sleep_enabled(_SHIPPED_GATE_SLEEP)
 
 
 def test_a_folded_source_is_not_ticked_at_all():
@@ -748,6 +831,62 @@ def test_a_belt_on_any_output_blocks_the_fold():
     assert seg is not None and seg.count > 0, (
         "and should still be filling its belt")
     ok("a belt on one output kept the Source firing on both routes")
+
+
+def test_a_belt_a_face_cannot_reach_does_not_block_the_fold():
+    """The other half of the rule above: *touching* a run is not connecting.
+
+    A segment takes from exactly one port (`take_dir()`), so a face a run
+    merely passes is a face that can never push an item -- a discard point
+    exactly like an empty cell. Refusing the fold on it refuses it for a
+    connection that does not exist, and the shape is common on a real board:
+    a Source tucked under a run that belongs to something else.
+
+    The fixture is the one that isolates it. A run owned by *another* Source
+    passes over both of our Source's +Y faces, so neither is its source,
+    while the +X face reaches a gate. The paired test above is the same
+    board with the run's tail against our own port, and there the fold must
+    still be refused -- which is why the two sit together.
+
+    It is invisible in the outline and in every arithmetic assertion, since
+    the touched faces emitted nothing either way. So this asserts the fold,
+    the constant, and that the Source left the gate table.
+    """
+    feed = engine.place_structure(Source, 3, 10)
+    # Tail at (3,11), against `feed`'s own north face: this run is its belt.
+    engine.place_belt_path((3, 11), (11, 11))
+    src = engine.place_structure(Source, 7, 10)   # +Y faces at (7,11), (8,11)
+    engine.place_structure(Shear, 9, 10)          # +X face -> a gate
+    src.emit_value = -3.0
+    engine.sync_segments()
+
+    seg = engine.segments.at(8, 11)
+    assert seg is not None, "expected a run passing over the Source"
+    owner = engine.gates._src_port(seg)
+    assert owner is not None and owner[0].row == feed.row, (
+        "the fixture is wrong unless the run belongs to the other Source -- "
+        "a run our own port owns is the paired test's case, not this one")
+    assert not engine.gates.is_folded(feed.row), (
+        "and the run's real producer must still be a producer")
+
+    assert engine.gates.is_folded(src.row), (
+        "a run the Source cannot deposit onto must not block the fold")
+    # The channel comes from the geometry (the +X face meets the Shear's west
+    # y-input), so it is read off the fold rather than hardcoded -- a guess
+    # here would make this a test of the port tables instead.
+    shear = engine.entity_at(9, 10)
+    folded_inputs = engine.gates._folds()[1]
+    assert [(r, c, v) for (r, c, v) in folded_inputs
+            if r == shear.row] == [(shear.row, 1, -3.0)], (
+        f"expected one folded -3 on the Shear, got {folded_inputs}")
+    assert shear.in_held(1) and shear.in_value(1) == -3.0, (
+        f"and it should be held on the row: held={shear.in_held(1)} "
+        f"value={shear.in_value(1)}")
+    rows, _n_in, _n_out, _strict = engine.gates._gate_table()
+    assert src.row not in set(rows.tolist()), (
+        "and the folded Source should leave the gate table")
+    _run(8)
+    ok("a run a Source's face only touches no longer blocks the fold")
 
 
 def test_erasing_a_folded_source_releases_the_channel():
