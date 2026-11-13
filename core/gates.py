@@ -1679,6 +1679,31 @@ class GateSim:
         return any(gate_flags(geom, i) & FLAG_HOST_DECIDES
                    for i in range(n))
 
+    def folded_slot_channels(self):
+        """Folded constants as `(slot, channel, value)`, in slot space.
+
+        `_assert_folded()` re-writes these into entity *rows* after every
+        structure phase, which is what makes `consumed()` clearing the
+        channel harmless. The GPU path never runs that method -- the phases
+        are swapped for dispatches -- so the kernel consumes each folded
+        input once and the gate is starved for ever after.
+
+        This is the same list in the coordinates the device uses, so the
+        dispatch can re-assert it per tick.
+        """
+        folded = self._folds()[1]
+        if not folded:
+            return []
+        slot_of = self.state.slot_of
+        cap = slot_of.shape[0]
+        out = []
+        for (row, channel, value) in folded:
+            if 0 <= row < cap:
+                slot = int(slot_of[row])
+                if slot >= 0:
+                    out.append((slot, channel, float(value)))
+        return out
+
     def sync_device(self):
         """Re-pack the device's per-edit geometry. Call after an edit.
 
@@ -1696,6 +1721,9 @@ class GateSim:
                 self._connected_channels(self.board.view(row))
         self.device.rebuild(self._gate_types, self.board,
                             edges=self._direct_edges())
+        # Folded constants, in slot space, for the per-tick re-assertion the
+        # GPU path needs in place of .
+        self.device.set_folds(self.folded_slot_channels())
         if self.belt_compute is not None:
             self.belt_compute.rebuild(self.state)
 

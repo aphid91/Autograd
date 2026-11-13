@@ -86,6 +86,8 @@ BELT_SEG_F_BINDING = 2
 BELT_ITEM_BINDING = 3
 #: The one thing the renderer never needs: each end's resolved port.
 BELT_PORT_BINDING = 14
+#: Folded constants, re-asserted each tick. See shaders/gate_fold.comp.
+GATE_FOLD_BINDING = 15
 
 #: Threads per work group. 64 is one wavefront on AMD and two warps on
 #: NVIDIA, which keeps a partly-filled group cheap -- the gate count is a few

@@ -1,0 +1,38 @@
+#version 430
+
+// Re-assert folded constants, one thread per folded channel.
+//
+// A fully-direct Source is folded into a permanently-held input channel on
+// its neighbour (see "Constant folding" in core/gates.py). On the CPU
+// `_assert_folded()` rewrites those channels after every structure phase,
+// which is what makes the gate's `consumed()` clearing them harmless.
+//
+// The GPU path never runs that method -- the phases are swapped out for
+// dispatches -- so without this pass the firing kernel consumes each folded
+// input once and the receiving gate is starved for ever. That is exactly the
+// reported symptom: a gate with a constant fold never fires.
+//
+// Runs after the firing kernel, for the same reason `_assert_folded()` is
+// called after `_fire_admitted()`: the channel must read as held while the
+// kernel decides, then be put back once consumption has cleared it.
+
+#include "common.glsl"
+
+layout(local_size_x = 64) in;
+
+layout(std430, binding = 4) buffer InValue { float in_value[]; };
+layout(std430, binding = 5) buffer InHeld  { float in_held[]; };
+
+// One per folded channel: .x gate slot, .y channel, .z the constant.
+layout(std430, binding = 15) buffer Folds { vec4 folds[]; };
+
+uniform int fold_count;
+
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= uint(fold_count)) return;
+    vec4 f = folds[i];
+    uint lane = uint(int(f.x)) * uint(MAX_CHANNELS) + uint(int(f.y));
+    in_value[lane] = f.z;
+    in_held[lane] = 1.0;
+}

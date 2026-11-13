@@ -147,11 +147,16 @@ class GateDevice:
         self.state = state
         self.kernel = compute.ComputeKernel(ctx, "gate_fire.comp")
         self.direct_kernel = compute.ComputeKernel(ctx, "gate_direct.comp")
+        self.fold_kernel = compute.ComputeKernel(ctx, "gate_fold.comp")
         self.geom = np.zeros((1, 4), dtype=np.int32)
         self.konst = np.zeros(1, dtype=np.float32)
         #: Gate-to-gate edges in *slot* space, one per receiving lane.
         self.edges = np.zeros((1, 4), dtype=np.int32)
         self.edge_count = 0
+        #: Folded constants as (slot, channel, value, 0). Re-asserted after
+        #: every firing dispatch -- see shaders/gate_fold.comp.
+        self.folds = np.zeros((1, 4), dtype=np.float32)
+        self.fold_count = 0
 
         b = compute
         self._bufs = {
@@ -169,12 +174,23 @@ class GateDevice:
                 ctx, self.konst, b.GATE_KONST_BINDING),
             "edges": compute.ComputeBuffer(
                 ctx, self.edges, b.GATE_EDGE_BINDING),
+            "folds": compute.ComputeBuffer(
+                ctx, self.folds, b.GATE_FOLD_BINDING),
         }
         #: Set by every dispatch, cleared by a readback. While true the host
         #: arrays are stale -- see the residency note in render/compute.py.
         self._gpu_ahead = False
 
     # --- layout -----------------------------------------------------------
+    def set_folds(self, folds):
+        """Record the folded constants, in slot space."""
+        self.fold_count = len(folds)
+        arr = np.zeros((max(len(folds), 1), 4), dtype=np.float32)
+        for i, (slot, channel, value) in enumerate(folds):
+            arr[i] = (slot, channel, value, 0.0)
+        self.folds = arr
+        self._bufs["folds"].set_array(self.folds)
+
     def rebuild(self, types, board, edges=None):
         """Re-pack the per-edit geometry and resize every buffer. Edit-time."""
         state = self.state
@@ -232,6 +248,7 @@ class GateDevice:
         self._bufs["geom"].upload(self.geom)
         self._bufs["konst"].upload(self.konst)
         self._bufs["edges"].upload(self.edges)
+        self._bufs["folds"].upload(self.folds)
         self._gpu_ahead = False
 
     def run(self, ticks=1, direct=True):
@@ -261,9 +278,21 @@ class GateDevice:
         if run_direct:
             self.direct_kernel["edge_count"] = int(self.edge_count)
             edge_groups = compute.groups_for(self.edge_count)
+        run_folds = self.fold_count > 0
+        if run_folds:
+            self.fold_kernel["fold_count"] = int(self.fold_count)
+            fold_groups = compute.groups_for(self.fold_count)
         for _ in range(int(ticks)):
             self.kernel.run(groups)
             compute.barrier(self.ctx)
+            # Put the folded constants back, exactly as `_assert_folded()`
+            # does after the CPU's structure phase: the channel must read as
+            # held while the firing kernel decides, and be restored once
+            # consumption has cleared it. Without this the kernel eats each
+            # folded input once and the gate is starved for ever.
+            if run_folds:
+                self.fold_kernel.run(fold_groups)
+                compute.barrier(self.ctx)
             if run_direct:
                 self.direct_kernel.run(edge_groups)
                 compute.barrier(self.ctx)
@@ -301,6 +330,7 @@ class GateDevice:
             buf.release()
         self.kernel.release()
         self.direct_kernel.release()
+        self.fold_kernel.release()
 
 
 def compare_against_cpu(gates, board, phase="fire"):
