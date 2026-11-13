@@ -157,14 +157,20 @@ def test_catchup_cap_bounds_work_per_frame():
     clock.set_rate(60.0)
     clock.reset()
     before = clock.tick
-    # app.py clamps dt to 0.1s, but the clock must be robust on its own:
-    # hand it a 10-second frame directly.
-    orch.frame(10.0)
+    # The stall has to be long enough to *reach* the cap, which depends on
+    # the rate and on MAX_CATCHUP_TICKS -- now set enormous to allow very
+    # high tick rates, so the old fixed 10s frame (600 ticks at 60/s) no
+    # longer trips it and the test asserted a cap that was never hit.
+    # Derived from the cap instead, with a margin, so it tracks the constant.
+    stall = (MAX_CATCHUP_TICKS + 100) / 60.0
+    orch.frame(stall)
     ran = clock.tick - before
     assert ran == MAX_CATCHUP_TICKS, (
-        f"a 10s frame ran {ran} ticks, expected the cap {MAX_CATCHUP_TICKS}")
+        f"a {stall:.1f}s frame ran {ran} ticks, expected the cap "
+        f"{MAX_CATCHUP_TICKS}")
     assert clock.dropped_ticks > 0, "the backlog should be recorded as dropped"
-    ok(f"a 10s frame ran {ran} ticks and dropped {clock.dropped_ticks}")
+    ok(f"a {stall:.1f}s frame ran {ran} ticks and dropped "
+       f"{clock.dropped_ticks}")
 
     # And the dropped time is genuinely discarded: the next frame runs a
     # normal number of ticks rather than still working through a backlog.

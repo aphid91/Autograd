@@ -913,7 +913,15 @@ class Engine:
         Seeds go back on afterwards, so a seeded run starts loaded exactly as
         it does after a load or a clear -- and after the reset rather than
         before, since the flush would otherwise wipe what was just placed.
+
+        **It forces a full re-derivation**, not just a flush. "Start over"
+        has to mean the connectivity too: segment ids, the port resolutions,
+        the constant fold, the direct edge list and the device's packed copy
+        of all of them are derived state, and a flush leaves every one of
+        them as it was. Re-deriving makes ctrl+R the player's recovery from
+        anything stale, which is what they reach for it expecting.
         """
+        self.invalidate_segments()
         self.flush_material()
         self.clock.reset()
         # Re-seed against the new timeline: seed_segments() dates its pushes
@@ -1246,6 +1254,15 @@ class Engine:
         # running on the CPU.
         if not self.clock.phases_are_only(self._structure_phase,
                                           self._belt_phase):
+            return False
+        # **The device's packed geometry must describe the current slots.**
+        # `GateState.build()` reassigns every slot, and anything that touches
+        # `_gate_table()` can trigger it between an edit and the frame's
+        # `sync_device()`. Dispatching in that window ran gates against
+        # another machine's type and channel counts -- the "connections made
+        # improperly" symptom that a force rebuild cleared. One tick on the
+        # CPU is the right price for closing it.
+        if self.gates._device_stale:
             return False
         return not self.gates.has_host_decided_gates()
 

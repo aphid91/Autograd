@@ -182,6 +182,16 @@ class GateDevice:
         self._gpu_ahead = False
 
     # --- layout -----------------------------------------------------------
+    def gate_count(self):
+        """How many gates the packed geometry actually describes.
+
+        The authority for every dispatch size and every `geom` read, because
+        it is a property of what was uploaded rather than of the live mirror
+        -- see `run()` on why the difference bites.
+        """
+        packed = self.geom.shape[0] // GEOM_STRIDE
+        return min(len(self.state.rows), packed)
+
     def set_folds(self, folds):
         """Record the folded constants, in slot space."""
         self.fold_count = len(folds)
@@ -267,7 +277,16 @@ class GateDevice:
         `direct=False` runs the firing half alone, for the oracle comparison
         which checks one phase at a time.
         """
-        n = len(self.state.rows)
+        # **Dispatch what was *packed*, not what the mirror now holds.**
+        # `state.rows` is rebuilt by `_gate_table()`, which anything can
+        # trigger between an edit and the frame's `sync_device()`; `geom` and
+        # the SoA arrays only change when this object is rebuilt. Sizing the
+        # dispatch by the row count let threads read geometry past the end of
+        # the block -- a gate running with another machine's type, channel
+        # counts and drains mask. That is the "connections made improperly,
+        # items appearing where they shouldn't" symptom, and it cleared on a
+        # force rebuild because that re-packed the two into agreement.
+        n = self.gate_count()
         if not n:
             return
         for buf in self._bufs.values():

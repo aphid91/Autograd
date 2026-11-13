@@ -216,6 +216,10 @@ class GateSim:
         #: reference and what `belt_compute.compare_against_cpu()` checks
         #: against.
         self.belt_compute = None
+        #: True when `state.build()` has reassigned slots since the device
+        #: was last packed, so `geom`/folds/edges describe a stale set.
+        #: `use_gpu_tick()` refuses to dispatch while it is set.
+        self._device_stale = True
         #: The gate classes, parallel to `state.rows`. Kept because the
         #: device's geometry packing needs the *class* and views are not
         #: safe to hold across frames.
@@ -541,6 +545,15 @@ class GateSim:
         # one-authority argument `_build_direct()` settles for adjacency.
         self.state.build(rows, n_in, n_out, type_id)
         self._gate_types = classes
+        # **Rebuilding the mirror invalidates the device's packed copy.**
+        # The geometry block, the fold list and the direct edge list are all
+        # keyed on *slot*, and this method has just reassigned every slot --
+        # so until `sync_device()` runs they describe a different set of
+        # gates. Marking it here rather than trusting callers to notice is
+        # the same reasoning that hooks grid invalidation at
+        # `write_cell()`: this is the one place slots are assigned, so a new
+        # caller cannot forget.
+        self._device_stale = True
 
         table = (np.asarray(rows, dtype=np.int64),
                  np.asarray(n_in, dtype=np.int64),
@@ -1672,10 +1685,21 @@ class GateSim:
         if self.device is None:
             return False
         from core.gate_device import FLAG_HOST_DECIDES, gate_flags
-        n = len(self.state.rows)
-        if not n:
-            return False
         geom = self.device.geom
+        # **Bound by what was packed, not by `state.rows`.** The two are
+        # packed together but read apart: this is called from the panel,
+        # which draws before the frame's `sync_segments()` has re-packed the
+        # device, so an edit that adds gates leaves `state.rows` longer than
+        # `geom` describes. Trusting the row count indexed past the end -- a
+        # stamp paste crashed here with "index 998 out of bounds for size
+        # 998", 998 being 499 gates at stride 2.
+        #
+        # `gate_count()` is the same authority the dispatch uses, which is
+        # the point: a gate the device has not been told about is not one the
+        # kernel will run, so it cannot be a reason to fall back either.
+        n = self.device.gate_count()
+        if n <= 0:
+            return False
         return any(gate_flags(geom, i) & FLAG_HOST_DECIDES
                    for i in range(n))
 
@@ -1724,6 +1748,7 @@ class GateSim:
         # Folded constants, in slot space, for the per-tick re-assertion the
         # GPU path needs in place of .
         self.device.set_folds(self.folded_slot_channels())
+        self._device_stale = False
         if self.belt_compute is not None:
             self.belt_compute.rebuild(self.state)
 

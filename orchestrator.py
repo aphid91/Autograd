@@ -875,6 +875,18 @@ class Orchestrator:
         if view.emit_value == value:
             return
         view.emit_value = value
+        # **Invalidate as well as flush**, which it did not before and which
+        # is now load-bearing. A Source's constant is *derived state* on the
+        # device: a fully-direct Source folds into its neighbours' input
+        # channels, and the fold -- plus the `konst` array the firing kernel
+        # reads for OP_CONST -- is packed once per edit. Flushing items in
+        # flight does not touch either, so the old value kept arriving from
+        # a fold nothing had re-derived.
+        #
+        # `invalidate_segments()` is the one method every real edit routes
+        # through: it settles the device, drops the fold and the caches, and
+        # schedules the rebuild whose `sync_device()` re-packs the constant.
+        self.engine.invalidate_segments()
         self.engine.flush_material()
 
     def _set_seed(self, row, on, value):
