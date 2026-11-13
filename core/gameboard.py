@@ -281,6 +281,17 @@ class Gameboard:
             self.entity_buffer = self._ctx.buffer(reserve=self.entities.nbytes)
         self.entities_dirty.add_range(0, new)
 
+    def bind_entities(self, binding=0):
+        """Bind the entity SSBO to a storage-buffer slot.
+
+        `Camera.render()` does this for the draw pass. A *compute* pass that
+        writes an entity field needs it too, and the GPU sleep layer's overlay
+        publish is the one such pass -- it stamps `Entity.F_ASLEEP` so the
+        fragment shader's `gate_asleep()` keeps working unchanged.
+        """
+        if self.entity_buffer is not None:
+            self.entity_buffer.bind_to_storage_buffer(int(binding))
+
     def spawn(self, entity_cls, x, y, direction=cell.DIR_PX, **fields):
         """Allocate a row, write the entity's cells, return a bound view.
 

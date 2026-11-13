@@ -1376,6 +1376,15 @@ class Orchestrator:
             self.camera.set_define("SEGMENT_DEBUG", requests.segment_debug)
         if requests.sleep_debug is not None:
             self.camera.set_define("SLEEP_DEBUG", requests.sleep_debug)
+            # The GPU sleep layer publishes its per-entity flags only while
+            # the overlay is on: that pass is the one O(total) thing in the
+            # layer, and a diagnostic must not become the cost of the
+            # mechanism it measures. See shaders/sleep_publish.comp.
+            sets = self.engine.gates.sleep_sets
+            if sets is not None:
+                sets.publish_flags = bool(requests.sleep_debug)
+        if requests.gpu_sleep is not None:
+            self.engine.gates.set_gpu_sleep(requests.gpu_sleep)
         # Plain attributes rather than set_define(): these are uniforms, so
         # flicking between them while watching a running factory costs
         # nothing and recompiles nothing. See render/camera.py.

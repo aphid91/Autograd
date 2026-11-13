@@ -48,7 +48,7 @@ There is no pytest/linter configured.
 | [tests/test_belts.py](tests/test_belts.py) | the closed form against the naive oracle, on fixed and randomised configs |
 | [tests/test_item_render.py](tests/test_item_render.py) | reads the framebuffer back: do discs appear where the simulation says, do the labels say what the formatter says, does the sleep overlay separate asleep from awake, and does the pass fill a resized window? |
 | [tests/test_gates.py](tests/test_gates.py) | firing rules, arithmetic, back pressure, dangling-output discard, and the bubble-free claim |
-| [tests/test_compute.py](tests/test_compute.py) | the compute kernels against the CPU oracle: every machine type at both control polarities, back pressure, the direct hand-off, belt transport, bounds, and a residency run |
+| [tests/test_compute.py](tests/test_compute.py) | the compute kernels against the CPU oracle: every machine type at both control polarities, back pressure, the direct hand-off, belt transport, bounds, a residency run — and the **GPU sleep layer's mechanism** (an edit wakes everything, an unfed run leaves the dispatch, a slept run wakes on its producer firing, the bypass detaches cleanly, the slot→row map tracks an edit) |
 | [tests/test_stamp.py](tests/test_stamp.py) | what the stamp transforms preserve: wiring, topology, arithmetic |
 | [tests/test_clipboard.py](tests/test_clipboard.py) | the copy/paste/erase mode machine, and matched-stamp substitution, driven through the fake mouse and keyboard |
 | [tests/test_inspect.py](tests/test_inspect.py) | the Status window, the per-Source emit value, the per-belt seed, the save filename box, the persisted toolbar |
@@ -70,6 +70,7 @@ and scheduling are kept honest. Run them by hand from `tools/`.
 | [tools/check_cache_coherence.py](tools/check_cache_coherence.py) | the four `GateSim` caches against freshly-computed answers, after each of 150 random edits. Catches the row/segment-id recycling hazard |
 | [tools/check_prefilter_safe.py](tools/check_prefilter_safe.py) | that the prefilter never excludes a gate the full path would fire, over ~58k gate-ticks of mixed machine types |
 | [tools/check_wakelist_safe.py](tools/check_wakelist_safe.py) | a sleeping timeline against a fully-ticked one, diffed every tick, **per sleeping layer** (`SLEEPERS`). Reports a sleep→wake transition count for each, plus the tier-two gate-sleep grants, because a layer with none proves nothing — and a combined count would let busy belts vouch for a gate layer that never woke. Also asserts `lying_sleepers()`: no sleeping gate may fail its own predicate, which the diff cannot see |
+| [tools/check_gpu_sleep_safe.py](tools/check_gpu_sleep_safe.py) | **GPU sleeping against full dispatch**, two ways: conservation (does a stranded item never arrive?) and *lying sleepers* (is any sleeping entity's own premise already false?). Not an exact state diff — a wake costs a tick to propagate and the GPU belt phase has no intra-phase visibility, so the bar is that the difference *settles*. Mutation-tested; its first version was vacuous and three unsafe mutations passed |
 | [tools/check_folding_safe.py](tools/check_folding_safe.py) | a constant-folded timeline against an unfolded one. **Not** a state diff — folding runs one tick ahead for ever, so it compares the destroy *rate* tick by tick, that the cumulative lead *settles*, and the set of values each gate ever holds. Reports the folded count so a vacuous run is visible |
 
 #### Profiling the board in front of you
@@ -1191,6 +1192,8 @@ everything else is grouped by layer.
 | [core/belt_device.py](core/belt_device.py) | packs segment + item state into SSBOs for the renderer, and is where the belt kernel's buffers live |
 | [core/gate_state.py](core/gate_state.py) | the gate-dense SoA mirror of the channel columns |
 | [core/gate_device.py](core/gate_device.py) | the gate kernels' buffers, the geometry word, and the oracle seam |
+| [core/sleep_device.py](core/sleep_device.py) | GPU sleep: the mailbox, the double-buffered awake sets, and the indirect dispatch args |
+| [core/sleep_graph.py](core/sleep_graph.py) | the one-hop adjacency the wake frontier walks, derived per edit |
 | [core/belt_compute.py](core/belt_compute.py) | belt transport as a dispatch, and its port table |
 | [core/gates.py](core/gates.py) | gate firing, and the port callbacks joining gates to belts |
 | [engine.py](engine.py) | preview/commit a plan, erase, ghost lifecycle |
@@ -1199,7 +1202,12 @@ everything else is grouped by layer.
 | [render/compute.py](render/compute.py) | compute plumbing: kernels, buffers, bindings, the barrier |
 | [shaders/gate_fire.comp](shaders/gate_fire.comp) | the structure phase, one thread per gate |
 | [shaders/gate_direct.comp](shaders/gate_direct.comp) | gate-to-gate delivery, one thread per edge |
-| [shaders/belt_tick.comp](shaders/belt_tick.comp) | belt transport, one thread per segment |
+| [shaders/belt_tick.comp](shaders/belt_tick.comp) | belt transport, one thread per **awake** segment |
+| [shaders/sleep_compact.comp](shaders/sleep_compact.comp) | rebuild the awake sets from the mailbox, over the one-hop frontier |
+| [shaders/sleep_reset.comp](shaders/sleep_reset.comp) | roll this tick's awake counts into next tick's frontier extent |
+| [shaders/sleep_groups.comp](shaders/sleep_groups.comp) | turn the compaction's atomic counts into indirect dispatch group counts |
+| [shaders/sleep_publish.comp](shaders/sleep_publish.comp) | the overlay flags: mark everything asleep (the one O(total) pass, overlay-only) |
+| [shaders/sleep_publish_awake.comp](shaders/sleep_publish_awake.comp) | ...then clear the awake members, so the flag means "the next tick skips me" |
 | [ui/input_manager.py](ui/input_manager.py) | input → intents; the gesture state machine |
 | [ui/panel.py](ui/panel.py) | imgui panel and the toolbelt bar |
 | [orchestrator.py](orchestrator.py) | wires the above; owns per-frame ordering |
@@ -3639,6 +3647,170 @@ offers is **conservation, not equality**, and
 This is the one place the two timelines can drift, and anybody comparing
 them needs to expect it.
 
+### GPU sleep: the dispatch shrinks to what can act
+
+[core/sleep_device.py](core/sleep_device.py) and the `shaders/sleep_*.comp`
+set. On a board built as a computer the tick now dispatches **0.5–8%** of the
+entities — and is **2.2× slower** for it at current sizes. Both halves are
+real and the second is not a bug; see "It costs more than it saves, for a
+measurable reason" below. The panel's checkbox is a **full bypass**, so the
+two states can be compared honestly.
+
+**A sleeping entity must not be a thread.** `if (asleep) return;` buys
+almost nothing: the warp still launches, the scheduler still occupies it, and
+sleeping lanes diverge against awake ones in the same warp. So the dispatch
+size itself shrinks — one thread per *awake* entity, ids from a compacted
+buffer, sized by `glDispatchComputeIndirect` reading a count the device
+produced. The host never learns that count during a residency run, which is
+the whole point.
+
+**The one rule is that the per-tick cost must be O(awake), never O(total).**
+[docs/sleep2gpu.md](docs/sleep2gpu.md) argued a dynamic set could not achieve
+that and recommended a static per-edit proof instead. It was wrong twice, and
+the corrections are the design:
+
+- **A static proof cannot express the case.** A RAM bank is wired to the CPU
+  that reads it, so no graph-local argument will ever call it inert — it is
+  inert because of its *state*, for thousands of ticks between accesses.
+- **The rebuild is not a scan.** Material moves exactly one hop per tick,
+  which the two-phase tick guarantees, so the awake set at `t+1` is contained
+  in the awake set at `t` plus its one-hop neighbourhood. The compaction is
+  dispatched over that **frontier**: O(awake × ports), independent of board
+  size. That property is a consequence of the tick's own design rather than
+  of this code.
+
+#### Waking is pushed, never polled
+
+A sleeping entity reads nothing — that is what sleeping means — so it can
+never notice its producer filling a zone. The entity that *does* the filling
+is awake by definition and knows who it fed, so it posts the wake.
+
+The mailbox is one `int32` per entity (segments, then gates past
+`gate_base`), and **nothing ever scans it**: storage is free, traffic is not.
+It carries an **epoch** rather than a bool, so a stale entry is simply a
+number that no longer matches and needs no clearing pass — which would be
+O(total) per tick and defeat the one rule. A claim is an `atomicExchange`, so
+exactly one of however many threads reach a candidate admits it; duplicates
+would tick a segment twice.
+
+**One mailbox for both families because the hardware forced it.**
+`GL_MAX_COMPUTE_SHADER_STORAGE_BLOCKS` is 16 here and `gate_fire.comp` needs
+4 for the blocks `common.glsl` declares, so two mailboxes put it at 17 and it
+refused to link with a bare "no buffers available for bindable storage
+buffer" — naming neither the limit nor the cause.
+
+**The awake sets are double-buffered.** Compacting in place aliases: one
+thread overwrites an entry another has yet to read, and no barrier available
+to a dispatch orders that. The host swaps which pair is which, so no data
+moves.
+
+#### Four wake edges, every one of them found by the checker
+
+Each was silent and cumulative, and each is now a comment at its site:
+
+| writer | the miss |
+|---|---|
+| `gate_fold.comp` | it writes an input lane every tick and posted nothing, so a folded gate slept and was never re-admitted |
+| `gate_fire.comp` | a gate holding an **undelivered result** slept on "I did nothing" — and a loaded zone is work owed to somebody else, so it and its consumer both correctly concluded there was nothing to do. Mutual sleep by a new route |
+| `belt_tick.comp` | `offered_nothing` read as "the producer is idle", which is a claim about the future. Fixed by requiring the zone to be **observably empty** — reading data, not predicting, the same correction the CPU's direct-lane clause documents |
+| the **host** | the Status window's emit box writes a channel the device's mailbox never saw. `Engine.note_host_write()` is the declaration; deliberately *not* folded into `settle()`, since settling is overwhelmingly a read and waking on reads means nothing sleeps while a panel is open |
+
+The belt rest predicate is the CPU's three fixed points, and **the
+head-at-end clause is load-bearing in two of them** for the reason CLAUDE.md
+already records twice: position is a closed form over the tick, so a run
+holding one mid-flight item has identical stored state for the item's whole
+journey and the pop has no external cause.
+
+#### The overlay is published from the compacted set
+
+Not by each tick kernel, and that distinction was a live bug. "I am at rest"
+is not "the tick will skip me": an entity that correctly concludes it is
+inert can be woken by a neighbour in the same tick and is then dispatched.
+Publishing per kernel measured **478 of 538 runs asleep while the dispatch
+covered 185**, and 270 of 494 gates asleep while it covered 355 — wrong in
+both directions, a flag contradicting the mechanism it exists to show.
+
+So `sleep_publish.comp` marks everything asleep and `sleep_publish_awake.comp`
+clears the members of the awake sets, which *is* the next tick's dispatch
+list by construction. It writes the same `SEG_I_ASLEEP` and `Entity.F_ASLEEP`
+the CPU path uses, so the overlay, its two family masks and the pixel tests
+need no GPU branch.
+
+Two consequences. It is the **one O(total) pass** in the layer, so it runs
+only while the overlay is on — a diagnostic must not become the cost of the
+thing it measures. And the two schedulers write the same field, so whichever
+ticked last owns it: `BeltDevice.gpu_owns_sleep_flag` stops `sync()` stamping
+the CPU's empty set over the kernel's answer, which painted a 97%-asleep
+board entirely amber.
+
+#### It costs more than it saves, for a measurable reason
+
+Per tick, `ctx.finish()`-bracketed over 4000 ticks with no readback:
+
+| board | segs | gates | sleep off | sleep on | awake |
+|---|---|---|---|---|---|
+| cpu.npz | 539 | 494 | **13.9 µs** | 30.6 µs | 223 segs, 371 gates |
+| Ram2.npz | 1269 | 732 | **13.5 µs** | 31.0 µs | 313 segs, 264 gates |
+| noram.npz | 751 | 617 | **14.5 µs** | 30.9 µs | 394 segs, 509 gates |
+| ram.npz | 337 | 197 | **13.4 µs** | 29.2 µs | 43 segs, 95 gates |
+
+**The cost is dispatch latency, not work**, and it isolates cleanly: one
+1-thread dispatch is 1.06 µs, with a barrier 1.99 µs, four-with-four-barriers
+7.79 µs against four-with-one 4.26 µs. So ~1 µs per dispatch and ~1 µs per
+barrier *whatever the thread count*. Dropping the two barriers that are
+provably unneeded — the two frontier passes share only atomics, which are
+coherent without one — took 35 µs to 30.6 µs.
+
+**The decisive number is that the no-sleep column is flat.** On a synthetic
+dormant-memory board the unslept tick cost 8.2–8.9 µs at *every* size from 10
+to 255 segments. The GPU is nowhere near work-bound at these scales, so there
+is no work for sleeping to save; it is pure added latency. The crossover
+needs a genuinely work-bound tick, which the fixed 512×512 grid cannot hold.
+
+Kept because every hard part works — the frontier argument, the mailbox, the
+indirect dispatch, the four wake edges, the overlay and the differential
+check — and because what it waits on is a bigger board, which is separate
+known work. **If it is picked up again the first lever is fewer dispatches,
+not better predicates**: at ~2 µs per dispatch-and-barrier against a 13 µs
+tick, that is where the budget is.
+
+#### Checking it, and the vacuity that nearly hid
+
+[tools/check_gpu_sleep_safe.py](tools/check_gpu_sleep_safe.py), and it needed
+**two** checks:
+
+- **conservation** — both paths for hundreds of ticks, comparing items on the
+  belts. Not an exact state diff, because the GPU belt phase has no
+  intra-phase visibility *and* a wake costs a tick to propagate; both are
+  delays, so the bar is that the difference settles (under 1% over 400 ticks)
+  rather than growing.
+- **lying sleepers** — any sleeping entity whose own premise is already
+  false. Strictly stronger, and what catches most mutations: a stale sleep is
+  usually rescued a tick later, so material flows and conservation agrees
+  while the scheduler holds a conclusion its premise no longer supports.
+  Same reasoning and same name as the CPU tool's `lying_sleepers()`.
+
+**The first version was vacuous and three unsafe mutations passed on all four
+real boards.** It flipped the sleep switch per tick, and `set_gpu_sleep(True)`
+calls `wake_all()` — so the sleeping timeline restarted from "everything
+awake" every tick and nothing could ever be stranded. Exactly the trap the
+CPU tool was written twice to escape, re-entered by a different door. The
+switch is now thrown once and the device-side sets are left alone.
+
+A second, worse version of the same hazard was in the **engine**:
+`_gpu_tick()` called `wake_all()` on every host handover, and `settle()`
+clears `_gpu_dirty`, so anything reading host state — an open panel, a
+profiler — wiped the sleep set on most frames. On a board with a window open
+*nothing ever slept*. `_gpu_host_wrote` now distinguishes a write from a
+read.
+
+Known-untested and recorded rather than assumed: the **fold pass's wake** is
+defensive (removing it passes everything, because it fires every tick so a
+folded gate is never asleep — 234 folded slots over 120 ticks, 0 asleep
+instances); the **wake on an edit**, for the same reason the CPU tool cannot
+cover it (a rebuild reassigns every id); and the **anchor clause**, invisible
+end to end as always.
+
 ### What was deliberately not ported
 
 - **The prefilter and both sleep tiers.** They exist to avoid per-gate
@@ -3756,11 +3928,16 @@ the CPU and run at ~100k ticks/sec — see "The tick on the GPU" — but
 edit, on a save, and when something the player can see needs the host's
 copy — not every frame. The renderer already needs none of it, since the
 belt kernel writes the buffers it draws from);
-**a sleep graph** (the dynamic CPU sleep set is kept and switched off — it
-measured as a net loss because the set churns every tick. A *static*,
-graph-local proof is the different mechanism the dormant-RAM case wants:
-computed per edit, costing nothing per tick, and sound because the
-conditions are structural rather than momentary. Not started);
+**a work-bound board for GPU sleep to pay on** (the GPU sleep layer is
+built, checked and switched on — see "GPU sleep" above. It dispatches 0.5–8%
+of the entities and is 2.2× *slower*, because at these sizes the tick is
+latency-bound: the unslept tick costs the same 8.2 µs whether it covers 10
+segments or 255, so there is no work to save. The lever is fewer dispatches,
+not better predicates — fusing the compaction into the tick's kernels, or one
+persistent kernel with in-kernel sync — and the other half is a board big
+enough to be work-bound, which the fixed 512×512 grid cannot hold. The CPU's
+own dynamic sleep set remains kept and switched off for its own separate
+reason);
 curved corner geometry (corners are currently a right-angle join of two
 straight arms, which reads fine but is not a true curve); entity-row
 compaction; a growable or chunked board (fixed 512×512).

@@ -1523,8 +1523,22 @@ def test_the_sleep_overlay_separates_asleep_from_awake():
     has, for the same reason (the shader cannot call Python) -- so what is
     really being pinned is that the two agree about a run the simulation has
     actually put to sleep.
+
+    **This is the CPU scheduler's overlay**, and the GPU sleep layer is
+    switched off for the duration. The two are different mechanisms with
+    different populations -- the GPU's is edge-triggered through a mailbox and
+    legitimately sleeps and wakes a run on different ticks from the CPU's
+    predicate (see core/sleep_device.py) -- and they write the same
+    `SEG_I_ASLEEP` field. Whoever ticked last owns it, so a test asserting
+    against `engine.belts.is_asleep` has to be the one that ticked.
+    `test_the_gpu_sleep_overlay_follows_the_dispatch` is the counterpart.
     """
     was = "SLEEP_DEBUG" in cam.defines
+    gpu_sleep_was = engine.gates.gpu_sleep_enabled()
+    if engine.gates.sleep_sets is not None:
+        engine.gates.set_gpu_sleep(False)
+    gpu_was = engine._gpu_enabled
+    engine._gpu_enabled = False
     try:
         # Row 20: fed by a Source, so it carries items and stays awake.
         src = engine.place_structure(Source, 8, 20)
@@ -1637,6 +1651,91 @@ def test_the_sleep_overlay_separates_asleep_from_awake():
            f"full-but-resting reads {ram_col.astype(int)}")
     finally:
         cam.set_define("SLEEP_DEBUG", was)
+        engine._gpu_enabled = gpu_was
+        if engine.gates.sleep_sets is not None:
+            engine.gates.set_gpu_sleep(gpu_sleep_was)
+
+
+def test_the_gpu_sleep_overlay_follows_the_dispatch():
+    """The GPU layer's overlay must agree with what the dispatch covered.
+
+    The counterpart to the CPU test above, and it has to be separate: the two
+    schedulers write the same `SEG_I_ASLEEP` field and reach different
+    answers, so whichever ticked last owns it.
+
+    What makes this worth a pixel test rather than an assertion on the
+    buffers is the failure the first implementation actually had. Each tick
+    kernel published its *own* conclusion, which sounds right and is a
+    different claim from the one the overlay makes: "I am at rest" is not
+    "the tick will skip me", because a run that correctly concludes it is
+    inert can be woken by its producer in the same tick and then *is*
+    dispatched. Measured on cpu.npz, 478 of 538 runs reported asleep while
+    the dispatch covered 185. So the flag is published from the compacted set
+    (shaders/sleep_publish.comp), and this is what checks the two agree.
+
+    Asserted against the **awake set**, not against any predicate: that set
+    is by construction the next tick's dispatch list.
+    """
+    from core.belt_device import SEG_I_ASLEEP
+    sets = engine.gates.sleep_sets
+    if sets is None or not engine.gpu_ready():
+        ok("no GPU sleep layer in this context; nothing to check")
+        return
+    was = "SLEEP_DEBUG" in cam.defines
+    sleep_was = engine.gates.gpu_sleep_enabled()
+    publish_was = sets.publish_flags
+    try:
+        # A Source-fed run that keeps working, and a bare run that cannot.
+        src = engine.place_structure(Source, 8, 20)
+        src.emit_value = 1.0
+        engine.place_belt_path((10, 20), (18, 20))
+        engine.place_belt_path((10, 26), (18, 26))
+        engine.sync_segments()
+        engine.gates.set_gpu_sleep(True)
+        # The publish pass runs only while the overlay is on, so arm it the
+        # way the orchestrator does rather than reaching past the switch.
+        sets.publish_flags = True
+        for t in range(8):
+            engine._gpu_tick(1, start=engine.clock.tick + t)
+        engine.settle()
+
+        idle = engine.segments.at(14, 26)
+        busy = engine.segments.at(14, 20)
+        assert idle is not None and busy is not None
+        n_seg, _n_gate = sets.counts()
+        awake = set(sets._bufs["awake_seg"].download()[:n_seg].tolist())
+        assert idle.sid not in awake, (
+            "the unfed run should not be dispatched; the fixture is wrong")
+        assert busy.sid in awake, (
+            "the Source-fed run should be dispatched; the fixture is wrong")
+
+        # The published flags must say exactly that. Read off the device,
+        # since the kernel wrote them there and the host mirror is only a
+        # copy -- which is the direction that has been wrong before.
+        engine.gates.belt_compute.device.download()
+        si = engine.gates.belt_compute.device.seg_i
+        assert int(si[idle.sid, SEG_I_ASLEEP]) == 1, (
+            f"a run the dispatch skipped must publish asleep, got "
+            f"{int(si[idle.sid, SEG_I_ASLEEP])}")
+        assert int(si[busy.sid, SEG_I_ASLEEP]) == 0, (
+            f"a run the dispatch covered must publish awake, got "
+            f"{int(si[busy.sid, SEG_I_ASLEEP])}")
+
+        # And the flags must reach the pixels, which is the half no buffer
+        # assertion can see.
+        assert cam.set_define("SLEEP_DEBUG", True), cam.compile_error
+        cam.center[:] = (14.0, 23.0)
+        cam.zoom = 30.0
+        img = _render()
+        cold = _mean_rgb(img, 14, 26)
+        assert _is_cold(cold), (
+            f"the skipped run should read blue, got {cold}")
+        ok(f"the overlay agrees with the dispatch: skipped run reads "
+           f"{cold.astype(int)}, {n_seg}/{sets.seg_count} runs dispatched")
+    finally:
+        cam.set_define("SLEEP_DEBUG", was)
+        sets.publish_flags = publish_was
+        engine.gates.set_gpu_sleep(sleep_was)
 
 
 def test_the_sleep_masks_isolate_belts_from_gates():

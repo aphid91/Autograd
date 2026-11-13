@@ -810,3 +810,187 @@ def test_the_geometry_block_tracks_an_edit():
     problems = compare_against_cpu(gates, board)
     assert not problems, "\n".join(problems)
     ok("an edit re-packs the geometry block")
+
+
+# --- the GPU sleep layer -------------------------------------------------
+#
+# What these pin, and what they deliberately do not. The *soundness* of
+# sleeping is `tools/check_gpu_sleep_safe.py`'s job: it needs the real boards
+# and hundreds of ticks, which is too slow for the suite, and its two halves
+# are mutation-tested there. These are the mechanism tests -- the parts that
+# can be wrong in a way no amount of ticking reveals, because they fail
+# *closed* (nothing sleeps, so nothing breaks) rather than open.
+
+def _sleep_sets():
+    """The sleep layer on the shared context, or None if unavailable."""
+    gates = _with_device()
+    return gates.sleep_sets
+
+
+def test_the_awake_sets_start_complete():
+    """After an edit, everything is awake.
+
+    The edit-time hammer, and it must be a hammer: `rebuild()` reassigns every
+    segment id and gate slot, so no sleep decision taken before it still
+    describes the same entity. An awake set carried across a rebuild would
+    omit entities silently -- and an omitted entity is never visited again,
+    which is the cumulative failure this layer's whole soundness burden is
+    about.
+    """
+    harness.reset()
+    engine.place_structure(Source, 8, 10)
+    engine.place_belt_path((10, 10), (16, 10))
+    engine.sync_segments()
+    sets = _sleep_sets()
+    if sets is None:
+        ok("no sleep layer in this context")
+        return
+    n_seg, n_gate = sets.counts()
+    assert n_seg == sets.seg_count, (
+        f"{n_seg} of {sets.seg_count} runs awake after an edit; a rebuild "
+        f"must wake everything")
+    assert n_gate == sets.gate_count, (
+        f"{n_gate} of {sets.gate_count} gates awake after an edit")
+    ok(f"an edit wakes all {n_seg} runs and {n_gate} gates")
+
+
+def test_an_unfed_run_leaves_the_dispatch():
+    """A run with nothing feeding it stops being dispatched.
+
+    The simplest possible statement that the layer does anything at all. It
+    matters because every failure mode here is *quiet*: a layer that never
+    slept anything would pass the differential checker, the conservation
+    check and every other test in this file, while delivering nothing.
+    """
+    harness.reset()
+    engine.place_belt_path((10, 10), (16, 10))
+    engine.sync_segments()
+    sets = _sleep_sets()
+    if sets is None:
+        ok("no sleep layer in this context")
+        return
+    engine.gates.set_gpu_sleep(True)
+    run = engine.segments.at(12, 10)
+    assert run is not None
+    for t in range(6):
+        engine._gpu_tick(1, start=t)
+    n_seg, _ = sets.counts()
+    awake = set(sets._bufs["awake_seg"].download()[:n_seg].tolist())
+    assert run.sid not in awake, (
+        f"a run with no producer and no consumer is a fixed point and must "
+        f"leave the dispatch; {n_seg} runs still awake")
+    ok(f"an unfed run left the dispatch ({n_seg} runs still awake)")
+
+
+def test_a_sleeping_run_wakes_when_its_producer_fires():
+    """The wake edge, end to end.
+
+    The half that cannot be checked by watching a board settle: a run that
+    goes quiet and *stays* quiet proves only that the sleep worked. This
+    starves a gate, lets the run sleep, then feeds the gate by hand and
+    requires the run to come back.
+
+    Hand-fed rather than Source-fed for exactly the reason
+    `check_wakelist_safe.py` records for the CPU tool: a Source-fed run either
+    stays busy for ever or sleeps once and never wakes, so it exercises no
+    wake edge at all.
+    """
+    harness.reset()
+    shear = engine.place_structure(Shear, 8, 10)
+    engine.place_belt_path((10, 10), (16, 10))
+    engine.place_structure(Sink, 17, 10)
+    engine.sync_segments()
+    sets = _sleep_sets()
+    if sets is None:
+        ok("no sleep layer in this context")
+        return
+    engine.gates.set_gpu_sleep(True)
+    run = engine.segments.at(12, 10)
+    assert run is not None
+
+    # Let the starved gate's run go quiet.
+    for t in range(8):
+        engine._gpu_tick(1, start=t)
+    n_seg, _ = sets.counts()
+    asleep_now = run.sid not in set(
+        sets._bufs["awake_seg"].download()[:n_seg].tolist())
+    assert asleep_now, "the run never slept, so this proves nothing"
+
+    # Feed the gate on the host, which is what a real producer upstream would
+    # eventually do. `settle()` first, or the write lands under the device's
+    # feet and the next dispatch overwrites it.
+    #
+    # **And `note_host_write()`**, which is the half that was missing and is
+    # the reason this test exists. A host write is a producer event the
+    # device's mailbox never saw, so without it the fed gate stays asleep for
+    # ever -- measured as a Shear with both inputs held that never fired
+    # again. The Status window's emit-value box is the same path in the real
+    # app, which is what makes this a bug rather than a test artefact.
+    engine.settle()
+    for c in range(shear.input_count()):
+        shear.set_input(c, 3.0)
+    engine.note_host_write()
+    engine._gpu_dirty = False
+    for t in range(8, 12):
+        engine._gpu_tick(1, start=t)
+    engine.settle()
+    assert run.count > 0, (
+        "the fed gate's item never reached the sleeping run -- a missed wake")
+    ok(f"a slept run woke on its producer firing and carries {run.count} item(s)")
+
+
+def test_the_bypass_dispatches_everything():
+    """Unticking the switch is a full bypass, not a wake-everything.
+
+    The distinction is the whole value of the control: a "wake all" would
+    still pay for the compaction pass, the mailbox writes and the indirect
+    indirection, so comparing it against sleeping would measure the
+    bookkeeping rather than the mechanism. With the sets detached the kernels
+    take their non-sleep branch and the tick costs what it did before this
+    layer existed.
+    """
+    harness.reset()
+    engine.place_belt_path((10, 10), (16, 10))
+    engine.sync_segments()
+    gates = _with_device()
+    if gates.sleep_sets is None:
+        ok("no sleep layer in this context")
+        return
+    gates.set_gpu_sleep(False)
+    assert gates.device.sleep is None, (
+        "the firing kernel still holds the sleep sets, so it will dispatch "
+        "indirectly over a set nothing is maintaining")
+    assert gates.belt_compute.sleep is None, (
+        "the belt kernel still holds the sleep sets")
+    assert not gates.gpu_sleep_enabled()
+    # And it must still simulate.
+    for t in range(4):
+        engine._gpu_tick(1, start=t)
+    engine.settle()
+    gates.set_gpu_sleep(True)
+    assert gates.device.sleep is not None, "the switch did not come back on"
+    ok("the bypass detaches the sets from both kernels and still ticks")
+
+
+def test_the_gate_row_map_is_packed_with_the_geometry():
+    """Slot->row must describe the same slot assignment as `geom`.
+
+    Everything in this layer is slot-keyed, and `GateState.build()` reassigns
+    slots on any gate-set change -- the hazard `GateDevice.gate_count()`
+    exists for. The row map is what carries the overlay flag back to the
+    entity table, so a stale one would publish one machine's sleep state onto
+    another's row: a lying overlay with no other symptom.
+    """
+    harness.reset()
+    engine.place_structure(Shear, 10, 10)
+    engine.sync_segments()
+    gates = _with_device()
+    engine.place_structure(Mac, 14, 10)
+    engine.sync_segments()
+    gates.sync_device()
+    n = gates.device.gate_count()
+    rows = gates.device.gate_rows[:n].tolist()
+    assert rows == gates.state.rows[:n].tolist(), (
+        f"row map {rows} disagrees with the mirror "
+        f"{gates.state.rows[:n].tolist()}")
+    ok(f"the slot->row map tracks the geometry across an edit ({n} gates)")

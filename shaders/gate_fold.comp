@@ -26,13 +26,63 @@ layout(std430, binding = 5) buffer InHeld  { float in_held[]; };
 // One per folded channel: .x gate slot, .y channel, .z the constant.
 layout(std430, binding = 15) buffer Folds { vec4 folds[]; };
 
+// The sleep mailbox. This pass writes an input lane, so it is a producer like
+// any other and owes its receiver a wake -- see below.
+layout(std430, binding = 16) buffer Wake { int wake[]; };
+
 uniform int fold_count;
+uniform int wake_epoch;
+uniform int sleep_on;
+uniform int wake_gate_base;
 
 void main() {
     uint i = gl_GlobalInvocationID.x;
     if (i >= uint(fold_count)) return;
     vec4 f = folds[i];
-    uint lane = uint(int(f.x)) * uint(MAX_CHANNELS) + uint(int(f.y));
+    int slot = int(f.x);
+    uint lane = uint(slot) * uint(MAX_CHANNELS) + uint(int(f.y));
     in_value[lane] = f.z;
     in_held[lane] = 1.0;
+
+    // **A folded gate must be kept awake, and missing this was a real bug.**
+    //
+    // Every other writer of a gate's input lane posts a wake: the belt kernel
+    // when it pops, `gate_direct.comp` when it delivers, the firing kernel
+    // for its neighbours. This pass writes a lane too -- that is its entire
+    // job -- and it is the one writer that lives outside the firing kernel,
+    // so it was the one that silently did not.
+    //
+    // The consequence was exactly the failure mode this layer's soundness
+    // burden is about. A folded gate fires, so it is re-armed by the firing
+    // kernel; but on a tick where it *cannot* fire (its other lane empty, or
+    // its zone blocked) it sleeps, and then nothing ever re-admits it --
+    // because the thing that makes it ready again is this pass, which said
+    // nothing. The gate stops for ever while the bypass timeline runs on.
+    //
+    // Found by the differential check at tick 2 on ram.npz: a run whose
+    // producer was a folded Shear never received the item the unslept
+    // timeline delivered. The gate is in the run's adjacency and the port
+    // table was correct -- the wake simply was not posted by anybody.
+    //
+    // Waking unconditionally rather than only on a change: the lane is
+    // re-asserted every tick by design, so "did this write change anything"
+    // is not a question with a stable answer, and a folded gate is a gate
+    // with a permanently live input. Keeping it awake is the honest reading.
+    //
+    // **This wake is defensive rather than load-bearing, and measurement says
+    // so** -- recorded because the wakes around it *are* load-bearing and the
+    // symmetry invites assuming the same. Removing it passes both halves of
+    // tools/check_gpu_sleep_safe.py on every real board. The reason is
+    // benignly circular: this is the only pass that would ever need to
+    // re-admit a folded gate, and because it fires every tick such a gate is
+    // never asleep to begin with -- instrumented on cpu.npz, 234 folded slots
+    // over 120 ticks, **0** instances of a folded gate entering a tick asleep.
+    //
+    // Kept anyway, for the same reason `took_from()` is kept on the CPU side:
+    // the protocol is then correct because every writer of a lane announces
+    // it, rather than because of a coincidence about which gates happen to
+    // stay awake. Any change that lets a folded gate sleep -- a fold asserted
+    // conditionally, say -- would make it load-bearing at once, and the
+    // failure would be a gate stopping for ever with no visible cause.
+    if (sleep_on != 0) wake[wake_gate_base + slot] = wake_epoch;
 }

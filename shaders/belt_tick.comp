@@ -76,8 +76,45 @@ layout(std430, binding = 7) buffer OutHeld  { float out_held[]; };
 //   .z  dst gate slot   .w  dst in channel
 layout(std430, binding = 14) buffer Ports { ivec4 seg_ports[]; };
 
+// --- the sleep layer (see core/sleep_device.py) -------------------------
+//
+// `awake_seg` is the compacted list of segment ids this dispatch covers, and
+// `args[0].w` is how many entries it holds -- both produced on the device by
+// `sleep_compact.comp`, so neither ever round-trips through the host.
+//
+// **The thread count is the awake count, not the segment count.** That is the
+// entire mechanism: an early `if (asleep) return;` would still launch the
+// warp, still occupy the scheduler, and still diverge sleeping lanes against
+// awake ones in the same warp. The dispatch has to shrink.
+// One mailbox for both families; see SLEEP_WAKE_BINDING in render/compute.py.
+layout(std430, binding = 16) buffer Wake      { int wake[]; };
+layout(std430, binding = 18) buffer AwakeSeg  { int awake_seg[]; };
+layout(std430, binding = 22) buffer Args      { uvec4 args[]; };
+
 uniform int segment_count;
 uniform int sim_tick;
+//: The epoch a wake must carry to be honoured next tick. See the epoch note
+//: in core/sleep_device.py -- a stale stamp is simply a number that no longer
+//: matches, which is what removes the need for an O(total) clearing pass.
+uniform int wake_epoch;
+//: 0 when the sleep layer is bypassed entirely, in which case this kernel is
+//: dispatched over every segment and posts no wakes. The player's switch, so
+//: "sleep system + its overhead" and "no sleep system, no overhead" are both
+//: measurable -- see the checkbox note in ui/panel.py.
+uniform int sleep_on;
+//: Start of the gate region in `wake`.
+uniform int wake_gate_base;
+
+//: Arm an entity for the coming tick. Plain stores, not atomics: a mailbox
+//: slot is written with one value by however many threads reach it, so the
+//: worst a race can do is write the same number twice.
+void wake_segment(int sid) {
+    if (sid >= 0 && sid < segment_count) wake[sid] = wake_epoch;
+}
+
+void wake_gate_slot(int slot) {
+    if (slot >= 0) wake[wake_gate_base + slot] = wake_epoch;
+}
 
 // Where item `k` is at `tick`, in fixed point. The closed form, and a second
 // implementation of BeltSim.position_of() -- pinned against it by
@@ -105,8 +142,19 @@ bool belt_has_room(int sid, int tick) {
 }
 
 void main() {
-    int sid = int(gl_GlobalInvocationID.x);
-    if (sid >= segment_count) return;
+    uint i = gl_GlobalInvocationID.x;
+    int sid;
+    if (sleep_on != 0) {
+        // One thread per *awake* run. The bound comes from the args buffer
+        // rather than a uniform because the count is produced by an atomic on
+        // the device -- reading it on the host to set a uniform is exactly the
+        // per-tick stall this layer exists inside residency to avoid.
+        if (i >= args[0].w) return;
+        sid = awake_seg[i];
+    } else {
+        sid = int(i);
+    }
+    if (sid < 0 || sid >= segment_count) return;
 
     ivec4 si = seg_core(sid);
     vec4 sf = seg_f[sid];
@@ -163,6 +211,12 @@ void main() {
                 anchor = max(0.0, length - spacing);
                 seg_f[sid] = vec4(anchor, length, speed, spacing);
                 seg_i[sid * 2] = ivec4(head, tail, base, cap);
+                // We just loaded a gate's input lane, so that gate can
+                // possibly fire next tick. It may be asleep and cannot have
+                // noticed: a sleeping entity reads nothing, which is why
+                // waking is pushed by whoever moved the material rather than
+                // polled by whoever is waiting for it.
+                if (sleep_on != 0) wake_gate_slot(ports.z);
             }
         }
     }
@@ -171,6 +225,11 @@ void main() {
     //    clear of the entrance. Note the room test comes *first*: a full
     //    belt is never even offered an item, so the producer keeps it as the
     //    back-pressure signal the next structure phase reads.
+    //
+    //    `offered_nothing` is the third fixed point's missing term, recorded
+    //    here because this is where the producer is actually consulted -- the
+    //    same reason `Segment._declined` carries it one line on the CPU.
+    bool offered_nothing = true;
     if (ports.x >= 0) {
         // Re-read: the pop above may have changed head/anchor, and room
         // depends on both.
@@ -178,6 +237,7 @@ void main() {
         if (belt_has_room(sid, sim_tick)) {
             uint zone = uint(ports.x) * uint(MAX_CHANNELS) + uint(ports.y);
             if (out_held[zone] > 0.0) {
+                offered_nothing = false;
                 int slot = si.y % cap;
                 items[base + slot] = vec2(float(sim_tick), out_value[zone]);
                 seg_i[sid * 2] = ivec4(si.x, si.y + 1, base, cap);
@@ -185,7 +245,100 @@ void main() {
                 // offering is not committing.
                 out_value[zone] = 0.0;
                 out_held[zone] = 0.0;
+                // That zone is now free, so the producer can fire again next
+                // tick even if it had blocked and gone to sleep on a full
+                // zone. The back-pressure edge, and the one easy to forget:
+                // a producer starved of *room* is as stuck as a consumer
+                // starved of material.
+                if (sleep_on != 0) wake_gate_slot(ports.x);
             }
         }
     }
+
+    // --- do I need to run again? ------------------------------------------
+    //
+    // The run decides for itself and posts the answer, because it has just
+    // read every term. A predicate re-derived in the compaction pass would be
+    // a second copy of this rule, which is the class of bug that has twice
+    // made GLSL disagree with Python here.
+    //
+    // Three fixed points, straight from `BeltSim.is_at_rest()`:
+    //
+    //   - empty, with the anchor saturated. The anchor advance is
+    //     `min(anchor + v, L)`, which saturates and then returns L for ever.
+    //     The clause looks redundant and is not: an empty run whose anchor
+    //     has yet to saturate still changes, and dropping it is invisible
+    //     end-to-end (see tools/probe_wakelist.py, which is why that tool
+    //     checks the predicate against its definition rather than behaviour).
+    //   - holding items, head parked at the end, with no room to accept.
+    //   - holding items, head parked at the end, and the producer offered
+    //     nothing.
+    //
+    // **The head-at-end clause is load-bearing in the last two**, and leaving
+    // it out is the bug CLAUDE.md records twice. An item's position is a
+    // closed form over the tick, so a run holding one mid-flight item has
+    // *identical stored state* for the item's whole journey -- it advances
+    // whether or not anybody visits it, and the pop that follows has no
+    // external cause. Sleeping on "nothing can enter" alone strands the item
+    // mid-belt for ever, which is exactly what happened to seeded runs.
+    if (sleep_on == 0) return;
+    si = seg_core(sid);
+    vec4 rest_f = seg_f[sid];
+    bool empty = si.x == si.y;
+    // `>=` rather than the pop's exact `==`: the pop needs exactness because
+    // a float a hair short would stall the belt for ever, while this only
+    // needs "has it arrived", and a position can never exceed the length.
+    bool head_at_end = !empty
+        && belt_position(sid, si.x, sim_tick) >= rest_f.y;
+    //
+    // **`offered_nothing` is not enough on its own, and that was a live bug.**
+    // It records that the producer had nothing *on this tick*. The CPU's
+    // equivalent clause is safe because `GateSim._wake_around()` raises an
+    // edge the moment a gate fills a waiting zone -- so "idle now" being
+    // falsified later always wakes the run.
+    //
+    // Here the only gate->run wake is posted when a gate *fires*, and a gate
+    // whose zone is already full does not fire. So a run that slept on
+    // `offered_nothing` while its producer was merely blocked for one tick
+    // was never woken when the zone drained elsewhere. Caught by the
+    // differential check at tick 1 on every real board: the sleeping run
+    // accepted one item where full ticking accepted two.
+    //
+    // The fix is to require the producer's zone to be **observably empty**,
+    // not merely to have declined. An empty zone can only be refilled by the
+    // producer firing, and a gate that fires posts the wake. That turns the
+    // clause from a claim about the future into a reading of present data --
+    // the same correction the CPU's direct-lane clause documents ("it reads
+    // data, not conclusions").
+    bool src_empty = true;
+    if (ports.x >= 0) {
+        uint zone = uint(ports.x) * uint(MAX_CHANNELS) + uint(ports.y);
+        src_empty = out_held[zone] <= 0.0;
+    }
+    bool at_rest;
+    if (empty) {
+        at_rest = rest_f.x >= rest_f.y;
+    } else {
+        at_rest = head_at_end
+            && (!belt_has_room(sid, sim_tick)
+                || (offered_nothing && src_empty));
+    }
+    // Re-arm unless provably inert. Note the asymmetry that makes this safe
+    // in the right direction: staying awake is always correct and merely
+    // wasteful, while sleeping wrongly strands material silently. So the
+    // default on any doubt is to run again.
+    if (!at_rest) wake_segment(sid);
+    // **The overlay flag is published by the compaction, not here.**
+    //
+    // This thread knows only its own conclusion, and that is the wrong
+    // question. "I am at rest" is not "the tick will skip me": a run that
+    // concludes it is at rest can still be woken a moment later by its
+    // producer's push, and then it *is* dispatched. Publishing from here
+    // measured 478 of 538 runs "asleep" on cpu.npz while the dispatch
+    // actually covered 185 -- the flag disagreeing with the mechanism it
+    // exists to display.
+    //
+    // So `sleep_compact.comp` writes it from the compacted set, which is by
+    // definition exactly what the next tick dispatches over. See the note
+    // there.
 }

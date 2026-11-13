@@ -216,6 +216,10 @@ class GateSim:
         #: reference and what `belt_compute.compare_against_cpu()` checks
         #: against.
         self.belt_compute = None
+        #: The GPU sleep layer, or None with no device. See
+        #: `create_device_resources()` and `set_gpu_sleep()`.
+        self.sleep_sets = None
+        self._gpu_sleep_enabled = True
         #: True when `state.build()` has reassigned slots since the device
         #: was last packed, so `geom`/folds/edges describe a stale set.
         #: `use_gpu_tick()` refuses to dispatch while it is set.
@@ -1660,13 +1664,80 @@ class GateSim:
         """
         from core.belt_compute import BeltCompute
         from core.gate_device import GateDevice
+        from core.sleep_device import SleepSets
         self._gate_table()
         self.device = GateDevice(ctx, self.state)
         if belt_device is not None:
             self.belt_compute = BeltCompute(
                 ctx, self.index, self.belts, self, belt_device)
+        #: The GPU sleep layer. Built here but **attached by
+        #: `set_gpu_sleep()`**, so the kernels' `sleep` reference is the one
+        #: switch: `None` there is a full bypass -- dispatch over every
+        #: entity, post no wakes, pay nothing. That is what makes the panel's
+        #: checkbox an honest A/B rather than a "wake everything" that still
+        #: pays for the compaction and the indirection.
+        self.sleep_sets = SleepSets(ctx)
+        self._gpu_sleep_enabled = True
         self.sync_device()
+        self.set_gpu_sleep(self._gpu_sleep_enabled)
         return self.device
+
+    def set_gpu_sleep(self, on):
+        """Switch the GPU sleep layer on or off. A **full bypass** when off.
+
+        Attaching or detaching the `SleepSets` from the two device objects is
+        the whole mechanism: with it absent the kernels take their non-sleep
+        branch, which dispatches over every entity and posts nothing. So the
+        off state costs exactly what the tick cost before this layer existed,
+        which is the measurement the player actually wants to compare against.
+
+        Turning it **on wakes everything**, because the sleep sets may hold a
+        population from before the switch was last flipped -- and an entity
+        absent from a stale awake set would simply never be visited again.
+        """
+        self._gpu_sleep_enabled = bool(on)
+        sets = self.sleep_sets if on else None
+        if self.device is not None:
+            self.device.sleep = sets
+        if self.belt_compute is not None:
+            self.belt_compute.sleep = sets
+            # **Hand the overlay's segment flag to whichever side decides it.**
+            # `belt_tick.comp` publishes its own; `BeltDevice.sync()` otherwise
+            # mirrors `BeltSim._asleep`, which is empty on the GPU path -- so
+            # leaving it to the CPU stamped 0 over every run the kernel slept
+            # and the overlay drew a 97%-asleep board entirely amber.
+            dev = self.belt_compute.device
+            if dev is not None:
+                dev.gpu_owns_sleep_flag = bool(on)
+        if sets is not None:
+            sets.wake_all()
+        else:
+            # Leaving the switch means leaving the flags, and a stale flag is
+            # a lying overlay: every run the kernel last slept would stay blue
+            # for ever on a board that is now fully dispatched. Clear both
+            # families so "off" reads as what it is -- nothing asleep.
+            self._clear_sleep_flags()
+
+    def _clear_sleep_flags(self):
+        """Zero the overlay's sleep flags in both families.
+
+        Only the *diagnostic* fields -- `GateSim._asleep` is untouched,
+        because the CPU scheduler's own state is not this method's business.
+        """
+        rows = self.state.rows
+        if len(rows):
+            self.board.entities[rows, Entity.F_ASLEEP] = 0.0
+            dirty = self.board.entities_dirty
+            for row in rows.tolist():
+                dirty.add(row)
+        if self.belt_compute is not None:
+            dev = self.belt_compute.device
+            if dev is not None:
+                from core.belt_device import SEG_I_ASLEEP
+                dev.seg_i[:, SEG_I_ASLEEP] = 0
+
+    def gpu_sleep_enabled(self):
+        return self._gpu_sleep_enabled
 
     def has_host_decided_gates(self):
         """Is any live gate one the firing kernel declines to decide?
@@ -1743,14 +1814,31 @@ class GateSim:
         for row in self.state.rows.tolist():
             if self.board.is_row_alive(row):
                 self._connected_channels(self.board.view(row))
-        self.device.rebuild(self._gate_types, self.board,
-                            edges=self._direct_edges())
+        edges = self._direct_edges()
+        self.device.rebuild(self._gate_types, self.board, edges=edges)
         # Folded constants, in slot space, for the per-tick re-assertion the
         # GPU path needs in place of .
         self.device.set_folds(self.folded_slot_channels())
         self._device_stale = False
         if self.belt_compute is not None:
             self.belt_compute.rebuild(self.state)
+        # **The sleep layer is re-packed last and wakes everything.** Its
+        # buffers are slot- and segment-id-keyed, and an edit reassigns both,
+        # so an awake set carried across a rebuild would describe a different
+        # population -- an entity missing from it would never be visited
+        # again, which is the silent cumulative failure this layer's whole
+        # soundness burden is about. `rebuild()` ends in `wake_all()`.
+        #
+        # Last because the adjacency is derived from the segment index and the
+        # same edge list the device was just packed from, so building it here
+        # cannot see a half-updated graph.
+        if self.sleep_sets is not None:
+            from core.sleep_graph import gate_neighbours
+            entries, offsets = gate_neighbours(
+                self.index, self, self.state, edges=edges)
+            max_sid = max(self.index.segments, default=0)
+            self.sleep_sets.rebuild(max_sid + 1, len(self.state.rows),
+                                    entries, offsets)
 
     # --- structure phase --------------------------------------------------
     def structure_phase(self):

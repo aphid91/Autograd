@@ -157,6 +157,11 @@ class GateDevice:
         #: every firing dispatch -- see shaders/gate_fold.comp.
         self.folds = np.zeros((1, 4), dtype=np.float32)
         self.fold_count = 0
+        #: Slot -> entity row, for publishing the sleep flag. Packed by
+        #: `rebuild()` alongside `geom`, never from the live mirror.
+        self.gate_rows = np.zeros(1, dtype=np.int32)
+        #: The sleep layer, or None when it is bypassed. Set by `Engine`.
+        self.sleep = None
 
         b = compute
         self._bufs = {
@@ -176,6 +181,12 @@ class GateDevice:
                 ctx, self.edges, b.GATE_EDGE_BINDING),
             "folds": compute.ComputeBuffer(
                 ctx, self.folds, b.GATE_FOLD_BINDING),
+            #: Entity row per slot, so `gate_fire.comp` can publish the sleep
+            #: flag into the row the renderer reads. int32 rather than the
+            #: mirror's int64, because GLSL has no 64-bit int in std430 here
+            #: and a row index never approaches 2^31.
+            "gate_rows": compute.ComputeBuffer(
+                ctx, np.zeros(1, dtype=np.int32), b.GATE_ROWS_BINDING),
         }
         #: Set by every dispatch, cleared by a readback. While true the host
         #: arrays are stale -- see the residency note in render/compute.py.
@@ -211,9 +222,17 @@ class GateDevice:
             if types[i] is Source or issubclass(types[i], Source):
                 self.konst[i] = board.entities[row, Source.F_EMIT]
         self.edges, self.edge_count = self._pack_edges(edges)
+        #: Slot -> row, for the sleep flag's trip back to the entity table.
+        #: Packed here with the rest of the per-edit geometry, so it can never
+        #: describe a different slot assignment than `geom` does -- the
+        #: staleness hazard `gate_count()` exists for.
+        self.gate_rows = np.zeros(max(n, 1), dtype=np.int32)
+        if n:
+            self.gate_rows[:n] = state.rows.astype(np.int32)
         self._bufs["geom"].set_array(self.geom)
         self._bufs["konst"].set_array(self.konst)
         self._bufs["edges"].set_array(self.edges)
+        self._bufs["gate_rows"].set_array(self.gate_rows)
         for name in ("in_value", "in_held", "out_value", "out_held"):
             self._bufs[name].set_array(getattr(state, name))
 
@@ -259,6 +278,7 @@ class GateDevice:
         self._bufs["konst"].upload(self.konst)
         self._bufs["edges"].upload(self.edges)
         self._bufs["folds"].upload(self.folds)
+        self._bufs["gate_rows"].upload(self.gate_rows)
         self._gpu_ahead = False
 
     def run(self, ticks=1, direct=True):
@@ -291,18 +311,46 @@ class GateDevice:
             return
         for buf in self._bufs.values():
             buf.bind()
+        sleep = self.sleep
+        if sleep is not None:
+            sleep.bind()
         self.kernel["gate_count"] = int(n)
+        self.kernel["sleep_on"] = 1 if sleep is not None else 0
+        if sleep is not None:
+            self.kernel["wake_gate_base"] = int(sleep.gate_base)
         groups = compute.groups_for(n)
         run_direct = direct and self.edge_count > 0
         if run_direct:
             self.direct_kernel["edge_count"] = int(self.edge_count)
+            self.direct_kernel["sleep_on"] = 1 if sleep is not None else 0
+            if sleep is not None:
+                self.direct_kernel["wake_gate_base"] = int(sleep.gate_base)
             edge_groups = compute.groups_for(self.edge_count)
         run_folds = self.fold_count > 0
         if run_folds:
             self.fold_kernel["fold_count"] = int(self.fold_count)
+            self.fold_kernel["sleep_on"] = 1 if sleep is not None else 0
+            if sleep is not None:
+                self.fold_kernel["wake_gate_base"] = int(sleep.gate_base)
             fold_groups = compute.groups_for(self.fold_count)
         for _ in range(int(ticks)):
-            self.kernel.run(groups)
+            if sleep is None:
+                self.kernel.run(groups)
+            else:
+                # Indirect: the group count was written by `sleep_groups.comp`
+                # from the compaction's own atomic, so the awake count never
+                # round-trips through the host.
+                #
+                # `wake_epoch` is the stamp this tick's kernels post with and
+                # the *next* compaction accepts. **Read, never bumped here**:
+                # the epoch advances in exactly one place, `Engine._gpu_tick()`
+                # where the compaction is called, because both phases of one
+                # tick must post the same stamp. Bumping it per phase put the
+                # belt phase a tick ahead of the gate phase, so a run woken by
+                # a gate was compacted on the following tick instead.
+                self.kernel["wake_epoch"] = int(sleep.epoch)
+                self.kernel.run_indirect(
+                    sleep.args_buffer(), sleep.gate_arg_offset())
             compute.barrier(self.ctx)
             # Put the folded constants back, exactly as `_assert_folded()`
             # does after the CPU's structure phase: the channel must read as
@@ -310,9 +358,17 @@ class GateDevice:
             # consumption has cleared it. Without this the kernel eats each
             # folded input once and the gate is starved for ever.
             if run_folds:
+                if sleep is not None:
+                    self.fold_kernel["wake_epoch"] = int(sleep.epoch)
                 self.fold_kernel.run(fold_groups)
                 compute.barrier(self.ctx)
             if run_direct:
+                # Same epoch the firing kernel just posted with: both halves
+                # of one tick arm for the *same* coming tick, so a value
+                # delivered here and a gate that fired above are compacted
+                # together rather than a tick apart.
+                if sleep is not None:
+                    self.direct_kernel["wake_epoch"] = int(sleep.epoch)
                 self.direct_kernel.run(edge_groups)
                 compute.barrier(self.ctx)
         self._gpu_ahead = True
@@ -327,6 +383,10 @@ class GateDevice:
         self.direct_kernel.run(compute.groups_for(self.edge_count))
         compute.barrier(self.ctx)
         self._gpu_ahead = True
+
+    def bind_rows(self):
+        """Bind the slot->row map alone, for the sleep layer's publish pass."""
+        self._bufs["gate_rows"].bind()
 
     def readback(self):
         """Device -> host. The deliberate, expensive act of asking.

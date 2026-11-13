@@ -70,7 +70,47 @@ const int GEOM_STRIDE = 2;
 // one value most gates never use.
 layout(std430, binding = 9) buffer Konst { float konst[]; };
 
+// --- the sleep layer (see core/sleep_device.py) -------------------------
+//
+// `awake_gate` is the compacted list of gate slots this dispatch covers and
+// `args[1].w` is how many it holds, both produced on the device. The thread
+// count is the awake count: an early return would still launch the warp.
+// One mailbox for both families; see SLEEP_WAKE_BINDING in render/compute.py.
+layout(std430, binding = 16) buffer Wake      { int wake[]; };
+layout(std430, binding = 19) buffer AwakeGate { int awake_gate[]; };
+layout(std430, binding = 22) buffer Args      { uvec4 args[]; };
+//: Each gate's adjacency, CSR, shared with sleep_compact.comp. A gate that
+//: fires has to wake whoever it just fed, and its neighbours are here --
+//: derived once per edit by core/sleep_graph.py so this kernel and the
+//: compaction cannot disagree about who is adjacent to whom.
+layout(std430, binding = 20) buffer GateNbr   { int gate_nbr[]; };
+layout(std430, binding = 21) buffer GateNbrAt { int gate_nbr_at[]; };
+
+//: Entity row per gate slot, so the sleep flag can be published into the row
+//: the *renderer* reads. The kernel works in slot space throughout (that is
+//: the whole point of the gate-dense SoA mirror); this is the one place it
+//: needs the row back, and translating here beats the renderer learning about
+//: slots.
+layout(std430, binding = 25) buffer GateRows { int gate_rows[]; };
+
 uniform int gate_count;
+//: The stamp a wake must carry to be honoured next tick.
+uniform int wake_epoch;
+//: 0 when the sleep layer is bypassed: dispatch over every gate, post no
+//: wakes, publish no flag. The player's A/B switch.
+uniform int sleep_on;
+//: Start of the gate region in `wake`.
+uniform int wake_gate_base;
+
+//: Publish one gate's sleep state into its entity row, for the SLEEP_DEBUG
+//: overlay. Writes the same `F_ASLEEP` field the CPU's `_publish_sleep()`
+//: does, so the overlay needs no GPU-specific branch and `gate_asleep()` in
+//: common.glsl keeps working unchanged.
+void gate_set_asleep(uint slot, bool asleep) {
+    int row = gate_rows[slot];
+    if (row < 0) return;
+    ent[row * ENTITY_STRIDE + F_ASLEEP] = asleep ? 1.0 : 0.0;
+}
 
 //: Flag bits in `geom[].w`. Mirrored by core/gate_device.py, and pinned
 //: against it by tests/test_glsl.py -- these are a layout contract between
@@ -85,13 +125,38 @@ bool gate_drains(int flags, int c) {
     return (flags & (1 << (FLAG_DRAIN_SHIFT + c))) != 0;
 }
 
-void main() {
-    uint slot = gl_GlobalInvocationID.x;
-    // The last work group is partly out of range whenever gate_count is not
-    // a multiple of 64. One comparison, and without it a thread writes past
-    // the end of every buffer bound here.
-    if (slot >= uint(gate_count)) return;
+//: Everything one hop from this gate, armed for the coming tick. Called when
+//: the gate actually changed something another entity reads -- it filled a
+//: waiting zone (so a downstream run or gate can move) or cleared an input
+//: lane (so an upstream producer blocked on it can deliver).
+//:
+//: **Coarse on purpose: both directions, every neighbour.** The precise
+//: version would wake only the entity on the face whose channel changed, and
+//: would need this kernel to resolve a channel back to a neighbour -- a
+//: second copy of the port geometry, in GLSL, which is the duplication that
+//: has twice made the two sides disagree here. A gate has a handful of
+//: neighbours, so the cost of waking all of them is a handful of stores,
+//: against a missed wake that fails silently and compounds for a hundred
+//: ticks. The asymmetry decides it.
+void wake_neighbours(int slot) {
+    int lo = gate_nbr_at[slot];
+    int hi = gate_nbr_at[slot + 1];
+    for (int k = lo; k < hi; ++k) {
+        int entry = gate_nbr[k];
+        if (entry < 0) wake[wake_gate_base + ~entry] = wake_epoch;
+        else wake[entry] = wake_epoch;
+    }
+}
 
+// Try to fire one gate. Returns true iff it did.
+//
+// **Split out of `main()` so the sleep decision has exactly one home.** Every
+// "I cannot act" exit used to be a bare `return` from main; with sleeping,
+// each of those is also a *conclusion about whether to run again*, and the
+// two must not drift apart. A `return false` here is a gate that did nothing
+// and whose state is therefore unchanged, which is precisely the condition
+// for sleeping -- stated once rather than at each of the six exits.
+bool try_fire(uint slot) {
     ivec4 g = geom[slot * GEOM_STRIDE];
     ivec4 sel = geom[slot * GEOM_STRIDE + 1];
     int type = g.x;
@@ -102,7 +167,7 @@ void main() {
     // A type whose readiness or consumption is value-dependent is the host's
     // business. Returning leaves its row untouched, so the CPU path sees
     // exactly the state it would have seen.
-    if ((flags & FLAG_HOST_DECIDES) != 0) return;
+    if ((flags & FLAG_HOST_DECIDES) != 0) return false;
 
     uint base_in = slot * uint(MAX_CHANNELS);
     uint base_out = slot * uint(MAX_CHANNELS);
@@ -120,9 +185,9 @@ void main() {
     int sel_lane = -1;
     if ((flags & FLAG_SELECT) != 0) {
         uint ctl = base_in + uint(sel.x);
-        if (in_held[ctl] <= 0.0) return;
+        if (in_held[ctl] <= 0.0) return false;
         sel_lane = (in_value[ctl] > 0.0) ? sel.y : sel.z;
-        if (in_held[base_in + uint(sel_lane)] <= 0.0) return;
+        if (in_held[base_in + uint(sel_lane)] <= 0.0) return false;
     } else {
         int fed = 0;
         for (int c = 0; c < MAX_CHANNELS; ++c) {
@@ -131,7 +196,7 @@ void main() {
         }
         bool strict = (flags & FLAG_FIRE_ANY) == 0;
         bool ready = (n_in == 0) || (strict ? (fed == n_in) : (fed > 0));
-        if (!ready) return;
+        if (!ready) return false;
     }
 
     // --- back pressure -------------------------------------------------
@@ -150,9 +215,9 @@ void main() {
         if (!gate_drains(flags, c)) continue;
         bool free = out_held[base_out + uint(c)] <= 0.0;
         if (free) any_free = true;
-        else if (!generator) return;   // blocked: a drained zone is occupied
+        else if (!generator) return false;   // blocked: a drained zone is occupied
     }
-    if (generator && !any_free) return;
+    if (generator && !any_free) return false;
 
     // --- fire -----------------------------------------------------------
     // Gather the inputs first: `consumed` clears them below, and an opcode
@@ -218,4 +283,103 @@ void main() {
             }
         }
     }
+    return true;
+}
+
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    uint slot;
+    if (sleep_on != 0) {
+        // The bound comes from the args buffer, not a uniform: the count is
+        // produced by an atomic on the device, and reading it on the host to
+        // set a uniform is the per-tick stall residency exists to avoid.
+        if (i >= args[1].w) return;
+        int s = awake_gate[i];
+        if (s < 0 || s >= gate_count) return;
+        slot = uint(s);
+    } else {
+        // The last work group is partly out of range whenever gate_count is
+        // not a multiple of 64. One comparison, and without it a thread
+        // writes past the end of every buffer bound here.
+        if (i >= uint(gate_count)) return;
+        slot = i;
+    }
+
+    bool fired = try_fire(slot);
+    if (sleep_on == 0) return;
+
+    // --- do I need to run again? -----------------------------------------
+    //
+    // **A gate that fired stays awake and wakes its neighbours.** It changed
+    // its own channels, so the same inputs may let it fire again next tick,
+    // and it filled a zone or cleared a lane that somebody else is waiting
+    // on. Both halves are needed: re-arming alone would leave a downstream
+    // consumer asleep on material that has arrived.
+    //
+    // **A gate that did not fire sleeps**, and the safety of that rests
+    // entirely on the mailbox rather than on any predicate here. It could not
+    // act from the state it just read, and that state can only change if
+    // somebody writes one of its channels -- which is `deliver_direct()`, a
+    // belt pop, or a belt accept, *all three of which post a wake*. So "did
+    // nothing" is a sound sleep condition without asking why it did nothing,
+    // which is what makes this far simpler than the CPU's two tiers: those
+    // had to prove a *feeder* was quiet because they had no push edges to
+    // rely on.
+    //
+    // That is also why this needs no equivalent of the CPU's
+    // `no_feeder_segment` refusal -- the dominant one there, at 64 of 79. A
+    // lane that nothing can ever feed is simply a lane nothing will ever post
+    // a wake for, which is correct rather than a case to detect.
+    if (fired) {
+        wake[wake_gate_base + int(slot)] = wake_epoch;
+        wake_neighbours(int(slot));
+    } else {
+        // **A gate still holding an undelivered result must stay awake, and
+        // must keep waking its neighbours.** This was the second missed wake,
+        // and it is subtler than the first because the gate genuinely did
+        // nothing this tick -- so "did nothing, therefore sleep" looks right.
+        //
+        // It is not, because a loaded output zone is *work owed to somebody
+        // else*. The belt phase drains a zone only when the receiving run is
+        // awake, and the run is woken only by its producer -- this gate. So a
+        // gate that fired on tick t, had its zone refused, and then slept on
+        // t+1 having "done nothing" leaves the zone loaded for ever with
+        // nobody left to announce it.
+        //
+        // Found on every real board at tick 2 (ram.npz segment 16, cpu.npz
+        // 43/52/245/530): an empty at-rest run whose producer had a full zone
+        // it could no longer advertise. The run and the gate each correctly
+        // concluded there was nothing to do, which is the mutual-sleep shape
+        // CLAUDE.md names for the CPU scheduler, reached by a different door.
+        //
+        // Reading `out_held` rather than tracking whether the zone was filled
+        // *this* tick, for the same reason the direct-lane clause reads
+        // `out_held`: it is a reading of present data rather than a claim
+        // about what another pass did.
+        ivec4 g = geom[slot * GEOM_STRIDE];
+        int n_out = g.z;
+        int flags = g.w;
+        uint base_out = slot * uint(MAX_CHANNELS);
+        bool owes = false;
+        for (int c = 0; c < MAX_CHANNELS; ++c) {
+            if (c >= n_out) break;
+            if (gate_drains(flags, c)
+                    && out_held[base_out + uint(c)] > 0.0) {
+                owes = true;
+            }
+        }
+        if (owes) {
+            wake[wake_gate_base + int(slot)] = wake_epoch;
+            wake_neighbours(int(slot));
+        }
+    }
+    // **The overlay flag is published by the compaction, not here** -- see
+    // the matching note in belt_tick.comp. "I did not fire" is not "the tick
+    // will skip me": a gate that did nothing can be woken by a neighbour's
+    // delivery in the same breath, and is then dispatched. Publishing from
+    // here reported 270 of 494 gates asleep on cpu.npz while the dispatch
+    // covered 355 -- a flag contradicting the mechanism it displays.
+    //
+    // `sleep_compact.comp` writes it from the compacted set, which *is* the
+    // next tick's dispatch list by construction.
 }

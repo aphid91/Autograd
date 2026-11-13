@@ -20,6 +20,7 @@ from core.segments import SegmentIndex
 from core.gates import GateSim
 from core.tick import Clock, PHASE_BELT, PHASE_STRUCTURE
 from core import persistence
+from render import compute
 
 # Re-exported so existing callers and tests keep working after the path
 # functions moved into engine_paths.
@@ -97,6 +98,12 @@ class Engine:
         #: Distinct from `_gpu_dirty`, which is already clear by then --
         #: see `sync_to_device()`.
         self._gpu_settled_this_frame = False
+        #: True when the host has *written* simulation state since the device
+        #: last ran, as against merely read it. A write is a producer event
+        #: the device's mailbox never saw, so the GPU sleep layer has to be
+        #: woken before the next dispatch -- see `_gpu_tick()`. Kept apart
+        #: from `_gpu_dirty` because an ordinary readback must stay free.
+        self._gpu_host_wrote = False
         #: Player-facing switch for the compute path, so the CPU and GPU
         #: timelines can be compared in the running app. On when a device
         #: exists; the panel exposes it.
@@ -1054,6 +1061,11 @@ class Engine:
         # running board, and for ever on a paused one, which is exactly when a
         # player changes a Source's value and watches what happens.
         self.gates.reassert_folded()
+        # Every gate channel on the board just changed from the host, which
+        # the device's mailbox never saw -- so the GPU sleep layer has to be
+        # told. Without it a flush can leave a gate holding a freshly-asserted
+        # folded constant while asleep, and nothing would ever re-admit it.
+        self.note_host_write()
 
     def _structure_phase(self):
         """Fire every gate that can. Registered on PHASE_STRUCTURE.
@@ -1280,15 +1292,109 @@ class Engine:
             # The host is authoritative, so push it up before the GPU takes
             # over. After this the direction of authority is reversed until
             # `settle()`.
+            # **The sleep sets are deliberately NOT touched here.**
+            #
+            # This is the handover from host authority to device authority,
+            # and the tempting thing is to `wake_all()` on the grounds that
+            # the host may have changed something. It is wrong twice over:
+            #
+            # - It is not needed. The only host changes that can invalidate a
+            #   sleep decision are *edits*, and every edit goes through
+            #   `invalidate_segments()` -> `sync_segments()` -> `sync_device()`,
+            #   which re-packs the sleep sets and wakes everything itself. A
+            #   `settle()` for a readback changes nothing about the board.
+            # - It is actively destructive. `settle()` clears `_gpu_dirty`, so
+            #   anything that reads host state -- an open panel, a profiler,
+            #   the Status window -- sends the next tick through this branch.
+            #   Waking here meant the sleep set was wiped on most frames, so
+            #   on a board with a window open **nothing ever slept**, and a
+            #   differential check could not fail: two genuinely unsafe
+            #   mutations passed on all four real boards because the sleeping
+            #   timeline was restarted from "all awake" every tick.
+            #
+            # The awake sets and the mailbox live in VRAM and persist across a
+            # readback, which is exactly the residency this layer sits inside.
+            #
+            # **But a host *write* is a different matter, and needs a wake.**
+            # This branch is reached both after a plain readback (nothing
+            # changed, so the sets are still right) and after something on the
+            # host has altered gate channels -- the Status window setting a
+            # Source's emit value, a test feeding a starved gate, a tool
+            # poking a row. Such a write is a producer event that posted no
+            # mailbox entry, because the mailbox only exists on the device, so
+            # the entity it fed stays asleep for ever: measured as a Shear
+            # with both inputs held that never fired again.
+            #
+            # `_gpu_host_wrote` is set by the paths that mutate simulation
+            # state rather than merely read it, so an ordinary settle-for-a-
+            # readback still costs nothing.
             gates.state.sync_from_rows()
             gates.device.upload()
             gates.belt_compute.upload()
+            sleep = gates.device.sleep
+            if sleep is not None and self._gpu_host_wrote:
+                sleep.wake_all()
+            self._gpu_host_wrote = False
             self._gpu_dirty = True
         if start is None:
             start = self.clock.tick
+        sleep = gates.device.sleep
         for i in range(ticks):
+            # **The phases run first, then the compaction builds the set for
+            # the next tick.** Order is the whole correctness argument, and
+            # the other way round does not work: a tick's wakes are posted
+            # *by* its phases, so compacting before them consumes a mailbox
+            # nothing has written yet. That is not a subtle degradation --
+            # the first compaction found an empty mailbox and slept the entire
+            # board on tick 0, and nothing ever woke it again because waking
+            # requires an awake neighbour.
+            #
+            # So the invariant is: entering a tick, the awake sets are already
+            # correct for it (from `wake_all()` on the first tick, or from the
+            # previous tick's compaction), and the mailbox is being filled for
+            # the next one. Both phases post with the same epoch because they
+            # contribute to one compaction, not to two.
+            # The epoch the phases stamp their wakes with, and the one the
+            # compaction below accepts -- the *same* number, since a wake
+            # posted this tick is for the set being built right after it.
+            # `compact()` does not advance it; `wake_all()` and this line are
+            # the only places it moves.
+            if sleep is not None:
+                sleep.epoch += 1
             gates.device.run(1)
             gates.belt_compute.run(start + i, 1)
+            if sleep is not None:
+                # The publish pass reads the entity table, the segment records
+                # and the gate row map, none of which `SleepSets` owns -- so
+                # the binds are handed in rather than reached for.
+                sleep.compact(sleep.epoch, extra_binds=(
+                    lambda: gates.belt_compute.device.bind(
+                        compute.BELT_SEG_I_BINDING,
+                        compute.BELT_SEG_F_BINDING,
+                        compute.BELT_ITEM_BINDING),
+                    lambda: gates.device.bind_rows(),
+                    self.board.bind_entities,
+                ))
+
+    def note_host_write(self):
+        """Declare that the host has changed simulation state.
+
+        Call after writing a gate channel, a Source's emit value, a seed --
+        anything the *device* would have posted a mailbox wake for had it
+        done the write itself. The GPU sleep layer wakes everything on the
+        next dispatch, which is the coarse but correct answer: a host write is
+        rare, human-paced, and can touch anything.
+
+        Not folded into `settle()`, because settling is overwhelmingly a
+        *read* -- an open panel settles every frame -- and waking on a read
+        would mean nothing ever slept while a window was open. That is the
+        same mistake, in a different place, as the `wake_all()` this branch
+        used to do unconditionally.
+
+        An edit needs no call: `invalidate_segments()` leads to
+        `sync_device()`, which re-packs the sleep sets and wakes them itself.
+        """
+        self._gpu_host_wrote = True
 
     def settle(self):
         """Bring the host's copy level with the device. Idempotent.

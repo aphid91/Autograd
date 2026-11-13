@@ -1,0 +1,57 @@
+#version 430
+
+// Move the awake counts to the "previous" slots and zero the ones the
+// compaction is about to build. One thread, once per tick.
+//
+// Why this is its own dispatch
+// ----------------------------
+// `sleep_compact.comp` both reads the previous count (to size its own
+// frontier walk) and bumps the next one with an atomic. Zeroing inside that
+// kernel would need every thread to observe the zero before any claim lands,
+// and work groups have no ordering between them -- `barrier()` synchronises a
+// single group, not a dispatch. So the reset is a separate dispatch with a
+// memory barrier after it, which is the only construct that actually provides
+// what is needed.
+//
+// It is one invocation doing six stores. That is a latency cost of a few
+// microseconds' fraction and it buys the one thing that cannot be had
+// otherwise: a guaranteed happens-before between the reset and the claims.
+//
+// Why the counts live in the args buffer at all
+// ---------------------------------------------
+// They are produced by an atomic on the device, and the next dispatch's size
+// has to come from them without a host round trip (that readback is what the
+// whole sleep layer exists inside residency to avoid). An indirect dispatch
+// reads `(group_x, group_y, group_z)` straight out of a buffer, so the count
+// and the group count derived from it are written here together.
+
+layout(local_size_x = 1) in;
+
+layout(std430, binding = 22) buffer Args { uvec4 args[]; };
+
+const int ARG_SEG = 0;
+const int ARG_GATE = 1;
+const int ARG_PREV_SEG = 2;
+const int ARG_PREV_GATE = 3;
+
+//: Must equal `compute.LOCAL_SIZE`, and is pinned against it by
+//: tests/test_glsl.py. A mismatch would under-dispatch the tick kernels and
+//: silently skip the tail of the awake set -- entities stopping for no
+//: visible reason, which is the worst failure mode this layer has.
+const uint LOCAL = 64u;
+
+void main() {
+    // This tick's result becomes next tick's frontier. Carried in the buffer
+    // rather than swapped on the host for the same reason as everything else
+    // here: the host must not need to know the count.
+    uint seg = args[ARG_SEG].w;
+    uint gate = args[ARG_GATE].w;
+    args[ARG_PREV_SEG] = uvec4((seg + LOCAL - 1u) / LOCAL, 1u, 1u, seg);
+    args[ARG_PREV_GATE] = uvec4((gate + LOCAL - 1u) / LOCAL, 1u, 1u, gate);
+
+    // The sets the compaction is about to fill start empty. The group counts
+    // are written by `sleep_groups.comp` once the atomics have settled, since
+    // the final count is not known until every claim has landed.
+    args[ARG_SEG] = uvec4(0u, 1u, 1u, 0u);
+    args[ARG_GATE] = uvec4(0u, 1u, 1u, 0u);
+}

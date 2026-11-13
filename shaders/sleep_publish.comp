@@ -1,0 +1,68 @@
+#version 430
+
+// Publish the awake sets as per-entity flags, for the SLEEP_DEBUG overlay.
+// One thread per entity -- the one O(total) pass in this layer, and the only
+// one that is pure diagnostics.
+//
+// Why this is a separate dispatch, and off by default
+// ---------------------------------------------------
+// Everything else here is deliberately O(awake): that is the module's one
+// rule (see core/sleep_device.py). This pass breaks it, because the question
+// it answers is about *every* entity -- "are you being skipped?" has to be
+// written somewhere the fragment shader can read per cell, and the renderer
+// reads the segment record and the entity row, both of which are indexed by
+// entity rather than compacted.
+//
+// So it is its own dispatch and the host runs it only when the overlay is
+// actually on. A diagnostic may not become the cost of the thing it measures
+// -- the same reasoning that has the CPU's `_publish_sleep()` run once per
+// structure phase rather than from the three hot sleep-set mutators.
+//
+// Why it is published from the compacted set rather than by each tick kernel
+// --------------------------------------------------------------------------
+// Each kernel knows only its own conclusion, and that is the wrong question.
+// "I am at rest" is not "the tick will skip me": an entity that correctly
+// concludes it is inert can be woken by a neighbour in the same tick, and is
+// then dispatched. Publishing per kernel measured 478 of 538 runs asleep on
+// cpu.npz while the dispatch covered 185, and 270 of 494 gates asleep while
+// it covered 355 -- in both directions, a flag contradicting the mechanism it
+// exists to display.
+//
+// The compacted set has no such gap: it *is* the next tick's dispatch list,
+// so marking everything asleep and then clearing the set's members is exactly
+// true by construction.
+//
+// Two passes, because the set is a list of members rather than a mask: this
+// one writes `asleep = 1` everywhere, and `sleep_publish_awake.comp` clears
+// the members. A single pass would need to search the set per entity.
+
+#include "common.glsl"
+
+layout(local_size_x = 64) in;
+
+layout(std430, binding = 25) buffer GateRows { int gate_rows[]; };
+
+uniform int seg_total;
+uniform int gate_total;
+
+void main() {
+    int i = int(gl_GlobalInvocationID.x);
+
+    // Segments: the record's second ivec4 carries the flag.
+    if (i < seg_total) {
+        // `cap == 0` is "no segment at this id" (a gap in the id space), and
+        // such a record must stay fully zeroed -- a flag set on a gap would
+        // paint a nonexistent run blue, which is the state core/belt_device.py
+        // asserts against.
+        if (seg_core(i).w != 0) {
+            seg_i[i * 2 + 1] = ivec4(1, 0, 0, 0);
+        }
+    }
+
+    // Gates: the flag lives in the entity row, where the renderer reads it
+    // via `gate_asleep()`.
+    if (i < gate_total) {
+        int row = gate_rows[i];
+        if (row >= 0) ent[row * ENTITY_STRIDE + F_ASLEEP] = 1.0;
+    }
+}

@@ -1,0 +1,47 @@
+#version 430
+
+// Clear the sleep flag on everything in the awake sets. The second half of
+// the overlay publish; see sleep_publish.comp for why there are two.
+//
+// This one is O(awake) and dispatched indirectly off the same args the tick
+// kernels use, so it covers exactly the entities the next tick will visit --
+// no more, no less. Running it after `sleep_publish.comp` (which sets the
+// flag everywhere) leaves the flag meaning precisely "the next tick will not
+// visit me", which is the claim the overlay makes to the player.
+//
+// Dispatched twice, once per family, because the two awake sets have
+// different lengths and different indirect args. The `family` uniform picks.
+
+#include "common.glsl"
+
+layout(local_size_x = 64) in;
+
+layout(std430, binding = 18) buffer AwakeSeg  { int awake_seg[]; };
+layout(std430, binding = 19) buffer AwakeGate { int awake_gate[]; };
+layout(std430, binding = 22) buffer Args      { uvec4 args[]; };
+layout(std430, binding = 25) buffer GateRows  { int gate_rows[]; };
+
+uniform int seg_total;
+uniform int gate_total;
+//: 0 = clear the awake segments, 1 = clear the awake gates.
+uniform int family;
+
+const int ARG_SEG = 0;
+const int ARG_GATE = 1;
+
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    if (family == 0) {
+        if (i >= args[ARG_SEG].w) return;
+        int sid = awake_seg[i];
+        if (sid < 0 || sid >= seg_total) return;
+        if (seg_core(sid).w == 0) return;
+        seg_i[sid * 2 + 1] = ivec4(0, 0, 0, 0);
+    } else {
+        if (i >= args[ARG_GATE].w) return;
+        int slot = awake_gate[i];
+        if (slot < 0 || slot >= gate_total) return;
+        int row = gate_rows[slot];
+        if (row >= 0) ent[row * ENTITY_STRIDE + F_ASLEEP] = 0.0;
+    }
+}

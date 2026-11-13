@@ -18,7 +18,7 @@ class UIRequests:
                  "cycle_backward", "flip_tool", "quicksave", "quickload",
                  "toggle_pause", "step_tick", "tick_rate",
                  "segment_debug", "sleep_debug",
-                 "sleep_show_belts", "sleep_show_gates",
+                 "sleep_show_belts", "sleep_show_gates", "gpu_sleep",
                  "rebuild_segments", "audit_segments", "profile_ticks",
                  "debug_feed", "clear_items", "close_status",
                  "set_emit", "set_seed", "set_slot", "swap_rows",
@@ -48,6 +48,15 @@ class UIRequests:
         #: one is isolated to compare against the other.
         self.sleep_show_belts = None
         self.sleep_show_gates = None
+        #: New state for the **GPU sleep layer**, or None for no change.
+        #: Unticking is a *full bypass*, not a wake-everything: the kernels
+        #: take their non-sleep branch, dispatch over every entity and post no
+        #: wakes, so the off state costs exactly what the tick cost before the
+        #: layer existed. That is what makes the comparison the player wants
+        #: -- "sleep system plus its overhead" against "no sleep system and no
+        #: overhead" -- an honest one rather than a measurement of the
+        #: bookkeeping alone.
+        self.gpu_sleep = None
         self.rebuild_segments = False
         self.audit_segments = False
         #: Ticks to profile and dump to the console, 0 to stop a running
@@ -355,6 +364,51 @@ class UI:
             # their amber needs one family silenced at a time.
             imgui.text_disabled("unticked = force blue, to isolate the other")
             imgui.unindent()
+        # --- the GPU sleep layer ---
+        #
+        # Its own checkbox and its own readout, deliberately not folded into
+        # the CPU numbers below. The two are different mechanisms: the CPU's
+        # is a per-tick predicate with a prefilter and is switched off as a
+        # measured loss, while this shrinks the *dispatch* via a compacted
+        # index buffer (see core/sleep_device.py). Reporting them together
+        # would make it impossible to tell which one a ratio described.
+        sets = engine.gates.sleep_sets
+        if sets is not None:
+            imgui.separator()
+            changed, on = imgui.checkbox(
+                "GPU sleep (dispatch only awake entities)",
+                engine.gates.gpu_sleep_enabled())
+            if changed:
+                req.gpu_sleep = on
+            # Unticking is a **full bypass**, which is the whole point of the
+            # control: it is not "wake everything" (which would still pay for
+            # the compaction and the indirection), so the two states really
+            # are "the sleep system and its overhead" against "no sleep system
+            # and no overhead".
+            imgui.text_disabled("off = full bypass, not wake-all: "
+                                "no compaction, no wake posts")
+            if engine.gates.gpu_sleep_enabled():
+                # One 4-byte read per *frame*, never per tick -- the counts
+                # are produced by an atomic on the device and asking stalls,
+                # so this is the deliberate cheap version of the question.
+                n_seg, n_gate = sets.counts()
+                imgui.indent()
+                if sets.seg_count:
+                    imgui.text(
+                        f"runs dispatched: {n_seg}/{sets.seg_count} "
+                        f"({100.0 * n_seg / sets.seg_count:.1f}% awake)")
+                if sets.gate_count:
+                    imgui.text(
+                        f"gates dispatched: {n_gate}/{sets.gate_count} "
+                        f"({100.0 * n_gate / sets.gate_count:.1f}% awake)")
+                imgui.unindent()
+                if not sleep_on:
+                    # The overlay is the only way to see *which* parts are
+                    # asleep, and the publish pass only runs while it is on --
+                    # so say so rather than leaving the flags looking stale.
+                    imgui.text_disabled(
+                        "  tick 'Sleep overlay' to colour them on the board")
+
         # The count beside the colour, because the overlay answers "where"
         # and this answers "how much" -- and on a board built as a computer
         # the ratio is the number that matters. Taken from the sim rather

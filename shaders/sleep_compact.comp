@@ -1,0 +1,159 @@
+#version 430
+
+// Rebuild both awake sets for the coming tick. One thread per *frontier*
+// entry, never one per entity.
+//
+// The frontier argument
+// ---------------------
+// The only entities that can be awake at tick t+1 are those awake at t, or a
+// one-hop neighbour of one. Material moves exactly one hop per tick -- that is
+// what the two-phase tick guarantees, for a belt hop and a direct gate-to-gate
+// hop alike -- so the wake frontier cannot advance faster than one edge per
+// tick. See the long version in core/sleep_device.py.
+//
+// So this is dispatched over the previous awake *gate* set and walks each
+// gate's adjacency (core/sleep_graph.py), claiming whatever is armed. The
+// previously-awake segments are covered by a second dispatch of the same
+// kernel with `pass_segments` set, since a run's neighbours are in its own
+// port table rather than in the gate adjacency.
+//
+// The mailbox is the only input
+// -----------------------------
+// This kernel evaluates no predicate of its own. Each tick kernel decides
+// whether *it* must run again and posts `epoch` into its own mailbox slot;
+// each kernel that moves material posts into its neighbour's. So the question
+// here is purely "does this mailbox slot carry the epoch I am building", which
+// is one load and one compare.
+//
+// That split is deliberate and is what keeps the predicate honest: the entity
+// that knows whether it is at rest is the entity itself, which has just read
+// every term of its own state. A predicate re-derived here would be a second
+// copy of a rule -- the class of bug that has bitten this project twice in
+// GLSL.
+//
+// Epoch, not a bool, so there is no clearing pass
+// -----------------------------------------------
+// A clear would be O(total) per tick, which is the one thing this layer may
+// not cost. A stale entry is a number that no longer matches the epoch being
+// built, so it is ignored at no cost and needs no erasing.
+//
+// Reading one set while writing another
+// -------------------------------------
+// The frontier is read out of the *previous* awake set and the survivors are
+// written into the *next* one, which are two different buffers swapped by the
+// host each tick. Compacting in place was the first shape and it aliases:
+// thread 0 would overwrite entry 0 while thread 500 had yet to read it, so
+// the frontier would be partly the set being built. Double-buffering costs
+// one id array (a few KB) and makes the hazard unrepresentable rather than
+// merely avoided by an ordering argument that work groups cannot provide.
+//
+// Atomics
+// -------
+// The next set is built with an atomic bump on the count in the args buffer.
+// Order within it is therefore nondeterministic, which is fine: it is a set,
+// every member gets exactly one thread, and no tick kernel cares what order
+// the ids arrive in. **Duplicates would not be fine** -- two threads running
+// one segment's transport would move an item twice -- so a candidate is
+// claimed with an atomicExchange on its mailbox slot, which admits exactly
+// one of however many threads reach it.
+
+#include "common.glsl"
+
+layout(local_size_x = 64) in;
+
+// One mailbox for both families: segments at [0, seg_total), gates at
+// [wake_gate_base, ...). Merged because this hardware allows only 16 storage
+// blocks per compute shader and gate_fire.comp was at 17 -- see
+// SLEEP_WAKE_BINDING in render/compute.py.
+layout(std430, binding = 16) buffer Wake       { int wake[]; };
+// The frontier: the awake sets as the last tick left them. Read only.
+layout(std430, binding = 18) buffer PrevSeg    { int prev_seg[]; };
+layout(std430, binding = 19) buffer PrevGate   { int prev_gate[]; };
+// The sets being built for the coming tick. Written only.
+layout(std430, binding = 23) buffer NextSeg    { int next_seg[]; };
+layout(std430, binding = 24) buffer NextGate   { int next_gate[]; };
+// Per-gate adjacency, CSR. Entries are segment ids when >= 0 and ~slot when
+// negative -- see core/sleep_graph.py on why `~` and not `-`.
+layout(std430, binding = 20) buffer GateNbr    { int gate_nbr[]; };
+layout(std430, binding = 21) buffer GateNbrAt  { int gate_nbr_at[]; };
+// Each segment's resolved ports, shared with belt_tick.comp:
+//   .x src gate slot  .y src channel  .z dst gate slot  .w dst channel
+layout(std430, binding = 14) buffer Ports      { ivec4 seg_ports[]; };
+// `.x` group count (what run_indirect reads), `.w` the entity count.
+// Index 0 is the segment consumer, 1 the gate consumer; 2 and 3 carry the
+// previous tick's counts, which is what this dispatch is sized from.
+layout(std430, binding = 22) buffer Args       { uvec4 args[]; };
+
+uniform int epoch;
+uniform int seg_total;
+uniform int gate_total;
+//: 0 = walk the previous awake gates, 1 = walk the previous awake segments.
+//: Two dispatches of one kernel rather than two kernels, because the claim
+//: logic is the whole body and only the frontier source differs.
+uniform int pass_segments;
+//: Start of the gate region in `wake`. A uniform so no shader hardcodes
+//: the split.
+uniform int wake_gate_base;
+
+const int ARG_SEG = 0;
+const int ARG_GATE = 1;
+const int ARG_PREV_SEG = 2;
+const int ARG_PREV_GATE = 3;
+
+// Claim a segment for the coming tick, exactly once.
+//
+// `atomicExchange` rather than a read-then-write: many threads can reach one
+// segment (a run between two gates is a neighbour of both, and is also its
+// own frontier entry), and a plain test would admit it twice. The exchange
+// hands back the previous value, so precisely one thread sees "it was armed
+// and I am the one who cleared it".
+//
+// Clearing to 0 as it is claimed is what makes that work, and it is also why
+// a mailbox slot never needs a separate reset: being admitted *is* the reset.
+void claim_segment(int sid) {
+    if (sid < 0 || sid >= seg_total) return;
+    if (atomicExchange(wake[sid], 0) != epoch) return;
+    uint at = atomicAdd(args[ARG_SEG].w, 1u);
+    if (at < uint(seg_total)) next_seg[at] = sid;
+}
+
+void claim_gate(int slot) {
+    if (slot < 0 || slot >= gate_total) return;
+    if (atomicExchange(wake[wake_gate_base + slot], 0) != epoch) return;
+    uint at = atomicAdd(args[ARG_GATE].w, 1u);
+    if (at < uint(gate_total)) next_gate[at] = slot;
+}
+
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+
+    if (pass_segments != 0) {
+        // The segment frontier: each previously-awake run, plus the gates at
+        // its two ends. A run that re-armed itself is claimed here; a gate it
+        // just fed is claimed because the run is its neighbour.
+        if (i >= args[ARG_PREV_SEG].w) return;
+        int sid = prev_seg[i];
+        if (sid < 0 || sid >= seg_total) return;
+        claim_segment(sid);
+        ivec4 p = seg_ports[sid];
+        claim_gate(p.x);
+        claim_gate(p.z);
+        return;
+    }
+
+    // The gate frontier: each previously-awake gate, plus everything one hop
+    // away. The adjacency is undirected, so this covers both "my producer
+    // filled a zone" and "my consumer freed a lane".
+    if (i >= args[ARG_PREV_GATE].w) return;
+    int slot = prev_gate[i];
+    if (slot < 0 || slot >= gate_total) return;
+    claim_gate(slot);
+
+    int lo = gate_nbr_at[slot];
+    int hi = gate_nbr_at[slot + 1];
+    for (int k = lo; k < hi; ++k) {
+        int entry = gate_nbr[k];
+        if (entry < 0) claim_gate(~entry);
+        else claim_segment(entry);
+    }
+}

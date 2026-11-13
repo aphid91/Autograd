@@ -141,6 +141,12 @@ class BeltDevice:
 
         #: True when the arena layout must be rebuilt (segmentation changed).
         self._layout_stale = True
+        #: Who writes `SEG_I_ASLEEP`. False (the default) means this class
+        #: mirrors `BeltSim`'s set, which is right for the CPU tick. The GPU
+        #: sleep layer sets it True: `belt_tick.comp` publishes the flag
+        #: itself, and the CPU set is empty on that path, so mirroring would
+        #: overwrite every kernel decision with a zero.
+        self.gpu_owns_sleep_flag = False
         self.stats = {"layouts": 0, "uploads": 0, "arena_slots": 0}
 
     # --- device resources -------------------------------------------------
@@ -235,10 +241,20 @@ class BeltDevice:
         # Through `is_asleep()` rather than reading `_asleep`, so the device
         # layer depends on a stated interface rather than on another object's
         # private attribute.
+        #
+        # **Unless the GPU owns the flag**, in which case this must not touch
+        # it. `belt_tick.comp` publishes its own sleep decision into the same
+        # slot, and the CPU's `_asleep` is empty on the GPU path -- so writing
+        # it here stamped `0` over every run the kernel had just slept, and the
+        # overlay painted a board that was 97% asleep entirely amber. The flag
+        # is a diagnostic, but a diagnostic that lies about the mechanism it
+        # exists to show is worse than none.
         asleep = sim.is_asleep
+        gpu_owns = self.gpu_owns_sleep_flag
         for sid, seg in self.index.segments.items():
             self.seg_i[sid, :4] = (seg.head, seg.tail, seg.base, seg.cap)
-            self.seg_i[sid, SEG_I_ASLEEP] = 1 if asleep(sid) else 0
+            if not gpu_owns:
+                self.seg_i[sid, SEG_I_ASLEEP] = 1 if asleep(sid) else 0
             self.seg_f[sid] = (seg.anchor, sim.length_of(seg),
                                sim.speed, sim.spacing)
             # The ring's live window only. Slots outside [head, tail) are

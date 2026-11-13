@@ -101,6 +101,8 @@ class BeltCompute:
 
         self.ports = np.full((1, 4), -1, dtype=np.int32)
         self.count = 0
+        #: The sleep layer, or None when it is bypassed. Set by `Engine`.
+        self.sleep = None
         self._ports_buf = compute.ComputeBuffer(
             ctx, self.ports, compute.BELT_PORT_BINDING)
 
@@ -192,11 +194,26 @@ class BeltCompute:
         if gate_device is not None:
             for buf in gate_device._bufs.values():
                 buf.bind()
+        sleep = self.sleep
+        if sleep is not None:
+            sleep.bind()
         self.kernel["segment_count"] = int(self.count)
+        self.kernel["sleep_on"] = 1 if sleep is not None else 0
+        if sleep is not None:
+            self.kernel["wake_gate_base"] = int(sleep.gate_base)
         groups = compute.groups_for(self.count)
         for i in range(int(ticks)):
             self.kernel["sim_tick"] = int(tick) + i
-            self.kernel.run(groups)
+            if sleep is None:
+                self.kernel.run(groups)
+            else:
+                # Indirect, from the count `sleep_groups.comp` wrote. The
+                # epoch is the one `GateDevice.run()` already bumped for this
+                # tick: both phases arm for the *same* coming tick, or a run
+                # woken by the structure phase would be compacted a tick late.
+                self.kernel["wake_epoch"] = int(sleep.epoch)
+                self.kernel.run_indirect(
+                    sleep.args_buffer(), sleep.seg_arg_offset())
             compute.barrier(self.ctx)
 
     def release(self):

@@ -89,6 +89,39 @@ BELT_PORT_BINDING = 14
 #: Folded constants, re-asserted each tick. See shaders/gate_fold.comp.
 GATE_FOLD_BINDING = 15
 
+#: The sleep layer (see core/sleep_device.py). The mailbox is indexed by
+#: entity and the awake sets are compacted lists of ids; both are read by the
+#: tick kernels and written by the compaction pass, so they are bound for the
+#: whole tick rather than per dispatch.
+#:
+#: **One mailbox buffer for both families**, segments first and gates after
+#: `wake_gate_base`. Not tidiness: `GL_MAX_COMPUTE_SHADER_STORAGE_BLOCKS` is
+#: **16** on this hardware, and `gate_fire.comp` needs 4 of those for the
+#: blocks `common.glsl` declares -- two separate mailboxes put it at 17 and it
+#: failed to link with a bare "no buffers available for bindable storage
+#: buffer". Merging two int32 arrays indexed by entity costs nothing and is
+#: what the layer already calls "the mailbox" in the singular.
+SLEEP_WAKE_BINDING = 16
+SLEEP_AWAKE_SEG_BINDING = 18
+SLEEP_AWAKE_GATE_BINDING = 19
+#: Per-gate adjacency (CSR) the compaction walks to find the frontier.
+SLEEP_GATE_NBR_BINDING = 20
+SLEEP_GATE_NBR_AT_BINDING = 21
+#: Indirect dispatch args *and* the awake counts. Bound as an SSBO so the
+#: compaction can write it, and used as the dispatch-indirect source so the
+#: next dispatch's size never round-trips through the host.
+SLEEP_ARGS_BINDING = 22
+#: The awake sets are **double-buffered**: the compaction reads the frontier
+#: from 18/19 and writes survivors to 23/24, then the host swaps which pair is
+#: which. Compacting in place aliases -- one thread overwrites an entry
+#: another has yet to read, and no barrier a dispatch can take orders that.
+SLEEP_NEXT_SEG_BINDING = 23
+SLEEP_NEXT_GATE_BINDING = 24
+#: Entity row per gate slot. The firing kernel publishes the sleep flag into
+#: the entity row the *renderer* reads (`Entity.F_ASLEEP`), and it works in
+#: slot space everywhere else, so this is the one translation it needs.
+GATE_ROWS_BINDING = 25
+
 #: Threads per work group. 64 is one wavefront on AMD and two warps on
 #: NVIDIA, which keeps a partly-filled group cheap -- the gate count is a few
 #: hundred, so the tail matters more than peak occupancy does.
@@ -180,6 +213,24 @@ class ComputeKernel:
 
     def run(self, groups):
         self.program.run(group_x=int(groups))
+
+    def run_indirect(self, buffer, offset=0):
+        """Dispatch with the group count read from a buffer, not the host.
+
+        The whole point of the sleep layer: the awake count is produced by an
+        atomic in a compute pass, so sizing the next dispatch from it on the
+        host would stall every tick -- which is the residency this module
+        exists to protect. `glDispatchComputeIndirect` reads
+        `(group_x, group_y, group_z)` as three uints at `offset`, so the
+        count never leaves the device.
+
+        The kernel must still bounds-check, exactly as under `run()`: the
+        group count covers the awake set and the last group is partly out of
+        range. See core/sleep_device.py on where the count it checks against
+        lives (the args buffer's `.w`, not a uniform -- a uniform would be the
+        readback again).
+        """
+        self.program.run_indirect(buffer, int(offset))
 
     def __setitem__(self, key, value):
         """Set a uniform, ignoring one the compiler removed.
