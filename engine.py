@@ -766,9 +766,17 @@ class Engine:
         Hanging it here rather than at each edit site is the same reasoning
         that put the segment invalidation on `Gameboard.on_grid_change`: a new
         edit path cannot forget it.
+
+        **`invalidate_board()` rather than `invalidate_connectivity()`**,
+        because this is the *edit* path and so is also where the constant fold
+        has to die. The fold deliberately survives the gate layer's per-tick
+        cache expiry (see the comment in `GateSim.invalidate_connectivity()`),
+        which means something has to drop it when the board really changes --
+        and this method, reached by every path that changes what a run looks
+        like, is the one place that is true of.
         """
         self._segments_stale = True
-        self.gates.invalidate_connectivity()
+        self.gates.invalidate_board()
 
     def sync_segments(self):
         """Rebuild the segment index if anything invalidated it.
@@ -974,6 +982,15 @@ class Engine:
                 gate.clear_input(c)
             for c in range(gate.output_count()):
                 gate.clear_output(c)
+        # A folded constant is not material in flight -- it is a property of
+        # the board, like the Source's emit value it comes from -- so a flush
+        # must put it back. Nothing else would: a folded channel is held by
+        # the fold alone, with no belt or neighbour to re-deliver it, so
+        # clearing it here and leaving it clear would starve every gate fed by
+        # a constant until the next structure phase refilled it. One tick on a
+        # running board, and for ever on a paused one, which is exactly when a
+        # player changes a Source's value and watches what happens.
+        self.gates.reassert_folded()
 
     def _structure_phase(self):
         """Fire every gate that can. Registered on PHASE_STRUCTURE.

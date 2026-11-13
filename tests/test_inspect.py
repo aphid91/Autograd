@@ -197,6 +197,36 @@ def test_the_emit_value_is_per_instance():
     ok("two Sources held different emit values independently")
 
 
+def test_the_status_window_reports_whether_a_source_is_folded():
+    """The one place a folded Source is distinguishable from any other.
+
+    It is invisible everywhere else: identical in outline, and the sleep
+    overlay paints it the same blue as any gate holding nothing -- which it
+    genuinely is, since the folded constant lives on its *neighbour's* input
+    channel rather than in its own waiting zone. So a reported true/false is
+    the whole affordance, and this pins that the two cases really differ
+    rather than the line always saying the same thing.
+    """
+    from core.entity import Shear
+    folded = engine.place_structure(Source, 7, 10)
+    engine.place_structure(Shear, 9, 10)
+    # A second Source feeding a belt instead: the not-folded case.
+    plain = engine.place_structure(Source, 7, 20)
+    engine.place_belt_path((7, 21), (12, 21))
+    engine.sync_segments()
+
+    assert engine.gates.is_folded(folded.row), (
+        "a Source whose only output reaches a gate should report folded")
+    assert not engine.gates.is_folded(plain.row), (
+        "a Source feeding a belt should report not folded")
+    # Both at once, which is what makes the readout informative rather than
+    # a constant: a single-Source board cannot tell the two apart.
+    assert len(engine.gates.folded_sources()) == 1, (
+        f"expected exactly one folded Source, got "
+        f"{engine.gates.folded_sources()}")
+    ok("the Status window can distinguish a folded Source from a producer")
+
+
 def test_a_source_emits_its_own_value_onto_a_belt():
     """The configured value must reach the belt, not just the row.
 

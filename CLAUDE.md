@@ -69,6 +69,7 @@ and scheduling are kept honest. Run them by hand from `tools/`.
 | [tools/check_cache_coherence.py](tools/check_cache_coherence.py) | the four `GateSim` caches against freshly-computed answers, after each of 150 random edits. Catches the row/segment-id recycling hazard |
 | [tools/check_prefilter_safe.py](tools/check_prefilter_safe.py) | that the prefilter never excludes a gate the full path would fire, over ~58k gate-ticks of mixed machine types |
 | [tools/check_wakelist_safe.py](tools/check_wakelist_safe.py) | a sleeping timeline against a fully-ticked one, diffed every tick, **per sleeping layer** (`SLEEPERS`). Reports a sleep→wake transition count for each, because a layer with none proves nothing — and a combined count would let busy belts vouch for a gate layer that never woke |
+| [tools/check_folding_safe.py](tools/check_folding_safe.py) | a constant-folded timeline against an unfolded one. **Not** a state diff — folding runs one tick ahead for ever, so it compares the destroy *rate* tick by tick, that the cumulative lead *settles*, and the set of values each gate ever holds. Reports the folded count so a vacuous run is visible |
 
 #### Profiling the board in front of you
 
@@ -1915,6 +1916,98 @@ board), 1.02 → 0.15 ms.
 where every gate fires there is nothing to skip and the prefilter costs
 0.04 ms for no benefit. It pays exactly in proportion to how idle the factory
 is — which, for a computer, is almost always.
+
+#### A fully-direct Source is folded into a constant
+
+A Source whose output faces reach **gates and nothing else** emits the same
+number into the same channels for ever. Nothing but an edit can change that,
+so it is not a machine that needs ticking — it is a constant.
+`GateSim._folds()` derives the set once per edit and the Source leaves the
+gate table entirely.
+
+This is the one population scheduling cannot touch. A generator fires *every
+tick it can*, so firing is its steady state: the prefilter always admits it
+and `_gate_is_inert()` never sleeps it. On `cpu.npz` **285 of 670 gates are
+Sources**, and 133 of those fold. Measured across the real saves:
+**cpu −26%, noram −20%, Ram2 −17%, ram −14%** (9.26 → 6.87 ms/tick on cpu).
+That is a far better return than gate sleep, which measured *slower* for no
+benefit on the same board.
+
+**The fold is a permanently-held input channel**, written into the receiving
+gate's row and re-asserted after each structure phase. That is what keeps the
+mechanism small: `inputs_ready()`, `consumed()`, `fire()`, the vectorised
+prefilter and the renderer all read `F_IN_HELD`/`F_IN_VALUE` and keep working
+with no folded-input branch anywhere. Overriding `inputs_ready()` and
+`consumed()` to treat some channels as virtual was the alternative, and it
+would have put a fold test in every one of those readers — including the numpy
+prefilter, where a per-gate branch is exactly the cost being avoided.
+
+Four things make it safe, and each had an obvious wrong alternative:
+
+- **The channel is exclusively ours.** A port face has exactly one neighbour,
+  so a folded Source on the far side means no belt can `accept_from()` into
+  that channel and no gate can `deliver_direct()` into it. Nothing else writes
+  the slot, so re-asserting cannot clobber material.
+- **Only a *fully*-direct Source folds.** One belt on any output and the
+  machine is a real producer whose rate that belt regulates through back
+  pressure. Folding on the strength of its *other* face reaching a gate leaves
+  five runs on the test fixture permanently empty — mutation-tested, and it is
+  the mutation the first version of the checker missed. Dangling faces are
+  fine: a dangling output is already destroyed at fire time.
+- **A dangling-only Source does not fold.** It emits nowhere, so there is
+  nothing to hold, and leaving it unfolded keeps it reported as `unconnected`
+  exactly as before. `test_a_dangling_generator_stays_inert` catches this.
+- **Dropping the fold must *release* the channels.** A folded channel is held
+  by nothing but the derivation, so a fold that outlived its Source would feed
+  a gate for ever from a constant with no visible origin.
+
+**It deliberately survives the per-tick cache expiry**, which is the one place
+it differs from the four caches beside it. `set_tick()` calls
+`invalidate_connectivity()` once a tick as a backstop so no entry outlives its
+tick; the fold must not be in that, for two reasons found by measurement.
+Re-deriving is a whole-board walk, so a per-tick drop made it a per-tick cost
+— the exact cost folding exists to remove (measured at twice a tick). And
+`_drop_folding()` releases the channels, so a per-tick drop briefly unfeeds
+every folded gate; that was invisible only because the re-derivation
+re-asserted them in the same call chain, which is a coincidence of ordering
+rather than a guarantee. `invalidate_board()` is the edit-time form, reached
+from `Engine.invalidate_segments()` — the one method every real edit goes
+through.
+
+**The one observable difference is a tick of latency**, and it is permanent: a
+folded input is present before the first tick where the unfolded equivalent
+arrives one hop later. For a constant the value is identical either way, so no
+arithmetic changes — but it means the two timelines can never be compared
+state-for-state, which is what shaped
+[tools/check_folding_safe.py](tools/check_folding_safe.py) (see its docstring
+for the three comparisons that were tried and rejected).
+
+**Folding is behaviour-neutral, so the saving needs its own test.** Every
+correctness test passes whether or not the Source is actually skipped — an
+unfolded one just fires, fills a zone, and has `deliver_direct()` write a
+channel the fold already holds. Leaving folded rows in the gate table survived
+the whole suite *and* the differential checker, because nothing is wrong with
+the result, only with the cost. `test_a_folded_source_is_not_ticked_at_all`
+pins the gate table itself.
+
+Two notes on the tests. `test_two_gates_connect_directly_with_no_belt` had to
+change its producer to a belt-fed Shear: a Source abutting a gate now folds,
+so `stats["direct"]` stays zero and the test would have silently stopped
+exercising `deliver_direct()` at all. And
+`test_erasing_a_folded_source_releases_the_channel` was **vacuous as first
+written** — `erase()` invalidates the segments, `sync_segments()` calls
+`flush_material()`, and that zeroes every gate input channel on the board, so
+the channel comes out clear whether or not the fold released it. It now tests
+`_drop_folding()` directly, with no flush nearby.
+
+The Status window reports `folded: yes/no` on a Source, and the Segments panel
+counts them. That readout is the whole affordance, because a folded Source is
+invisible in every other view: identical in outline, and the sleep overlay
+paints it the same blue as any gate holding nothing — which it genuinely is,
+since the constant lives on its *neighbour's* channel. A green tint in the
+overlay was considered and dropped: `.z` has one spare bit, but using it means
+a restamp on every fold change plus a GLSL mirror plus a pixel test, which is
+a lot of machinery for a debug colour.
 
 #### Two mechanisms the second gate vocabulary needed
 

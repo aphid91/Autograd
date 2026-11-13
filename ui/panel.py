@@ -364,6 +364,14 @@ class UI:
         if total:
             imgui.text(f"asleep: {asleep}/{total} "
                        f"({100.0 * asleep / total:.0f}%)")
+        # Folded Sources, beside the sleep ratio because it is the same
+        # question -- how much of the board is the tick not visiting -- for
+        # the one population sleeping can never reach. A generator fires every
+        # tick it can, so folding is the *only* thing that takes one out of
+        # the phase, and the count is how much that is worth on this board.
+        folded = len(engine.gates.folded_sources())
+        if folded:
+            imgui.text(f"folded Sources: {folded}")
         if imgui.button("Force rebuild"):
             req.rebuild_segments = True
         imgui.same_line()
@@ -780,6 +788,27 @@ class UI:
                 req.set_emit = (entity.row, value)
             imgui.text_disabled(
                 "changing this clears every item in flight")
+            # Whether this Source has been folded into a constant. Reported
+            # rather than configurable: it is derived from how the machine is
+            # wired, so the way to change it is to wire it differently.
+            #
+            # Worth surfacing because a folded Source is **invisible** in
+            # every other view -- it looks identical, and the sleep overlay
+            # paints it the same blue as any gate holding nothing (which it
+            # is, since the constant lives on its *neighbour's* channel). A
+            # player wondering why a Source shows no activity has nowhere
+            # else to find out that this is the answer.
+            folded = orch.engine.gates.is_folded(entity.row)
+            if folded:
+                imgui.text("folded: yes")
+                imgui.text_disabled(
+                    "every output goes straight to a gate, so this Source is\n"
+                    "a constant on its neighbours' inputs and is not ticked")
+            else:
+                imgui.text("folded: no")
+                imgui.text_disabled(
+                    "a belt on any output makes this a real producer, whose\n"
+                    "rate the belt regulates -- so it ticks like any gate")
 
         n_in = entity.input_count()
         n_out = entity.output_count()

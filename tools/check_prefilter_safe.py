@@ -59,7 +59,24 @@ def would_fire(gate):
     Mirrors structure_phase()'s own sequence of tests, which is what makes it
     a valid oracle: readiness, then (for a consumer) every connected output
     zone clear, or (for a generator) at least one connected zone free.
+
+    **A constant-folded Source is excluded, and that is a specification
+    change rather than a prefilter bug.** Folding replaces such a Source with
+    a permanently-held constant on its neighbour's channel and takes it out of
+    the gate table entirely (see "Constant folding" in core/gates.py), so it
+    is no longer a machine the phase is supposed to fire -- this oracle would
+    otherwise report every folded Source as an unsafe exclusion, which it did
+    on first run.
+
+    The exclusion is safe because firing a folded Source is a **no-op**: its
+    only effect would be to fill a waiting zone that `deliver_direct()` then
+    writes to a channel the fold already holds at the same value. That
+    equivalence is not asserted here, because asserting it is a different
+    job and has its own file -- `tools/check_folding_safe.py` runs the board
+    with folding on and off and compares what actually flows.
     """
+    if gates.is_folded(gate.row):
+        return False
     if not gate.inputs_ready():
         return False
     drains = gates._compute_connected_channels(gate)

@@ -563,20 +563,184 @@ def test_a_full_belt_is_never_even_offered_an_item():
 
 
 def test_two_gates_connect_directly_with_no_belt():
-    """Adjacent gates hand items over, one tick per hop like a belt."""
-    # A Source's +X tip at (8,10) touching a Sink at (9,10).
+    """Adjacent gates hand items over, one tick per hop like a belt.
+
+    **The producer here must not be a constant-foldable Source.** A Source
+    whose every output reaches a gate is folded into its neighbour's input
+    channel and stops firing entirely, so `deliver_direct()` never runs and
+    `stats["direct"]` stays zero -- correct behaviour, and it would make this
+    test silently stop exercising the path it is named after. So the producer
+    is a Shear fed by belt: a real gate whose result has to make the hop.
+    `test_a_folded_source_feeds_its_neighbour_without_a_direct_hop` covers
+    the other route deliberately.
+    """
+    # A Shear at (10,10)-(11,10) with its +X output tip touching a Sink.
+    engine.place_structure(Source, 3, 10)
+    engine.place_belt_path((5, 10), (9, 10))
+    sh = engine.place_structure(Shear, 10, 10)
+    snk = engine.place_structure(Sink, 12, 10)
+    engine.sync_segments()
+    # Feed the Shear's x channel directly so it is actually ready to fire.
+    _drain_every_output(sh)
+
+    before = engine.gates.stats["direct"]
+    for _ in range(8):
+        sh.set_input(0, 2.0)
+        sh.set_input(1, 3.0)
+        _run(1)
+    assert engine.gates.stats["direct"] > before, (
+        f"nothing moved directly between adjacent gates: "
+        f"{engine.gates.stats}")
+    assert engine.gates.stats["consumed"] > 0, engine.gates.stats
+    ok(f"Shear -> Sink with no belt: "
+       f"{engine.gates.stats['direct'] - before} direct hand-offs, "
+       f"{engine.gates.stats['consumed']} consumed")
+
+
+def test_a_folded_source_feeds_its_neighbour_without_a_direct_hop():
+    """A fully-direct Source becomes a constant on its neighbour's channel.
+
+    The other half of the test above. Three claims, and the third is the one
+    that makes folding a saving rather than a rename:
+
+      - the neighbour's input reads as fed, with the Source's value;
+      - the Source is reported folded;
+      - **no direct hand-off happens**, because the Source never fires.
+    """
     src = engine.place_structure(Source, 7, 10)
+    src.emit_value = -1.0
     snk = engine.place_structure(Sink, 9, 10)
     engine.sync_segments()
     assert engine.segments.count == 0, "no belts in this layout"
 
+    assert engine.gates.is_folded(src.row), (
+        "a Source whose only output reaches a gate should fold")
+    # Fed before a single tick has run: the fold is a property of the board,
+    # not something that arrives a hop later.
+    fed = [c for c in range(snk.input_count()) if snk.in_held(c)]
+    assert fed, "the folded constant should already be on a Sink channel"
+    assert snk.in_value(fed[0]) == -1.0, snk.in_value(fed[0])
+
+    before = engine.gates.stats["direct"]
     _run(6)
+    assert engine.gates.stats["direct"] == before, (
+        f"a folded Source should make no direct hand-offs, got "
+        f"{engine.gates.stats['direct'] - before}")
+    assert engine.gates.stats["consumed"] > 0, (
+        f"the Sink should still be eating the constant: {engine.gates.stats}")
+    # And it is still held after six ticks of being consumed every one.
+    assert any(snk.in_held(c) for c in range(snk.input_count())), (
+        "the folded constant must be re-asserted after each fire")
+    ok(f"a folded Source held -1 on its neighbour for 6 ticks with 0 direct "
+       f"hops and {engine.gates.stats['consumed']} consumed")
+
+
+def test_a_folded_source_is_not_ticked_at_all():
+    """The saving, pinned: a folded Source leaves the firing set.
+
+    Folding is behaviour-neutral by design, so **every correctness test here
+    passes whether or not the Source is actually skipped** -- it would just
+    fire, fill a zone, and have `deliver_direct()` write a channel the fold
+    already holds. Mutation-tested: leaving folded rows in the gate table
+    survived the whole suite *and* the differential checker, because there is
+    nothing wrong with the result, only with the cost.
+
+    So the saving needs its own assertion. It is the reason the feature
+    exists: on cpu.npz 133 of 285 Sources fold, and a generator fires every
+    single tick, so these are rows no prefilter or sleep set could ever skip.
+    """
+    src = engine.place_structure(Source, 7, 10)
+    engine.place_structure(Shear, 9, 10)
+    engine.sync_segments()
+    assert engine.gates.is_folded(src.row)
+
+    rows, _n_in, _n_out, _strict = engine.gates._gate_table()
+    assert src.row not in set(rows.tolist()), (
+        "a folded Source must be absent from the gate table, which is what "
+        "keeps it out of both the firing prefilter and deliver_direct()")
+
+    admit, _starved, _blocked = engine.gates._candidate_rows()
+    assert src.row not in set(admit), "and so never admitted to fire"
+    # And it really never fires, over a stretch where an unfolded one would
+    # have fired every tick.
+    before = engine.gates.stats["fired"]
+    _run(10)
+    fired = engine.gates.stats["fired"] - before
+    assert src.row not in set(engine.gates._rows_holding_output()), (
+        "a folded Source should never hold a waiting zone, having not fired")
+    ok(f"a folded Source stayed out of the gate table and never fired "
+       f"({fired} fires on the board, none its own)")
+
+
+def test_a_belt_on_any_output_blocks_the_fold():
+    """One belt and the Source is a real producer again.
+
+    The narrowing that keeps folding safe: a belt regulates a producer's rate
+    through back pressure, so a Source feeding one must keep firing. Folding
+    on the strength of its *other* face reaching a gate would have it emit on
+    the belt while also standing permanently fed into the neighbour.
+    """
+    src = engine.place_structure(Source, 7, 10)
+    engine.place_structure(Sink, 9, 10)          # +X tip -> a gate
+    engine.place_belt_path((7, 11), (10, 11))    # +Y face -> a belt
+    engine.sync_segments()
+
+    assert not engine.gates.is_folded(src.row), (
+        "a Source with a belt on any output must not fold")
+    _run(8)
     assert engine.gates.stats["direct"] > 0, (
-        f"nothing moved directly between adjacent gates: "
+        f"an unfolded Source should still hand over directly: "
         f"{engine.gates.stats}")
-    assert engine.gates.stats["consumed"] > 0, engine.gates.stats
-    ok(f"Source -> Sink with no belt: {engine.gates.stats['direct']} direct "
-       f"hand-offs, {engine.gates.stats['consumed']} consumed")
+    seg = engine.segments.at(8, 11) or engine.segments.at(9, 11)
+    assert seg is not None and seg.count > 0, (
+        "and should still be filling its belt")
+    ok("a belt on one output kept the Source firing on both routes")
+
+
+def test_erasing_a_folded_source_releases_the_channel():
+    """A fold is derived state, so it must not outlive its Source.
+
+    The failure this guards is the nastiest one available to the mechanism: a
+    folded channel is held by nothing but the derivation, so a fold that
+    survived its Source would leave the neighbour fed for ever by a constant
+    with no visible origin.
+
+    **Asserting on the board after an erase is not enough, and the first
+    version of this test was vacuous for exactly that reason.** `erase()`
+    invalidates the segments, and `sync_segments()` calls `flush_material()`,
+    which zeroes every gate input channel on the board -- so the channel comes
+    out clear whether or not the fold released it. Mutation-tested: gutting
+    `_drop_folding()`'s release left this passing.
+
+    So the release is tested through `_drop_folding()` directly, with no flush
+    anywhere near it. The erase path is still exercised below, for the
+    *re-derivation* half -- that the fold is gone and does not come back.
+    """
+    src = engine.place_structure(Source, 7, 10)
+    src.emit_value = 5.0
+    sh = engine.place_structure(Shear, 9, 10)
+    engine.sync_segments()
+    assert engine.gates.is_folded(src.row)
+    held = [c for c in range(sh.input_count()) if sh.in_held(c)]
+    assert held, "expected the Shear to be holding the folded constant"
+    assert sh.in_value(held[0]) == 5.0, sh.in_value(held[0])
+
+    # The mechanism, with no flush to mask it.
+    engine.gates._drop_folding()
+    assert not any(sh.in_held(c) for c in range(sh.input_count())), (
+        "dropping the fold must release the channel it was holding, since "
+        "nothing else on the board is feeding it")
+
+    # And the edit path: the fold is gone and does not re-derive.
+    engine.gates._folds()           # re-derive against the unchanged board
+    assert engine.gates.is_folded(src.row), "it should fold again unchanged"
+    engine.erase(7, 10)
+    engine.sync_segments()
+    assert not engine.gates.folded_sources(), "the fold should be gone"
+    assert not any(sh.in_held(c) for c in range(sh.input_count())), (
+        "erasing the Source must leave the channel clear")
+    ok("dropping a fold released the channel, and erasing the Source kept "
+       "it released")
 
 
 def test_ghost_gates_never_fire():

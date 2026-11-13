@@ -92,12 +92,57 @@ Contention is not an issue even though several gates may write inputs in the
 same pass: each (gate, channel) pair has exactly one upstream source, because
 a port face has exactly one neighbour. The pass reads only end-of-structure
 state and writes disjoint slots.
+
+
+Constant folding
+----------------
+
+A **fully-direct Source** -- one whose output faces reach gates and nothing
+else, with no belt anywhere on them -- emits the same number into the same
+channels for ever. Nothing can change that but an edit. So it is not a
+machine that needs ticking; it is a constant.
+
+Folding it removes two per-tick costs. The Source stops being fired (on
+cpu.npz, 133 of 285 Sources fold, and a generator fires *every* tick -- firing
+is its steady state, so it is never idle enough for a prefilter or a sleep set
+to skip), and the `deliver_direct()` walk that carried its value one hop also
+goes.
+
+**The fold is expressed as a permanently-held input channel**, written into
+the receiving gate's row and re-asserted after each fire. That choice is what
+keeps the mechanism small: `inputs_ready()`, `consumed()`, `fire()`, the
+vectorised prefilter and the renderer all read `F_IN_HELD` / `F_IN_VALUE` and
+keep working unchanged, with no folded-input branch anywhere. The alternative
+-- overriding `inputs_ready()` and `consumed()` to treat some channels as
+virtual -- would have put a fold test in every one of those readers, including
+the numpy prefilter where a per-gate branch is exactly the cost being avoided.
+
+Three things make it safe:
+
+- **The channel is exclusively ours.** A port face has exactly one neighbour,
+  so if a folded Source is on the far side of that face then no belt can
+  `accept_from()` into it and no other gate can `deliver_direct()` into it.
+  Nothing else writes the slot, so re-asserting it cannot clobber material.
+- **Only a *fully*-direct Source folds.** One output on a belt and the machine
+  is a real producer whose rate the belt regulates through back pressure; its
+  value arrives one hop later and its zone can be held. Folding that would
+  change behaviour. Other faces may dangle freely -- a dangling output is
+  already discarded at fire time, so it was never carrying anything.
+- **It is derived state with the same invalidation condition as the four
+  caches above**, so it is dropped by `invalidate_connectivity()` and nothing
+  new has to be remembered on an edit.
+
+The visible consequence is a **one-tick latency difference**: a folded input
+is present from the first tick rather than arriving one hop later. For a
+constant that is the same value either way, so no arithmetic changes -- but a
+chain's start-up is one tick earlier, which is why the tests assert on values
+rather than on exact tick numbers at the boundary.
 """
 
 import numpy as np
 
 from core import cell
-from core.entity import MAX_CHANNELS, Entity
+from core.entity import MAX_CHANNELS, Entity, Source
 from core.tick_profile import Profiler
 
 
@@ -134,6 +179,13 @@ class GateSim:
         #: (downstream, upstream) gate row -> segments, or None. See
         #: _segments_of_gate().
         self._gate_segments = None
+        #: Constant folding, or None when not yet derived. See _folds().
+        #: `folded_sources` is the set of Source rows that no longer tick;
+        #: `folded_inputs` is [(row, channel, value)] to hold permanently.
+        self._folding = None
+        #: False disables constant folding outright, for
+        #: `tools/check_folding_safe.py`. See set_folding_enabled().
+        self._folding_enabled = True
         #: Gate rows currently at rest. See the "sleeping gates" block below.
         #: Empty means "every gate is visited", the pre-sleep behaviour and so
         #: the safe default after any wholesale change.
@@ -172,6 +224,30 @@ class GateSim:
         self._dst_cache.clear()
         self._gate_table_cache = None
         self._gate_segments = None
+        # **Constant folding is deliberately NOT dropped here**, which is the
+        # one exception among the derivations above and needs stating because
+        # it looks like an omission.
+        #
+        # This method has two callers with different meanings. A real edit
+        # (`Engine`'s grid hooks, a segment rebuild) genuinely changes what is
+        # on the board. But `set_tick()` also calls it once per tick as a
+        # *backstop*, so that a cache entry can never outlive the tick it was
+        # computed in -- and the fold must survive that one, for two reasons:
+        #
+        #   - **Cost.** Re-deriving the fold is a whole-board walk over every
+        #     gate's output faces. Dropping it per tick made it a per-tick
+        #     cost, which is precisely the per-tick cost folding exists to
+        #     remove: measured at 10 derivations over 5 ticks, i.e. twice a
+        #     tick, turning an edit-time optimisation into a tick-time
+        #     pessimisation.
+        #   - **Correctness.** `_drop_folding()` *releases* the channels it
+        #     was holding, so a per-tick drop briefly unfeeds every folded
+        #     gate. It happened to be invisible only because the re-derivation
+        #     re-asserted them within the same call chain -- a coincidence of
+        #     ordering, not a guarantee.
+        #
+        # `invalidate_folding()` is the explicit form, called from the edit
+        # paths. See `set_tick()` for the other half of this split.
         # The gate sleep set is an *answer derived from* that adjacency -- "my
         # neighbours are quiet" -- so dropping the adjacency without dropping
         # the conclusion would leave gates asleep on a claim about a board
@@ -180,6 +256,22 @@ class GateSim:
         # one: rows are recycled by the free list, so a new machine could
         # inherit the previous occupant's sleep.
         self._asleep.clear()
+
+    def invalidate_board(self):
+        """A real edit: drop the per-tick caches **and** the constant fold.
+
+        The edit-time entry point, as against `invalidate_connectivity()`'s
+        per-tick backstop role. See the comment there for why the fold is
+        excluded from that one; everything that genuinely changes the board
+        must call this instead, and `Engine` routes its grid hook and its
+        segment rebuild here.
+        """
+        self.invalidate_connectivity()
+        self._drop_folding()
+        # The gate table excludes folded rows, so dropping the fold without
+        # dropping the table would leave a folded Source missing from the
+        # firing set with nothing holding its constant.
+        self._gate_table_cache = None
 
     # --- gate discovery ---------------------------------------------------
     #: Types that are rows but not gates. Checked against the raw type column
@@ -255,12 +347,23 @@ class GateSim:
         functions of which rows hold which type -- not of anything the tick
         mutates. `strict` marks the rows whose readiness is decided by
         occupancy (FIRE_ALL); the rest are always admitted.
+
+        **A folded Source is left out of the table entirely**, which is what
+        makes constant folding a saving rather than just a different spelling.
+        Excluding it here rather than in the two consumers means the firing
+        prefilter and `_rows_holding_output()` both drop it from one change,
+        and the exclusion is paid once per edit instead of once per tick. A
+        folded Source can hold nothing in a waiting zone anyway -- it never
+        fires -- so `deliver_direct()` loses nothing by not seeing it.
         """
         if self._gate_table_cache is not None:
             return self._gate_table_cache
 
+        folded, _inputs = self._folds()
         rows, n_in, n_out, strict = [], [], [], []
         for gate in self.gates():
+            if gate.row in folded:
+                continue
             cls = type(gate)
             rows.append(gate.row)
             n_in.append(gate.input_count())
@@ -634,6 +737,16 @@ class GateSim:
         board = self.board
         with prof.probe("structure/fire"):
             fired = self._fire_admitted(admit, board)
+        # Re-assert the folded constants the fires above consumed. **After
+        # firing, not before**: a folded channel must read as held when the
+        # prefilter and `inputs_ready()` look at it, which is what the
+        # assertion at derivation time already guarantees, and then be put
+        # back once `consumed()` has cleared it. Refilling first would be
+        # wrong in a way that is invisible on a constant -- the value is the
+        # same either way -- but would mean a gate's folded input was
+        # momentarily unfed between the phase's start and the refill, which
+        # any future reader of mid-phase state would see.
+        self._assert_folded(self._folds()[1])
         self.stats["fired"] += fired
         return fired
 
@@ -1165,6 +1278,188 @@ class GateSim:
         # and a working one mean the same thing.
         back = (face + 2) % 4
         return self._input_channel_for(other, back, at=(nx, ny)) is not None
+
+    # --- constant folding -------------------------------------------------
+    #
+    # See the module docstring for what this is and why it is shaped this way.
+    # The two halves it produces are used in three places and nowhere else:
+    #
+    #   - `folded_sources` is subtracted from the firing set (the prefilter)
+    #     and from `deliver_direct()`'s walk;
+    #   - `folded_inputs` is asserted into the receiving rows once at
+    #     derivation and re-asserted after each structure phase.
+    def _folds(self):
+        """(folded_source_rows, folded_inputs), derived once per edit.
+
+        `folded_inputs` is a tuple of `(row, channel, value)`. Derived lazily
+        and cached beside the connectivity caches, because it is a function of
+        exactly the same inputs and must die at exactly the same moment.
+        """
+        if self._folding is not None:
+            return self._folding
+        if not self._folding_enabled:
+            # Cache the empty answer, so the latch costs one test rather than
+            # a whole-board walk per tick.
+            self._folding = (frozenset(), ())
+            return self._folding
+
+        sources = set()
+        inputs = []
+        for gate in self.gates():
+            fold = self._fold_of(gate)
+            if fold is None:
+                continue
+            sources.add(gate.row)
+            inputs.extend(fold)
+        folding = (sources, tuple(inputs))
+        self._folding = folding
+        # Assert the constants immediately rather than waiting for the next
+        # structure phase. Two reasons: a gate's readiness is read by the
+        # renderer and the Status window between ticks, so a folded input must
+        # be visible as held the moment the fold is derived; and the phase's
+        # refill runs *after* firing, so waiting would cost the first tick.
+        self._assert_folded(folding[1])
+        return folding
+
+    def _fold_of(self, gate):
+        """[(row, channel, value)] if `gate` is a foldable Source, else None.
+
+        Foldable means: a generator whose output faces reach at least one gate
+        input and **no belt at all**. One belt makes it a real producer whose
+        rate that belt regulates, so folding it would change behaviour; see the
+        module docstring.
+
+        Dangling faces are ignored rather than disqualifying, per the design:
+        a dangling output is already destroyed at fire time, so it carries
+        nothing a fold could lose.
+        """
+        if gate.input_count() != 0 or not isinstance(gate, Source):
+            return None
+        reached = []
+        for (xy, face, _channel) in self._output_faces(gate):
+            step = cell.DIR_STEPS[face]
+            nx, ny = xy[0] + step[0], xy[1] + step[1]
+            if not self.board.in_bounds(nx, ny):
+                continue
+            # A belt on any face disqualifies the whole machine, not just that
+            # face: the Source is then a producer that has to be ticked, and a
+            # half-folded one would emit on the belt while its folded channel
+            # also stood permanently fed.
+            if self.index.at(nx, ny) is not None:
+                return None
+            row = self.board.entity_id_at(nx, ny)
+            if not row or not self.board.is_row_alive(row):
+                continue
+            other = self.board.view(row)
+            if other.row == gate.row or other.is_ghost:
+                continue
+            in_ch = self._input_channel_for(other, (face + 2) % 4, at=(nx, ny))
+            if in_ch is None:
+                continue
+            reached.append((other.row, in_ch, float(gate.emit_value)))
+        if not reached:
+            # Nothing but dangling faces. Deliberately *not* folded: it emits
+            # nowhere, so there is nothing to hold, and leaving it unfolded
+            # keeps it reported as `unconnected` exactly as before.
+            return None
+        return reached
+
+    def _assert_folded(self, folded_inputs):
+        """Write every folded constant into its receiving row.
+
+        Called once when the fold is derived and again after each structure
+        phase, which is what makes `consumed()` clearing the channel harmless.
+        Writing unconditionally rather than testing `in_held` first: the test
+        costs more than the two float stores it would save, and a value that
+        is already right is written with the same number it had.
+        """
+        if not folded_inputs:
+            return
+        ents = self.board.entities
+        dirty = self.board.entities_dirty
+        for (row, channel, value) in folded_inputs:
+            ents[row, Entity.F_IN_VALUE + channel] = value
+            ents[row, Entity.F_IN_HELD + channel] = 1.0
+            dirty.add(row)
+
+    def _drop_folding(self):
+        """Forget the fold, and release the channels it was holding.
+
+        **Releasing is the half that is easy to miss and fatal to omit.** A
+        folded channel is held by nothing but this derivation -- no belt, no
+        neighbour -- so dropping the fold without clearing it would leave the
+        input permanently fed by a Source that may have just been erased, and
+        no later edit or flush would ever clear it. The gate would fire for
+        ever on a phantom constant.
+
+        Rows are cleared before the re-derivation that follows, so a fold that
+        survives an edit is simply re-asserted; one that does not is gone.
+        Guarded on the row still being alive, since an erase is exactly the
+        edit that gets here.
+        """
+        if self._folding is None:
+            return
+        _sources, inputs = self._folding
+        self._folding = None
+        ents = self.board.entities
+        for (row, channel, _value) in inputs:
+            if not self.board.is_row_alive(row):
+                continue
+            ents[row, Entity.F_IN_VALUE + channel] = 0.0
+            ents[row, Entity.F_IN_HELD + channel] = 0.0
+            self.board.entities_dirty.add(row)
+
+    def set_folding_enabled(self, on):
+        """Turn constant folding off entirely, for a differential check.
+
+        Mirrors `set_sleep_enabled()` and is latched for the same reason: the
+        fold is re-derived lazily, so clearing it without a latch would simply
+        have the next tick fold again and an oracle timeline built on that
+        would stop being an oracle immediately.
+
+        Turning it **off** releases the channels the fold was holding (via
+        `_drop_folding()`), and turning it back on re-derives on next use. So
+        an oracle built with this off sees a board where every Source really
+        does fire, which is the pre-folding behaviour it is meant to compare
+        against.
+        """
+        self._folding_enabled = bool(on)
+        self._drop_folding()
+        # The gate table *excludes* folded rows, so it is derived from the
+        # fold and has to be dropped with it in either direction.
+        self._gate_table_cache = None
+        if self._folding_enabled:
+            # **Re-derive now, do not wait.** `_drop_folding()` has just
+            # released every folded channel, and the re-derivation is lazy, so
+            # returning here would leave the board with folding nominally on
+            # and every constant missing until something next called
+            # `_folds()`. The gates fed by a constant would be starved for
+            # that whole window -- one tick on a running board, and
+            # indefinitely on a paused one.
+            self._folds()
+        return self._folding_enabled
+
+    def reassert_folded(self):
+        """Put every folded constant back. For `Engine.flush_material()`.
+
+        The public form of `_assert_folded()`, so the engine does not reach
+        into the derivation. See the call site for why a flush has to do this.
+        """
+        self._assert_folded(self._folds()[1])
+
+    def folded_sources(self):
+        """The set of Source rows currently folded. For the UI and the tools."""
+        return self._folds()[0]
+
+    def is_folded(self, row):
+        """Is this row a Source whose output is folded into its neighbours?
+
+        The query the Status window and the sleep overlay ask. Derives the
+        fold if it has not been derived yet, so a caller between ticks gets a
+        real answer rather than `False`.
+        """
+        sources, _inputs = self._folds()
+        return row in sources
 
     def _channel_of_face(self, gate, xy, face):
         """Which output channel sits on this (cell, face) pair, or None."""

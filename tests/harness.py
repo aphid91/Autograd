@@ -213,6 +213,13 @@ def reset():
     # but any scenario *asserting* that something slept would then fail for a
     # reason nowhere near itself.
     engine.belts.set_sleep_enabled(True)
+    # Same class of reason for constant folding, with a *louder* signature:
+    # `tools/check_folding_safe.py` latches it off, and a scenario running with
+    # it off would find every Source firing and no constant held -- so a test
+    # asserting a gate is fed by a fold would fail a long way from the cause.
+    # Re-enabling also re-derives, so the board a scenario builds folds on its
+    # own terms rather than inheriting an empty answer.
+    engine.gates.set_folding_enabled(True)
     for k in engine.belts.stats:
         engine.belts.stats[k] = 0
     for k in engine.gates.stats:
