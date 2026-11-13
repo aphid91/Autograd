@@ -83,6 +83,18 @@ class GateState:
         #: every prefilter pass rebuilt them from `arange` comparisons.
         self.in_used = np.zeros((0, MAX_CHANNELS), dtype=bool)
         self.out_used = np.zeros((0, MAX_CHANNELS), dtype=bool)
+        #: Which output channels have somewhere to send a result -- the
+        #: vectorised form of `GateSim._connected_channels()`. Filled by
+        #: `set_drains()` rather than in `build()`, because it is derived from
+        #: the grid *and* the segmentation while everything above comes from
+        #: the entity rows alone, and the two have different owners.
+        #:
+        #: It belongs here, with the rest of the per-edit geometry, because
+        #: it is the one term the firing kernel needs that is not row state:
+        #: it decides both which zones can block a gate and which results are
+        #: discarded. Resolved once per edit, it stops being a grid walk and
+        #: becomes a mask the kernel ANDs against.
+        self.drains = np.zeros((0, MAX_CHANNELS), dtype=bool)
 
     # --- layout -----------------------------------------------------------
     def build(self, rows, n_in, n_out, type_id):
@@ -105,6 +117,12 @@ class GateState:
         lanes = np.arange(MAX_CHANNELS)
         self.in_used = lanes[None, :] < self.n_in[:, None]
         self.out_used = lanes[None, :] < self.n_out[:, None]
+        # Unknown until `set_drains()` runs. **All-False rather than
+        # all-True**, so a caller that forgets produces a visibly inert gate
+        # rather than one that silently fires into nothing and destroys its
+        # results -- the conservative direction for a mask whose meaning is
+        # "this result has somewhere to go".
+        self.drains = np.zeros((n, MAX_CHANNELS), dtype=bool)
 
         # The reverse map is sized to cover the highest gate row *and* the
         # table, rebuilt here because the free list may have recycled a row
@@ -123,6 +141,22 @@ class GateState:
         self.slot_of = np.full(cap, -1, dtype=np.int64)
         if n:
             self.slot_of[self.rows] = np.arange(n, dtype=np.int64)
+
+    def set_drains(self, slot, channels):
+        """Record which output channels of one gate have a consumer.
+
+        Per slot rather than wholesale because the source
+        (`GateSim._connected_channels()`) answers one gate at a time and is
+        memoised per gate; filling the mask as those answers arrive keeps a
+        single authority rather than a second walk that could disagree.
+        """
+        if not 0 <= slot < self.drains.shape[0]:
+            return
+        row = self.drains[slot]
+        row[:] = False
+        for c in channels:
+            if 0 <= c < MAX_CHANNELS:
+                row[c] = True
 
     # --- transfers --------------------------------------------------------
     #

@@ -203,6 +203,18 @@ class GateSim:
         #: `_gate_table()` from the same walk, so the two cannot disagree
         #: about the population. See core/gate_state.py.
         self.state = GateState(board)
+        #: The compute-shader form of the structure phase, or None when
+        #: there is no GL context (every headless path, and the app before
+        #: `create_device_resources`). **None is the normal state**, not a
+        #: degraded one: the CPU phase is the reference implementation and
+        #: stays the one the tick calls -- the device exists to be compared
+        #: against it (see `gate_device.compare_against_cpu`) until it is
+        #: carrying the work.
+        self.device = None
+        #: The gate classes, parallel to `state.rows`. Kept because the
+        #: device's geometry packing needs the *class* and views are not
+        #: safe to hold across frames.
+        self._gate_types = []
         #: (downstream, upstream) gate row -> segments, or None. See
         #: _segments_of_gate().
         self._gate_segments = None
@@ -504,11 +516,12 @@ class GateSim:
 
         folded, _inputs = self._folds()
         rows, n_in, n_out, strict = [], [], [], []
-        type_id = []
+        type_id, classes = [], []
         for gate in self.gates():
             if gate.row in folded:
                 continue
             cls = type(gate)
+            classes.append(cls)
             rows.append(gate.row)
             n_in.append(gate.input_count())
             n_out.append(gate.output_count())
@@ -522,6 +535,7 @@ class GateSim:
         # with the prefilter about which rows are gates -- the same
         # one-authority argument `_build_direct()` settles for adjacency.
         self.state.build(rows, n_in, n_out, type_id)
+        self._gate_types = classes
 
         table = (np.asarray(rows, dtype=np.int64),
                  np.asarray(n_in, dtype=np.int64),
@@ -1611,6 +1625,38 @@ class GateSim:
         """Drop the cached gate table. Called when the gate set changes."""
         self._gate_table_cache = None
 
+    # --- the compute form -------------------------------------------------
+    def create_device_resources(self, ctx):
+        """Compile the structure-phase kernel and size its buffers.
+
+        Optional: with no device the CPU phase runs exactly as before, which
+        is how every headless test and the whole existing suite behave. The
+        device is additive until it is proven, and `compare_against_cpu()`
+        is what proves it.
+        """
+        from core.gate_device import GateDevice
+        self._gate_table()
+        self.device = GateDevice(ctx, self.state)
+        self.sync_device()
+        return self.device
+
+    def sync_device(self):
+        """Re-pack the device's per-edit geometry. Call after an edit.
+
+        Needs `_connected_channels()` to have run for every gate, since the
+        drains mask is filled as those answers arrive -- so it asks for them
+        here rather than hoping the tick already did. That is the one term
+        the kernel needs that is not row state, and a missing entry reads as
+        "no consumer", which would make a gate inert rather than wrong.
+        """
+        if self.device is None:
+            return
+        self._gate_table()
+        for row in self.state.rows.tolist():
+            if self.board.is_row_alive(row):
+                self._connected_channels(self.board.view(row))
+        self.device.rebuild(self._gate_types, self.board)
+
     # --- structure phase --------------------------------------------------
     def structure_phase(self):
         """Fire every gate that can. Returns the number that fired.
@@ -2135,6 +2181,13 @@ class GateSim:
         if hit is None:
             hit = self._compute_connected_channels(gate)
             self._drains_cache[gate.row] = hit
+            # Mirror it into the SoA mask as the answer arrives, so the
+            # kernel form has the same term without a second walk that could
+            # disagree with this one. Harmless for a row that is not in the
+            # table (a folded Source): `set_drains()` ignores a bad slot.
+            slot = self.state.slot_of
+            if gate.row < slot.shape[0]:
+                self.state.set_drains(int(slot[gate.row]), hit)
         return hit
 
     def _compute_connected_channels(self, gate):
