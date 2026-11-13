@@ -48,6 +48,7 @@ There is no pytest/linter configured.
 | [tests/test_belts.py](tests/test_belts.py) | the closed form against the naive oracle, on fixed and randomised configs |
 | [tests/test_item_render.py](tests/test_item_render.py) | reads the framebuffer back: do discs appear where the simulation says, do the labels say what the formatter says, does the sleep overlay separate asleep from awake, and does the pass fill a resized window? |
 | [tests/test_gates.py](tests/test_gates.py) | firing rules, arithmetic, back pressure, dangling-output discard, and the bubble-free claim |
+| [tests/test_compute.py](tests/test_compute.py) | the compute kernels against the CPU oracle: every machine type at both control polarities, back pressure, the direct hand-off, belt transport, bounds, and a residency run |
 | [tests/test_stamp.py](tests/test_stamp.py) | what the stamp transforms preserve: wiring, topology, arithmetic |
 | [tests/test_clipboard.py](tests/test_clipboard.py) | the copy/paste/erase mode machine, and matched-stamp substitution, driven through the fake mouse and keyboard |
 | [tests/test_inspect.py](tests/test_inspect.py) | the Status window, the per-Source emit value, the per-belt seed, the save filename box, the persisted toolbar |
@@ -1187,11 +1188,18 @@ everything else is grouped by layer.
 | [core/tick.py](core/tick.py) | the simulation clock: tick counter, fixed timestep, phase order |
 | [core/segments.py](core/segments.py) | belt runs coalesced into the O(1) simulation unit; derived from the grid |
 | [core/belts.py](core/belts.py) | closed-form item transport, and the naive oracle it is tested against |
-| [core/belt_device.py](core/belt_device.py) | packs segment + item state into SSBOs for the renderer |
+| [core/belt_device.py](core/belt_device.py) | packs segment + item state into SSBOs for the renderer, and is where the belt kernel's buffers live |
+| [core/gate_state.py](core/gate_state.py) | the gate-dense SoA mirror of the channel columns |
+| [core/gate_device.py](core/gate_device.py) | the gate kernels' buffers, the geometry word, and the oracle seam |
+| [core/belt_compute.py](core/belt_compute.py) | belt transport as a dispatch, and its port table |
 | [core/gates.py](core/gates.py) | gate firing, and the port callbacks joining gates to belts |
 | [engine.py](engine.py) | preview/commit a plan, erase, ghost lifecycle |
 | [render/camera.py](render/camera.py) | pan/zoom, world↔screen, the world render pass |
 | [render/shader_loader.py](render/shader_loader.py) | reads `shaders/`, resolves `#include` |
+| [render/compute.py](render/compute.py) | compute plumbing: kernels, buffers, bindings, the barrier |
+| [shaders/gate_fire.comp](shaders/gate_fire.comp) | the structure phase, one thread per gate |
+| [shaders/gate_direct.comp](shaders/gate_direct.comp) | gate-to-gate delivery, one thread per edge |
+| [shaders/belt_tick.comp](shaders/belt_tick.comp) | belt transport, one thread per segment |
 | [ui/input_manager.py](ui/input_manager.py) | input → intents; the gesture state machine |
 | [ui/panel.py](ui/panel.py) | imgui panel and the toolbelt bar |
 | [orchestrator.py](orchestrator.py) | wires the above; owns per-frame ordering |
@@ -3537,6 +3545,92 @@ bugs:
 - `imgui.ini` (saved window layout) and `gates_config.json` (panel
   preferences) are generated at runtime and gitignored.
 
+## The tick on the GPU
+
+The whole tick — fire, direct hand-off, belt transport — now runs as three
+compute dispatches. Measured on the real saves:
+
+| board | CPU tick | GPU tick | ticks/sec |
+|---|---|---|---|
+| cpu.npz | 4.39 ms | **13.2 µs** | 76,000 |
+| Ram2.npz | 7.17 ms | **9.9 µs** | 100,000 |
+
+The larger board is *faster per tick*, because a few hundred gates and a
+thousand segments is latency-bound rather than work-bound. That is the
+headroom the design was for.
+
+### Residency is the design, not an optimisation
+
+The target is thousands of ticks with **no readback between them**: state
+lives in VRAM, the tick mutates it in place, and the CPU reads only when the
+player has to see something or the board is edited. `GateDevice.run(n)` and
+`BeltCompute.run(tick, n)` dispatch n ticks back to back with only a memory
+barrier between them — nothing mapped, nothing read.
+
+So **dirty tracking is inverted** from the rest of the project. Elsewhere the
+CPU mutates and marks what the GPU must be told (`Gameboard.entities_dirty`);
+here the GPU mutates and `_gpu_ahead` marks what the CPU must be told *about*.
+Reading host state while that flag is set is reading a stale copy.
+
+`barrier()` is the explicit form of the sequencing the CPU got free by having
+one phase return before the next was called — core/tick.py predicted this
+line of code. Wrong or missing, it corrupts state *silently and
+intermittently*, which is why it is one named function rather than a line
+repeated at each dispatch site.
+
+### What was deliberately not ported
+
+- **The prefilter and both sleep tiers.** They exist to avoid per-gate
+  *Python*. A thread deciding "I cannot fire" is a few ALU ops and one
+  coalesced read; compacting the survivors costs a scan and bookkeeping the
+  CPU already measured as a net loss. The kernel visits every gate.
+- **`FIRE_SELECT`.** `inputs_ready()` and `consumed()` are overridable and
+  Merge overrides both — readiness on the *values* held, consumption of only
+  the selected lane. Those types are flagged `FLAG_HOST_DECIDES` and left
+  exactly as found, the same bargain the CPU prefilter always made by
+  admitting them rather than deciding them. A kernel that guessed would
+  silently eat a loaded lane.
+
+The CPU path stays as the **oracle**, per docs/belt_report.md.
+`gate_device.compare_against_cpu()` and `belt_compute.compare_against_cpu()`
+run one phase both ways from identical state and diff every channel.
+
+### Traps, each of which read as something else
+
+- **Partial component writes to an std430 buffer.** `seg_f[sid].x = v`
+  silently did nothing while `seg_i` took its component writes, so a run
+  popped with its anchor frozen. Write the whole vector.
+- **Every buffer a kernel reads must be bound by that kernel.** The belt
+  kernel reads `in_held` to decide whether a gate will take the head item;
+  binding only the segment buffers left bindings 4–7 as whatever bound last,
+  so it read a stale lane and popped into a full channel. The symptom was the
+  belt layer disagreeing about a *pop* — a transport-shaped symptom with a
+  binding cause.
+- **Two buffers on one binding is a silent race.** `BeltCompute` borrows
+  `BeltDevice`'s buffers rather than keeping its own; with separate copies the
+  kernel advanced one while the renderer drew the other.
+- **The CPU oracle must run with sleeping latched off**, or it skips runs the
+  kernel visits and the diff reports the *scheduler* rather than the
+  transport.
+- **A vacuous comparison passes.** A bare gate on an empty board has no
+  connected outputs, so every result is a dangling-output discard: both sides
+  write nothing and agree having computed nothing. Four arithmetic mutations
+  survived the whole file before the fixtures grew consumers. Fixtures drain
+  every output face, and the probe values avoid `1.0` (where `c + a*b` and
+  `a + b*c` coincide, hiding an OP_MAC transposition).
+- **`packed` is a GLSL reserved word**, and produces a bare
+  `syntax error, unexpected '='` with no mention of the keyword.
+
+### The arithmetic is data
+
+`fire()` cannot cross to the GPU — no subclassing, no `None`. So each machine
+also declares `Entity.OPS`: one entry per output channel over ten total
+opcodes, every one defined for every float input. `eval_ops()` is the
+reference, `glsl_types.py` emits both the `gate_ops()` table and
+`gate_eval()`, and `_check_ops_match_fire()` sweeps `OPS` against `fire()` so
+the pair cannot drift. A type that does not fit declares `OPS = None` and is
+left to the host.
+
 ## Deferred
 
 Simulation now works end to end — belts carry items, gates fire, and a
@@ -3577,24 +3671,45 @@ low tick rate; the inspector reports rebuild counts, and
 [tools/profile_tick.py](tools/profile_tick.py)'s `churn` experiment times it.
 Note a memo over `_cell_at()` was tried and **reverted**: correct, but only
 ~6%, since dict hashing costs about what the numpy reads did);
-**a batched belt phase** (segments are independent — the loop is already
-documented as becoming `gl_GlobalInvocationID.x` — so head/tail/anchor could
-advance as array ops for every awake segment at once. This is the one
-remaining change that would both close the CPU gap and *be* the GPU port
-rather than prepare for it. It touches the closed form's tick order, which
-`tests/test_belts.py`'s oracle guards closely, so measure first);
-**compute shader passes** (the context is 4.3 and all four SSBOs are bound
-and read, but nothing dispatches);
+**wiring the dispatch into the frame loop** (the kernels exist, agree with
+the CPU and run at ~100k ticks/sec — see "The tick on the GPU" — but
+`Clock._run_tick()` still calls the CPU phases. What is left is the
+*policy*: when to read back. A readback stalls, so it wants to happen on an
+edit, on a save, and when something the player can see needs the host's
+copy — not every frame. The renderer already needs none of it, since the
+belt kernel writes the buffers it draws from);
+**the host-decided types on the GPU** (Merge is flagged `FLAG_HOST_DECIDES`
+and skipped, so a board using them needs a CPU pass beside the dispatch.
+Expressing value-dependent readiness and partial consumption in the opcode
+set is the obvious next step, and `FIRE_SELECT` is where it would go);
+**a sleep graph** (the dynamic CPU sleep set is kept and switched off — it
+measured as a net loss because the set churns every tick. A *static*,
+graph-local proof is the different mechanism the dormant-RAM case wants:
+computed per edit, costing nothing per tick, and sound because the
+conditions are structural rather than momentary. Not started);
 curved corner geometry (corners are currently a right-angle join of two
 straight arms, which reads fine but is not a true curve); entity-row
 compaction; a growable or chunked board (fixed 512×512).
 
-**Simulation is being built CPU-first, then ported.** The tick phases, the
-belt segment representation and the gate logic are all designed so the port to
-compute shaders replaces phase-callback *bodies* with dispatches and leaves
-the sequencing alone — see "The simulation clock and the two-phase tick". The
-CPU implementation is kept afterwards as the test oracle, per
-[docs/belt_report.md](docs/belt_report.md).
+**Simulation was built CPU-first, then ported, and the bet paid.** The tick
+phases, the belt segment representation and the gate logic were all designed
+so the port replaces phase-callback *bodies* with dispatches and leaves the
+sequencing alone — and that is exactly what happened: three kernels, no
+change to the two-phase split, and the implicit barrier between phases became
+one `glMemoryBarrier`. The CPU implementation is kept as the test oracle, per
+[docs/belt_report.md](docs/belt_report.md), and is what every
+`compare_against_cpu()` diffs against.
+
+What the port *did* need first was three refactors, and the pattern is worth
+noting because it is the same one the firing protocol showed: each was a case
+of a per-tick cost that should have been per-edit. Gate-to-gate delivery was
+rediscovering its adjacency every tick (it became an edge list); the gate
+channel columns were being gathered out of an AoS table (they became a
+gate-dense SoA mirror); and the arithmetic lived only in Python methods (it
+became a declared opcode table, generated into GLSL). None of the three was
+GPU-specific — all three made the CPU faster too, by 20–31%, 0%, and 0%
+respectively. The first was a plain bug: the gate table was being rebuilt
+once a tick by a cache backstop documented as "one dict clear".
 
 Copy/paste landed as `PasteBuilder` plus [core/clipboard.py](core/clipboard.py)
 and needed no change to the builder abstraction, which is the evidence that
