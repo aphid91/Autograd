@@ -3555,6 +3555,16 @@ compute dispatches. Measured on the real saves:
 | cpu.npz | 4.39 ms | **13.2 µs** | 76,000 |
 | Ram2.npz | 7.17 ms | **9.9 µs** | 100,000 |
 
+And per *frame*, through the real orchestrator loop, on every real save —
+all four dispatch now that Merge is expressible:
+
+| board | CPU | GPU | |
+|---|---|---|---|
+| cpu.npz | 5.65 ms | **0.115 ms** | 49× |
+| noram.npz | 6.91 ms | **0.130 ms** | 53× |
+| Ram2.npz | 9.35 ms | **0.146 ms** | 64× |
+| ram.npz | 2.33 ms | **0.063 ms** | 37× |
+
 The larger board is *faster per tick*, because a few hundred gates and a
 thousand segments is latency-bound rather than work-bound. That is the
 headroom the design was for.
@@ -3635,12 +3645,29 @@ them needs to expect it.
   *Python*. A thread deciding "I cannot fire" is a few ALU ops and one
   coalesced read; compacting the survivors costs a scan and bookkeeping the
   CPU already measured as a net loss. The kernel visits every gate.
-- **`FIRE_SELECT`.** `inputs_ready()` and `consumed()` are overridable and
-  Merge overrides both — readiness on the *values* held, consumption of only
-  the selected lane. Those types are flagged `FLAG_HOST_DECIDES` and left
-  exactly as found, the same bargain the CPU prefilter always made by
-  admitting them rather than deciding them. A kernel that guessed would
-  silently eat a loaded lane.
+- **Nothing, now.** `FIRE_SELECT` was the one gap: `inputs_ready()` and
+  `consumed()` are overridable and Merge overrides both — readiness on the
+  *values* held, consumption of only the selected lane — so the kernel
+  skipped it. That meant **one Merge vetoed the dispatch for the whole
+  board**, and Merge is on three of the four real saves, so the port did not
+  reach the machines that mattered.
+
+  `Entity.SELECT_RULE` closes it by making the rule *data*:
+  `(control, when_positive, when_not)`, one declaration answering both
+  questions, because they are the same fact and letting them drift apart is
+  exactly how a machine eats the lane it did not select. The Python methods
+  read it too, so there is one authority; `_check_select_rules_match_the_
+  methods()` sweeps every held-mask and both control signs against
+  `inputs_ready()` and `consumed()`.
+
+  `FLAG_HOST_DECIDES` survives with **no current users**, for a future type
+  that does not fit — and is tested by forcing the flag rather than by a real
+  machine needing it, since an untested fallback stops working before the
+  type that needs it arrives.
+
+  Deliberately narrow: a richer predicate language would cover more
+  hypothetical machines and need its own interpreter on both sides. This
+  covers the one shape that exists.
 
 The CPU path stays as the **oracle**, per docs/belt_report.md.
 `gate_device.compare_against_cpu()` and `belt_compute.compare_against_cpu()`
@@ -3729,10 +3756,6 @@ the CPU and run at ~100k ticks/sec — see "The tick on the GPU" — but
 edit, on a save, and when something the player can see needs the host's
 copy — not every frame. The renderer already needs none of it, since the
 belt kernel writes the buffers it draws from);
-**the host-decided types on the GPU** (Merge is flagged `FLAG_HOST_DECIDES`
-and skipped, so a board using them needs a CPU pass beside the dispatch.
-Expressing value-dependent readiness and partial consumption in the opcode
-set is the obvious next step, and `FIRE_SELECT` is where it would go);
 **a sleep graph** (the dynamic CPU sleep set is kept and switched off — it
 measured as a net loss because the set churns every tick. A *static*,
 graph-local proof is the different mechanism the dormant-RAM case wants:

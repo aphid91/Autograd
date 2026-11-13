@@ -21,8 +21,8 @@ from core.entity import (
     MAX_CHANNELS, Entity, Floor, Mac, Max, Merge, Reciprocal, Route, Shear,
     Sink, Source, Swap)
 from core.gate_device import (
-    FLAG_DRAIN_SHIFT, FLAG_FIRE_ANY, FLAG_HOST_DECIDES, compare_against_cpu,
-    geometry_for)
+    FLAG_DRAIN_SHIFT, FLAG_FIRE_ANY, FLAG_HOST_DECIDES, FLAG_SELECT,
+    GEOM_STRIDE, compare_against_cpu, gate_flags, gate_type_ids, geometry_for)
 from render import compute, shader_loader
 
 from tests import harness
@@ -103,6 +103,8 @@ def test_the_glsl_flag_bits_match_python():
     src = shader_loader.load("gate_fire.comp")
     for name, want in (("FLAG_HOST_DECIDES", FLAG_HOST_DECIDES),
                        ("FLAG_FIRE_ANY", FLAG_FIRE_ANY),
+                       ("FLAG_SELECT", FLAG_SELECT),
+                       ("GEOM_STRIDE", GEOM_STRIDE),
                        ("FLAG_DRAIN_SHIFT", FLAG_DRAIN_SHIFT)):
         needle = f"const int {name} = {want};"
         assert needle in src, (
@@ -112,7 +114,7 @@ def test_the_glsl_flag_bits_match_python():
     # make channel 0's drain read as "host decides", which silently stops a
     # whole population of gates firing on the GPU.
     assert FLAG_DRAIN_SHIFT > max(
-        FLAG_HOST_DECIDES, FLAG_FIRE_ANY).bit_length()
+        FLAG_HOST_DECIDES, FLAG_FIRE_ANY, FLAG_SELECT).bit_length()
     ok("the geometry flag bits agree between Python and GLSL")
 
 
@@ -135,13 +137,12 @@ def test_every_machine_type_agrees():
     One type at a time rather than all at once, so a failure names the
     machine rather than a slot index.
 
-    **Host-decided types are excluded, and must be.** The kernel skips Merge
-    by design, so after one phase the CPU has fired and consumed while the
-    GPU has deliberately done nothing -- the two *should* differ, and a
-    comparison here would be asserting that the design does not work. That
-    the kernel leaves such a type alone is a real claim and gets its own
-    test (`test_a_host_decided_type_is_left_alone_by_the_kernel`), which
-    checks the untouched state directly rather than against the CPU.
+    **Every machine in the game is now a kernel type**, Merge included --
+    its `SELECT_RULE` states the value-dependent readiness and consumption
+    that used to need the host. The `FLAG_HOST_DECIDES` skip below stays as
+    the mechanism for a *future* type that does not fit, and the assertion
+    at the end pins that nothing currently uses it: a machine quietly
+    falling back would otherwise look exactly like a pass.
     """
     checked = []
     for cls in (Shear, Mac, Reciprocal, Max, Floor, Route, Swap, Merge, Sink,
@@ -153,7 +154,7 @@ def test_every_machine_type_agrees():
         _drain_every_output(gate)
         gates = _with_device()
         slot = int(gates.state.slot_of[gate.row])
-        if int(gates.device.geom[slot][3]) & FLAG_HOST_DECIDES:
+        if gate_flags(gates.device.geom, slot) & FLAG_HOST_DECIDES:
             continue
         # Vacuity guard: with no connected output every result is discarded
         # and the two implementations agree without computing anything.
@@ -190,53 +191,81 @@ def test_every_machine_type_agrees():
                 f"{cls.__name__} (control sign {sign:+.0f}):\n"
                 + "\n".join(problems))
         checked.append(cls.__name__)
-    # Merge is the only type the kernel declines, so everything else must
-    # have been compared -- a guard against the skip above quietly widening
-    # and leaving this test asserting nothing.
-    assert len(checked) >= 8, checked
-    assert "Merge" not in checked
+    # **Every machine is now a kernel type**, Merge included -- its
+    # `SELECT_RULE` made it expressible. The guard is against the skip above
+    # quietly widening and leaving this test asserting nothing, so it names
+    # the full set rather than a count: a type silently dropping out is
+    # exactly the regression that would otherwise look like a pass.
+    assert "Merge" in checked, (
+        "Merge should be compared now that it declares a SELECT_RULE; if it "
+        "is being skipped again, FLAG_HOST_DECIDES has caught it")
+    assert len(checked) >= 9, checked
     ok(f"CPU and GPU agree on every machine type: {', '.join(checked)}")
 
 
-def test_a_host_decided_type_is_left_alone_by_the_kernel():
-    """Merge must come back from the kernel exactly as it went in.
+def test_merge_selects_a_lane_and_leaves_the_other_loaded():
+    """Merge on the GPU: the whole reason `SELECT_RULE` exists.
 
-    The kernel cannot express Merge: its readiness depends on the values
-    held and it consumes only the lane its control selects. The honest
-    behaviour is to skip it, and the dangerous failure is a kernel that
-    runs the *default* rule instead -- which would clear the unselected lane
-    and destroy material the player can see sitting in the machine.
+    Two claims, and the second is the one that matters. Firing is easy to
+    get right; **not eating the unselected lane** is the bug with no visual
+    artefact -- items quietly vanishing from a machine the player can see
+    holding them. The default "consume every fed channel" would do exactly
+    that, which is why `consumed()` became a method in the first place.
 
-    So this asserts on the flag and on the untouched state, not merely that
-    the two agree: both would agree if both were wrong.
+    Both control polarities, because a rule that selected the same lane
+    either way would pass a single-signed test.
+    """
+    for control, taken, left in ((1.0, Merge.CH_A, Merge.CH_B),
+                                 (-1.0, Merge.CH_B, Merge.CH_A)):
+        harness.reset()
+        mg = engine.place_structure(Merge, 10, 10)
+        _drain_every_output(mg)
+        gates = _with_device()
+        slot = int(gates.state.slot_of[mg.row])
+        assert gate_flags(gates.device.geom, slot) & FLAG_SELECT, (
+            "Merge should be a selecting type on the device")
+        assert not gate_flags(gates.device.geom, slot) & FLAG_HOST_DECIDES, (
+            "a declared SELECT_RULE should let the kernel handle Merge")
+
+        mg.set_input(Merge.CH_CONTROL, control)
+        mg.set_input(Merge.CH_A, 11.0)
+        mg.set_input(Merge.CH_B, 22.0)
+        problems = compare_against_cpu(gates, board)
+        assert not problems, (
+            f"control {control:+.0f}:\n" + "\n".join(problems))
+        # ...and specifically: the unselected lane survived, with its value.
+        assert mg.in_held(left), (
+            f"control {control:+.0f}: the kernel ate the unselected lane "
+            f"{left} -- material the player can see in the machine")
+        assert mg.in_value(left) == (11.0 if left == Merge.CH_A else 22.0)
+        assert not mg.in_held(taken), (
+            f"control {control:+.0f}: lane {taken} should have been consumed")
+    ok("Merge selects on the control's sign and leaves the other lane loaded")
+
+
+def test_merge_waits_for_the_lane_its_control_names():
+    """Readiness is value-dependent, not a count of fed channels.
+
+    The other half of `SELECT_RULE`. With the control held and only the
+    *unselected* lane fed, Merge must not fire -- FIRE_ANY would (one
+    channel is fed) and FIRE_ALL would deadlock waiting for both. Neither
+    occupancy rule expresses it, which is the whole reason the rule is data.
     """
     harness.reset()
     mg = engine.place_structure(Merge, 10, 10)
-    engine.sync_segments()
+    _drain_every_output(mg)
     gates = _with_device()
 
-    slot = int(gates.state.slot_of[mg.row])
-    flags = int(gates.device.geom[slot][3])
-    assert flags & FLAG_HOST_DECIDES, (
-        "Merge must be flagged for the host; the kernel cannot express "
-        "its value-dependent readiness")
-
-    # Load the control and *both* lanes, then run only the kernel.
+    # Control selects A; only B is fed. Nothing should happen on either path.
     mg.set_input(Merge.CH_CONTROL, 1.0)
-    mg.set_input(Merge.CH_A, 11.0)
     mg.set_input(Merge.CH_B, 22.0)
-    gates.state.sync_from_rows()
-    gates.device.upload()
-    gates.device.run(1)
-    gates.device.readback()
-    gates.state.flush()
-
-    assert mg.in_held(Merge.CH_B), (
-        "the kernel consumed Merge's unselected lane -- the default "
-        "consumption rule must not reach a host-decided type")
-    assert mg.in_value(Merge.CH_B) == 22.0, mg.in_value(Merge.CH_B)
-    assert mg.in_value(Merge.CH_A) == 11.0, mg.in_value(Merge.CH_A)
-    ok("the kernel leaves a host-decided machine untouched")
+    problems = compare_against_cpu(gates, board)
+    assert not problems, "\n".join(problems)
+    assert mg.in_held(Merge.CH_B) and mg.in_held(Merge.CH_CONTROL), (
+        "nothing was ready, so nothing should have been consumed")
+    assert not any(mg.out_held(c) for c in range(mg.output_count())), (
+        "Merge fired with the lane its control did not name")
+    ok("Merge waits for the lane its control names, on both paths")
 
 
 def test_back_pressure_blocks_the_kernel_too():
@@ -600,13 +629,18 @@ def test_the_tick_counter_advances_the_same_either_way():
     ok("the tick counter advances identically on both paths")
 
 
-def test_a_board_with_merge_falls_back_to_the_cpu():
-    """A host-decided machine vetoes the dispatch for the whole board.
+def test_a_merge_no_longer_vetoes_the_dispatch():
+    """A board with a Merge runs on the device.
 
-    The kernel skips Merge by design, so a GPU tick would leave it
-    permanently unfired -- a stall the player would read as a wiring
-    mistake. The veto is what keeps "the kernel declines this type" from
-    becoming "this machine does not work".
+    This test used to assert the opposite, and the inversion is the point:
+    Merge was on three of the four real saves, so the veto meant the port
+    did not reach the boards that mattered. `SELECT_RULE` is what removed
+    it.
+
+    The veto *mechanism* is still live and still needed for a future type
+    that does not fit the rule -- `test_an_unexpressible_machine_vetoes_the
+    _dispatch` covers that path directly rather than relying on a real
+    machine happening to need it.
     """
     harness.reset()
     engine.place_structure(Shear, 6, 10)
@@ -618,9 +652,43 @@ def test_a_board_with_merge_falls_back_to_the_cpu():
     engine.place_structure(Merge, 12, 10)
     engine.sync_segments()
     engine.gates.sync_device()
-    assert not engine.use_gpu_tick(), (
-        "a board containing a Merge must fall back to the CPU phase")
-    ok("a Merge on the board vetoes the GPU tick")
+    assert engine.use_gpu_tick(), (
+        "a Merge should no longer veto the dispatch -- its SELECT_RULE "
+        "makes it expressible")
+    assert not engine.gates.has_host_decided_gates()
+    ok("a Merge on the board no longer vetoes the GPU tick")
+
+
+def test_an_unexpressible_machine_vetoes_the_dispatch():
+    """The veto mechanism, exercised without a real machine needing it.
+
+    Nothing in the game is host-decided any more, so the fallback has no
+    natural fixture -- and an untested fallback is one that quietly stops
+    working before the type that needs it arrives. This forces the flag the
+    way `geometry_for()` would set it and checks the engine honours it.
+
+    The flag is forced in the packed block rather than by inventing a type,
+    because what is under test is the *engine's* response to it, not the
+    packing rule (which `geometry_for`'s own self-check covers).
+    """
+    harness.reset()
+    engine.place_structure(Shear, 6, 10)
+    engine.sync_segments()
+    gates = _with_device()
+    assert engine.use_gpu_tick()
+
+    saved = gates.device.geom.copy()
+    try:
+        gates.device.geom[0][3] |= FLAG_HOST_DECIDES
+        assert gates.has_host_decided_gates(), (
+            "has_host_decided_gates() did not see the flag")
+        assert not engine.use_gpu_tick(), (
+            "a host-decided gate must send the whole board to the CPU, or "
+            "that machine would silently never fire")
+    finally:
+        gates.device.geom[...] = saved
+    assert engine.use_gpu_tick(), "the veto should have lifted"
+    ok("a host-decided gate still vetoes the dispatch")
 
 
 def test_an_edit_settles_before_re_deriving():
@@ -736,7 +804,7 @@ def test_the_geometry_block_tracks_an_edit():
     assert len(gates.state.rows) == first + 1, (
         "the new gate never reached the mirror")
     assert gates.device.geom.shape[0] >= first + 1, gates.device.geom.shape
-    types = {int(g[0]) for g in gates.device.geom[:first + 1]}
+    types = set(gate_type_ids(gates.device.geom, first + 1))
     assert Mac.TYPE_ID in types, (
         "the geometry block does not know about the Mac that was just placed")
     problems = compare_against_cpu(gates, board)

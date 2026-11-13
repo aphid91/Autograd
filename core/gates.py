@@ -1671,12 +1671,13 @@ class GateSim:
         """
         if self.device is None:
             return False
-        from core.gate_device import FLAG_HOST_DECIDES
+        from core.gate_device import FLAG_HOST_DECIDES, gate_flags
         n = len(self.state.rows)
         if not n:
             return False
-        flags = self.device.geom[:n, 3]
-        return bool((flags & FLAG_HOST_DECIDES).any())
+        geom = self.device.geom
+        return any(gate_flags(geom, i) & FLAG_HOST_DECIDES
+                   for i in range(n))
 
     def sync_device(self):
         """Re-pack the device's per-edit geometry. Call after an edit.

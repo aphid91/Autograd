@@ -48,7 +48,12 @@ from render import compute
 #: files, like the segment record's fields.
 FLAG_HOST_DECIDES = 1
 FLAG_FIRE_ANY = 2
+FLAG_SELECT = 4
 FLAG_DRAIN_SHIFT = 8
+
+#: ivec4s per gate in the geometry block: the counts and flags, then the
+#: select rule. Mirrored by `GEOM_STRIDE` in shaders/gate_fire.comp.
+GEOM_STRIDE = 2
 
 
 def geometry_for(state, types):
@@ -58,12 +63,16 @@ def geometry_for(state, types):
     be checked without a board or a context.
     """
     n = len(state.rows)
-    geom = np.zeros((max(n, 1), 4), dtype=np.int32)
+    geom = np.zeros((max(n, 1) * GEOM_STRIDE, 4), dtype=np.int32)
     for i in range(n):
         cls = types[i]
         flags = 0
         if cls.FIRE_RULE == cls.FIRE_ANY:
             flags |= FLAG_FIRE_ANY
+        rule = cls.SELECT_RULE
+        if rule is not None:
+            flags |= FLAG_SELECT
+            geom[i * GEOM_STRIDE + 1] = (rule[0], rule[1], rule[2], 0)
         # A type that decides readiness or consumption from values rather
         # than occupancy stays on the host. Detected from the *class* rather
         # than from FIRE_RULE alone, because an override is the real
@@ -78,17 +87,51 @@ def geometry_for(state, types):
         # consumer on any board back to the CPU, vetoing the dispatch for the
         # whole board. The real condition is a table that does not describe
         # every channel.
-        if (cls.FIRE_RULE == cls.FIRE_SELECT
-                or cls.inputs_ready is not Entity.inputs_ready
-                or cls.consumed is not Entity.consumed
+        #
+        # **A declared `SELECT_RULE` excuses the overrides it explains.**
+        # `inputs_ready()` and `consumed()` are overridden precisely *because*
+        # the type selects a lane on a control's sign, and the rule states
+        # that in a form the kernel evaluates -- so those two overrides are no
+        # longer evidence the host is needed. Any *other* override still is:
+        # the rule covers one shape, not every possible one.
+        #
+        # Without this, declaring the rule would change nothing, since the
+        # override test alone would keep flagging Merge. That is the whole
+        # reason the condition is phrased per-method rather than as "does
+        # this class override anything".
+        explained = Entity.inputs_ready, Entity.consumed
+        if rule is not None:
+            overridden = False
+        else:
+            overridden = (cls.inputs_ready is not explained[0]
+                          or cls.consumed is not explained[1])
+        if (overridden
+                or (cls.FIRE_RULE == cls.FIRE_SELECT and rule is None)
                 or len(cls.OPS) != cls.out_channels()):
             flags |= FLAG_HOST_DECIDES
         for c in range(MAX_CHANNELS):
             if state.drains[i, c]:
                 flags |= 1 << (FLAG_DRAIN_SHIFT + c)
-        geom[i] = (cls.TYPE_ID, int(state.n_in[i]), int(state.n_out[i]),
-                   flags)
+        geom[i * GEOM_STRIDE] = (cls.TYPE_ID, int(state.n_in[i]),
+                                 int(state.n_out[i]), flags)
     return geom
+
+
+def gate_flags(geom, slot):
+    """The flags word for one gate slot.
+
+    An accessor rather than `geom[slot][3]` spelled at each call site,
+    because the block grew a second vector and the stride is now easy to
+    forget -- the same reason `seg_core()` exists in common.glsl. Reading
+    slot 1's flags out of the select rule of slot 0 would be a plausible
+    number, not a crash.
+    """
+    return int(geom[slot * GEOM_STRIDE][3])
+
+
+def gate_type_ids(geom, n):
+    """The type id of each of the first `n` gate slots."""
+    return [int(geom[i * GEOM_STRIDE][0]) for i in range(n)]
 
 
 class GateDevice:
@@ -342,28 +385,34 @@ def _self_check():
 
     # Sink is FIRE_ANY and must say so, or it would wait for all four faces
     # and deadlock when fed from one side.
-    assert geom[1][3] & FLAG_FIRE_ANY, geom[1]
-    assert not geom[0][3] & FLAG_FIRE_ANY, "Shear is FIRE_ALL"
+    assert gate_flags(geom, 1) & FLAG_FIRE_ANY, geom[GEOM_STRIDE]
+    assert not gate_flags(geom, 0) & FLAG_FIRE_ANY, "Shear is FIRE_ALL"
 
-    # Merge decides on the host: its readiness and consumption are
-    # value-dependent, and a kernel guessing would eat its unselected lane.
-    assert geom[2][3] & FLAG_HOST_DECIDES, geom[2]
-    assert not geom[0][3] & FLAG_HOST_DECIDES, "Shear is pure occupancy"
+    # **Merge is expressible now**, via its declared SELECT_RULE -- the rule
+    # is what excuses the two overrides it explains, so the kernel handles it
+    # rather than handing the whole board back to the host.
+    assert gate_flags(geom, 2) & FLAG_SELECT, geom[2 * GEOM_STRIDE]
+    assert not gate_flags(geom, 2) & FLAG_HOST_DECIDES, (
+        "a declared SELECT_RULE should make Merge a kernel type")
+    assert not gate_flags(geom, 0) & FLAG_SELECT, "Shear selects nothing"
+    # ...and the rule's channels reach the second vector in order.
+    assert geom[2 * GEOM_STRIDE + 1].tolist()[:3] == list(Merge.SELECT_RULE)
 
     # The drains mask lands in the right bits, and only for drained channels.
-    assert geom[0][3] & (1 << (FLAG_DRAIN_SHIFT + 0))
-    assert geom[0][3] & (1 << (FLAG_DRAIN_SHIFT + 1))
-    assert not geom[0][3] & (1 << (FLAG_DRAIN_SHIFT + 2))
-    assert geom[2][3] & (1 << (FLAG_DRAIN_SHIFT + 1))
-    assert not geom[2][3] & (1 << (FLAG_DRAIN_SHIFT + 0))
+    assert gate_flags(geom, 0) & (1 << (FLAG_DRAIN_SHIFT + 0))
+    assert gate_flags(geom, 0) & (1 << (FLAG_DRAIN_SHIFT + 1))
+    assert not gate_flags(geom, 0) & (1 << (FLAG_DRAIN_SHIFT + 2))
+    assert gate_flags(geom, 2) & (1 << (FLAG_DRAIN_SHIFT + 1))
+    assert not gate_flags(geom, 2) & (1 << (FLAG_DRAIN_SHIFT + 0))
 
     # The mask must not collide with the low flag bits -- an off-by-one in
     # FLAG_DRAIN_SHIFT would have channel 0 read as "host decides".
-    assert FLAG_DRAIN_SHIFT > max(FLAG_HOST_DECIDES, FLAG_FIRE_ANY).bit_length()
+    assert FLAG_DRAIN_SHIFT > max(
+        FLAG_HOST_DECIDES, FLAG_FIRE_ANY, FLAG_SELECT).bit_length()
 
     # An empty gate set still packs a valid (unused) record rather than a
     # zero-length buffer, which moderngl cannot reserve.
-    assert geometry_for(_State(0), []).shape == (1, 4)
+    assert geometry_for(_State(0), []).shape == (GEOM_STRIDE, 4)
 
 
 _self_check()

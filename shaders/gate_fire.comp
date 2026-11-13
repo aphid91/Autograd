@@ -51,7 +51,18 @@ layout(std430, binding = 7) buffer OutHeld  { float out_held[]; };
 // The drains mask rides in the flags word rather than in an array of its
 // own: it is MAX_CHANNELS bits, the word has room, and a gate that reads its
 // geometry needs the mask in the same breath -- one fetch instead of two.
+//
+// **Two ivec4s per gate**, the second carrying the select rule:
+//   [1].x  control channel   [1].y  lane a positive control names
+//   [1].z  lane it names otherwise   [1].w  reserved
+// Only meaningful with FLAG_SELECT set. A second vector rather than more
+// bits in the flags word because these are channel *indices*, not a mask,
+// and std430 pads an ivec4 array stride anyway -- the same reasoning that
+// grew the segment record from one vector to two.
 layout(std430, binding = 8) buffer Geom { ivec4 geom[]; };
+
+//: Slots per gate in `geom`. Mirrored by core/gate_device.py.
+const int GEOM_STRIDE = 2;
 
 // The per-instance constant OP_CONST reads (a Source's emit value), one per
 // gate slot. A separate array rather than a column of `geom` because it is a
@@ -64,8 +75,9 @@ uniform int gate_count;
 //: Flag bits in `geom[].w`. Mirrored by core/gate_device.py, and pinned
 //: against it by tests/test_glsl.py -- these are a layout contract between
 //: two files exactly as the segment record's fields are.
-const int FLAG_HOST_DECIDES = 1;   // FIRE_SELECT, or inputs_ready() overridden
+const int FLAG_HOST_DECIDES = 1;   // the kernel cannot express this type
 const int FLAG_FIRE_ANY = 2;       // one fed channel is enough (Sink's rule)
+const int FLAG_SELECT = 4;         // readiness/consumption follow a control
 const int FLAG_DRAIN_SHIFT = 8;    // the drains mask starts here
 
 //: Does output channel `c` of this gate have somewhere to send a result?
@@ -80,7 +92,8 @@ void main() {
     // the end of every buffer bound here.
     if (slot >= uint(gate_count)) return;
 
-    ivec4 g = geom[slot];
+    ivec4 g = geom[slot * GEOM_STRIDE];
+    ivec4 sel = geom[slot * GEOM_STRIDE + 1];
     int type = g.x;
     int n_in = g.y;
     int n_out = g.z;
@@ -98,14 +111,28 @@ void main() {
     // FIRE_ALL needs every declared channel fed; FIRE_ANY needs one. A type
     // with no inputs is vacuously ready, which is what lets a Source through
     // with no special case -- the same property the Python base class has.
-    int fed = 0;
-    for (int c = 0; c < MAX_CHANNELS; ++c) {
-        if (c >= n_in) break;
-        if (in_held[base_in + uint(c)] > 0.0) fed++;
+    // A selecting type's readiness is value-dependent: the control must be
+    // held, and so must the one lane its *sign* names. Neither FIRE_ALL
+    // (which would deadlock whenever the unused lane is empty) nor FIRE_ANY
+    // (which would fire with no control at all) expresses that -- see
+    // `Entity.SELECT_RULE`, which is the single declaration this and the
+    // consumption below both read.
+    int sel_lane = -1;
+    if ((flags & FLAG_SELECT) != 0) {
+        uint ctl = base_in + uint(sel.x);
+        if (in_held[ctl] <= 0.0) return;
+        sel_lane = (in_value[ctl] > 0.0) ? sel.y : sel.z;
+        if (in_held[base_in + uint(sel_lane)] <= 0.0) return;
+    } else {
+        int fed = 0;
+        for (int c = 0; c < MAX_CHANNELS; ++c) {
+            if (c >= n_in) break;
+            if (in_held[base_in + uint(c)] > 0.0) fed++;
+        }
+        bool strict = (flags & FLAG_FIRE_ANY) == 0;
+        bool ready = (n_in == 0) || (strict ? (fed == n_in) : (fed > 0));
+        if (!ready) return;
     }
-    bool strict = (flags & FLAG_FIRE_ANY) == 0;
-    bool ready = (n_in == 0) || (strict ? (fed == n_in) : (fed > 0));
-    if (!ready) return;
 
     // --- back pressure -------------------------------------------------
     // Only a channel with somewhere to send a result can block: a dangling
@@ -165,14 +192,30 @@ void main() {
     }
 
     // --- consume ---------------------------------------------------------
-    // The default is every fed channel, which is what every machine but
-    // Merge wants -- and Merge is flagged FLAG_HOST_DECIDES above, so the
-    // default is the only rule that reaches here.
+    // The default is every fed channel, which is what every machine but a
+    // selecting one wants.
+    //
+    // **A selecting type consumes the control and the chosen lane only.**
+    // The lane it did not select stays loaded -- neither emitted nor
+    // destroyed -- until a later tick's control names it. Falling through to
+    // the default here would silently eat material the player can see
+    // sitting in the machine, which is the single worst bug this kernel
+    // could have: no error, no visual artefact, just items quietly vanishing
+    // from a Merge.
     if (!generator) {
-        for (int c = 0; c < MAX_CHANNELS; ++c) {
-            if (c >= n_in) break;
-            in_value[base_in + uint(c)] = 0.0;
-            in_held[base_in + uint(c)] = 0.0;
+        if (sel_lane >= 0) {
+            uint ctl = base_in + uint(sel.x);
+            in_value[ctl] = 0.0;
+            in_held[ctl] = 0.0;
+            uint lane = base_in + uint(sel_lane);
+            in_value[lane] = 0.0;
+            in_held[lane] = 0.0;
+        } else {
+            for (int c = 0; c < MAX_CHANNELS; ++c) {
+                if (c >= n_in) break;
+                in_value[base_in + uint(c)] = 0.0;
+                in_held[base_in + uint(c)] = 0.0;
+            }
         }
     }
 }

@@ -214,6 +214,40 @@ class Entity:
     #: default for one whose arithmetic has not been written.
     OPS = ()
 
+    # --- value-dependent readiness, as data ------------------------------
+    #
+    # `FIRE_ALL` and `FIRE_ANY` are occupancy rules: a count of fed channels
+    # decides them, which is why the vectorised prefilter and the firing
+    # kernel can both evaluate them with no per-type knowledge. `FIRE_SELECT`
+    # is the case they cannot express -- readiness depends on the *value*
+    # held on a control channel -- and the base class deliberately refuses to
+    # resolve it, so a type declaring it must override `inputs_ready()`.
+    #
+    # That override is Python, and Python does not cross to the GPU. The
+    # kernel's honest answer was to skip such types entirely
+    # (`FLAG_HOST_DECIDES`), which is safe but means **one Merge on a board
+    # vetoes the dispatch for every machine on it** -- and Merge is on three
+    # of the four real saves. So the rule itself becomes data.
+    #
+    # `SELECT_RULE` is `(control, when_positive, when_not)`: a control
+    # channel whose sign names one of two data lanes. That single declaration
+    # answers both questions the protocol grew for:
+    #
+    #   readiness   -- the control is held, and so is the lane it names
+    #   consumption -- the control and that lane, and nothing else
+    #
+    # One declaration rather than two because they are the same fact, and
+    # letting them drift apart is exactly how a machine eats the lane it did
+    # not select. `None` means "not a selecting type", which is every machine
+    # but Merge.
+    #
+    # It is deliberately narrow. A richer predicate language would cover more
+    # hypothetical machines and would need its own interpreter on both sides;
+    # this covers the one shape that exists, is checked against `fire()` and
+    # `inputs_ready()` by the self-check below, and leaves `FLAG_HOST_DECIDES`
+    # in place for anything that does not fit.
+    SELECT_RULE = None
+
     #: Value a *freshly placed* Source emits. The live value is per instance,
     #: in the row at `Source.F_EMIT`; this is only the starting point, which
     #: is why it stays a class attribute rather than a literal in the tick.
@@ -1414,9 +1448,18 @@ class Merge(Structure):
 
     PASS_THROUGH = (cell.DIR_PX,)
 
+    #: The readiness and consumption rule, as data the kernel can read: the
+    #: control channel, the lane a positive control names, and the lane it
+    #: names otherwise. `_selected()` and `inputs_ready()` below read *this*
+    #: rather than restating it, so the Python and the GPU cannot disagree
+    #: about which lane is selected -- the same one-authority argument the
+    #: opcode table makes for the arithmetic.
+    SELECT_RULE = (CH_CONTROL, CH_A, CH_B)
+
     def _selected(self, control):
         """Which data channel the control names. c > 0 selects a."""
-        return self.CH_A if control > 0.0 else self.CH_B
+        _ctl, positive, negative = self.SELECT_RULE
+        return positive if control > 0.0 else negative
 
     def inputs_ready(self):
         """The control, plus the one lane it selects. Nothing else.
@@ -1747,6 +1790,87 @@ def eval_ops(ops, values, const=0.0):
     return out
 
 
+def _check_select_rules_match_the_methods():
+    """A declared `SELECT_RULE` must agree with `inputs_ready()`/`consumed()`.
+
+    The rule exists so the kernel can evaluate value-dependent readiness
+    without the Python override (see `Entity.SELECT_RULE`). That makes it a
+    second expression of the same fact, and the failure mode is the one the
+    whole firing protocol was grown to avoid: a machine consuming the lane it
+    did not select, destroying material the player can see sitting in it.
+
+    So both questions are checked against the methods, over every combination
+    of which channels are held and both signs of the control.
+    """
+    for cls in ALL_STRUCTURES:
+        rule = cls.SELECT_RULE
+        if rule is None:
+            continue
+        ctl, pos, neg = rule
+        n_in = cls.in_channels()
+        for ch in (ctl, pos, neg):
+            assert 0 <= ch < n_in, (
+                f"{cls.__name__}.SELECT_RULE names channel {ch}, but the "
+                f"type has {n_in} input channels")
+        assert pos != neg, (
+            f"{cls.__name__}.SELECT_RULE selects the same lane either way")
+        assert ctl not in (pos, neg), (
+            f"{cls.__name__}.SELECT_RULE uses its control as a data lane")
+
+        inst = _stub_instance(cls)
+        for mask in range(1 << n_in):
+            held = [bool(mask & (1 << i)) for i in range(n_in)]
+            for control in (2.0, -2.0, 0.0):
+                for i in range(n_in):
+                    if held[i]:
+                        inst.set_input(i, control if i == ctl else 1.0)
+                    else:
+                        inst.clear_input(i)
+                want_lane = pos if control > 0.0 else neg
+                # Readiness: the control held, and the lane it names held.
+                want_ready = held[ctl] and held[want_lane]
+                assert cls.inputs_ready(inst) == want_ready, (
+                    f"{cls.__name__} held={held} c={control}: "
+                    f"inputs_ready says {cls.inputs_ready(inst)}, the rule "
+                    f"says {want_ready}")
+                if not want_ready:
+                    continue
+                # Consumption: the control and that lane, and nothing else.
+                values = [inst.in_value(i) if held[i] else None
+                          for i in range(n_in)]
+                got = sorted(cls.consumed(inst, values))
+                assert got == sorted({ctl, want_lane}), (
+                    f"{cls.__name__} held={held} c={control}: consumed "
+                    f"{got}, the rule says {sorted({ctl, want_lane})}")
+
+
+def _stub_instance(cls):
+    """An instance over a throwaway row, for the checks below.
+
+    A dict keyed by `(row, offset)` rather than numpy: `_get`/`_set` index
+    with that tuple and entity.py is otherwise numpy-free -- a self-check is
+    not a reason to give the module a dependency.
+    """
+    class _Cells(dict):
+        def __missing__(self, _key):
+            return 0.0
+
+    class _Dirty:
+        def add(self, _row):
+            pass
+
+    class _Stub:
+        def __init__(self):
+            self.entities = _Cells()
+            self.entities_dirty = _Dirty()
+
+    inst = cls.__new__(cls)
+    inst.board = _Stub()
+    inst.row = 0
+    inst._ghost = None
+    return inst
+
+
 def _check_ops_match_fire():
     """Every declared `OPS` must agree with that type's `fire()`.
 
@@ -1775,27 +1899,7 @@ def _check_ops_match_fire():
         # reads only `values`, except Source, whose `emit_value` is a row
         # property -- so the instance needs a board rather than a patched
         # __dict__.
-        # A dict keyed by `(row, offset)` rather than numpy: `_get`/`_set`
-        # index with that tuple and nothing here needs an array, and
-        # entity.py is otherwise numpy-free -- a self-check is not a reason
-        # to give the module a dependency.
-        class _Cells(dict):
-            def __missing__(self, _key):
-                return 0.0
-
-        class _Dirty:
-            def add(self, _row):
-                pass
-
-        class _Stub:
-            def __init__(self):
-                self.entities = _Cells()
-                self.entities_dirty = _Dirty()
-
-        inst = cls.__new__(cls)
-        inst.board = _Stub()
-        inst.row = 0
-        inst._ghost = None
+        inst = _stub_instance(cls)
         for i, a in enumerate(probes):
             # Rotate the probe list so each channel sees a different value --
             # which is what makes a swapped pair of channels visible. Equal
@@ -2440,6 +2544,7 @@ def _self_check():
     # The opcode tables against the methods they describe. Last, because it
     # is the only check here that depends on ALL_STRUCTURES being complete.
     _check_ops_match_fire()
+    _check_select_rules_match_the_methods()
 
 
 _self_check()
