@@ -405,6 +405,87 @@ def test_generated_channel_tables_match_python():
     ok("generated channel tables match in_channel()/out_channel()")
 
 
+def test_generated_gate_ops_match_python():
+    """The emitted opcode table is exactly what `Entity.OPS` declares.
+
+    The table is generated, so this is checking the *generator* rather than
+    pinning a hand-written copy -- the same job
+    `test_generated_channel_tables_match_python` does one layer down.
+
+    Note what guards what. `OPS` against `fire()` is `entity._self_check()`'s
+    business and is the check that matters for *semantics*; this one only
+    says the declaration reached GLSL intact. Both are needed: a correct
+    table emitted for the wrong type id computes a plausible wrong number,
+    and no pixel test can see it.
+    """
+    seen = 0
+    for c in entity.ALL_STRUCTURES:
+        if not c.OPS:
+            continue
+        name = "TYPE_" + cell.TYPE_NAMES[c.TYPE_ID].upper()
+        assert len(c.OPS) == c.out_channels(), (
+            f"{c.__name__} declares {len(c.OPS)} opcodes for "
+            f"{c.out_channels()} output channels")
+        for ch, spec in enumerate(c.OPS):
+            op, args = spec[0], list(spec[1:])
+            args += [0] * (glsl_types.OP_SLOTS - 1 - len(args))
+            needle = (f"if (type == {name} && channel == {ch}) "
+                      f"return ivec4({op}, {args[0]}, {args[1]}, {args[2]});")
+            assert needle in _tables, (
+                f"{c.__name__} channel {ch} missing from the generated "
+                f"opcode table:\n  {needle}")
+            seen += 1
+    assert seen, "no opcode entries were emitted at all"
+    ok(f"{seen} generated opcode entries match Entity.OPS")
+
+
+def test_glsl_gate_eval_mirrors_the_python_reference():
+    """`gate_eval()` in GLSL says what `entity.eval_ops()` says.
+
+    The evaluator is hand-written on both sides -- the opcode *semantics*
+    are prose, not data, so unlike the table they cannot be generated from
+    one source. That makes this the same kind of check as
+    `test_glsl_item_position_mirrors_the_python_closed_form`: two copies of
+    one rule, pinned together structurally.
+
+    Each needle is a decision the Python reference makes that a plausible
+    GLSL version would get wrong -- and three of them were real traps while
+    writing it: clamping *after* flooring (floor(inf) has no value),
+    ordering NaN instead of propagating it, and treating a declined channel
+    as a zero rather than as silence.
+    """
+    body = _re.search(r"float gate_eval\(.*?\n\}", _tables, _re.S)
+    assert body, "gate_eval() is missing from the generated source"
+    body = body.group(0)
+
+    for op in ("OP_NONE", "OP_IN", "OP_ADD", "OP_MAC", "OP_RECIP", "OP_MAX",
+               "OP_FLOOR", "OP_SEL", "OP_GATED", "OP_CONST"):
+        assert op in body, f"gate_eval() never handles {op}"
+        emitted = _re.search(rf"const int {op} = (\d+);", _tables)
+        assert emitted, f"{op} has no generated constant"
+        assert int(emitted.group(1)) == getattr(entity.Entity, op), (
+            f"{op} is {emitted.group(1)} in GLSL, "
+            f"{getattr(entity.Entity, op)} in Python")
+
+    # OP_MAC is `c + a*b`, not `a + b*c`. The arg order is the whole content
+    # of the opcode, and a transposition still type-checks.
+    assert "c + a * b" in body, "OP_MAC must compute c + a*b"
+    # OP_FLOOR clamps before flooring; the reverse raises in Python and
+    # silently returns garbage in GLSL.
+    assert "floor(clamp(a" in body, "OP_FLOOR must clamp before flooring"
+    # OP_MAX propagates NaN rather than ordering it.
+    assert "isnan(a) || isnan(b)" in body, "OP_MAX must propagate NaN"
+    # OP_GATED's silence is a real decision, not a zero.
+    assert _re.search(r"OP_GATED.*?emit\s*=", body, _re.S), (
+        "OP_GATED must set `emit` rather than returning a value")
+    # The limit the two sides clamp to has to be the same number.
+    m = _re.search(r"const float VALUE_LIMIT = ([0-9.]+);", _tables)
+    assert m and float(m.group(1)) == float(entity.VALUE_LIMIT), (
+        f"VALUE_LIMIT is {m and m.group(1)} in GLSL, "
+        f"{entity.VALUE_LIMIT} in Python")
+    ok("gate_eval() mirrors entity.eval_ops() on every opcode")
+
+
 def test_glsl_unrotate_face_inverts_the_placement():
     # Looking up a port's *channel* needs the authored face, not the placed
     # one -- the masks only answer "is this a port?", which is

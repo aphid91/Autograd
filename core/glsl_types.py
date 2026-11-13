@@ -25,7 +25,7 @@ marker, so there is no generated file to get stale or to commit.
 """
 
 from core import cell
-from core.entity import Entity
+from core.entity import VALUE_LIMIT, Entity
 
 #: Glyph names usable in `Entity.GLYPH`, mapped to the GLSL constants in
 #: common.glsl. Keep in step with the GLYPH_* block there.
@@ -201,8 +201,107 @@ def generate():
         body.append(f"if (type == {_type_const(c)}) "
                     f"return {GLYPHS[c.GLYPH]};")
     lines += _fn("int type_glyph(int type)", body, "GLYPH_NONE")
+    lines.append("")
+
+    lines += _gate_ops()
 
     return "\n".join(lines)
+
+
+#: Slots per opcode entry: the opcode plus three argument slots. Fixed width
+#: so the table is a flat `ivec4` lookup rather than a ragged one -- the same
+#: reason BeltDevice uses fixed-size vectors instead of a packed struct.
+OP_SLOTS = 4
+
+
+def _gate_ops():
+    """The per-type arithmetic, as a flat opcode table plus its evaluator.
+
+    `Entity.OPS` declares each machine's arithmetic as data precisely so it
+    can cross to GLSL, where there is no subclassing and no `None`. This
+    emits two things:
+
+      `gate_ops(type, channel)` -- an `ivec4` of (opcode, arg, arg, arg)
+      `gate_eval(op, a, b, c, konst, out_emit)` -- the opcode semantics
+
+    **The evaluator is a transcription of `entity.eval_ops()`**, which is the
+    reference, and the two are pinned against each other by
+    tests/test_glsl.py -- the same relationship `item_position()` has to
+    `BeltSim.position_of()`. The *table* needs no such pinning because it is
+    generated from the same `OPS` the Python reads.
+
+    A type with `OPS = None` declares "no GPU form"; it emits nothing here
+    and a kernel reaching it falls through to OP_NONE rather than silently
+    computing something wrong.
+    """
+    from core.entity import Entity
+
+    types = [c for c in _emitted_types() if c.OPS]
+    lines = [
+        "// --- gate arithmetic --------------------------------------------",
+        "// Generated from Entity.OPS. See core/glsl_types.py:_gate_ops().",
+        "",
+    ]
+    for name in ("OP_NONE", "OP_IN", "OP_ADD", "OP_MAC", "OP_RECIP",
+                 "OP_MAX", "OP_FLOOR", "OP_SEL", "OP_GATED", "OP_CONST"):
+        lines.append(f"const int {name} = {getattr(Entity, name)};")
+    lines.append(f"const float VALUE_LIMIT = {float(VALUE_LIMIT)};")
+    lines.append("")
+
+    body = []
+    for c in types:
+        for ch, entry in enumerate(c.OPS):
+            op, args = entry[0], list(entry[1:])
+            args += [0] * (OP_SLOTS - 1 - len(args))
+            body.append(
+                f"if (type == {_type_const(c)} && channel == {ch}) "
+                f"return ivec4({op}, {args[0]}, {args[1]}, {args[2]});")
+    lines += _fn("ivec4 gate_ops(int type, int channel)", body,
+                 "ivec4(OP_NONE, 0, 0, 0)")
+    lines.append("")
+
+    # The evaluator. Hand-written GLSL, transcribing entity.eval_ops() --
+    # the opcode *semantics* are not themselves generated, because they are
+    # prose in both languages rather than data. tests/test_glsl.py is what
+    # holds the two copies together.
+    lines += [
+        "// Evaluate one opcode. `konst` is the per-instance constant",
+        "// (Source's F_EMIT); `emit` comes back false when the channel",
+        "// stays silent, which is how Route sends one item one way rather",
+        "// than a copy both ways.",
+        "float gate_eval(int op, float a, float b, float c, float konst,",
+        "                int polarity, out bool emit) {",
+        "    emit = true;",
+        "    if (op == OP_NONE) { emit = false; return 0.0; }",
+        "    if (op == OP_IN)    return a;",
+        "    if (op == OP_ADD)   return a + b;",
+        "    if (op == OP_MAC)   return c + a * b;",
+        "    if (op == OP_RECIP) {",
+        "        // 1/0 has no answer; clamp carrying the sign of the zero.",
+        "        if (a == 0.0) return sign(1.0 / a) * VALUE_LIMIT;",
+        "        return clamp(1.0 / a, -VALUE_LIMIT, VALUE_LIMIT);",
+        "    }",
+        "    if (op == OP_MAX) {",
+        "        // NaN propagates rather than being ordered.",
+        "        if (isnan(a) || isnan(b)) return a + b;",
+        "        return clamp(max(a, b), -VALUE_LIMIT, VALUE_LIMIT);",
+        "    }",
+        "    if (op == OP_FLOOR) {",
+        "        if (isnan(a)) return a;",
+        "        // Clamp *before* flooring: floor(inf) has no value.",
+        "        return floor(clamp(a, -VALUE_LIMIT, VALUE_LIMIT));",
+        "    }",
+        "    if (op == OP_SEL)   return (a > 0.0) ? b : c;",
+        "    if (op == OP_GATED) {",
+        "        emit = ((a > 0.0) == (polarity != 0));",
+        "        return emit ? b : 0.0;",
+        "    }",
+        "    if (op == OP_CONST) return konst;",
+        "    emit = false;",
+        "    return 0.0;",
+        "}",
+    ]
+    return lines
 
 
 def type_constants():

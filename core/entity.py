@@ -158,6 +158,62 @@ class Entity:
     FIRE_SELECT = 2
     FIRE_RULE = FIRE_ALL
 
+    # --- the arithmetic, as data -----------------------------------------
+    #
+    # `fire()` is the authority and stays Python: it is readable, it is what
+    # the tests exercise, and ten short methods are the clearest statement of
+    # ten machines' semantics. But it cannot cross to the GPU -- there is no
+    # subclassing in GLSL and no `None` -- so the arithmetic also has to exist
+    # in a form a generator can emit.
+    #
+    # `OPS` is that form. One entry per declared output channel, each a tuple
+    #
+    #     (opcode, arg, arg, ...)
+    #
+    # where an arg is an input channel index. The opcodes are deliberately few
+    # and total -- every one is defined for every float input, which is what
+    # lets a kernel evaluate them branchlessly or with a cheap switch:
+    #
+    #   OP_IN        a              pass input `a` through unchanged
+    #   OP_ADD       a, b           a + b
+    #   OP_MAC       a, b, c        c + a*b
+    #   OP_RECIP     a              1/a, clamped (see VALUE_LIMIT)
+    #   OP_MAX       a, b           max(a, b), NaN-propagating
+    #   OP_FLOOR     a              floor(a), clamped before flooring
+    #   OP_SEL       c, a, b        a if c > 0 else b
+    #   OP_GATED     c, a, pol      `a` if (c > 0) == pol, else emit nothing
+    #   OP_CONST     -              the per-instance constant (Source)
+    #   OP_NONE      -              emit nothing, ever
+    #
+    # **`OPS` is a declaration, not an implementation.** The base `fire()`
+    # does not read it, because a machine whose semantics do not fit the
+    # opcode set must still be expressible -- it simply overrides `fire()` and
+    # declares `OPS = None`, which the generator reads as "this type has no
+    # GPU form yet" rather than silently emitting something wrong.
+    #
+    # The two are cross-validated: `_self_check()` evaluates `OPS` against
+    # `fire()` over a sweep of inputs for every type that declares both, so
+    # the pair cannot drift. That is the same oracle relationship
+    # `naive_tick()` has to the closed form, and it exists for the same
+    # reason -- a wrong opcode table computes a perfectly plausible wrong
+    # number, with no visual artefact at all.
+    OP_NONE = 0
+    OP_IN = 1
+    OP_ADD = 2
+    OP_MAC = 3
+    OP_RECIP = 4
+    OP_MAX = 5
+    OP_FLOOR = 6
+    OP_SEL = 7
+    OP_GATED = 8
+    OP_CONST = 9
+
+    #: Per-output-channel opcodes, or None for a type with no GPU form.
+    #: Default is "emit nothing on every channel", matching the base
+    #: `fire()` -- which is correct for a type with no outputs and a safe
+    #: default for one whose arithmetic has not been written.
+    OPS = ()
+
     #: Value a *freshly placed* Source emits. The live value is per instance,
     #: in the row at `Source.F_EMIT`; this is only the starting point, which
     #: is why it stays a class attribute rather than a literal in the tick.
@@ -1030,6 +1086,13 @@ class Swap(Structure):
             return [x, z, y]
         return [x, y, z]
 
+    # x passes through; y and z are each selected from the pair on x's sign.
+    OPS = (
+        (Structure.OP_IN, 0),
+        (Structure.OP_SEL, 0, 2, 1),
+        (Structure.OP_SEL, 0, 1, 2),
+    )
+
 
 class Shear(Structure):
     """Shear: x,y -> x, x+y.
@@ -1061,6 +1124,11 @@ class Shear(Structure):
         """x,y -> x, x+y. Outputs are declared (x out, x+y out)."""
         x, y = values
         return [x, x + y]
+
+    OPS = (
+        (Structure.OP_IN, 0),
+        (Structure.OP_ADD, 0, 1),
+    )
 
 
 class Mac(Structure):
@@ -1095,6 +1163,12 @@ class Mac(Structure):
         """x,y,z -> x, y, z + x*y. Declared order is (x out, y out, z' out)."""
         x, y, z = values
         return [x, y, z + x * y]
+
+    OPS = (
+        (Structure.OP_IN, 0),
+        (Structure.OP_IN, 1),
+        (Structure.OP_MAC, 0, 1, 2),
+    )
 
 
 class Reciprocal(Structure):
@@ -1135,6 +1209,8 @@ class Reciprocal(Structure):
             # approached from.
             return [math.copysign(VALUE_LIMIT, a)]
         return [clamp_value(1.0 / a)]
+
+    OPS = ((Structure.OP_RECIP, 0),)
 
 
 class Max(Structure):
@@ -1181,6 +1257,12 @@ class Max(Structure):
         m = clamp_value(a if a > b else b)
         return [m, m]
 
+    # Both outputs carry the same value, so both name the same op.
+    OPS = (
+        (Structure.OP_MAX, 0, 1),
+        (Structure.OP_MAX, 0, 1),
+    )
+
 
 class Floor(Structure):
     """a -> floor(a). Authored as a 2x1 (wide) body.
@@ -1214,6 +1296,8 @@ class Floor(Structure):
         if a != a:
             return [a]
         return [float(math.floor(clamp_value(a)))]
+
+    OPS = ((Structure.OP_FLOOR, 0),)
 
 
 class Route(Structure):
@@ -1270,6 +1354,15 @@ class Route(Structure):
         if b > 0.0:
             return [None, a, b]
         return [a, None, b]
+
+    # The two data paths are gated on opposite polarities of the control, so
+    # exactly one emits; the control itself passes through. `OP_GATED`'s last
+    # arg is the polarity: 1 means "emit when c > 0", 0 means "emit when not".
+    OPS = (
+        (Structure.OP_GATED, 1, 0, 0),
+        (Structure.OP_GATED, 1, 0, 1),
+        (Structure.OP_IN, 1),
+    )
 
 
 class Merge(Structure):
@@ -1355,6 +1448,16 @@ class Merge(Structure):
         """
         control = values[self.CH_CONTROL]
         return [values[self._selected(control)], control]
+
+    # The selected lane, then the control passing through. Note `OPS`
+    # describes the *arithmetic* only: Merge's readiness and its partial
+    # consumption are value-dependent and live in `inputs_ready()` /
+    # `consumed()`, which the opcode set deliberately does not try to
+    # express -- see FIRE_SELECT.
+    OPS = (
+        (Structure.OP_SEL, CH_CONTROL, CH_A, CH_B),
+        (Structure.OP_IN, CH_CONTROL),
+    )
 
 
 class Source(Structure):
@@ -1467,6 +1570,13 @@ class Source(Structure):
         """
         return [self.emit_value] * self.out_channels()
 
+    # Every channel carries the per-instance constant from the row, which is
+    # why `OP_CONST` takes no argument: a kernel reads `F_EMIT` rather than
+    # an input channel. This is also the one type whose `OPS` length is a
+    # function of the *instance* rather than the class, since out_channels()
+    # follows the declared ports -- the self-check derives it per type.
+    OPS = ((Structure.OP_CONST,),) * 3
+
 
 class Sink(Structure):
     """2x2 consumer that accepts on every perimeter face.
@@ -1571,6 +1681,148 @@ HIDDEN_STRUCTURES = ()
 #: Every machine, placeable or not. What anything reasoning about *types*
 #: rather than about *tools* should iterate.
 ALL_STRUCTURES = STRUCTURES + HIDDEN_STRUCTURES
+
+
+def eval_ops(ops, values, const=0.0):
+    """Evaluate a declared `OPS` table. The reference the GLSL transcribes.
+
+    `values` are the input channel values (None for an unfed channel),
+    `const` the per-instance constant `OP_CONST` reads. Returns a list the
+    same shape `fire()` returns, with None meaning "emit nothing".
+
+    This is the opcode set's *meaning*, written once. `fire()` stays the
+    authority for the CPU tick -- this exists so the declaration can be
+    checked against it (see `_self_check`) and so the GLSL has a definition
+    to be a transcription of rather than an invention. Same relationship
+    `BeltSim.position_of()` has to `item_position()` in common.glsl.
+
+    Deliberately total: every opcode is defined for every float input, with
+    no raising and no unreachable branch. A kernel evaluating this needs no
+    guards, which is the property the opcode set was chosen for.
+    """
+    E = Entity
+    out = []
+    for entry in ops:
+        op, args = entry[0], entry[1:]
+
+        def val(i):
+            v = values[i]
+            return 0.0 if v is None else float(v)
+
+        if op == E.OP_NONE:
+            out.append(None)
+        elif op == E.OP_IN:
+            out.append(val(args[0]))
+        elif op == E.OP_ADD:
+            out.append(val(args[0]) + val(args[1]))
+        elif op == E.OP_MAC:
+            out.append(val(args[2]) + val(args[0]) * val(args[1]))
+        elif op == E.OP_RECIP:
+            a = val(args[0])
+            # 1/0 has no answer; clamp carrying the sign *bit* of the zero so
+            # +0 and -0 stay distinguishable. Mirrors Reciprocal.fire().
+            out.append(math.copysign(VALUE_LIMIT, a) if a == 0.0
+                       else clamp_value(1.0 / a))
+        elif op == E.OP_MAX:
+            a, b = val(args[0]), val(args[1])
+            # NaN propagates rather than being ordered -- see Max.fire().
+            out.append(float("nan") if (a != a or b != b)
+                       else clamp_value(a if a > b else b))
+        elif op == E.OP_FLOOR:
+            a = val(args[0])
+            # Clamp *before* flooring: floor(inf) has no value at all.
+            out.append(a if a != a else float(math.floor(clamp_value(a))))
+        elif op == E.OP_SEL:
+            out.append(val(args[1]) if val(args[0]) > 0.0 else val(args[2]))
+        elif op == E.OP_GATED:
+            # Emit only on the declared polarity of the control; the other
+            # channel stays silent, which is how Route sends one item one way
+            # rather than a copy both ways.
+            emit = (val(args[0]) > 0.0) == bool(args[2])
+            out.append(val(args[1]) if emit else None)
+        elif op == E.OP_CONST:
+            out.append(float(const))
+        else:
+            raise ValueError(f"unknown opcode {op}")
+    return out
+
+
+def _check_ops_match_fire():
+    """Every declared `OPS` must agree with that type's `fire()`.
+
+    The cross-validation that makes `OPS` a second *expression* of the
+    arithmetic rather than a second *truth*. Without it the table is a
+    hand-written mirror of exactly the kind generating the GLSL tables was
+    meant to abolish -- and a wrong opcode draws a perfectly crisp wrong
+    number, with no visual artefact to notice.
+
+    Swept over values chosen to separate the machines that are easy to
+    confuse: both signs (every control is "positive means act"), zero (the
+    inactive branch *and* Reciprocal's special case), and a NaN (which Max
+    and Floor propagate and nothing else should invent).
+    """
+    probes = (-2.5, -1.0, -0.0, 0.0, 0.5, 1.0, 3.0, float("nan"))
+    for cls in ALL_STRUCTURES:
+        ops = cls.OPS
+        if not ops:
+            continue
+        n_in = cls.in_channels()
+        n_out = cls.out_channels()
+        assert len(ops) == n_out, (
+            f"{cls.__name__}: {len(ops)} opcodes for {n_out} output channels")
+
+        # A fake instance over a one-row stub table. Every type declaring OPS
+        # reads only `values`, except Source, whose `emit_value` is a row
+        # property -- so the instance needs a board rather than a patched
+        # __dict__.
+        # A dict keyed by `(row, offset)` rather than numpy: `_get`/`_set`
+        # index with that tuple and nothing here needs an array, and
+        # entity.py is otherwise numpy-free -- a self-check is not a reason
+        # to give the module a dependency.
+        class _Cells(dict):
+            def __missing__(self, _key):
+                return 0.0
+
+        class _Dirty:
+            def add(self, _row):
+                pass
+
+        class _Stub:
+            def __init__(self):
+                self.entities = _Cells()
+                self.entities_dirty = _Dirty()
+
+        inst = cls.__new__(cls)
+        inst.board = _Stub()
+        inst.row = 0
+        inst._ghost = None
+        for i, a in enumerate(probes):
+            # Rotate the probe list so each channel sees a different value --
+            # which is what makes a swapped pair of channels visible. Equal
+            # inputs would let Shear's (x, x+y) pass as (y, x+y).
+            values = [probes[(i + k) % len(probes)] for k in range(n_in)]
+            const = a
+            if n_in == 0:
+                inst.board.entities[0, cls.F_EMIT] = const
+            try:
+                got = cls.fire(inst, list(values))
+            except Exception as exc:   # pragma: no cover - a real failure
+                raise AssertionError(
+                    f"{cls.__name__}.fire({values}) raised {exc!r}") from exc
+            want = eval_ops(ops, values, const)
+            assert len(got) == len(want), (
+                f"{cls.__name__}: fire gave {len(got)} results, OPS "
+                f"{len(want)}")
+            for ch, (g, w) in enumerate(zip(got, want)):
+                if g is None or w is None:
+                    assert (g is None) == (w is None), (
+                        f"{cls.__name__} ch{ch} on {values}: fire gave {g!r}, "
+                        f"OPS gave {w!r} -- one emitted and the other did not")
+                    continue
+                same = (g == w) or (g != g and w != w)   # NaN == NaN
+                assert same, (
+                    f"{cls.__name__} ch{ch} on {values}: fire gave {g}, "
+                    f"OPS gave {w}")
 
 
 def _self_check():
@@ -2184,6 +2436,10 @@ def _self_check():
                     f"differs at {cell.DIR_NAMES[d]}")
 
     assert Belt.ROTATABLE is False
+
+    # The opcode tables against the methods they describe. Last, because it
+    # is the only check here that depends on ALL_STRUCTURES being complete.
+    _check_ops_match_fire()
 
 
 _self_check()

@@ -544,6 +544,22 @@ class GateSim:
         if not len(all_rows):
             return [], 0, 0
 
+        # **Load the SoA mirror here, not in `structure_phase()`.** The
+        # mirror is authoritative only for the span between this load and the
+        # next write to `Gameboard.entities` (see core/gate_state.py), and
+        # putting the load in the caller let the two come apart: every
+        # in-tree caller went through `structure_phase()`, but
+        # `tools/check_prefilter_safe.py` calls this directly and so read a
+        # mirror one tick stale. It reported an excluded Sink that the full
+        # path would have fired -- which is exactly the "conservative"
+        # property the prefilter must never lose, surfacing as a safety
+        # failure rather than as a wrong number.
+        #
+        # Keeping the load adjacent to the only read is what makes that
+        # unrepresentable: there is no way to reach the gather below without
+        # having refreshed first.
+        self.state.sync_from_rows()
+
         # **The sleep set slices the table, and it has to.** For a long time
         # it did not: every vectorised quantity below was computed over the
         # whole table and the sleep set was updated afterwards, so sleeping
@@ -1624,19 +1640,7 @@ class GateSim:
         # dominates `fire` is one where the prefilter is admitting almost
         # nothing -- working as intended -- and the reverse means the survivors
         # are where the time is.
-        # Load the SoA mirror before anything reads it. **The window the
-        # mirror is authoritative in is this call and no wider** (see
-        # core/gate_state.py): the per-gate path below still writes through
-        # views to `Gameboard.entities`, so the mirror is refreshed here, read
-        # by the prefilter, and never written back -- there is exactly one
-        # writer at any moment, which is the whole safety argument for keeping
-        # a second copy at all.
-        #
-        # `_gate_table()` builds the mirror's layout, so it must be called
-        # first; `_candidate_rows()` does that as its first act.
         with prof.probe("structure/prefilter"):
-            self._gate_table()
-            self.state.sync_from_rows()
             admit, pre_starved, pre_blocked = self._candidate_rows()
         self.stats["starved"] += pre_starved
         self.stats["blocked"] += pre_blocked
