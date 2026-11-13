@@ -299,7 +299,6 @@ class GateSim:
         self._faces_cache.clear()
         self._src_cache.clear()
         self._dst_cache.clear()
-        self._gate_table_cache = None
         self._gate_segments = None
         # The feeder map is the inverse of `_dst_cache`, so it dies with it --
         # and it must, because it holds segment *objects* and a rebuild
@@ -321,6 +320,31 @@ class GateSim:
         # free list reuses, and it is derived from port geometry an in-place
         # turn changes -- so it must die on an edit; it just must not die on a
         # tick.
+        # **The gate table is NOT dropped here either, for the same reason and
+        # at the same price.** This is the third derivation to make the
+        # mistake, after the direct-feeder index above and the constant fold
+        # below, and it survived longest because it is *correct* -- merely
+        # recomputed. `_gate_table()` is `(rows, n_in, n_out, strict)`, all
+        # four functions of which rows hold which type, which nothing but an
+        # edit changes; but it is built by walking `gates()` and constructing
+        # a view per row, which is the per-gate Python the prefilter exists to
+        # avoid, paid once a tick to rebuild the list of who to avoid it for.
+        #
+        # Measured at exactly one rebuild per tick on every real board, and it
+        # is the single largest line in the profile after `fire`:
+        #
+        #                 rows   per rebuild   share of tick
+        #   cpu.npz        450      1.20ms         20%
+        #   noram.npz      617      1.54ms         19%
+        #   Ram2.npz       732      2.06ms         19%
+        #   ram.npz        197      0.64ms         23%
+        #
+        # The docstring above calls this method "cheap enough to do
+        # unconditionally -- one dict clear", which is true of the four caches
+        # it was written for and false of everything added since. A whole-board
+        # walk hidden behind a line that reads as a clear is how all three of
+        # these got here, so the rule is now stated rather than implied: this
+        # method may only drop things whose rebuild is O(1) or lazy per entry.
         # **Constant folding is deliberately NOT dropped here**, which is the
         # one exception among the derivations above and needs stating because
         # it looks like an omission.
