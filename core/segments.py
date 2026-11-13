@@ -154,7 +154,7 @@ class Segment:
 
     __slots__ = ("sid", "cells", "length", "head", "tail", "anchor",
                  "base", "cap", "enter_tick", "payload",
-                 "src", "dst")
+                 "src", "dst", "_declined")
 
     def __init__(self, sid, cells, length):
         self.sid = sid
@@ -193,6 +193,21 @@ class Segment:
         #: (entity_row, face_direction) or None for a dangling end.
         self.src = None
         self.dst = None
+
+        #: **Per-tick scratch, not state**: did this run's producer get asked
+        #: for an item on the last tick and decline? Written by
+        #: `BeltSim.tick_segment()` and read one line later by `BeltSim.tick()`
+        #: to decide whether the run can sleep -- "nothing will be offered" is
+        #: a fact about the upstream gate that the segment cannot derive, and
+        #: this is how it crosses over without `BeltSim` acquiring a reference
+        #: to the gate layer.
+        #:
+        #: False here is the conservative default and has to be: it means "no
+        #: information", so a segment that has never been ticked (or is asked
+        #: about between ticks) falls back to the purely-local rest test
+        #: rather than claiming its producer is idle. Deliberately **not**
+        #: saved, uploaded or compared -- see `BeltSim.is_at_rest()`.
+        self._declined = False
 
     @property
     def count(self):

@@ -91,9 +91,13 @@ int segment_offset(int w) { return (w >> SEG_OFF_SHIFT) & SEG_OFF_MASK; }
 const float BELT_UNIT = 256.0;
 
 layout(std430, binding = 1) buffer SegmentsI {
-    // .x head, .y tail, .z base, .w cap
+    // Two ivec4s per segment:
+    //   [0] .x head, .y tail, .z base, .w cap
+    //   [1] .x asleep (the simulation's own sleep set), .yzw reserved
+    // MUST match SEG_IVEC / SEG_I_ASLEEP in core/belt_device.py.
     ivec4 seg_i[];
 };
+
 layout(std430, binding = 2) buffer SegmentsF {
     // .x anchor, .y length, .z speed, .w spacing
     vec4 seg_f[];
@@ -102,6 +106,16 @@ layout(std430, binding = 3) buffer BeltItems {
     // .x enter_tick, .y payload
     vec2 items[];
 };
+
+//: The four mutable/layout fields of a segment record. Every reader goes
+//: through this rather than indexing `seg_i` directly, so the two-vector
+//: stride is written once -- the record grew from one vector to two, and the
+//: four call sites would otherwise each have had to remember the `* 2`.
+ivec4 seg_core(int sid) { return seg_i[sid * 2]; }
+
+//: Is the belt phase currently skipping this run? Uploaded rather than
+//: re-derived -- see `segment_at_rest()` for why that had to change.
+bool seg_asleep_flag(int sid) { return seg_i[sid * 2 + 1].x != 0; }
 
 // The entity table, as flat floats. Row `r` starts at `r * ENTITY_STRIDE`.
 // Generated constants give the field offsets -- see core/glsl_types.py, which
@@ -164,7 +178,7 @@ bool gate_asleep(int row) {
 // the whole-tick `min(anchor + v, L)`. Without that clamp a blocked clump
 // slides forward between ticks and the head drifts off the end of the belt.
 float item_position(int sid, int k, int tick, float alpha) {
-    ivec4 si = seg_i[sid];
+    ivec4 si = seg_core(sid);
     vec4  sf = seg_f[sid];
     int   slot = si.z + (k % si.w);
 
@@ -181,46 +195,37 @@ float item_position(int sid, int k, int tick, float alpha) {
 }
 
 float item_payload(int sid, int k) {
-    ivec4 si = seg_i[sid];
+    ivec4 si = seg_core(sid);
     return items[si.z + (k % si.w)].y;
 }
 
 // Is this segment at rest -- i.e. would the belt phase skip it?
 //
-// MUST match BeltSim.is_at_rest() in core/belts.py. Derived here rather than
-// uploaded as a flag because every term is already in the segment record:
-// head, tail and anchor are the three mutable fields, and length/spacing are
-// the constants beside them. A sleeping segment is a fixed point of the tick
-// (the anchor saturates, an empty ring cannot pop, an idle producer offers
-// nothing), so "asleep" is a function of state the renderer already has.
+// **This reads the simulation's uploaded sleep flag, and used to re-derive
+// the predicate. The change was forced, not preferred.**
 //
-// `tick` is taken as a parameter rather than read from a uniform so this
-// file stays self-contained -- common.glsl declares no uniforms, and every
-// other function here is a pure function of its arguments and the SSBOs.
-// Evaluated at whole-tick state, with no alpha: sleeping is a property of
-// the simulation's decision, not of where the interpolation currently sits.
-// A run that woke this tick should read as awake for the whole frame.
+// Re-deriving was honest for as long as every term was in the segment
+// record: `head`, `tail` and `anchor` are the mutable fields, `length` and
+// `spacing` the constants beside them, so "asleep" really was a function of
+// state the renderer already had -- the same relationship `item_position()`
+// has to `BeltSim.position_of()`.
+//
+// The **producer-idle** clause broke that. `is_at_rest()` now also rests a
+// run holding items with room to spare when its upstream gate offered
+// nothing, and that term is not in the record at all: it is a fact about an
+// *entity row*. Deriving it here would mean resolving the run's source port
+// and reading that gate's waiting zone in GLSL -- a mirror of
+// `GateSim._src_cached()` plus the port geometry, which is exactly the class
+// of second copy that has already caused two "GLSL disagrees with Python"
+// bugs. The gate half of this overlay made the same call for the same reason
+// (see `gate_asleep()`), so the two halves are now consistent.
+//
+// `tick` is kept as a parameter, unused, deliberately: every caller passes
+// `sim_tick` and the signature is pinned by tests/test_glsl.py. Dropping it
+// would churn the call sites to save nothing, and a future term might need
+// it again.
 bool segment_at_rest(int sid, int tick) {
-    ivec4 si = seg_i[sid];
-    vec4  sf = seg_f[sid];
-    if (si.x == si.y) {
-        // Empty: inert once the anchor has saturated at the far end. The
-        // anchor clause is load-bearing -- an empty run whose anchor is
-        // still advancing is not yet a fixed point.
-        return sf.x >= sf.y;
-    }
-    // Holding items: both halves of the tick must be unable to act.
-    //
-    // The head must already be at the end -- a run whose head is still
-    // travelling has a pop coming on a future tick, with no external event
-    // to announce it (positions are a closed form over `tick`, so they
-    // advance whether or not the run is visited). Omitting this reported a
-    // seeded run as asleep from its first tick; see BeltSim.is_at_rest().
-    if (item_position(sid, si.x, tick, 0.0) < sf.y) return false;
-    // ...and nothing can enter: the last item has not yet moved a full
-    // spacing clear of the entrance. This is the RAM case, a run storing a
-    // value nobody is taking.
-    return item_position(sid, si.y - 1, tick, 0.0) < sf.w;
+    return seg_asleep_flag(sid);
 }
 
 bool is_empty(int w) { return cell_type(w) == TYPE_EMPTY; }

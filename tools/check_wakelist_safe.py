@@ -707,6 +707,32 @@ def main():
 
     gates._direct_lane_is_quiet = _counting_direct
 
+    #: Belt sleeps granted by the **producer-idle** clause: a run holding
+    #: items, head parked at the end, with room to spare, whose producer was
+    #: asked and declined. Counted because removing a sleep is always *safe*
+    #: -- the differential diff passes with the clause gutted, since ticking
+    #: more is never wrong -- so the diff cannot tell a working clause from an
+    #: absent one. Only a grant count can.
+    #:
+    #: `room` is the interesting number: a sleep that would also have been
+    #: granted by the old `not has_room()` test proves nothing new, so this
+    #: counts only the ones where there *was* room and the producer term was
+    #: the deciding factor.
+    producer_idle = {"room": 0, "full": 0}
+    _belts = engine.belts
+    _real_rest = _belts.is_at_rest
+
+    def _counting_rest(seg, at_tick, offers_nothing=False):
+        rest = _real_rest(seg, at_tick, offers_nothing)
+        if rest and seg.head != seg.tail:
+            if _belts.has_room(seg, at_tick):
+                producer_idle["room"] += 1
+            else:
+                producer_idle["full"] += 1
+        return rest
+
+    _belts.is_at_rest = _counting_rest
+
     def run_one_tick(at_tick):
         """One tick at a fixed tick number, from whatever is loaded."""
         engine.clock.tick = at_tick
@@ -842,6 +868,11 @@ def main():
           f"{direct['dangling']} refused as dangling")
     if not direct["grant"]:
         vacuous.append("gates tier two direct clause")
+    print(f"  belts: {producer_idle['room']} non-empty sleeps granted with "
+          f"room to spare (the producer-idle clause), "
+          f"{producer_idle['full']} with no room (the old rule)")
+    if not producer_idle["room"]:
+        vacuous.append("belts producer-idle clause")
     for name in vacuous:
         print(f"  WARNING: nothing in '{name}' ever woke, so this run did "
               f"not exercise its wake edges at all")

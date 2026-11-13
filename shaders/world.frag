@@ -757,7 +757,7 @@ vec4 draw_items(ivec4 c, vec2 p, int travel, float px) {
     int sid = segment_id(c.w);
     if (sid == 0) return out_col;
 
-    ivec4 si = seg_i[sid];
+    ivec4 si = seg_core(sid);
     int head = si.x, tail = si.y;
     if (head == tail) return out_col;          // nothing on this run
 
@@ -1317,9 +1317,17 @@ void main() {
                 // tier-two sleeper **amber**, and the one population the
                 // overlay existed to reveal was the one it could not show.
                 //
-                // With sleeping switched off the flag is never written and
-                // stays 0, so every gate reads awake -- which is exactly
-                // right, because every gate is then visited.
+                // The flag also covers a **folded Source**, which is not in
+                // the sleep set at all -- it has left the gate table, a
+                // stronger form of not being ticked. Blue means "costing no
+                // time in tick()", so a constant folded out of the phase is
+                // what the colour is for; it read amber before, and folding
+                // is otherwise invisible in the world view since a folded
+                // Source is identical in outline.
+                //
+                // With sleeping switched off the only rows flagged are those
+                // folded Sources, so every real gate reads awake -- which is
+                // right, because every one of them is then visited.
                 // Masked off -> report asleep, so the gates drop to a flat
                 // blue field and only the belts carry amber. Same contract as
                 // the belt mask above: the mask decides whether to *ask*,

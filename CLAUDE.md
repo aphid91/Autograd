@@ -1616,12 +1616,57 @@ position depends on it, so it is correct by luck under today's spacing.
 definition (does an idle tick really change nothing?) rather than against
 observable behaviour, and that is the only thing that catches it.
 
-**The two fixed points are sound but not complete, and the gap is the common
-case.** `is_at_rest()` asks "can an item *enter*", never "will anything
-offer one" — so a run that is backed up but one item short of full stays
-awake for ever. Measured on `cpu.npz`: **37 of 466 runs awake, and all 37
-unchanged over 200 further ticks.** The whole awake set was being ticked for
-nothing.
+**The two fixed points were sound but not complete, and the gap was the
+common case.** `is_at_rest()` asked "can an item *enter*", never "will
+anything offer one" — so a run backed up but one item short of full stayed
+awake for ever. Capacity is `L/d + 1`, so a 3-cell run needs *four* items
+before `has_room()` goes False. Measured after 60 ticks: of the awake
+non-empty runs, **42 of 67 on cpu.npz and 92 of 107 on Ram2.npz** were
+blocked-with-room behind a producer holding nothing.
+
+**That gap is now closed by a third fixed point** — *holding items, head
+parked at the end, and the producer offering nothing.* Two things about it:
+
+- **The missing term is not the run's to answer.** "Nothing can enter" is a
+  property of the segment; "nothing will be offered" is a property of the
+  upstream *gate*. It arrives as an `offers_nothing` parameter rather than a
+  lookup, because `BeltSim` holds no reference to the gate layer and must not
+  acquire one — `offer()` is already the sanctioned way for node state to
+  reach the belt phase, and the tick loop has *just called it*, so the answer
+  is free. `Segment._declined` carries it the one line from `tick_segment()`
+  to `tick()`, as per-tick scratch rather than state.
+- **The head-at-end clause is what makes it safe**, and it is the whole
+  argument rather than an inherited detail. A run holding one mid-flight item
+  has *identical stored state* for the item's entire journey — traced on a
+  10-cell run, `(head, tail, anchor) == (0, 1, 2560)` from tick 1 to tick 10
+  while the item visibly slid the full length, then popped at tick 11 with no
+  external cause. Position is a closed form over `tick`, so an idle producer
+  **alone** is not a fixed point: sleeping on it strands the item mid-belt.
+  That is the seeded-belt bug re-entered by a different door, and
+  `tools/check_wakelist_safe.py` catches the mutation within 5 ticks as
+  `MUTUAL SLEEP`.
+
+Two notes on testing it, both of which bit:
+
+- **Removing a sleep is always safe**, so the differential diff passes with
+  the clause gutted — ticking more is never wrong. The checker therefore
+  reports a **grant count** (`18 non-empty sleeps granted with room to
+  spare`), and warns when it is zero, because the diff alone cannot tell a
+  working clause from an absent one.
+- **`tools/probe_wakelist.py` must test in the engine's order.** It now
+  checks this clause against the definition, and the first version asked
+  `is_at_rest()` *before* the tick and reported failures that are not
+  reachable: `BeltSim.tick()` ticks, then asks, and only sleeps when the tick
+  reported `not (popped or pushed)` — so the predicate is never consulted
+  about a run whose pop is still pending. The idle tick must also **keep its
+  consumer**, since "the producer offers nothing" says nothing about the
+  consumer; dropping it makes the pop impossible for an unrelated reason and
+  the check passes against any predicate at all.
+
+**One consequence for the overlay: "at rest" and "asleep" now differ by a
+tick.** The `not (p or q)` guard means the tick that fills a run to capacity
+makes it `is_at_rest()` but does not sleep it — the next one does. Pixel
+tests must assert against `is_asleep()`, not the predicate.
 
 Two shapes produce it, and the second is the surprising one:
 
@@ -2024,14 +2069,26 @@ written** — `erase()` invalidates the segments, `sync_segments()` calls
 the channel comes out clear whether or not the fold released it. It now tests
 `_drop_folding()` directly, with no flush nearby.
 
-The Status window reports `folded: yes/no` on a Source, and the Segments panel
-counts them. That readout is the whole affordance, because a folded Source is
-invisible in every other view: identical in outline, and the sleep overlay
-paints it the same blue as any gate holding nothing — which it genuinely is,
-since the constant lives on its *neighbour's* channel. A green tint in the
-overlay was considered and dropped: `.z` has one spare bit, but using it means
-a restamp on every fold change plus a GLSL mirror plus a pixel test, which is
-a lot of machinery for a debug colour.
+The Status window reports `folded: yes/no` on a Source and the Segments panel
+counts them — but the **sleep overlay paints a folded Source blue**, which is
+the view-level affordance. Blue means "costing no tick time", and a folded
+Source has left the gate table entirely: a *stronger* form of not being
+ticked than sleeping is.
+
+It read **amber** until the overlay started reading a published flag, because
+a folded row is not in `GateSim._asleep` and the old occupancy guess only
+knew about that set. So `_publish_sleep()` flags the folded rows too,
+separately from the gate table — whose whole point is that they are absent
+from it — and **runs unconditionally**, not gated on `_sleep_enabled`, since
+folding is a different mechanism with its own switch and tying its colour to
+the sleep latch would make the overlay lie about whichever was off.
+
+Pinned by `test_the_overlay_draws_a_folded_source_as_asleep`, which compares
+against an *unfolded* Source on the same board: "blue" alone would also pass
+if the overlay painted every gate blue. An earlier note here proposed a
+distinct green tint via `.z`'s spare bit and rejected it as too much
+machinery for a debug colour; reusing the row flag got the same information
+across for nothing.
 
 #### Gate sleep is built and correct, and still costs more than it saves
 
@@ -2632,12 +2689,27 @@ while staying internally consistent. Two tools, both free when off:
   above, and the panel reports the `asleep/total` ratio beside the checkbox —
   the overlay answers *where*, the number answers *how much*.
 
-  **Nothing new is uploaded for it.** `segment_at_rest()` in `common.glsl`
-  re-derives the predicate from the segment record the renderer already
-  has — `head`, `tail`, `anchor`, `length`, `spacing` are exactly the terms
-  `BeltSim.is_at_rest()` uses. So it is a second implementation of a Python
-  rule, like `item_position()` beside `BeltSim.position_of()`, and pinned the
-  same way.
+  **`segment_at_rest()` now reads an uploaded flag, and that change was
+  forced rather than preferred.** It used to re-derive the predicate from the
+  segment record the renderer already had — `head`, `tail`, `anchor`,
+  `length`, `spacing` were exactly the terms `BeltSim.is_at_rest()` used, so
+  it was a second implementation of a Python rule like `item_position()`
+  beside `BeltSim.position_of()`.
+
+  The **producer-idle clause** broke that: "the upstream gate offered
+  nothing" is a fact about an *entity row*, not about the segment, so
+  deriving it in GLSL would mean mirroring `GateSim._src_cached()` and the
+  port geometry — exactly the class of second copy that has already caused
+  two "GLSL disagrees with Python" bugs. So the flag is uploaded in the
+  segment record's second `ivec4` (`SEG_I_ASLEEP`), and the gate half made
+  the same call for the same reason, which leaves the two halves consistent.
+
+  Two details: `SEG_IVEC` grew 4 → 8 rather than squatting on a spare bit of
+  `base` or `cap`, which are used in an index and a modulo respectively where
+  a sign-bit trick would be silent corruption; and every reader goes through
+  `seg_core(sid)` so the two-vector stride is written once. `speed` looked
+  spare and is **not** — `item_position()` reads `sf.z` three times, checked
+  rather than assumed.
 
   A **gate** body reads a published flag (`Entity.F_ASLEEP`) rather than
   re-deriving anything, which is the one place the overlay is asymmetric with

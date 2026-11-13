@@ -1545,11 +1545,21 @@ def test_the_sleep_overlay_separates_asleep_from_awake():
         engine.sync_segments()
 
         _at_whole_tick()
-        # Five ticks is the window where all three states hold at once: the
+        # Six ticks is the window where all three states hold at once: the
         # long run is awake with its far end still bare (so the awake test
         # can be a positive check for amber -- see `_is_warm`), and the short
-        # run has already packed full and gone to rest.
-        for _ in range(5):
+        # run has already packed full, gone to rest, *and* been put in the
+        # sleep set.
+        #
+        # **Those last two are one tick apart, which is why this is 6 and not
+        # 5.** `BeltSim.tick()` only sleeps a run whose tick reported
+        # `not (popped or pushed)`, so the tick that fills the short run to
+        # capacity makes it `is_at_rest()` but does not sleep it -- the
+        # *next* tick does. The overlay reads the scheduler's sleep set
+        # rather than re-deriving the predicate (see `segment_at_rest()` in
+        # common.glsl), so the fixture has to be past that one-tick lag or it
+        # samples a run that is at rest and still being visited.
+        for _ in range(6):
             engine.clock.request_step()
             engine.clock.advance(0.0)
 
@@ -1559,14 +1569,20 @@ def test_the_sleep_overlay_separates_asleep_from_awake():
         busy = engine.segments.at(14, 20)
         ram = engine.segments.at(12, 32)
         assert idle is not None and busy is not None and ram is not None
-        assert engine.belts.is_at_rest(idle, tick), (
-            "the unfed run should be at rest; the fixture is wrong")
-        assert not engine.belts.is_at_rest(busy, tick), (
+        # **Asserted against the sleep set, not against `is_at_rest()`.** The
+        # overlay now reads the scheduler's own answer rather than
+        # re-deriving the predicate, so the sleep set is what it must agree
+        # with -- and the two differ by a tick (see the loop above). Using the
+        # predicate as the oracle here would have the test disagree with the
+        # shader for a reason that is not a bug in either.
+        assert engine.belts.is_asleep(idle.sid), (
+            "the unfed run should be asleep; the fixture is wrong")
+        assert not engine.belts.is_asleep(busy.sid), (
             "the Source-fed run should be awake; the fixture is wrong")
-        assert ram.count and engine.belts.is_at_rest(ram, tick), (
-            f"the short run should be at rest *holding* items; got "
-            f"{ram.count} items, at_rest="
-            f"{engine.belts.is_at_rest(ram, tick)}")
+        assert ram.count and engine.belts.is_asleep(ram.sid), (
+            f"the short run should be asleep while *holding* items -- the RAM "
+            f"fixed point; got {ram.count} items, asleep="
+            f"{engine.belts.is_asleep(ram.sid)}")
 
         # Pick a cell on the awake run that no item has reached, or the test
         # measures item colour instead of the overlay.
@@ -1740,6 +1756,79 @@ def test_the_sleep_masks_isolate_belts_from_gates():
         ok(f"belt amber {belt_shown.astype(int)} -> masked "
            f"{belt_hidden.astype(int)}; gate {gate_shown.astype(int)} -> "
            f"masked {gate_hidden.astype(int)}")
+    finally:
+        cam.set_define("SLEEP_DEBUG", was)
+        cam.sleep_show_belts = True
+        cam.sleep_show_gates = True
+
+
+def test_the_overlay_draws_a_folded_source_as_asleep():
+    """A folded constant costs no tick time, so blue is what it should read.
+
+    Blue means "the tick is not visiting this", and a folded Source has left
+    the gate table entirely -- a stronger form of not being ticked than
+    sleeping is. It rendered **amber** before, because it is not in
+    `GateSim._asleep` and the overlay's gate half only knew about that set.
+
+    It is also the only way folding is visible in the world view: a folded
+    Source is identical in outline to a working one, and the Status window's
+    `folded: yes` answers for one entity at a time.
+
+    The comparison is against an *unfolded* Source on the same board, because
+    "blue" on its own would also pass if the overlay painted every gate blue.
+    """
+    was = "SLEEP_DEBUG" in cam.defines
+    try:
+        # Folded: its only output face reaches a gate, no belt anywhere.
+        folded = engine.place_structure(Source, 7, 10)
+        engine.place_structure(Shear, 9, 10)
+        # Not folded: a belt on its output makes it a real producer, and a
+        # one-cell run backs up so it ends the tick *holding* a zone --
+        # unambiguously awake, and the contrast this test needs.
+        producer = engine.place_structure(Source, 7, 16)
+        producer.emit_value = 1.0
+        engine.place_belt(9, 16)
+        engine.sync_segments()
+
+        _at_whole_tick()
+        for _ in range(6):
+            engine.clock.request_step()
+            engine.clock.advance(0.0)
+
+        gates = engine.gates
+        assert gates.is_folded(folded.row), (
+            "the fixture is wrong unless the first Source folds")
+        assert not gates.is_folded(producer.row), (
+            "and unless the second one does not")
+        # Vacuity guard: the unfolded one must really be holding something,
+        # or this compares blue against blue and passes whatever the overlay
+        # did -- the same trap the mask test documents.
+        held = engine.board.view(producer.row)
+        assert any(held.out_held(c) for c in range(held.output_count())), (
+            "the unfolded Source should be holding a blocked zone by now; "
+            "without that the contrast below is vacuous")
+
+        assert cam.set_define("SLEEP_DEBUG", True), cam.compile_error
+        assert cam.compile_error is None, cam.compile_error
+        cam.center[:] = (8.0, 13.0)
+        cam.zoom = 20.0
+        cam.sleep_show_belts = True
+        cam.sleep_show_gates = True
+
+        img = _render()
+        fx, fy = folded.origin
+        px, py = producer.origin
+        folded_col = _mean_rgb(img, fx, fy)
+        producer_col = _mean_rgb(img, px, py)
+        assert _is_cold(folded_col), (
+            f"a folded Source costs no tick time and must read blue, got "
+            f"{folded_col}")
+        assert _is_warm(producer_col), (
+            f"an unfolded, firing Source must still read amber, got "
+            f"{producer_col} -- if both are blue the overlay is painting "
+            f"every gate asleep and this test proves nothing")
+        ok(f"folded Source reads asleep {folded_col.astype(int)}, "
+           f"a real producer reads awake {producer_col.astype(int)}")
     finally:
         cam.set_define("SLEEP_DEBUG", was)
         cam.sleep_show_belts = True

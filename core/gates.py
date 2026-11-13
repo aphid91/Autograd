@@ -1308,26 +1308,48 @@ class GateSim:
         and a *recycled* row is handled because `invalidate_board()` clears
         the table and the set together.
 
-        Skipped entirely when sleeping is off, so the flag reads 0 everywhere
-        and the overlay falls back to exactly the pre-sleep picture.
+        **A folded Source publishes as asleep too**, and it is not in
+        `_asleep` -- it leaves the gate table entirely (see `_gate_table()`),
+        which is a stronger form of not being ticked than sleeping is. Blue
+        means "costing no time in `tick()`", so a constant that has been
+        folded out of the phase is exactly what the colour is for, and it read
+        amber before this. It is also the only way folding is visible in the
+        world view: a folded Source is identical in outline and the Status
+        window's `folded: yes` is one entity at a time.
+
+        That is why the folded rows are published **separately from the gate
+        table** rather than by including them in it -- the table's whole point
+        is that they are absent from it.
+
+        Runs whether or not gate *sleeping* is on, for the same reason: the
+        fold is a different mechanism with its own switch
+        (`set_folding_enabled`), so tying its colour to the sleep latch would
+        make the overlay lie about whichever one happened to be off.
         """
-        rows, _n_in, _n_out, _strict = self._gate_table()
-        if not len(rows):
-            return
         ents = self.board.entities
-        asleep = self._asleep
-        if asleep:
-            flags = np.isin(rows, np.fromiter(
-                asleep, dtype=np.int64, count=len(asleep)))
-            ents[rows, Entity.F_ASLEEP] = flags.astype(np.float32)
-        else:
-            ents[rows, Entity.F_ASLEEP] = 0.0
+        rows, _n_in, _n_out, _strict = self._gate_table()
+        if len(rows):
+            asleep = self._asleep
+            if asleep:
+                flags = np.isin(rows, np.fromiter(
+                    asleep, dtype=np.int64, count=len(asleep)))
+                ents[rows, Entity.F_ASLEEP] = flags.astype(np.float32)
+            else:
+                ents[rows, Entity.F_ASLEEP] = 0.0
+        folded = self._folds()[0]
+        if folded:
+            ents[list(folded), Entity.F_ASLEEP] = 1.0
         # `entities_dirty` is a **union range**, not a set, so one
-        # `add_range()` over the table's extent is both the correct call and
+        # `add_range()` spanning both populations is both the correct call and
         # cheaper than adding each row -- the upload is one contiguous write
-        # either way, and the gate rows are scattered through the table.
-        self.board.entities_dirty.add_range(
-            int(rows[0]), int(rows[-1]) + 1)
+        # either way, and these rows are scattered through the table.
+        touched = list(folded)
+        if len(rows):
+            touched.append(int(rows[0]))
+            touched.append(int(rows[-1]))
+        if touched:
+            self.board.entities_dirty.add_range(
+                int(min(touched)), int(max(touched)) + 1)
 
     def _awake_slice(self, rows, n_in, n_out, strict):
         """The gate table restricted to the rows not asleep, memoised.
@@ -1490,9 +1512,12 @@ class GateSim:
         self._assert_folded(self._folds()[1])
         # Publish the sleep set for the overlay, last, so it describes the
         # state the frame will actually render rather than a mid-phase one.
-        if self._sleep_enabled:
-            with prof.probe("structure/publish_sleep"):
-                self._publish_sleep()
+        # **Unconditional**, not gated on `_sleep_enabled`: it also publishes
+        # the folded Sources, which are a separate mechanism with a separate
+        # switch, so skipping it with sleeping off would paint every folded
+        # constant awake.
+        with prof.probe("structure/publish_sleep"):
+            self._publish_sleep()
         self.stats["fired"] += fired
         return fired
 

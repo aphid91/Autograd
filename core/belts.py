@@ -271,10 +271,19 @@ class BeltSim:
         # 3. Produce. There is room once the last item has moved a full
         #    spacing clear of the entrance.
         pushed = False
+        # **"The producer was asked and gave nothing"**, which is not the same
+        # as "nothing was pushed": a run with no room is never asked, so its
+        # producer may be holding an item and about to be taken from. Only the
+        # asked-and-declined case licenses the sleep clause in
+        # `is_at_rest()`, so the two are tracked apart. Starts False, meaning
+        # "no information", which is the conservative value.
+        declined = False
         if offer is not None:
             if self.has_room(seg, tick):
                 payload = offer(seg)
-                if payload is not None:
+                if payload is None:
+                    declined = True
+                else:
                     self._push(seg, payload, tick)
                     pushed = True
                     # Only now has the producer actually parted with it.
@@ -283,6 +292,17 @@ class BeltSim:
 
         if popped:
             self.stats["popped"] += 1
+        # Hand the producer's answer to the sleep test via the segment rather
+        # than widening the return tuple. **Deliberate, and the lesser evil:**
+        # `(popped, pushed)` is unpacked at ~25 call sites across the tests,
+        # the oracle comparison and two probe tools, and a third element would
+        # churn all of them to deliver a value only `tick()` consumes -- one
+        # line below the call.
+        #
+        # It is per-tick scratch, not state: written on every visit, read
+        # immediately, and never persisted or uploaded. `_declined` rather
+        # than a public name for exactly that reason.
+        seg._declined = declined
         # `pushed` is counted by _push(), the single place an item enters a
         # ring -- counting again here would double every tick's push and also
         # miss a seed, which does not come through this path at all.
@@ -311,6 +331,27 @@ class BeltSim:
     #     segment's. Item positions freeze too, so the closed form keeps
     #     describing it and the renderer needs no special case.
     #
+    # ...and a third, which needs one fact the segment does not own:
+    #
+    #   **holding items, head parked at the end, and the producer offering
+    #     nothing.** The two above are *local* -- "no room" is a property of
+    #     the run. But the room test is the wrong question when the run is
+    #     nearly empty: capacity is `L/d + 1`, so a 3-cell run needs *four*
+    #     items before `has_room()` goes False, and one item short of that the
+    #     predicate notices nothing even though the upstream gate is idle and
+    #     will offer nothing for a thousand ticks.
+    #
+    #     Measured, and it is the larger of the two remaining gaps: of the
+    #     awake non-empty runs after 60 ticks, **42 of 67 on cpu.npz and 92 of
+    #     107 on Ram2.npz** were blocked-with-room behind a producer holding
+    #     nothing. The whole awake set was being ticked to re-derive "the
+    #     producer still has nothing".
+    #
+    #     The missing term is not the run's to answer: "nothing can enter" is
+    #     a property of the segment, while "nothing will be offered" is a
+    #     property of the upstream *gate*. `offers_nothing` carries it in --
+    #     see `is_at_rest()` on why it is a parameter rather than a lookup.
+    #
     # This matters far more than the factory workload suggested. A *computer*
     # built from these parts runs one trace through a sea of memory: measured
     # on a CPU-shaped board, 1101 of 1101 segments were inert and the belt
@@ -328,12 +369,28 @@ class BeltSim:
     # It is also the GPU shape: the awake set is a compacted index buffer, and
     # the sleep test is a per-segment predicate a compute pass can evaluate
     # and compact. That is the same structure GateSim._candidate_rows() has.
-    def is_at_rest(self, seg, tick):
+    def is_at_rest(self, seg, tick, offers_nothing=False):
         """Is this segment in a fixed point of `tick_segment()`?
 
         Conservative: a False answer only costs a tick of work, while a wrong
-        True silently freezes a run. Both branches are the exact conditions
-        argued above, with no slack.
+        True silently freezes a run. Every branch is one of the exact
+        conditions argued above, with no slack.
+
+        `offers_nothing` is the caller's assertion that this run's **producer
+        yielded nothing on this tick** -- the one term the segment cannot
+        derive, since it is a fact about the upstream gate. Default False, so
+        a caller who does not know keeps the old, purely-local answer; that
+        matters because this is called from the shader-mirroring tests, from
+        `tools/probe_wakelist.py`, and from `GateSim`, none of which should
+        have to care.
+
+        **A parameter rather than a lookup.** `BeltSim` holds no reference to
+        the gate layer and must not acquire one: the belt phase is a compute
+        dispatch later and `offer()` is already the sanctioned way for node
+        state to reach it (see `tick()`'s "Segments are independent" note).
+        The tick loop has just *called* `offer()`, so it knows the answer for
+        free -- asking again here would both duplicate the call and invent a
+        dependency the report's determinism argument rests on not existing.
         """
         length = self.length_of(seg)
         if seg.head == seg.tail:
@@ -364,7 +421,33 @@ class BeltSim:
         # consumer taking *is* an event that raises a wake.
         if self.position_of(seg, seg.head, tick) < length:
             return False
-        return not self.has_room(seg, tick)
+        # Either nothing can enter (local, and the RAM case), or nothing will
+        # be offered (the producer term). The head-at-end test above guards
+        # **both**, and keeping it is the whole safety argument for the new
+        # clause rather than an inherited detail:
+        #
+        # A run holding one item mid-flight has *identical stored state* for
+        # as many ticks as the item takes to travel -- traced on a 10-cell
+        # run, `(head, tail, anchor) == (0, 1, 2560)` from tick 1 to tick 10
+        # while the item visibly slid the whole length. Position is a closed
+        # form over `tick`, so it advances whether or not the run is visited,
+        # and the pop at tick 11 has no external cause. So an idle producer on
+        # its own is *not* a fixed point: sleeping on it would strand the item
+        # mid-belt, which is exactly the seeded-belt bug the head-at-end
+        # clause was added to fix, re-entered by a different door.
+        if not self.has_room(seg, tick):
+            return True
+        return offers_nothing
+
+    def is_asleep(self, sid):
+        """Is the belt phase currently skipping this segment id?
+
+        The public read of the sleep set, for `BeltDevice` (which uploads it
+        for the SLEEP_DEBUG overlay) and the tests. A method rather than
+        exposing `_asleep`, so a caller cannot mutate it by accident -- every
+        change goes through `wake()` or the tick's own decision.
+        """
+        return sid in self._asleep
 
     def wake(self, seg):
         """Mark a segment as needing ticks again. Idempotent and cheap.
@@ -450,7 +533,8 @@ class BeltSim:
             # `not (p or q)` guard is belt and braces -- a segment that just
             # popped or pushed is not at rest by either test -- but it keeps
             # "did work" and "is inert" from having to agree.
-            if sleeping and not (p or q) and self.is_at_rest(seg, tick):
+            if sleeping and not (p or q) and self.is_at_rest(
+                    seg, tick, seg._declined):
                 asleep.add(seg.sid)
         self.stats["ticks"] += 1
         self.stats["asleep"] = len(asleep)

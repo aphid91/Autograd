@@ -204,6 +204,74 @@ def verify_fixed_points():
     for d in disagreements[:4]:
         print("    " + d)
 
+    # (e) The **producer-idle clause**, checked the same way: against the
+    # definition rather than against observable behaviour.
+    #
+    # `is_at_rest(..., offers_nothing=True)` claims that a run holding items
+    # with *room to spare* is inert, which the two local clauses deny. The
+    # claim is only sound while the producer really offers nothing, so the
+    # idle tick below is given **no offer at all** -- that is what
+    # `offers_nothing` asserts, and modelling it any other way would test a
+    # different predicate.
+    #
+    # The case that must NOT be granted is the one this clause is most
+    # tempting for and where it is most wrong: an item still **travelling**.
+    # Its position is a closed form over `tick`, so it advances with no
+    # external event and the pop that eventually fires has no cause anybody
+    # raises -- so the head-at-end guard has to refuse. Every tick of the
+    # journey is sampled here rather than just the ends, because the stored
+    # state `(head, tail, anchor)` is *identical* throughout and a predicate
+    # reading only that cannot tell travelling from parked.
+    # **The contract is "inert *after* a tick that did nothing", and this has
+    # to be tested in that order.** `BeltSim.tick()` ticks a segment, then
+    # asks `is_at_rest()`, and only sleeps when the tick also reported
+    # `not (popped or pushed)`. So the predicate is never consulted about a
+    # run whose pop is still pending -- the tick immediately before it either
+    # performed that pop or had it refused.
+    #
+    # Testing in the other order (ask, then tick) measures a predicate the
+    # engine never evaluates, and it reports failures that are not reachable:
+    # a run parked at the end with a willing consumer is *correctly* granted
+    # rest only once the pop has been attempted. Verified against the real
+    # engine -- that exact board delivers its item on schedule and sleeps the
+    # tick after, never early.
+    #
+    # The consumer is kept on the idle tick, though, because "the producer
+    # offers nothing" says nothing about the consumer. Dropping it would make
+    # the pop impossible for an unrelated reason, and then nothing ever moves
+    # and the check passes against any predicate at all -- verified: with no
+    # consumer, the mutation deleting the head-at-end guard sails through.
+    idle_bad = []
+    for L in (1, 2, 3, 5, 8):
+        for spacing in (UNIT, 2 * UNIT, 3 * UNIT):
+            seg = _Seg(L, cap=32)
+            sim = BeltSim(_Index(seg), UNIT, spacing)
+            # One item on, then never offer again: the exact shape the clause
+            # is for (one item, lots of room, idle producer).
+            sim.tick_segment(seg, 0, offer=lambda _s: 1.0)
+            for t in range(1, 40):
+                # Tick first, in the engine's order. No producer (that is what
+                # `offers_nothing` asserts), consumer willing.
+                p, q = sim.tick_segment(seg, t, accept=lambda _s, _p: True)
+                if p or q:
+                    # The engine would not even ask: `not (p or q)` gates it.
+                    continue
+                claimed = sim.is_at_rest(seg, t, offers_nothing=True)
+                before_s = seg.state()
+                sim.tick_segment(seg, t + 1, accept=lambda _s, _p: True)
+                really = (seg.state() == before_s)
+                if claimed and not really:
+                    idle_bad.append(
+                        f"L={L} d={spacing // UNIT}: granted at tick {t} "
+                        f"but an idle tick moved head/tail/anchor "
+                        f"{before_s[:3]} -> {seg.state()[:3]}")
+                    break
+    print(f"  producer-idle clause is a fixed point: "
+          f"{'yes' if not idle_bad else 'NO'}")
+    for d in idle_bad[:4]:
+        print("    " + d)
+    problems.extend(idle_bad)
+
     for p in problems + full_problems:
         print("    " + p)
     return not (problems or full_problems or disagreements) and moved

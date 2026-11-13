@@ -57,15 +57,18 @@ matching how the entity table behaves.
 
 import numpy as np
 
-#: Slots per segment record, in each of the two arrays.
-SEG_IVEC = 4
+#: Slots per segment record, in each of the two arrays. The int side is two
+#: `ivec4`s: the four original fields, then the sleep flag (see
+#: `SEG_I_ASLEEP` below) and three reserved slots.
+SEG_IVEC = 8
 SEG_VEC = 4
 
 #: int32 fields of a segment record.
-#:   .x  head   (monotonic counter)
-#:   .y  tail   (monotonic counter)
-#:   .z  base   (first slot of this segment's ring in the item arena)
-#:   .w  cap    (ring capacity, a power of two)
+#:   [0].x  head   (monotonic counter)
+#:   [0].y  tail   (monotonic counter)
+#:   [0].z  base   (first slot of this segment's ring in the item arena)
+#:   [0].w  cap    (ring capacity, a power of two)
+#:   [1].x  asleep (1 if the belt phase is currently skipping this run)
 SEG_I_HEAD, SEG_I_TAIL, SEG_I_BASE, SEG_I_CAP = 0, 1, 2, 3
 
 #: float32 fields of a segment record.
@@ -74,6 +77,32 @@ SEG_I_HEAD, SEG_I_TAIL, SEG_I_BASE, SEG_I_CAP = 0, 1, 2, 3
 #:   .z  speed   (fixed point per tick)
 #:   .w  spacing (fixed point)
 SEG_F_ANCHOR, SEG_F_LENGTH, SEG_F_SPEED, SEG_F_SPACING = 0, 1, 2, 3
+
+#: **The sleep flag, and why it is uploaded rather than derived.**
+#:
+#: `segment_at_rest()` in common.glsl re-derived the rest predicate from
+#: `head`/`tail`/`anchor`, which was honest while every term was in the
+#: record. The producer-idle clause broke that: "the upstream gate offered
+#: nothing" is a fact about an *entity row*, not about the segment, and the
+#: renderer would have to resolve the run's source port and read that gate's
+#: waiting zone -- a mirror of `GateSim._src_cached()` in GLSL, which is
+#: exactly the kind of second copy that has already caused two
+#: "GLSL disagrees with Python" bugs.
+#:
+#: So the overlay reads the simulation's own answer, the same choice
+#: `Entity.F_ASLEEP` made for gates one layer up.
+#:
+#: It takes the int record's spare slot. `SEG_IVEC` was 4 with only three
+#: fields used (`head`, `tail`, `base`, `cap` -- all four, in fact), so the
+#: vector grows to 8: std430 pads an `ivec4` array stride anyway, and two
+#: `ivec4`s per record is the next honest size.
+#:
+#: Against the alternatives: `speed` is **not** spare (`item_position()` reads
+#: `sf.z` three times, which I checked rather than assumed), and squatting on
+#: a sign bit of `base` or `cap` would be a silent corruption waiting for the
+#: first run that grew past the bit, since those are used in an index and a
+#: modulo respectively.
+SEG_I_ASLEEP = 4
 
 #: Slots per item: (enter_tick as float, payload). enter_tick is a float
 #: rather than an int so both arrays are vec2 and the shader needs one type;
@@ -199,8 +228,17 @@ class BeltDevice:
             self._rebuild_layout()
 
         sim = self.sim
+        # The simulation's own sleep set, so the overlay reports what the tick
+        # actually skipped rather than re-deriving a predicate whose newest
+        # term lives in an entity row. See SEG_I_ASLEEP.
+        #
+        # Through `is_asleep()` rather than reading `_asleep`, so the device
+        # layer depends on a stated interface rather than on another object's
+        # private attribute.
+        asleep = sim.is_asleep
         for sid, seg in self.index.segments.items():
-            self.seg_i[sid] = (seg.head, seg.tail, seg.base, seg.cap)
+            self.seg_i[sid, :4] = (seg.head, seg.tail, seg.base, seg.cap)
+            self.seg_i[sid, SEG_I_ASLEEP] = 1 if asleep(sid) else 0
             self.seg_f[sid] = (seg.anchor, sim.length_of(seg),
                                sim.speed, sim.spacing)
             # The ring's live window only. Slots outside [head, tail) are
@@ -264,7 +302,12 @@ class BeltDevice:
             if sid >= self.seg_i.shape[0]:
                 problems.append(f"segment {sid} is past the mirror's size")
                 continue
-            got = tuple(int(v) for v in self.seg_i[sid])
+            # The **core four only**: the record's second vector carries the
+            # sleep flag, which is the simulation's scheduling decision rather
+            # than anything the index holds, so there is nothing here to
+            # compare it against. Slicing rather than comparing the whole row
+            # keeps this audit about "does the mirror match the index".
+            got = tuple(int(v) for v in self.seg_i[sid][:4])
             want = (seg.head, seg.tail, seg.base, seg.cap)
             if got != want:
                 problems.append(
@@ -310,6 +353,12 @@ def _self_check():
         def length_of(self, seg):
             return seg.length * 256
 
+        def is_asleep(self, sid):
+            # The stub implements the whole protocol `sync()` uses, rather
+            # than `sync()` guarding with getattr: a stub that silently lacks
+            # a field is how an upload path stops being exercised.
+            return sid == 3
+
     # Non-contiguous ids: the segment arrays are indexed by id, so a gap
     # must simply leave an unused record rather than shifting anything.
     index = _Index([_Seg(1, 4, 8), _Seg(3, 10, 16), _Seg(7, 2, 4)])
@@ -335,9 +384,25 @@ def _self_check():
     assert abs(float(dev.seg_f[3][SEG_F_ANCHOR]) - 123.0) < 1e-6
     assert not dev.audit(), dev.audit()
 
+    # The sleep flag reaches its slot, and only for the sleeping run. Pinned
+    # here because the overlay now *reads* this rather than re-deriving the
+    # predicate, so a record that silently stopped carrying it would paint
+    # every run awake with no other symptom -- and the pixel tests can only
+    # see the colour, not which field produced it. `_Sim.is_asleep` sleeps
+    # segment 3 alone, so this also catches a flag written to every record.
+    assert int(dev.seg_i[3][SEG_I_ASLEEP]) == 1, dev.seg_i[3]
+    assert int(dev.seg_i[1][SEG_I_ASLEEP]) == 0, dev.seg_i[1]
+    assert int(dev.seg_i[7][SEG_I_ASLEEP]) == 0, dev.seg_i[7]
+    # And it must not have landed on a field something else reads.
+    assert int(dev.seg_i[3][SEG_I_HEAD]) == index.segments[3].head
+    assert int(dev.seg_i[3][SEG_I_CAP]) == index.segments[3].cap
+
     # An unused id's record stays zeroed, so a shader reading it finds an
-    # empty segment rather than stale values.
-    assert tuple(dev.seg_i[2]) == (0, 0, 0, 0), dev.seg_i[2]
+    # empty segment rather than stale values. The whole record, both vectors,
+    # so the sleep flag cannot be left set on a gap either -- that would paint
+    # a nonexistent run blue, which is harmless now and would not be if
+    # anything ever iterated the flags.
+    assert not dev.seg_i[2].any(), dev.seg_i[2]
 
     # Item data must land in the right slice.
     seg.enter_tick[0] = 42
