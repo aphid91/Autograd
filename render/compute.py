@@ -63,7 +63,8 @@ GATE_IN_HELD_BINDING = 5
 GATE_OUT_VALUE_BINDING = 6
 GATE_OUT_HELD_BINDING = 7
 GATE_GEOM_BINDING = 8
-GATE_EDGE_BINDING = 9
+GATE_KONST_BINDING = 9
+GATE_EDGE_BINDING = 10
 
 #: Threads per work group. 64 is one wavefront on AMD and two warps on
 #: NVIDIA, which keeps a partly-filled group cheap -- the gate count is a few

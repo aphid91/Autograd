@@ -1,0 +1,66 @@
+#version 430
+
+// Gate-to-gate delivery, as a dispatch: one thread per *edge*.
+//
+// The GPU form of GateSim.deliver_direct(). Two gates can touch with no belt
+// between them, and the value makes the hop in one tick exactly as a belt
+// would -- which is what keeps the two cases consistent.
+//
+// Why one thread per edge rather than per gate
+// --------------------------------------------
+// This is the one place in the tick that writes *another* entity's row, so
+// the shape is a correctness question before it is a speed one. Per gate,
+// the disjointness of the writes is a claim about geometry ("a port face has
+// exactly one neighbour") that a reader has to re-establish from the loop.
+// Per edge it is a property of the data: the edge list has exactly one entry
+// per receiving lane, so no two threads can target the same destination slot
+// however they are scheduled. That is why the host resolves the adjacency
+// into an edge list once per edit (see GateSim._direct_edges()).
+//
+// The race that is left, and why it is not one
+// --------------------------------------------
+// A *source* zone can appear in several edges only if one output face
+// reached several neighbours, which the port geometry forbids -- a face has
+// one neighbour. So both the read of the source zone and the clear of it are
+// also unshared. Nothing here needs an atomic.
+//
+// Ordering against the structure phase is the host's business: this runs
+// after a barrier, so every write the firing kernel made is visible.
+
+#include "common.glsl"
+
+layout(local_size_x = 64) in;
+
+layout(std430, binding = 4) buffer InValue  { float in_value[]; };
+layout(std430, binding = 5) buffer InHeld   { float in_held[]; };
+layout(std430, binding = 6) buffer OutValue { float out_value[]; };
+layout(std430, binding = 7) buffer OutHeld  { float out_held[]; };
+
+// One edge per receiving lane, resolved per edit:
+//   .x  source gate slot        .y  source output channel
+//   .z  destination gate slot   .w  destination input channel
+//
+// Slots, not entity rows: the kernel indexes the gate-dense SoA arrays, so
+// the host translates once at pack time rather than every thread doing it.
+layout(std430, binding = 10) buffer Edges { ivec4 edges[]; };
+
+uniform int edge_count;
+
+void main() {
+    uint e = gl_GlobalInvocationID.x;
+    if (e >= uint(edge_count)) return;
+
+    ivec4 edge = edges[e];
+    uint src = uint(edge.x) * uint(MAX_CHANNELS) + uint(edge.y);
+    uint dst = uint(edge.z) * uint(MAX_CHANNELS) + uint(edge.w);
+
+    // Nothing waiting, or the far lane is still loaded: the two `continue`s
+    // the per-face walk made, in the order it made them.
+    if (out_held[src] <= 0.0) return;
+    if (in_held[dst] > 0.0) return;
+
+    in_value[dst] = out_value[src];
+    in_held[dst] = 1.0;
+    out_value[src] = 0.0;
+    out_held[src] = 0.0;
+}

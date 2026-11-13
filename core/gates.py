@@ -1655,7 +1655,8 @@ class GateSim:
         for row in self.state.rows.tolist():
             if self.board.is_row_alive(row):
                 self._connected_channels(self.board.view(row))
-        self.device.rebuild(self._gate_types, self.board)
+        self.device.rebuild(self._gate_types, self.board,
+                            edges=self._direct_edges())
 
     # --- structure phase --------------------------------------------------
     def structure_phase(self):

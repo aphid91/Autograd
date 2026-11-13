@@ -95,8 +95,12 @@ class GateDevice:
         self.ctx = ctx
         self.state = state
         self.kernel = compute.ComputeKernel(ctx, "gate_fire.comp")
+        self.direct_kernel = compute.ComputeKernel(ctx, "gate_direct.comp")
         self.geom = np.zeros((1, 4), dtype=np.int32)
         self.konst = np.zeros(1, dtype=np.float32)
+        #: Gate-to-gate edges in *slot* space, one per receiving lane.
+        self.edges = np.zeros((1, 4), dtype=np.int32)
+        self.edge_count = 0
 
         b = compute
         self._bufs = {
@@ -111,14 +115,16 @@ class GateDevice:
             "geom": compute.ComputeBuffer(
                 ctx, self.geom, b.GATE_GEOM_BINDING),
             "konst": compute.ComputeBuffer(
-                ctx, self.konst, b.GATE_EDGE_BINDING),
+                ctx, self.konst, b.GATE_KONST_BINDING),
+            "edges": compute.ComputeBuffer(
+                ctx, self.edges, b.GATE_EDGE_BINDING),
         }
         #: Set by every dispatch, cleared by a readback. While true the host
         #: arrays are stale -- see the residency note in render/compute.py.
         self._gpu_ahead = False
 
     # --- layout -----------------------------------------------------------
-    def rebuild(self, types, board):
+    def rebuild(self, types, board, edges=None):
         """Re-pack the per-edit geometry and resize every buffer. Edit-time."""
         state = self.state
         self.geom = geometry_for(state, types)
@@ -127,10 +133,44 @@ class GateDevice:
         for i, row in enumerate(state.rows.tolist()):
             if types[i] is Source or issubclass(types[i], Source):
                 self.konst[i] = board.entities[row, Source.F_EMIT]
+        self.edges, self.edge_count = self._pack_edges(edges)
         self._bufs["geom"].set_array(self.geom)
         self._bufs["konst"].set_array(self.konst)
+        self._bufs["edges"].set_array(self.edges)
         for name in ("in_value", "in_held", "out_value", "out_held"):
             self._bufs[name].set_array(getattr(state, name))
+
+    def _pack_edges(self, edges):
+        """Translate the host edge list from entity rows into gate slots.
+
+        `GateSim._direct_edges()` speaks rows, because that is what the CPU
+        path and every cache around it use; the kernel indexes the SoA arrays
+        and so wants slots. Translating once here rather than per thread is
+        the same bargain the geometry block makes.
+
+        **An edge touching a row that is not in the gate table is dropped.**
+        That is not defensive: a folded Source is deliberately absent from
+        the table (it never fires, so it has nothing to hand over), and
+        keeping its edges would index slot -1.
+        """
+        if not edges or not len(edges[0]):
+            return np.zeros((1, 4), dtype=np.int32), 0
+        src_row, src_ch, dst_row, dst_ch = edges
+        slot_of = self.state.slot_of
+        cap = slot_of.shape[0]
+        ok = (src_row < cap) & (dst_row < cap)
+        s = np.where(ok, slot_of[np.clip(src_row, 0, cap - 1)], -1)
+        d = np.where(ok, slot_of[np.clip(dst_row, 0, cap - 1)], -1)
+        live = (s >= 0) & (d >= 0)
+        n = int(live.sum())
+        if not n:
+            return np.zeros((1, 4), dtype=np.int32), 0
+        out = np.zeros((n, 4), dtype=np.int32)
+        out[:, 0] = s[live]
+        out[:, 1] = src_ch[live]
+        out[:, 2] = d[live]
+        out[:, 3] = dst_ch[live]
+        return out, n
 
     # --- the dispatch -----------------------------------------------------
     def upload(self):
@@ -140,15 +180,24 @@ class GateDevice:
             self._bufs[name].upload(getattr(state, name))
         self._bufs["geom"].upload(self.geom)
         self._bufs["konst"].upload(self.konst)
+        self._bufs["edges"].upload(self.edges)
         self._gpu_ahead = False
 
-    def run(self, ticks=1):
-        """Dispatch the structure phase `ticks` times, with no readback.
+    def run(self, ticks=1, direct=True):
+        """Dispatch the tick's gate work `ticks` times, with no readback.
 
         **This is the point of the exercise.** Nothing is mapped and the host
-        learns nothing; consecutive ticks are separated only by a memory
+        learns nothing; consecutive dispatches are separated only by a memory
         barrier, which is the explicit form of the sequencing the CPU got by
         having one phase return before the next was called.
+
+        Each tick is two dispatches with a barrier between: fire, then the
+        direct hand-off. That order is the CPU's -- `deliver_direct()` runs
+        after the structure phase, so a value makes one hop per tick -- and
+        the barrier is what makes the second see the first's writes.
+
+        `direct=False` runs the firing half alone, for the oracle comparison
+        which checks one phase at a time.
         """
         n = len(self.state.rows)
         if not n:
@@ -157,9 +206,27 @@ class GateDevice:
             buf.bind()
         self.kernel["gate_count"] = int(n)
         groups = compute.groups_for(n)
+        run_direct = direct and self.edge_count > 0
+        if run_direct:
+            self.direct_kernel["edge_count"] = int(self.edge_count)
+            edge_groups = compute.groups_for(self.edge_count)
         for _ in range(int(ticks)):
             self.kernel.run(groups)
             compute.barrier(self.ctx)
+            if run_direct:
+                self.direct_kernel.run(edge_groups)
+                compute.barrier(self.ctx)
+        self._gpu_ahead = True
+
+    def run_direct_only(self):
+        """Dispatch the hand-off alone, for the oracle comparison."""
+        if not self.edge_count:
+            return
+        for buf in self._bufs.values():
+            buf.bind()
+        self.direct_kernel["edge_count"] = int(self.edge_count)
+        self.direct_kernel.run(compute.groups_for(self.edge_count))
+        compute.barrier(self.ctx)
         self._gpu_ahead = True
 
     def readback(self):
@@ -182,10 +249,15 @@ class GateDevice:
         for buf in self._bufs.values():
             buf.release()
         self.kernel.release()
+        self.direct_kernel.release()
 
 
-def compare_against_cpu(gates, board):
-    """One structure phase both ways from identical state. Returns problems.
+def compare_against_cpu(gates, board, phase="fire"):
+    """One phase both ways from identical state. Returns problems.
+
+    `phase` is `"fire"` (the structure phase) or `"direct"` (the gate-to-gate
+    hand-off), compared one at a time so a disagreement names which kernel
+    produced it.
 
     The oracle seam. The CPU path is the reference -- it is what every test
     in the suite exercises and what the differential checkers already trust
@@ -206,7 +278,10 @@ def compare_against_cpu(gates, board):
             Entity.F_OUT_VALUE, Entity.F_OUT_HELD)
     before = {c: board.entities[rows, c:c + MAX_CHANNELS].copy() for c in cols}
 
-    gates.structure_phase()
+    if phase == "direct":
+        gates.deliver_direct()
+    else:
+        gates.structure_phase()
     after_cpu = {c: board.entities[rows, c:c + MAX_CHANNELS].copy()
                  for c in cols}
 
@@ -214,7 +289,10 @@ def compare_against_cpu(gates, board):
         board.entities[rows, c:c + MAX_CHANNELS] = before[c]
     state.sync_from_rows()
     device.upload()
-    device.run(1)
+    if phase == "direct":
+        device.run_direct_only()
+    else:
+        device.run(1, direct=False)
     device.readback()
     state.flush()
     after_gpu = {c: board.entities[rows, c:c + MAX_CHANNELS].copy()

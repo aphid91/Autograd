@@ -324,6 +324,118 @@ def test_the_kernel_bounds_checks_its_last_group():
     ok(f"a {made}-gate dispatch stays inside its buffers")
 
 
+def test_the_direct_handoff_agrees_with_the_cpu():
+    """Gate-to-gate delivery, both ways, on a board that actually has one.
+
+    The producer is a belt-fed Shear rather than a Source, for the reason
+    `test_gates.py` records: a Source abutting a gate *folds* into its
+    neighbour's channel and never fires, so the edge list would be empty and
+    this would compare two no-ops. The vacuity guard below is what makes
+    that visible rather than a silent pass.
+    """
+    harness.reset()
+    engine.place_structure(Source, 3, 10)
+    engine.place_belt_path((5, 10), (9, 10))
+    sh = engine.place_structure(Shear, 10, 10)
+    engine.place_structure(Sink, 12, 10)
+    engine.sync_segments()
+    gates = _with_device()
+
+    assert gates.device.edge_count > 0, (
+        "no direct edge on a board built to have one -- the comparison "
+        "below would pass whatever the kernel did")
+
+    # Load the Shear's zones by hand so there is material to hand over.
+    for c in range(sh.output_count()):
+        sh.set_output(c, 4.0 + c)
+    problems = compare_against_cpu(gates, board, phase="direct")
+    assert not problems, "\n".join(problems)
+    ok(f"the direct hand-off agrees with the CPU over "
+       f"{gates.device.edge_count} edge(s)")
+
+
+def test_a_direct_edge_moves_material_on_the_gpu():
+    """...and actually moves something, rather than agreeing about nothing.
+
+    Separate from the comparison above because "both did nothing" is a
+    passing comparison. This asserts the destination lane filled and the
+    source zone emptied, which is the whole content of the hand-off.
+    """
+    harness.reset()
+    engine.place_structure(Source, 3, 10)
+    engine.place_belt_path((5, 10), (9, 10))
+    sh = engine.place_structure(Shear, 10, 10)
+    engine.place_structure(Sink, 12, 10)
+    engine.sync_segments()
+    gates = _with_device()
+    assert gates.device.edge_count > 0
+
+    edge = gates.device.edges[0]
+    s_slot, s_ch, d_slot, d_ch = (int(v) for v in edge)
+    st = gates.state
+    st.sync_from_rows()
+    st.out_value[s_slot, s_ch] = 6.25
+    st.out_held[s_slot, s_ch] = 1.0
+    st.in_held[d_slot, d_ch] = 0.0
+    gates.device.upload()
+    gates.device.run_direct_only()
+    gates.device.readback()
+
+    assert st.in_held[d_slot, d_ch] > 0.0, "the far lane was never loaded"
+    assert st.in_value[d_slot, d_ch] == 6.25, st.in_value[d_slot, d_ch]
+    assert st.out_held[s_slot, s_ch] <= 0.0, "the source zone was not cleared"
+    ok("a direct edge moved its value and cleared the zone")
+
+
+def test_a_loaded_destination_refuses_the_handoff():
+    """Back pressure on the direct path: a full lane is not overwritten.
+
+    The failure this guards is silent and destructive -- a kernel that
+    clobbered a loaded lane would destroy material with no trace, which is
+    exactly what the `in_held` test exists to prevent.
+    """
+    harness.reset()
+    engine.place_structure(Source, 3, 10)
+    engine.place_belt_path((5, 10), (9, 10))
+    engine.place_structure(Shear, 10, 10)
+    engine.place_structure(Sink, 12, 10)
+    engine.sync_segments()
+    gates = _with_device()
+    assert gates.device.edge_count > 0
+
+    s_slot, s_ch, d_slot, d_ch = (int(v) for v in gates.device.edges[0])
+    st = gates.state
+    st.sync_from_rows()
+    st.out_value[s_slot, s_ch] = 6.25
+    st.out_held[s_slot, s_ch] = 1.0
+    st.in_value[d_slot, d_ch] = 99.0
+    st.in_held[d_slot, d_ch] = 1.0
+    gates.device.upload()
+    gates.device.run_direct_only()
+    gates.device.readback()
+
+    assert st.in_value[d_slot, d_ch] == 99.0, (
+        f"the kernel overwrote a loaded lane: {st.in_value[d_slot, d_ch]}")
+    assert st.out_held[s_slot, s_ch] > 0.0, (
+        "the source zone was cleared even though nothing was delivered")
+
+    # **An empty source zone must also deliver nothing**, which is the other
+    # half of the guard and needs its own case: with every fixture holding
+    # material, deleting the `out_held` test entirely was invisible --
+    # mutation-tested, and it survived until this block existed. Without it
+    # a gate holding nothing would hand its neighbour a stale zero.
+    st.out_held[s_slot, s_ch] = 0.0
+    st.out_value[s_slot, s_ch] = 0.0
+    st.in_held[d_slot, d_ch] = 0.0
+    st.in_value[d_slot, d_ch] = 0.0
+    gates.device.upload()
+    gates.device.run_direct_only()
+    gates.device.readback()
+    assert st.in_held[d_slot, d_ch] <= 0.0, (
+        "an empty source zone still loaded the destination lane")
+    ok("a loaded lane refuses the hand-off, and an empty zone offers none")
+
+
 def test_the_geometry_block_tracks_an_edit():
     """Placing a gate re-packs the geometry rather than leaving it stale.
 
