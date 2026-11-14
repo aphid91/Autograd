@@ -1,0 +1,41 @@
+# Publish the web viewer (web/) to GitHub Pages on every push to Web.
+#
+# One-time setup in the repo settings:
+#   Settings > Pages > Source: "GitHub Actions"
+#   Settings > Environments > github-pages > deployment branches: allow "Web"
+name: pages
+
+on:
+  push:
+    branches: [Web]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      # Regenerate the type table from the Python classes, so a deploy can
+      # never ship a types.json older than core/entity.py.
+      - run: pip install numpy && python tools/export_web_types.py
+      - run: bash web/build.sh _site
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: _site
+      - id: deployment
+        uses: actions/deploy-pages@v4

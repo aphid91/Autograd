@@ -1,0 +1,68 @@
+html, body {
+  margin: 0;
+  height: 100%;
+  background: #121217;
+  color: #d8d8e0;
+  font: 14px system-ui, sans-serif;
+  overflow: hidden;
+  overscroll-behavior: none;
+  -webkit-user-select: none;
+  user-select: none;
+  -webkit-tap-highlight-color: transparent;
+}
+
+body {
+  display: flex;
+  flex-direction: column;
+}
+
+#board {
+  flex: 1;
+  min-height: 0;
+  width: 100%;
+  display: block;
+  /* The canvas owns every gesture: no page scroll, no browser zoom. */
+  touch-action: none;
+}
+
+#bar {
+  display: flex;
+  gap: 8px;
+  padding: 8px 16px;
+  padding-top: max(8px, env(safe-area-inset-top));
+  background: #1b1b21;
+  border-bottom: 1px solid #2c2c35;
+}
+
+#bar select {
+  flex: 1;
+  min-width: 0;
+}
+
+#bar select, .btn {
+  min-height: 40px;
+  padding: 0 14px;
+  border-radius: 8px;
+  border: 1px solid #3a3a46;
+  background: #26262e;
+  color: inherit;
+  font: inherit;
+}
+
+.btn {
+  display: inline-flex;
+  align-items: center;
+  cursor: pointer;
+}
+
+#status {
+  padding: 6px 16px;
+  padding-bottom: max(6px, env(safe-area-inset-bottom));
+  background: #1b1b21;
+  border-top: 1px solid #2c2c35;
+  font-size: 12px;
+  color: #9a9aa8;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}

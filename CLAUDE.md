@@ -14,6 +14,10 @@ modes, camera pan/zoom, save/load — and the **simulation**: belts carry items
 in closed form, gates fire on a two-phase tick, and a saturated chain moves
 one item per tick. See "Deferred" for what is still missing.
 
+**Web editor:** the `Web` branch carries a phone-first board editor in
+[web/](web/) — plain JS, reads and writes the same `.npz` saves. See
+[web/CLAUDE.md](web/CLAUDE.md).
+
 ## Commands
 
 ```bash

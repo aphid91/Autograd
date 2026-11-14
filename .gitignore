@@ -4,3 +4,4 @@ __pycache__/
 imgui.ini
 gates_config.json
 
+_site/
