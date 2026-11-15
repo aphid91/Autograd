@@ -55,8 +55,8 @@ export function glyphPaths(name, cx, cy, r, t) {
 
 // The glyph for a structure covering w x h cells at (x, y): scaled to the
 // footprint's shorter side, as the shader does, so it stays inside a 2x1.
-export function structGlyph(name, x, y, w, h) {
+export function structGlyph(name, x, y, w, h, scale = 1, weight = 1) {
   const s = Math.min(w, h);
-  const t = MARK_THICK * s;
-  return { ...glyphPaths(name, x + w / 2, y + h / 2, MARK_RADIUS * s, t), width: 2 * t };
+  const t = MARK_THICK * s * weight;
+  return { ...glyphPaths(name, x + w / 2, y + h / 2, MARK_RADIUS * s * scale, t), width: 2 * t };
 }

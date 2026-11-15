@@ -79,6 +79,23 @@ pulled from a CDN, which keeps the no-build, works-offline property. Status
 writes the same row fields the desktop's Status window does, plus the
 seed's `.z` bits, so a save edited here reads correctly there.
 
+### The Dev folder
+
+Every number tuned by eye, and one behaviour switch, as dials in the
+panel's **Dev** folder ([tune.js](tune.js)): belt width, chevron size,
+overlay width and edge, port size and edge, glyph size and weight, the
+Source value's size, grid opacity, ghost opacity, and the tap margin round
+a ghost or a run's tip. Scales multiply the shipped value, so 1 is always
+"as shipped", and **Reset dials** puts them all back. They persist with the
+panel's preferences; a stored key this build does not know is ignored.
+
+**Force build** makes the builder tools win: a blocked machine or raw belt
+deletes whatever is in its way and is placed, and a belt run deletes what
+occupies its **blocked** cells (not the ones it tunnels under, which it
+never wanted) and is built in full. Whole entities go -- one cell of a
+machine takes the machine -- through the same erase as everywhere else.
+Stamps are unaffected; a paste already places whatever fits.
+
 ## The belt planner
 
 [planner.js](planner.js) is the geometry, as pure functions over a
@@ -180,8 +197,9 @@ There are no type names; a Source shows its value instead of its dot, at
 every zoom the glyphs draw at (it was first cut off at legibility, which
 turned values into dots too early to be useful for finding a constant).
 
-The overlay is **belt-wide and opaque, with a thin dark edge**, so it reads
-as a belt running through the machine. The edge scales with the board
+The overlay is **0.28 cells wide and opaque, with a thin dark edge** -- between
+the desktop's faint 0.22 and a belt's 0.34 -- so it reads as a belt
+running through the machine. The edge scales with the board
 (0.03 cells, at least half a pixel) so zoomed out it thins rather than
 striping every machine.
 
@@ -395,6 +413,8 @@ is harmless and removes double-tap arbitration.
 | `segtrace.js` | the belt run through a cell, as `core/segments.py` would cut it |
 | `ghost.js` | a stamp at a board position, in the renderer's shapes |
 | `placer.js` | where a ghost's footprint sits: the port of `origin_for_cursor()` |
+| `glyphs.js` | the machine glyphs, ports of the shader's `sd_*` marks |
+| `tune.js` | the Dev dials: defaults, panel spec, the live values |
 | `tests/` | `node --test` suites for the pure modules |
 | `types.json` | generated — do not edit |
 | `build.sh` | assembles `_site/` |

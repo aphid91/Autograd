@@ -6,6 +6,7 @@
 // main.js applies it to the board.
 
 import { Pane } from "./vendor/tweakpane-4.0.5.min.js";
+import { TUNE_DEFAULTS, TUNE_SPEC } from "./tune.js";
 
 const PANE_KEY = "gates.web.pane.v1";
 const DIR_NAMES = ["+X east", "+Y north", "-X west", "-Y south"];
@@ -45,6 +46,25 @@ export class Panel {
         cb.onView({ ...this.view });
       });
     }
+
+    // Dev: the tuned-by-eye numbers and the force-build switch. Persisted
+    // with the rest of the panel's preferences.
+    this.dev = { ...TUNE_DEFAULTS, ...(this.prefs.dev || {}) };
+    const dev = this.pane.addFolder({ title: "Dev", expanded: false });
+    const pushDev = () => {
+      this.prefs.dev = { ...this.dev };
+      savePrefs(this.prefs);
+      cb.onTune({ ...this.dev });
+    };
+    const devBindings = [];
+    for (const [key, label, opts] of TUNE_SPEC) {
+      devBindings.push(dev.addBinding(this.dev, key, { label, ...(opts || {}) }).on("change", pushDev));
+    }
+    dev.addButton({ title: "Reset dials" }).on("click", () => {
+      Object.assign(this.dev, TUNE_DEFAULTS);
+      for (const b of devBindings) b.refresh();
+      pushDev();
+    });
 
     const dbg = this.pane.addFolder({ title: "Debug", expanded: false });
     dbg.addButton({ title: "Clear stamps" }).on("click", () => cb.onClearStamps());

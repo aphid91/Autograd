@@ -16,6 +16,7 @@ import { VALUE_CHOICES, hasValue, toolValue } from "./tools.js";
 import { makeStamp, mirrored, rotated, stampCells, subset } from "./stamp.js";
 import { emitMask, emitsWith, stampGhost } from "./ghost.js";
 import { traceRun } from "./segtrace.js";
+import { TUNE, setTune } from "./tune.js";
 
 const DEFAULT_SAVE = "default.npz";
 
@@ -56,7 +57,7 @@ const ROUTE_ICONS = { [ROUTE_H_FIRST]: "routeHV", [ROUTE_V_FIRST]: "routeVH" };
 // the stamp's shape -- is read from the held tool on every redraw, so
 // turning the tool turns the ghost with no second copy to keep in step.
 let place = null;
-const GHOST_TAP_PX = 20;   // a tap this close to the ghost counts as on it
+// A tap within TUNE.tapMarginPx (20 by default) of a ghost counts as on it.
 
 // The SELECTION: entities lifted off the board, held as a stamp at a pose,
 // or null. Selecting an entity deletes it from the board and adds it here;
@@ -262,15 +263,35 @@ function cancelRun() {
 }
 
 function commitRun() {
-  const plan = currentPlan();
+  let plan = currentPlan();
+  // Force build: what blocks the run is deleted and the run goes down over
+  // it. Only the cells the run could not have -- not the ones it tunnels
+  // under, which it never wanted.
+  if (plan && TUNE.forceBuild) {
+    const blocked = plan.cells.filter(c => c.kind === "blocked");
+    if (blocked.length) {
+      clearCells(blocked);
+      plan = { ...plan, cells: plan.cells.map(c => (c.kind === "blocked" ? { ...c, kind: "belt" } : c)) };
+    }
+  }
   if (plan) board.buildPlan(plan);
   cancelRun();
+}
+
+// Delete whatever occupies these cells (whole entities: one cell of a
+// machine takes the machine, as erasing does on the desktop).
+function clearCells(cells) {
+  const rows = new Set();
+  for (const c of cells) { const r = board.entityAt(c.x, c.y); if (r >= 0) rows.add(r); }
+  if (!rows.size) return;
+  if (rows.has(inspectRow)) inspect(-1);
+  board.eraseRows([...rows]);
 }
 
 // --- placing a machine, a raw belt or a stamp -----------------------------
 //
 // A tap starts placing: a ghost centred on the tap. A drag moves it. Then:
-//   tap ON the ghost (or within GHOST_TAP_PX of it)  place it, and keep the
+//   tap ON the ghost (or within the tap margin of it)  place it, and keep the
 //                       ghost where it is -- so a row of machines is a row
 //                       of taps on the ghost, nudging it between them;
 //   tap anywhere else   place it, and stop placing.
@@ -358,7 +379,12 @@ function placeOnce() {
     redraw();
     return placed.size > 0;
   }
-  if (pl.blocked.length) return false;
+  if (pl.blocked.length) {
+    // Force build clears the way for a machine or a raw belt. Not for a
+    // stamp, which already places whatever fits.
+    if (!TUNE.forceBuild) return false;
+    clearCells(pl.blocked);
+  }
   const [x, y] = pl.origin;
   if (pl.kind === "rawbelt") {
     board.spawnBelt(x, y, pl.dir, pl.value);
@@ -371,11 +397,11 @@ function placeOnce() {
 }
 
 // Is screen point (sx, sy) on the w x h cell box at (x, y), or within
-// GHOST_TAP_PX of it?
+// TUNE.tapMarginPx of it?
 function onCells(sx, sy, x, y, w, h) {
   const [x0, y1] = cam.worldToScreen(x, y + h);
   const [x1, y0] = cam.worldToScreen(x + w, y);
-  const m = GHOST_TAP_PX;
+  const m = TUNE.tapMarginPx;
   return sx >= x0 - m && sx <= x1 + m && sy >= y1 - m && sy <= y0 + m;
 }
 
@@ -717,12 +743,14 @@ async function init() {
     onOpenFile: () => fileInput.click(),
     onFit: () => { if (board) cam.frame(board.bounds); redraw(); },
     onView: (v) => { view = v; redraw(); },
+    onTune: (t) => { setTune(t); redraw(); },
     onClearStamps: () => shell.clearStamps(),
     onCloseStatus: () => inspect(-1),
     onEmit: (row, v) => { board.setEmit(row, v); shell.setInspectValue(handValueOf(row)); redraw(); },
     onSeed: (row, on, v) => { board.setSeed(row, on, v); shell.setInspectValue(handValueOf(row)); redraw(); },
   });
   view = { ...panel.view };
+  setTune(panel.dev);
 
   resize();
   new ResizeObserver(resize).observe(canvas);

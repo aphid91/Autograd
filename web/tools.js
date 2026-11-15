@@ -149,8 +149,8 @@ export function toolArt(T, slot) {
   return frame(o.w, o.h,
     `<rect x="0.05" y="0.05" width="${o.w - 0.1}" height="${o.h - 0.1}" fill="${css(c)}" ` +
     `stroke="${css(c.map(v => v * 0.6))}" stroke-width="0.06"/>` +
-    (pass ? `<path d="${pass}" fill="none" stroke="#000" stroke-width="0.4" stroke-linecap="butt"/>` +
-            `<path d="${pass}" fill="none" stroke="#757885" stroke-width="0.34" stroke-linecap="butt"/>` : "") +
+    (pass ? `<path d="${pass}" fill="none" stroke="#000" stroke-width="0.34" stroke-linecap="butt"/>` +
+            `<path d="${pass}" fill="none" stroke="#757885" stroke-width="0.28" stroke-linecap="butt"/>` : "") +
     (g.stroke ? `<path d="${g.stroke}" fill="none" stroke="#e0e6f0" stroke-width="${g.width}" stroke-linecap="round" stroke-linejoin="round"/>` : "") +
     (g.fill ? `<path d="${g.fill}" fill="#e0e6f0"/>` : "") +
     `<path d="${ins}" fill="#5999f2" stroke="rgba(0,0,0,0.5)" stroke-width="0.025"/>` +

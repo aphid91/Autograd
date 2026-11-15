@@ -96,7 +96,7 @@ html, body {
   position: absolute;
   top: calc(6 * var(--u));
   right: calc(6 * var(--u));
-  width: min(230px, calc(100% - 12 * var(--u)));
+  width: min(290px, calc(100% - 12 * var(--u)));
   max-height: calc(100% - 12 * var(--u));
   overflow-y: auto;
   z-index: 5;

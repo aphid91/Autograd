@@ -43,13 +43,15 @@ const LOD = { beltSolid: 4, gridLines: 6, chevrons: 10, ports: 8, labels: 22, ma
 // that makes it -- a value still reads as "a number, roughly this long" well
 // after its digits stop being legible. Below that nothing but bodies draws.
 const EMIT_SCALE = 0.56;
+const OVERLAY_WIDTH = 0.28;
 function emitSize(s, z) {
   const text = fmtNumber(s.emit);
-  return Math.min(EMIT_SCALE * z, (s.w * z * 0.8) / (text.length * 0.62));
+  return TUNE.emitSize * Math.min(EMIT_SCALE * z, (s.w * z * 0.8) / (text.length * 0.62));
 }
 const emitShown = (s, z, labels) => s.emit !== null && labels && z >= LOD.marks;
 
 import { structGlyph } from "./glyphs.js";
+import { TUNE } from "./tune.js";
 
 const css = (c) => `rgb(${(c[0] * 255) | 0},${(c[1] * 255) | 0},${(c[2] * 255) | 0})`;
 const shade = (c, k) => css(c.map(v => v * k));
@@ -99,7 +101,9 @@ export function render(ctx, board, cam, dpr, opts = {}) {
       }
       ctx.strokeStyle = major ? COL.gridMajor : COL.grid;
       ctx.lineWidth = px;
+      ctx.globalAlpha = TUNE.gridOpacity;
       ctx.stroke();
+      ctx.globalAlpha = 1;
     }
   }
 
@@ -165,7 +169,7 @@ function drawBelts(ctx, belts, z, on, S) {
     ctx.lineTo(cx + o[0] * 0.5, cy + o[1] * 0.5);
   }
   ctx.strokeStyle = COL.belt;
-  ctx.lineWidth = 0.34;
+  ctx.lineWidth = 0.34 * TUNE.beltWidth;
   ctx.lineJoin = "round";
   ctx.lineCap = "butt";
   ctx.stroke();
@@ -174,7 +178,7 @@ function drawBelts(ctx, belts, z, on, S) {
   ctx.beginPath();
   for (const b of belts) {
     if (!on(b.x, b.y)) continue;
-    chevron(ctx, b.x + 0.5, b.y + 0.5, S[b.dir], 0.1);
+    chevron(ctx, b.x + 0.5, b.y + 0.5, S[b.dir], 0.1 * TUNE.chevronSize);
   }
   ctx.strokeStyle = COL.chevron;
   ctx.lineWidth = 0.06;
@@ -256,7 +260,7 @@ function underFunnel(path, bars, cx, cy, f, s) {
 // solid, the start hollow, so the two read apart at a glance.
 function drawGhost(ctx, T, g, z, px, on, S, ports, labels) {
   ctx.save();
-  ctx.globalAlpha = 0.6;
+  ctx.globalAlpha = TUNE.ghostAlpha;
   // Seeded ghost belts tint like real ones; drawBelts does that itself.
   drawBelts(ctx, g.belts || [], Math.max(z, LOD.chevrons), on, S);
   drawUnders(ctx, g.unders || [], Math.max(z, LOD.chevrons), on, S);
@@ -339,20 +343,24 @@ function drawStructs(ctx, T, structs, z, px, on, S, ports, labels) {
       const f = S[a], cx = s.x + lx + 0.5, cy = s.y + ly + 0.5;
       spine.moveTo(cx - f[0] * 0.5, cy - f[1] * 0.5);
       spine.lineTo(cx + f[0] * 0.5, cy + f[1] * 0.5);
-      if (z >= LOD.chevrons) chevron(chev, cx, cy, f, 0.1);
+      if (z >= LOD.chevrons) chevron(chev, cx, cy, f, 0.1 * TUNE.chevronSize);
     }
   }
-  // Belt-wide (0.34, the spine's width), over a slightly wider dark stroke
-  // that shows as an edge down each side. Butt caps, so the edge does not
-  // close the ends: the channel reads as continuing into the belts beyond.
+  // 0.28 cells: between the desktop's faint 0.22 and a belt's 0.34, over a
+  // slightly wider dark stroke that shows as an edge down each side. Butt
+  // caps, so the edge does not close the ends: the channel reads as
+  // continuing into the belts beyond.
+  const ow = OVERLAY_WIDTH * TUNE.overlayWidth;
   ctx.lineCap = "butt";
-  ctx.strokeStyle = COL.passEdge;
   // The edge scales with the board (0.03 cells) down to half a pixel, so
   // zoomed out it fades rather than striping every machine.
-  ctx.lineWidth = 0.34 + 2 * Math.max(0.5 * px, 0.03);
-  ctx.stroke(spine);
+  if (TUNE.overlayEdge > 0) {
+    ctx.strokeStyle = COL.passEdge;
+    ctx.lineWidth = ow + 2 * TUNE.overlayEdge * Math.max(0.5 * px, 0.03);
+    ctx.stroke(spine);
+  }
   ctx.strokeStyle = COL.pass;
-  ctx.lineWidth = 0.34;
+  ctx.lineWidth = ow;
   ctx.stroke(spine);
   ctx.strokeStyle = COL.passChevron;
   ctx.lineWidth = 0.06;
@@ -366,7 +374,7 @@ function drawStructs(ctx, T, structs, z, px, on, S, ports, labels) {
   for (const s of structs) {
     if (!on(s.x, s.y, s.w, s.h)) continue;
     if (emitShown(s, z, labels)) continue;
-    const g = structGlyph(types[s.type].glyph, s.x, s.y, s.w, s.h);
+    const g = structGlyph(types[s.type].glyph, s.x, s.y, s.w, s.h, TUNE.glyphScale, TUNE.glyphWeight);
     if (g.stroke) widths.set(g.width, (widths.get(g.width) || "") + g.stroke);
     fills += g.fill;
   }
@@ -390,9 +398,9 @@ function drawStructs(ctx, T, structs, z, px, on, S, ports, labels) {
   ctx.fillStyle = COL.out; ctx.fill(outs);
   // The edge only once the arrows are big enough to need one; zoomed out it
   // would be most of what is drawn.
-  if (z >= LOD.portEdge) {
+  if (z >= LOD.portEdge && TUNE.portEdge > 0) {
     ctx.strokeStyle = COL.portEdge;
-    ctx.lineWidth = 0.75 * px;
+    ctx.lineWidth = 0.75 * px * TUNE.portEdge;
     ctx.lineJoin = "miter";
     ctx.stroke(ins);
     ctx.stroke(outs);
@@ -404,8 +412,9 @@ function port(path, x, y, f, inward) {
   const ex = cx + f[0] * 0.45, ey = cy + f[1] * 0.45;   // just inside the face
   // Smaller again now the control overlay helps orient a machine: 35% under
   // the enlarged cut (0.169 / 0.208). The tip sits on the face, not past it.
-  const sx = -f[1] * 0.11, sy = f[0] * 0.11;
-  const d = 0.135;
+  const k = TUNE.portScale;
+  const sx = -f[1] * 0.11 * k, sy = f[0] * 0.11 * k;
+  const d = 0.135 * k;
   // Inward: base on the face, tip inside. Outward: base inside, tip on face.
   const tip = inward ? [ex - f[0] * d, ey - f[1] * d] : [ex, ey];
   const base = inward ? [ex, ey] : [ex - f[0] * d, ey - f[1] * d];
