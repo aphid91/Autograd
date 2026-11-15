@@ -99,8 +99,7 @@ export class Panel {
     }
     this.status.addButton({ title: "Close" }).on("click", () => this.cb.onCloseStatus());
 
-    // Opening the panel is the point of the tap.
-    this.pane.expanded = true;
-    this.status.expanded = true;
+    // The panel is NOT opened for the player: a Hand tap is often just to
+    // reach the number swatches, and the player opens Status when wanted.
   }
 }

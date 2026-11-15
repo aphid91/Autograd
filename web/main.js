@@ -14,7 +14,8 @@ import { ROUTE_NAMES, ROUTE_H_FIRST, ROUTE_V_FIRST, planRun, turnTip } from "./p
 import { originFor } from "./placer.js";
 import { VALUE_CHOICES, hasValue, toolValue } from "./tools.js";
 import { makeStamp, mirrored, rotated, stampCells, subset } from "./stamp.js";
-import { stampGhost } from "./ghost.js";
+import { emitMask, emitsWith, stampGhost } from "./ghost.js";
+import { traceRun } from "./segtrace.js";
 
 const DEFAULT_SAVE = "default.npz";
 
@@ -490,27 +491,67 @@ function selectFlip() {
   redraw();
 }
 
-// Delete, Cut and Copy act on the selection; none of them is a mode.
+// Delete, Cut and Copy act on the selection; none of them is a mode. Cut
+// and Copy start pasting with the ghost exactly where the selection was --
+// the selection's own pose, so the stamp lands cell for cell on it. A cut
+// is therefore a selection turned into a stamp you can carry off or
+// cancel; a copy's ghost sits over the originals.
 function selectCommand(c) {
   if (!sel) return;
   if (c === "delete") { setSel([]); return; }
+  const pose = [sel.px, sel.py];
   const id = shell.addStamp(sel.stamp);
-  if (c === "cut") { setSel([]); enterPaste(id); return; }
+  if (c === "cut") { setSel([]); enterPaste(id, pose); return; }
   // Copy: the selection goes back down. If all of it fit, there is nothing
   // left selected and the copy is ready to paste; anything that could not go
   // back stays selected for the player to deal with.
   dropAll();
-  if (!sel) enterPaste(id);
+  if (!sel) enterPaste(id, pose);
 }
 
 // Entering paste puts the selection down first, and deletes whatever of it
-// could not go down: a paste never coexists with a selection.
-function enterPaste(id) {
+// could not go down: a paste never coexists with a selection. `pose`, if
+// given, puts the ghost up straight away at that centre point.
+function enterPaste(id, pose = null) {
   dropAll();
   if (sel) setSel([]);
-  place = null;
+  place = pose ? { px: pose[0], py: pose[1] } : null;
   shell.setPasting(id);
   syncBar();
+}
+
+// --- long press: a whole belt run ------------------------------------------
+//
+// In Build with nothing planned, or while selecting, a long press on a belt
+// or underground selects the whole run through it (core/segments.py's
+// segment). If every cell of that run is already selected, it deselects
+// them instead. The run is traced over the board AND the selection
+// together, so a run that is partly lifted is still one run.
+function onLongPress(sx, sy) {
+  if (!board || shell.state.mode !== "build") return false;
+  if (run || place || shell.activeStamp) return false;
+  const [x, y] = cellUnder(sx, sy);
+  const abs = sel ? selAbs() : [];
+  const at = abs.map(e => [e.dx, e.dy]);
+  const W = board.width;
+  const lifted = new Map();   // cell key -> selection index, belts and undergrounds only
+  abs.forEach((e, i) => { if (e.type === "belt" || e.type === "under") lifted.set(e.dy * W + e.dx, i); });
+  const node = (cx, cy) => {
+    const i = lifted.get(cy * W + cx);
+    if (i !== undefined) {
+      const e = abs[i];
+      return { kind: e.type, dir: e.dir, exit: !!e.exit, key: `s${i}`, sel: i,
+               partner: e.partner !== null && e.partner !== undefined ? at[e.partner] : null };
+    }
+    return board.beltNode(cx, cy);
+  };
+  const emits = emitsWith(board, emitMask(board, abs, at));
+  const cells = traceRun(node, (cx, cy, d) => board.incoming(cx, cy, d, emits), x, y);
+  if (!cells.length) return false;
+  const rows = cells.filter(c => c.row !== undefined).map(c => c.row);
+  if (rows.length) lift(rows);
+  else drop(cells.map(c => c.sel));
+  return true;
 }
 
 function exitPaste() {
@@ -685,7 +726,7 @@ async function init() {
 
   resize();
   new ResizeObserver(resize).observe(canvas);
-  attachGestures(canvas, cam, redraw, { onTap, drag: dragHooks });
+  attachGestures(canvas, cam, redraw, { onTap, onLongPress, drag: dragHooks });
 
   fileInput.addEventListener("change", async () => {
     const f = fileInput.files[0];

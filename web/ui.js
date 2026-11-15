@@ -432,6 +432,7 @@ export class Shell {
         art: stampArt(this.T, st.stamp), name: st.name, cls: "stampsw",
         selected: s.pasteStamp === st.id,
         onTap: () => this.cb.onPasteStamp?.(st.id),
+        onHold: () => this.openStampMenu(st.id),
       }));
     }
   }
@@ -444,6 +445,36 @@ export class Shell {
     s.stamps.length = Math.min(s.stamps.length, STAMP_HISTORY);
     this.changed();
     return id;
+  }
+
+  // Long press on a stamp: rename it, or delete it from the history. A
+  // stamp baked into a toolbar slot is a copy, so deleting the history's
+  // one leaves the slot alone.
+  openStampMenu(id) {
+    const m = document.getElementById("stampmenu");
+    const s = this.state;
+    const st = s.stamps.find(t => t.id === id);
+    if (!m || !st) return;
+    const name = m.querySelector("#stampmenu-name");
+    name.value = st.name;
+    const close = () => { m.dataset.open = "false"; name.blur(); };
+    const rename = () => {
+      const v = name.value.trim();
+      if (v) st.name = v;
+      close();
+      this.changed();
+    };
+    m.querySelector("#stampmenu-rename").onclick = rename;
+    name.onkeydown = (e) => { if (e.key === "Enter") rename(); if (e.key === "Escape") close(); };
+    m.querySelector("#stampmenu-cancel").onclick = close;
+    m.onclick = (e) => { if (e.target === m) close(); };
+    m.querySelector("#stampmenu-delete").onclick = () => {
+      close();
+      s.stamps = s.stamps.filter(t => t.id !== id);
+      if (s.pasteStamp === id) this.cb.onPasteStamp?.(id);   // stops the paste
+      this.changed();
+    };
+    m.dataset.open = "true";
   }
 
   setPasting(id) {

@@ -43,8 +43,9 @@ scale 1.15.
     Tapping an existing entity **selects** it, whatever the hand holds, and
     the bar becomes the selection's: Box, Delete, Cut, Copy, then the stamp
     history, most recent first. See "Selecting" below.
-  - **Hand**: tapping the board inspects: the Status folder opens in the
-    panel, and a tap on bare board closes it. While Status shows a Source or
+  - **Hand**: tapping the board inspects: the Status folder fills in (the
+    panel is **not** opened for you -- a tap is often only to reach the
+    number swatches), and a tap on bare board clears it. While Status shows a Source or
     a belt, the bar offers the number swatches (0, 1, −1, 2, 4, 8) for its
     emit value or seed; on a belt, tapping the lit number unseeds it.
 - **Sim** (right): Reset (ctrl+R) and Play/Pause. Neither is wired to a
@@ -202,9 +203,11 @@ outlined in cyan. Deselecting places it back wherever the selection now is.
 | Box, then a drag (from anywhere) | a rectangle: everything it touches is **added**, then Box disarms |
 | Turn buttons | turn / mirror the selection as one stamp |
 | Delete | discard the selection |
-| Cut | the selection becomes a stamp, is discarded, and pasting starts |
-| Copy | the selection becomes a stamp and goes back down; if all of it fit, pasting starts |
+| long press a belt or underground | select its whole run; if the whole run is already selected, deselect it |
+| Cut | the selection becomes a stamp, and pasting starts with the ghost **exactly where the selection was** |
+| Copy | the selection becomes a stamp and goes back down; if all of it fit, pasting starts with the ghost over the originals |
 | a stamp swatch | paste it (tap it again to stop) |
+| long press a stamp swatch | rename it, or delete it from the history |
 
 - **Deselecting is "if able", per entity.** Anything that does not fit
   (moved onto something, say) stays selected, tinted red where it clashes.
@@ -221,6 +224,22 @@ outlined in cyan. Deselecting places it back wherever the selection now is.
   selection down and deletes whatever of it could not go down.
 - **Leaving Build (for Hand) puts the selection down.** What does not fit
   stays lifted and is still there on coming back.
+- **Cut is a move you can carry off or cancel.** Its ghost uses the
+  selection's own pose, so the stamp lands cell for cell where the
+  entities were: tap the ghost to put them back, drag it and tap to move
+  them, or Cancel to delete them.
+- **Long press traces the run over the board and the selection together**
+  (`segtrace.js`), so a run that is partly lifted is still one run; it
+  lifts whatever of the run is still on the board, and only when all of it
+  is lifted does it put the run down. It stops where a desktop segment
+  stops -- at a machine, at the loser of a merge, at an unpaired
+  entrance -- and passes through underground pairs.
+  `tests/segtrace.test.mjs` checks it against `core/segments.py` on every
+  belt cell of `cpu.npz`, and was mutation-tested (dropping either the
+  merge check or the underground jump fails it). Long press works in Build
+  with nothing planned, and while selecting; elsewhere it is an ordinary
+  press. A long press on anything but a belt is an ordinary press too, so
+  it ends as a tap.
 - **Underground pairs.** Lifting one end of a pair releases the other
   (`Engine.unpair_under()`). Both ends lifted stay paired to each other.
   Placing back pairs the stamp's own ends first, then each unpaired end
@@ -343,6 +362,7 @@ is harmless and removes double-tap arbitration.
 | `render.js` | Canvas 2D drawing under a world transform; labels in screen space |
 | `planner.js` | belt-run geometry: paths, facings, the tip, auto-undergrounds |
 | `stamp.js` | stamps: rotate and mirror (port of `core/stamp.py`), cells, subsets |
+| `segtrace.js` | the belt run through a cell, as `core/segments.py` would cut it |
 | `ghost.js` | a stamp at a board position, in the renderer's shapes |
 | `placer.js` | where a ghost's footprint sits: the port of `origin_for_cursor()` |
 | `tests/` | `node --test` suites for the pure modules |
@@ -364,7 +384,8 @@ time, for the console and headless tests.
 node --test web/tests/*.test.mjs
 ```
 
-Pure-JS tests (the planner, the placer, the stamp transforms) run in Node, with no npm and no browser.
+Pure-JS tests (the planner, the placer, the stamp transforms, the run
+tracer) run in Node, with no npm and no browser.
 
 Playwright with phone emulation (`devices['Pixel 7']`) and CDP
 `Input.dispatchTouchEvent` drives real multi-touch. Check counts against

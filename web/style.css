@@ -377,7 +377,7 @@ html, body {
 /* ----------------------------------------------------------------------
    THE PICKER: a bottom sheet listing every tool a slot can hold.
    ---------------------------------------------------------------------- */
-#picker {
+#picker, .sheetwrap {
   --u: calc(var(--ui) * 1px);
   position: fixed;
   inset: 0;
@@ -389,7 +389,21 @@ html, body {
   -webkit-user-select: none;
   user-select: none;
 }
-#picker[data-open="true"] { display: flex; }
+#picker[data-open="true"], .sheetwrap[data-open="true"] { display: flex; }
+.namerow { display: flex; gap: calc(6 * var(--u)); }
+.namerow input {
+  flex: 1;
+  min-width: 0;
+  height: calc(34 * var(--u));
+  box-sizing: border-box;
+  padding: 0 calc(10 * var(--u));
+  background: var(--chrome-2);
+  color: var(--ink);
+  border: var(--border) solid var(--edge);
+  border-radius: var(--r);
+  font: inherit;
+  font-size: 16px;   /* below 16px iOS zooms the page on focus */
+}
 .sheet {
   width: min(480px, 100%);
   max-height: 75dvh;

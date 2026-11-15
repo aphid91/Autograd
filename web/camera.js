@@ -72,6 +72,10 @@ export class Camera {
 //   pan    and moves the camera.
 //   pinch  a second finger landed: always the camera, whatever was going on.
 //          A drag in progress ends where it is, and does not snap back.
+//   held   the press stayed still for LONG_PRESS_MS and `hooks.onLongPress`
+//          claimed it. The lift that follows does nothing, and neither do
+//          moves: the finger has had its say. A long press the board does
+//          not claim stays a press, so it can still end as a tap.
 //   dead   a pinch dropped back to one finger while the board wants drags.
 //          That finger does nothing, rather than surprising anyone by
 //          dragging the run's end from wherever it happens to be.
@@ -81,11 +85,14 @@ export class Camera {
 // grabbed thing does not lag the finger (the same reason the desktop anchors
 // a note drag at the press).
 const TAP_SLOP = 8;   // CSS px
+const LONG_PRESS_MS = 500;   // as the toolbar's long press
 
 export function attachGestures(el, camera, onChange, hooks = {}) {
   const pts = new Map();   // pointerId -> [x, y] in element CSS px
   let gesture = "idle";
   let press = null;        // { id, x, y }
+  let holdTimer = null;
+  const cancelHold = () => { if (holdTimer !== null) clearTimeout(holdTimer); holdTimer = null; };
 
   const local = (e) => {
     const r = el.getBoundingClientRect();
@@ -102,7 +109,18 @@ export function attachGestures(el, camera, onChange, hooks = {}) {
     if (pts.size === 1) {
       gesture = e.button === 0 ? "press" : "pan";
       press = { id: e.pointerId, x: p[0], y: p[1] };
+      cancelHold();
+      if (gesture === "press" && hooks.onLongPress) {
+        holdTimer = setTimeout(() => {
+          holdTimer = null;
+          if (gesture === "press" && hooks.onLongPress(press.x, press.y)) {
+            gesture = "held";
+            onChange();
+          }
+        }, LONG_PRESS_MS);
+      }
     } else {
+      cancelHold();
       if (gesture === "drag") hooks.drag.end();
       gesture = "pinch";
     }
@@ -120,6 +138,7 @@ export function attachGestures(el, camera, onChange, hooks = {}) {
 
     if (gesture === "press") {
       if (Math.hypot(p[0] - press.x, p[1] - press.y) <= TAP_SLOP) return;
+      cancelHold();
       if (wantsDrag(press.x, press.y)) {
         gesture = "drag";
         hooks.drag.begin(press.x, press.y);
@@ -148,6 +167,7 @@ export function attachGestures(el, camera, onChange, hooks = {}) {
   const lift = (e, cancelled) => {
     if (!pts.has(e.pointerId)) return;
     pts.delete(e.pointerId);
+    cancelHold();
     if (gesture === "press" && !cancelled && press && press.id === e.pointerId) {
       hooks.onTap?.(press.x, press.y);
     } else if (gesture === "drag") {

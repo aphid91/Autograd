@@ -334,6 +334,22 @@ export class Board {
     return new Set(rows.keys());
   }
 
+  // A belt-like cell as segtrace.js's node(): belt or underground end, or
+  // null. An underground's partner is its row's partner, if alive.
+  beltNode(x, y) {
+    const E = this.T.entity, C = this.T.cell;
+    const w = this.cellX(x, y), t = this.cellType(w);
+    if (t !== C.TYPE_BELT && t !== C.TYPE_UNDER) return null;
+    const row = this.cellId(w);
+    if (!this.alive(row)) return null;
+    const dir = this.cellDir(w);
+    if (t === C.TYPE_BELT) return { kind: "belt", dir, exit: false, partner: null, key: row, row };
+    const p = this.field(row, E.F_UNDER_PARTNER) | 0;
+    const partner = p && this.alive(p) && (this.field(p, E.F_UNDER_PARTNER) | 0) === row
+      ? [this.field(p, E.F_ORIGIN_X) | 0, this.field(p, E.F_ORIGIN_Y) | 0] : null;
+    return { kind: "under", dir, exit: !!this.field(row, E.F_UNDER_IS_EXIT), partner, key: row, row };
+  }
+
   // Engine.find_under_partner(): the nearest unpaired end of the opposite
   // role with the same facing, looking upstream from a new exit and
   // downstream from a new entrance. Nothing in between blocks.
