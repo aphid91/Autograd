@@ -169,29 +169,36 @@ function onTap(sx, sy) {
     inspect(board.entityAt(x, y));
     return;
   }
+  if (mode !== "build") return;
   const tool = placer();
-  if (tool) {
+  // Something already planned keeps the tap, even over an entity.
+  if (place || shell.activeStamp) {
     if (!place) startPlace(wx, wy);
     else if (onGhost(sx, sy)) placeOnce();
     else {
       placeOnce();
       // A paste ends the way placing does: a tap elsewhere places and
-      // leaves, back to plain selecting.
-      if (tool.pasting) exitPaste();
+      // leaves -- and with nothing selected, that is back to the tool.
+      if (tool?.pasting) exitPaste();
       else endPlace();
     }
     return;
   }
-  if (mode === "build" && beltHeld()) {
+  if (run) {
     // A tap on the tip turns it (straight, right, left). Any other second
     // tap places the run exactly as shown; it does not move the tip to
     // where the finger landed.
-    if (run && onCells(sx, sy, run.end[0], run.end[1], 1, 1)) { turnTip(run, true); redraw(); }
-    else if (run) commitRun();
-    else if (x >= 0 && y >= 0 && x < board.width && y < board.height) startRun(x, y);
+    if (onCells(sx, sy, run.end[0], run.end[1], 1, 1)) { turnTip(run, true); redraw(); }
+    else commitRun();
     return;
   }
-  if (mode === "select") selectTap(x, y);
+  if (sel) { selectTap(x, y); return; }
+  // Idle: a tap on an entity selects it, whatever the hand holds; a tap on
+  // empty board is the held tool's.
+  const row = board.entityAt(x, y);
+  if (row >= 0) lift([row]);
+  else if (tool) startPlace(wx, wy);
+  else if (beltHeld() && x >= 0 && y >= 0 && x < board.width && y < board.height) startRun(x, y);
 }
 
 // --- planning a belt run --------------------------------------------------
@@ -378,12 +385,15 @@ function onGhost(sx, sy) {
 
 // --- the selection ----------------------------------------------------------
 //
+// Not a mode: tapping an entity in Build starts it, and it ends -- handing
+// the taps back to the held tool -- whenever nothing is selected.
+//
 //   tap a board entity        select it: lifted off the board into `sel`
 //   tap a selected entity     deselect it: placed back where it now is,
 //                             if it fits -- otherwise it stays selected
 //   tap empty board           deselect everything that fits
 //   drag from a selected one  move the whole selection
-//   drag with Box armed       a rectangle that toggles what it touches
+//   drag with Box armed       a rectangle that adds what it touches
 //   Turn buttons              turn / mirror the selection as one stamp
 
 const selOrigin = () => originFor(sel.stamp.w, sel.stamp.h, sel.px, sel.py);
@@ -448,25 +458,15 @@ function selectTap(x, y) {
   else dropAll();
 }
 
-// Toggle-if-able: whatever was selected in the box tries to go back down,
-// and whatever was on the board in it is selected. The board's entities are
-// collected FIRST, so something dropped by this same box is not picked
-// straight back up.
-function boxToggle(r) {
+// Add every board entity the box touches to the selection. It only adds:
+// what is already selected stays selected.
+function boxAdd(r) {
   const rows = new Set();
   for (let y = r.y; y < r.y + r.h; y++) {
     for (let x = r.x; x < r.x + r.w; x++) {
       const row = board.entityAt(x, y);
       if (row >= 0) rows.add(row);
     }
-  }
-  if (sel) {
-    const [ox, oy] = selOrigin();
-    const inBox = new Set();
-    for (const [cx, cy, i] of stampCells(T, sel.stamp, ox, oy)) {
-      if (cx >= r.x && cx < r.x + r.w && cy >= r.y && cy < r.y + r.h) inBox.add(i);
-    }
-    if (inBox.size) drop([...inBox]);
   }
   lift([...rows]);
 }
@@ -534,7 +534,7 @@ const dragHooks = {
   // back to one finger, which never starts a selection drag of its own.
   wants(sx, sy) {
     if (run || place) return true;
-    if (shell.state.mode !== "select" || shell.state.pasteStamp !== null) return false;
+    if (!shell.selecting) return false;
     if (sx === undefined) return false;
     if (shell.state.boxArmed) return true;
     return selIndexAt(...cellUnder(sx, sy)) >= 0;
@@ -581,7 +581,7 @@ const dragHooks = {
     if (grab?.box && boxRect) {
       const r = boxRect;
       boxRect = null;
-      boxToggle(r);
+      boxAdd(r);
       // Box is one-shot: after its rectangle, back to plain selecting.
       shell.state.boxArmed = false;
       shell.changed();
@@ -643,9 +643,9 @@ async function init() {
       if (s.mode !== "hand" && inspectRow >= 0) inspect(-1);
       if (run && !(s.mode === "build" && beltHeld())) { run = null; grab = null; }
       if (place && !placer()) { place = null; grab = null; }
-      // Leaving Select puts the selection down. Anything that does not fit
+      // Leaving Build puts the selection down. Anything that does not fit
       // stays lifted, and is still there on coming back.
-      const left = lastMode === "select" && s.mode !== "select";
+      const left = lastMode === "build" && s.mode !== "build";
       lastMode = s.mode;
       if (left) dropAll();
       if (board) syncBar();   // the ghost reads the tool: a turn or a number shows at once

@@ -134,7 +134,7 @@ html, body {
 }
 /* The three sections share the row's width, as sand mode's band does: the
    round buttons shrink to fit their section rather than squeezing Mode. */
-#modesec { flex: 1.45 1 0; }
+#modesec { flex: 1 1 0; }
 #simsec { flex: 0.95 1 0; }
 #turnsec { flex: 1 1 0; }
 
@@ -149,7 +149,7 @@ html, body {
 .grid {
   display: grid;
   gap: calc(var(--btn-gap) * var(--u));
-  grid-template-columns: repeat(3, minmax(0, 1fr));
+  grid-template-columns: repeat(2, minmax(0, 1fr));
 }
 
 .b {

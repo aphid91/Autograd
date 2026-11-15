@@ -16,7 +16,7 @@ const LONG_PRESS_MS = 500;   // as sand mode
 const LONG_PRESS_SLOP = 10;  // px a held finger may wander
 const STAMP_HISTORY = 12;
 
-export const MODES = ["build", "hand", "select"];
+export const MODES = ["build", "hand"];
 // Select mode's bar: Box is a one-shot tool (the next drag is a rectangle);
 // the other three are COMMANDS on the current selection, not modes.
 export const COMMANDS = ["delete", "cut", "copy"];
@@ -93,20 +93,31 @@ export class Shell {
     this.cb.onChange?.(s);
   }
 
+  // The Build tool that taps use. Null while selecting or pasting: the
+  // selection takes the bar and the taps, and the tool comes back the
+  // moment nothing is selected or pasted.
   get heldTool() {
     const s = this.state;
+    if (this.selectActive) return null;
     return s.mode === "build" && s.selected >= 0 ? s.slots[s.selected] : null;
+  }
+
+  // Selection is a state of Build, not a mode: entered by tapping an entity,
+  // left when nothing is selected and nothing is being pasted.
+  get selectActive() {
+    const s = this.state;
+    return s.mode === "build" && (s.selCount > 0 || s.pasteStamp !== null);
   }
 
   // The stamp being pasted in Select, or null. `.stamp` is its geometry.
   get activeStamp() {
     const s = this.state;
-    if (s.mode !== "select" || s.pasteStamp === null) return null;
+    if (s.mode !== "build" || s.pasteStamp === null) return null;
     return s.stamps.find(t => t.id === s.pasteStamp) || null;
   }
 
   get selecting() {
-    return this.state.mode === "select" && this.state.pasteStamp === null && this.state.selCount > 0;
+    return this.state.mode === "build" && this.state.pasteStamp === null && this.state.selCount > 0;
   }
 
   // --- the controls row ---------------------------------------------------
@@ -177,7 +188,8 @@ export class Shell {
 
   renderThumbs() {
     const p = this.state.planning;
-    const show = !!p;
+    // Also while a selection is held: turning it wants a thumb too.
+    const show = !!p || this.selecting;
     const flippable = p?.kind === "belt" || (this.heldTool ? canFlip(this.T, this.heldTool) : !!this.activeStamp || this.selecting);
     for (const pad of this.thumbs) {
       pad.dataset.show = String(show);
@@ -188,8 +200,8 @@ export class Shell {
   setMode(m) {
     if (this.state.mode === m) return;
     this.state.mode = m;
-    // Leaving Select ends its gesture; the stamp history survives.
-    if (m !== "select") { this.state.pasteStamp = null; this.state.boxArmed = false; }
+    // Leaving Build ends a paste or a Box; the stamp history survives.
+    if (m !== "build") { this.state.pasteStamp = null; this.state.boxArmed = false; }
     this.changed();
   }
 
@@ -246,7 +258,8 @@ export class Shell {
     c.querySelector("#btn-flip").disabled = !flippable;
 
     const rowMode = planning ? s.planning.kind
-      : s.mode === "hand" && s.inspectValue ? "inspect" : s.mode;
+      : s.mode === "hand" && s.inspectValue ? "inspect"
+      : this.selectActive ? "select" : s.mode;
     this.els.bar.dataset.mode = rowMode;
     const row = this.els.swatches;
     const keep = row.scrollLeft;
@@ -255,8 +268,8 @@ export class Shell {
     row.dataset.mode = rowMode;
     if (beltRun) this.renderPlanning(row);
     else if (planning) this.renderPlacing(row);
+    else if (this.selectActive) this.renderSelect(row);
     else if (s.mode === "build") this.renderBuild(row);
-    else if (s.mode === "select") this.renderSelect(row);
     else if (s.mode === "hand") this.renderHand(row);
     // Re-rendering the same row must not throw away the player's scroll.
     if (sameRow) row.scrollLeft = keep;
@@ -440,8 +453,11 @@ export class Shell {
   }
 
   setSelection(n) {
-    if (this.state.selCount === n) return;
-    this.state.selCount = n;
+    const s = this.state;
+    if (s.selCount === n) return;
+    s.selCount = n;
+    // Nothing left to add to: a Box armed for this selection goes with it.
+    if (!n) s.boxArmed = false;
     this.render();
   }
 

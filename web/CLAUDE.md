@@ -36,12 +36,13 @@ controls, then a scrolling swatch bar. The layout tokens and darkroom colours
 at the top of `style.css` are sand mode's; sizes are `N * var(--u)` at UI
 scale 1.15.
 
-- **Mode** (left): Build, Hand, Select. It decides what the swatch bar shows.
+- **Mode** (left): Build and Hand. It decides what the swatch bar shows.
   - **Build**: the toolbelt. Tap selects, tapping the held slot again puts it
     down, **long press** (right-click on a mouse) opens the picker for that
     slot, and the `+` swatch appends. Slots persist in localStorage.
-  - **Select**: Box, Delete, Cut, Copy, then the stamp history, most recent
-    first. See "Selecting" below.
+    Tapping an existing entity **selects** it, whatever the hand holds, and
+    the bar becomes the selection's: Box, Delete, Cut, Copy, then the stamp
+    history, most recent first. See "Selecting" below.
   - **Hand**: tapping the board inspects: the Status folder opens in the
     panel, and a tap on bare board closes it. While Status shows a Source or
     a belt, the bar offers the number swatches (0, 1, −1, 2, 4, 8) for its
@@ -113,8 +114,8 @@ Four rules, each chosen over an obvious alternative:
 - **The second tap builds what is shown**, rather than moving the tip to
   where the finger landed. Tapping is a confirmation, not an aim.
 
-**Thumb pads.** While anything is planned (a run, a placement, a paste) the
-Turn buttons appear again in both bottom corners of the board -- rotate
+**Thumb pads.** While anything is planned (a run, a placement, a paste) or
+a selection is held, the Turn buttons appear again in both bottom corners of the board -- rotate
 left and right, flip above them -- so the thumb steering the ghost need not
 travel to the Turn row. On a belt run, flip toggles the route. Added in its
 own commit as an experiment.
@@ -176,7 +177,18 @@ no differences.
 
 ## Selecting
 
-Select mode lifts entities **off the board**. A selected entity is deleted
+Selecting is **a state of Build, not a mode**. With nothing planned, a tap on
+an existing entity selects it, whatever tool is held (or none); a tap on
+empty board is the held tool's (a run, a ghost). While anything is
+selected or a stamp is being pasted the bar shows the selection's swatches
+and the held tool is set aside (`Shell.heldTool` reads null). The moment
+nothing is selected and nothing is pasted, the tool is back -- so with the
+belt held, tapping empty board plans a run and tapping a machine selects
+it. The tap that deselects the last entity only hands the tool back; it
+does not also start a run. A run or ghost already being planned keeps its
+taps, even over an entity.
+
+Selecting lifts entities **off the board**. A selected entity is deleted
 from the board and held in `sel`, a stamp at a pose; it draws as a ghost
 outlined in cyan. Deselecting places it back wherever the selection now is.
 
@@ -187,7 +199,7 @@ outlined in cyan. Deselecting places it back wherever the selection now is.
 | tap empty board | deselect everything that fits |
 | one-finger drag from a selected entity | move the whole selection |
 | one-finger drag elsewhere | pan |
-| Box, then a drag (from anywhere) | a rectangle: everything it touches toggles, then Box disarms |
+| Box, then a drag (from anywhere) | a rectangle: everything it touches is **added**, then Box disarms |
 | Turn buttons | turn / mirror the selection as one stamp |
 | Delete | discard the selection |
 | Cut | the selection becomes a stamp, is discarded, and pasting starts |
@@ -198,17 +210,17 @@ outlined in cyan. Deselecting places it back wherever the selection now is.
   (moved onto something, say) stays selected, tinted red where it clashes.
   So a deselect-all can leave a few behind, and Copy then does not start
   pasting, leaving the player to deal with them.
-- **The Box toggles, and collects before it drops.** Board entities in the
-  rectangle are gathered first, then selected entities in it go back down,
-  then the gathered ones are lifted, so nothing the box just dropped is
-  picked straight back up.
+- **The Box only adds.** It appears only once something is selected, so a
+  box select is: tap one thing that belongs in it, then Box and drag. It
+  first toggled (dropping what was selected in the rectangle), which made
+  growing a selection by overlapping boxes undo itself.
 - **The pose is a continuous centre point**, like a placement ghost, so four
   turns come back exactly where they started. It is re-centred on the
   selection's box whenever the membership changes.
 - **Pasting never coexists with a selection.** Entering a paste puts the
   selection down and deletes whatever of it could not go down.
-- **Leaving Select puts the selection down.** What does not fit stays lifted
-  and is still there on coming back.
+- **Leaving Build (for Hand) puts the selection down.** What does not fit
+  stays lifted and is still there on coming back.
 - **Underground pairs.** Lifting one end of a pair releases the other
   (`Engine.unpair_under()`). Both ends lifted stay paired to each other.
   Placing back pairs the stamp's own ends first, then each unpaired end
@@ -320,7 +332,7 @@ is harmless and removes double-tap arbitration.
 |---|---|
 | `index.html`, `style.css` | the shell: board, controls row, swatch bar, picker sheet |
 | `main.js` | wiring: applies the shell's and panel's requests to the board; resize, redraw |
-| `ui.js` | the shell's state and DOM: modes, sim and turn buttons, swatches, long press, picker |
+| `ui.js` | the shell's state and DOM: modes, sim and turn buttons, thumb pads, swatches, long press, picker |
 | `tools.js` | the tool catalog (from `types.json`) and the swatch drawings |
 | `icons.js` | line icons as path data (mostly Lucide, ISC) |
 | `panel.js` | the Tweakpane panel: saves, View, Debug, Status |
