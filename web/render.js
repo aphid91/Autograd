@@ -26,11 +26,28 @@ const COL = {
   frustrated: "rgba(230,64,56,0.55)",
   lifted: "#5fd3e6",
   liftedFill: "rgba(95,211,230,0.12)",
-  portEdge: "#000000",
+  // A thin, translucent edge: enough to separate an arrow from a body of a
+  // similar colour, not so much that zoomed out the ports are all you see.
+  portEdge: "rgba(0,0,0,0.5)",
+  mark: "#e0e6f0",            // the glyph: COL_STRUCT_MARK
+  pass: "rgba(117,120,133,0.82)",   // the control overlay: COL_BELT at PASS_ALPHA
+  passChevron: "rgba(189,194,209,0.82)",
 };
 
 // Below this zoom (CSS px per cell) detail is not drawn at all.
-const LOD = { beltSolid: 4, gridLines: 6, chevrons: 10, ports: 8, labels: 22 };
+const LOD = { beltSolid: 4, gridLines: 6, chevrons: 10, ports: 8, labels: 22, marks: 5, portEdge: 14 };
+
+// A Source's number, in CSS px: 1.75x the first cut, bounded by the body's
+// width. Below 7 px it is not drawn and the Source shows its glyph instead,
+// as the desktop does -- a blank body would stop reading as a generator.
+const EMIT_SCALE = 0.56, EMIT_MIN_PX = 7;
+function emitSize(s, z) {
+  const text = fmtNumber(s.emit);
+  return Math.min(EMIT_SCALE * z, (s.w * z * 0.8) / (text.length * 0.62));
+}
+const emitShown = (s, z, labels) => s.emit !== null && labels && z >= LOD.labels && emitSize(s, z) >= EMIT_MIN_PX;
+
+import { structGlyph } from "./glyphs.js";
 
 const css = (c) => `rgb(${(c[0] * 255) | 0},${(c[1] * 255) | 0},${(c[2] * 255) | 0})`;
 const shade = (c, k) => css(c.map(v => v * k));
@@ -86,14 +103,14 @@ export function render(ctx, board, cam, dpr, opts = {}) {
 
   drawBelts(ctx, board.belts, z, on, S);
   drawUnders(ctx, board.unders, z, on, S);
-  drawStructs(ctx, board.T, board.structs, z, px, on, S, view.ports);
+  drawStructs(ctx, board.T, board.structs, z, px, on, S, view.ports, view.labels);
 
   ctx.strokeStyle = COL.border;
   ctx.lineWidth = 2 * px;
   ctx.strokeRect(0, 0, board.width, board.height);
 
   const ghosts = (view.ghosts || [view.ghost]).filter(Boolean);
-  for (const g of ghosts) drawGhost(ctx, board.T, g, z, px, on, S, view.ports);
+  for (const g of ghosts) drawGhost(ctx, board.T, g, z, px, on, S, view.ports, view.labels && z >= LOD.labels);
 
   // The inspected entity: an outline that stays a few pixels wide at any
   // zoom, drawn over everything so it cannot be hidden by what it marks.
@@ -235,13 +252,13 @@ function underFunnel(path, bars, cx, cy, f, s) {
 // A planned run: the proposed belts and undergrounds translucent, cells the
 // run cannot have tinted red, and a ring on each draggable end -- the tip
 // solid, the start hollow, so the two read apart at a glance.
-function drawGhost(ctx, T, g, z, px, on, S, ports) {
+function drawGhost(ctx, T, g, z, px, on, S, ports, labels) {
   ctx.save();
   ctx.globalAlpha = 0.6;
   // Seeded ghost belts tint like real ones; drawBelts does that itself.
   drawBelts(ctx, g.belts || [], Math.max(z, LOD.chevrons), on, S);
   drawUnders(ctx, g.unders || [], Math.max(z, LOD.chevrons), on, S);
-  if (g.structs) drawStructs(ctx, T, g.structs, Math.max(z, LOD.ports), px, on, S, ports);
+  if (g.structs) drawStructs(ctx, T, g.structs, Math.max(z, LOD.ports), px, on, S, ports, labels);
   ctx.restore();
 
   ctx.beginPath();
@@ -294,7 +311,7 @@ function drawGhost(ctx, T, g, z, px, on, S, ports) {
   }
 }
 
-function drawStructs(ctx, T, structs, z, px, on, S, ports) {
+function drawStructs(ctx, T, structs, z, px, on, S, ports, labels) {
   const types = T.types;
   const inset = 0.05;
   for (const s of structs) {
@@ -306,10 +323,53 @@ function drawStructs(ctx, T, structs, z, px, on, S, ports) {
     ctx.lineWidth = Math.max(px, 0.04);
     ctx.strokeRect(s.x + inset, s.y + inset, s.w - 2 * inset, s.h - 2 * inset);
   }
+  if (z < LOD.marks) return;
+
+  // The control overlay: a faint belt straight through each cell a channel
+  // passes unchanged (Entity.PASS_THROUGH), so which signal survives the
+  // machine reads at a glance. Over the body, under the glyph. Which cells
+  // carry it is exported per orientation (`o.pass`), worked out in Python
+  // by the same rule the desktop shader applies.
+  const spine = new Path2D(), chev = new Path2D();
+  for (const s of structs) {
+    if (!on(s.x, s.y, s.w, s.h)) continue;
+    for (const [lx, ly, a] of s.o.pass) {
+      const f = S[a], cx = s.x + lx + 0.5, cy = s.y + ly + 0.5;
+      spine.moveTo(cx - f[0] * 0.5, cy - f[1] * 0.5);
+      spine.lineTo(cx + f[0] * 0.5, cy + f[1] * 0.5);
+      if (z >= LOD.chevrons) chevron(chev, cx, cy, f, 0.1);
+    }
+  }
+  ctx.lineCap = "butt";
+  ctx.strokeStyle = COL.pass;
+  ctx.lineWidth = 0.22;
+  ctx.stroke(spine);
+  ctx.strokeStyle = COL.passChevron;
+  ctx.lineWidth = 0.06;
+  ctx.lineJoin = "miter";
+  ctx.stroke(chev);
+
+  // The glyph, centred on the footprint. A Source whose number is shown
+  // wears the number instead.
+  let fills = "";
+  const widths = new Map();   // stroke width -> path data: footprints differ
+  for (const s of structs) {
+    if (!on(s.x, s.y, s.w, s.h)) continue;
+    if (emitShown(s, z, labels)) continue;
+    const g = structGlyph(types[s.type].glyph, s.x, s.y, s.w, s.h);
+    if (g.stroke) widths.set(g.width, (widths.get(g.width) || "") + g.stroke);
+    fills += g.fill;
+  }
+  ctx.strokeStyle = COL.mark;
+  ctx.fillStyle = COL.mark;
+  ctx.lineCap = "round";
+  ctx.lineJoin = "round";
+  for (const [w, d] of widths) { ctx.lineWidth = w; ctx.stroke(new Path2D(d)); }
+  if (fills) ctx.fill(new Path2D(fills));
+  ctx.lineCap = "butt";
 
   if (!ports || z < LOD.ports) return;
-  // Ports: blue triangles pointing in at inputs, red pointing out at outputs,
-  // each with a black outline so it reads against any body colour.
+  // Ports: blue triangles pointing in at inputs, red pointing out at outputs.
   const ins = new Path2D(), outs = new Path2D();
   for (const s of structs) {
     if (!on(s.x, s.y, s.w, s.h)) continue;
@@ -318,20 +378,24 @@ function drawStructs(ctx, T, structs, z, px, on, S, ports) {
   }
   ctx.fillStyle = COL.in; ctx.fill(ins);
   ctx.fillStyle = COL.out; ctx.fill(outs);
-  ctx.strokeStyle = COL.portEdge;
-  ctx.lineWidth = Math.max(1.2 * px, 0.03);
-  ctx.lineJoin = "miter";
-  ctx.stroke(ins);
-  ctx.stroke(outs);
+  // The edge only once the arrows are big enough to need one; zoomed out it
+  // would be most of what is drawn.
+  if (z >= LOD.portEdge) {
+    ctx.strokeStyle = COL.portEdge;
+    ctx.lineWidth = 0.75 * px;
+    ctx.lineJoin = "miter";
+    ctx.stroke(ins);
+    ctx.stroke(outs);
+  }
 }
 
 function port(path, x, y, f, inward) {
   const cx = x + 0.5, cy = y + 0.5;
   const ex = cx + f[0] * 0.45, ey = cy + f[1] * 0.45;   // just inside the face
-  // 30% larger than the first cut (0.13 / 0.16), which read as specks on a
-  // phone. Still inside the cell: the tip sits on the face, not past it.
-  const sx = -f[1] * 0.169, sy = f[0] * 0.169;
-  const d = 0.208;
+  // Smaller again now the control overlay helps orient a machine: 35% under
+  // the enlarged cut (0.169 / 0.208). The tip sits on the face, not past it.
+  const sx = -f[1] * 0.11, sy = f[0] * 0.11;
+  const d = 0.135;
   // Inward: base on the face, tip inside. Outward: base inside, tip on face.
   const tip = inward ? [ex - f[0] * d, ey - f[1] * d] : [ex, ey];
   const base = inward ? [ex, ey] : [ex - f[0] * d, ey - f[1] * d];
@@ -350,13 +414,10 @@ function drawLabels(ctx, T, structs, cam, dpr, on) {
   ctx.fillStyle = COL.label;
   const z = cam.zoom;
   for (const s of structs) {
-    if (!on(s.x, s.y, s.w, s.h)) continue;
-    const text = s.emit !== null ? fmtNumber(s.emit)
-      : T.types[s.type].name.toUpperCase();
-    const size = Math.min(0.32 * z, (s.w * z * 0.8) / (text.length * 0.62));
-    if (size < 7) continue;
+    if (!on(s.x, s.y, s.w, s.h) || !emitShown(s, z, true)) continue;
+    const size = emitSize(s, z);
     ctx.font = `600 ${size.toFixed(1)}px system-ui, sans-serif`;
     const [sx, sy] = cam.worldToScreen(s.x + s.w / 2, s.y + s.h / 2);
-    ctx.fillText(text, sx, sy);
+    ctx.fillText(fmtNumber(s.emit), sx, sy);
   }
 }

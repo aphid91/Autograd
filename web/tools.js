@@ -9,6 +9,7 @@
 // in the picker with no change here.
 
 import { isValidStamp, typeByName } from "./stamp.js";
+import { structGlyph } from "./glyphs.js";
 
 export const CW = (d) => (d + 3) % 4;    // directions are CCW quarter turns
 export const CCW = (d) => (d + 1) % 4;
@@ -94,7 +95,7 @@ function port(x, y, d, inward) {
   const [fx, fy] = STEP[d];
   const cx = x + 0.5, cy = y + 0.5;
   const ex = cx + fx * 0.45, ey = cy + fy * 0.45;
-  const sx = -fy * 0.195, sy = fx * 0.195, k = 0.26;
+  const sx = -fy * 0.127, sy = fx * 0.127, k = 0.17;   // the board's ports, at swatch scale
   const tip = inward ? [ex - fx * k, ey - fy * k] : [ex, ey];
   const base = inward ? [ex, ey] : [ex - fx * k, ey - fy * k];
   return `M${base[0] + sx} ${base[1] + sy}L${tip[0]} ${tip[1]}L${base[0] - sx} ${base[1] - sy}Z`;
@@ -139,11 +140,20 @@ export function toolArt(T, slot) {
   const c = td.colour || [0.5, 0.5, 0.5];
   const ins = o.inputs.map(([x, y, f]) => port(x, y, f, true)).join("");
   const outs = o.outputs.map(([x, y, f]) => port(x, y, f, false)).join("");
+  // The control overlay and the glyph, as on the board.
+  const pass = o.pass.map(([x, y, a]) => {
+    const [fx, fy] = STEP[a];
+    return `M${x + 0.5 - fx * 0.5} ${y + 0.5 - fy * 0.5}L${x + 0.5 + fx * 0.5} ${y + 0.5 + fy * 0.5}`;
+  }).join("");
+  const g = structGlyph(td.glyph, 0, 0, o.w, o.h);
   return frame(o.w, o.h,
     `<rect x="0.05" y="0.05" width="${o.w - 0.1}" height="${o.h - 0.1}" fill="${css(c)}" ` +
     `stroke="${css(c.map(v => v * 0.6))}" stroke-width="0.06"/>` +
-    `<path d="${ins}" fill="#5999f2" stroke="#000" stroke-width="0.05"/>` +
-    `<path d="${outs}" fill="#f2594d" stroke="#000" stroke-width="0.05"/>`);
+    (pass ? `<path d="${pass}" fill="none" stroke="rgba(117,120,133,0.82)" stroke-width="0.22" stroke-linecap="butt"/>` : "") +
+    (g.stroke ? `<path d="${g.stroke}" fill="none" stroke="#e0e6f0" stroke-width="${g.width}" stroke-linecap="round" stroke-linejoin="round"/>` : "") +
+    (g.fill ? `<path d="${g.fill}" fill="#e0e6f0"/>` : "") +
+    `<path d="${ins}" fill="#5999f2" stroke="rgba(0,0,0,0.5)" stroke-width="0.025"/>` +
+    `<path d="${outs}" fill="#f2594d" stroke="rgba(0,0,0,0.5)" stroke-width="0.025"/>`);
 }
 
 // A stamp drawn small: machines as their coloured bodies, belts as their

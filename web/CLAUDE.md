@@ -170,6 +170,30 @@ the footprint about its middle.
 Underground ends draw **narrowing toward the buried side** (the front of an
 entrance, the back of an exit), on the board and on the swatch.
 
+### How machines draw
+
+As the desktop draws them, because a design reads by it: the body, the
+**control overlay** -- a faint belt straight through each cell a channel
+passes unchanged (`Entity.PASS_THROUGH`) -- then the type's **glyph**
+(Shear's +, Mac's ×, Swap's Z, Floor's arrow...), then small port arrows.
+There are no type names; a Source shows its value instead of its dot once
+the number is big enough to read, and its dot below that.
+
+- **The overlay's cells are exported**, not worked out here.
+  `export_web_types.py` applies the shader's rule (an axis from
+  `PASS_THROUGH`, flipped then rotated like a port; drawn on a cell with a
+  port along it, or between two cells of the footprint on that axis) and
+  writes `pass: [[lx, ly, axis]]` per orientation, beside the ports.
+- **The glyphs are ports of the `sd_*` functions in world.frag**, as SVG
+  path data in `glyphs.js`, so the board (`Path2D`) and the swatches share
+  one definition. A distance field minus a half-thickness is a round-capped
+  stroke, so the shapes match. They do not turn with the machine: the
+  shader draws them in world-aligned footprint space.
+- **Ports are small and lightly edged.** They were enlarged while there was
+  no overlay to orient a machine by; with it they came back down 35%, and
+  the black edge became a translucent 0.75 px line drawn only from 14
+  px/cell up, where zoomed out it had been most of what was drawn.
+
 `Board.spawnStructure()` stamps every cell with its offset within the
 **placed** footprint, as `Gameboard._stamp_footprint()` does. Checked by
 re-placing every machine on a board (1,026 of them, the save's own plus new

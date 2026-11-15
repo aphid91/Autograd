@@ -34,6 +34,34 @@ def kind_of(cls):
     return "structure"
 
 
+def pass_cells(cls, d, flipped, w, h, ins, outs):
+    """[(lx, ly, axis)] for the control-signal overlay, in placed space.
+
+    The same rule the desktop shader applies per pixel (world.frag, the
+    "control-signal overlay" block): an axis the type declares in
+    PASS_THROUGH, flipped then rotated like a port face; drawn on a cell that
+    has an output port facing along it, an input port facing back along it,
+    or that sits between two cells of the footprint on that axis.
+    """
+    axes = []
+    for a in cls.PASS_THROUGH:
+        if flipped:
+            a = cell.flip_dir_y(a)
+        axes.append(cell.rotate_dir_ccw_n(a, d))
+    out = []
+    for lx in range(w):
+        for ly in range(h):
+            for a in axes:
+                sx, sy = cell.DIR_STEPS[a]
+                back = (a + 2) % 4
+                fwd_room = (lx + sx in range(w)) and (ly + sy in range(h)) and (sx or sy)
+                back_room = (lx - sx in range(w)) and (ly - sy in range(h)) and (sx or sy)
+                on = ((lx, ly), a) in outs or ((lx, ly), back) in ins or (fwd_room and back_room)
+                if on:
+                    out.append([lx, ly, a])
+    return out
+
+
 def type_entry(cls):
     orient = {}
     for d in range(4):
@@ -45,6 +73,7 @@ def type_entry(cls):
                 # [local_x, local_y, face_direction], in placed space.
                 "inputs": [[x, y, f] for ((x, y), f) in ins],
                 "outputs": [[x, y, f] for ((x, y), f) in outs],
+                "pass": pass_cells(cls, d, flipped, w, h, set(ins), set(outs)),
             }
     return {
         "name": cell.TYPE_NAMES[cls.TYPE_ID],
@@ -53,6 +82,7 @@ def type_entry(cls):
         "footprint": list(cls.FOOTPRINT),
         "colour": list(cls.COLOUR) if cls.COLOUR else None,
         "chiral": bool(cls.is_chiral()) if kind_of(cls) == "structure" else False,
+        "glyph": getattr(cls, "GLYPH", "none"),
         "orient": orient,
     }
 

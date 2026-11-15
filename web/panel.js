@@ -38,7 +38,7 @@ export class Panel {
 
     this.view = { grid: true, ports: true, labels: true, ...this.prefs.view };
     const view = this.pane.addFolder({ title: "View", expanded: false });
-    for (const [key, label] of [["grid", "grid lines"], ["ports", "ports"], ["labels", "labels"]]) {
+    for (const [key, label] of [["grid", "grid lines"], ["ports", "ports"], ["labels", "source values"]]) {
       view.addBinding(this.view, key, { label }).on("change", () => {
         this.prefs.view = { ...this.view };
         savePrefs(this.prefs);
