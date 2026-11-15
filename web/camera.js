@@ -59,8 +59,16 @@ export class Camera {
 // Touch / mouse / wheel -> camera. Pointer events cover all three input
 // kinds; `touch-action: none` on the element stops the browser claiming the
 // gestures for page scroll and page zoom.
-export function attachGestures(el, camera, onChange) {
+//
+// A TAP is a single pointer that went down and up without travelling past
+// TAP_SLOP or overlapping a second finger. It is decided on release, because
+// a press alone could still become a pan -- the same ambiguity the desktop
+// resolves with STATE_ARMED.
+const TAP_SLOP = 8;   // CSS px
+
+export function attachGestures(el, camera, onChange, onTap) {
   const pts = new Map();   // pointerId -> [x, y] in element CSS px
+  let tap = null;          // { id, x, y } while a tap is still possible
 
   const local = (e) => {
     const r = el.getBoundingClientRect();
@@ -70,10 +78,16 @@ export function attachGestures(el, camera, onChange) {
   el.addEventListener("pointerdown", (e) => {
     el.setPointerCapture(e.pointerId);
     pts.set(e.pointerId, local(e));
+    const [x, y] = local(e);
+    tap = pts.size === 1 && e.button === 0 ? { id: e.pointerId, x, y } : null;
   });
 
   el.addEventListener("pointermove", (e) => {
     if (!pts.has(e.pointerId)) return;
+    if (tap) {
+      const [x, y] = local(e);
+      if (Math.hypot(x - tap.x, y - tap.y) > TAP_SLOP) tap = null;
+    }
     // Compare the first two active pointers before and after this move, so
     // a finger joining or leaving never causes a jump: there is no baseline
     // to go stale.
@@ -92,9 +106,15 @@ export function attachGestures(el, camera, onChange) {
     onChange();
   });
 
-  const up = (e) => pts.delete(e.pointerId);
-  el.addEventListener("pointerup", up);
-  el.addEventListener("pointercancel", up);
+  el.addEventListener("pointerup", (e) => {
+    pts.delete(e.pointerId);
+    if (tap && tap.id === e.pointerId) {
+      const [x, y] = local(e);
+      tap = null;
+      onTap?.(x, y);
+    }
+  });
+  el.addEventListener("pointercancel", (e) => { pts.delete(e.pointerId); tap = null; });
 
   el.addEventListener("wheel", (e) => {
     e.preventDefault();

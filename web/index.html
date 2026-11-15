@@ -3,18 +3,41 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
-<meta name="theme-color" content="#121217">
+<meta name="theme-color" content="#0b0c0f">
 <title>Gates</title>
 <link rel="stylesheet" href="style.css">
 </head>
 <body>
-<header id="bar">
-  <select id="save-select" aria-label="Bundled save"></select>
-  <label class="btn">Open<input id="save-file" type="file" accept=".npz" hidden></label>
-  <button id="fit" class="btn" type="button">Fit</button>
-</header>
-<canvas id="board"></canvas>
-<footer id="status"></footer>
+<!-- The phone shell, after Fluoddity's sand mode: the board, a row of
+     controls, and the swatch bar. ui.js builds into these containers. -->
+<div id="shell">
+  <div id="stage">
+    <canvas id="board"></canvas>
+    <div id="pane-host"></div>
+  </div>
+  <div id="controls"></div>
+  <footer id="bar">
+    <div id="swrow">
+      <button type="button" class="swarrow" id="sw-left" aria-label="Scroll tools left"></button>
+      <div id="swatches"></div>
+      <button type="button" class="swarrow" id="sw-right" aria-label="Scroll tools right"></button>
+    </div>
+    <div id="bar-hint">Tap a machine or belt to inspect it</div>
+  </footer>
+</div>
+
+<div id="picker" data-open="false" role="dialog" aria-modal="true" aria-labelledby="picker-title">
+  <div class="sheet">
+    <div class="sheet-head">
+      <span id="picker-title"></span>
+      <button type="button" class="b sheet-btn" id="picker-cancel">Cancel</button>
+    </div>
+    <div id="picker-list"></div>
+    <button type="button" class="b sheet-btn danger" id="picker-remove">Remove slot</button>
+  </div>
+</div>
+
+<input id="save-file" type="file" accept=".npz" hidden>
 <script type="module" src="main.js"></script>
 </body>
 </html>

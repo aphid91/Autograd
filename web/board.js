@@ -57,6 +57,61 @@ export class Board {
   cellDir(word) { return (word >> this.T.cell.DIR_SHIFT) & this.T.cell.DIR_MASK; }
   cellId(word) { return (word >> this.T.cell.ID_SHIFT) & this.T.cell.ID_MASK; }
   field(row, f) { return this.entities[row * this.T.entity.STRIDE + f]; }
+  setField(row, f, v) { this.entities[row * this.T.entity.STRIDE + f] = v; }
+
+  // The entity row covering cell (x, y), or -1. Every cell of a multi-cell
+  // entity carries its row id, so this is one grid read.
+  entityAt(x, y) {
+    const w = this.cellX(x, y);
+    if (this.cellType(w) === this.T.cell.TYPE_EMPTY) return -1;
+    const row = this.cellId(w);
+    return this.field(row, this.T.entity.F_ALIVE) ? row : -1;
+  }
+
+  // What the Status panel shows about a row. A fresh object each call:
+  // like the desktop's views, never hold one across an edit.
+  describe(row) {
+    const E = this.T.entity;
+    if (row < 0 || row >= this.rows || !this.field(row, E.F_ALIVE)) return null;
+    const td = this.T.types[this.field(row, E.F_TYPE) | 0];
+    if (!td) return null;
+    return {
+      row, td,
+      x: this.field(row, E.F_ORIGIN_X) | 0,
+      y: this.field(row, E.F_ORIGIN_Y) | 0,
+      w: this.field(row, E.F_W) | 0,
+      h: this.field(row, E.F_H) | 0,
+      dir: this.field(row, E.F_DIR) | 0,
+      flip: !!this.field(row, E.F_FLIPPED),
+      emit: td.name === "source" ? this.field(row, E.F_EMIT) : null,
+      seedOn: td.kind === "belt" ? !!this.field(row, E.F_SEED_ON) : null,
+      seedValue: td.kind === "belt" ? this.field(row, E.F_SEED_VALUE) : null,
+    };
+  }
+
+  // --- per-instance settings ---------------------------------------------
+  // Same fields the desktop's Status window writes, so a save made here
+  // loads there with the setting intact.
+
+  setEmit(row, value) {
+    this.setField(row, this.T.entity.F_EMIT, value);
+    this.derive();
+  }
+
+  // The seed's on-flag and sign are mirrored into the cell's .z, because
+  // the desktop renderer reads them from the grid with no row lookup. A
+  // row-only write would leave the desktop drawing a stale tint.
+  setSeed(row, on, value) {
+    const E = this.T.entity, C = this.T.cell;
+    this.setField(row, E.F_SEED_ON, on ? 1 : 0);
+    this.setField(row, E.F_SEED_VALUE, value);
+    const x = this.field(row, E.F_ORIGIN_X) | 0, y = this.field(row, E.F_ORIGIN_Y) | 0;
+    const i = (y * this.width + x) * 4 + 2;
+    let z = this.grid[i] & ~(C.SEED_BIT | C.SEED_POS_BIT);
+    if (on) z |= C.SEED_BIT | (value > 0 ? C.SEED_POS_BIT : 0);
+    this.grid[i] = z;
+    this.derive();
+  }
 
   // --- derived render lists --------------------------------------------
 

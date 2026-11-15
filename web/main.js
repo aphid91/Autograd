@@ -1,25 +1,39 @@
-// Wiring: load the type table, pick a save, keep the canvas sized, and
-// redraw on demand (never in a free-running loop -- the board is static).
+// Wiring: the board, the camera, the phone shell (ui.js) and the Tweakpane
+// panel. The shell and the panel only report intents; this file is the one
+// place that applies them to the board -- the same split the desktop keeps
+// between its panel and its orchestrator.
+//
+// Rendering is on demand: nothing runs in a loop.
 
 import { Board } from "./board.js";
 import { Camera, attachGestures } from "./camera.js";
 import { render } from "./render.js";
+import { Shell } from "./ui.js";
+import { Panel } from "./panel.js";
 
 const DEFAULT_SAVE = "default.npz";
 
 const canvas = document.getElementById("board");
 const ctx = canvas.getContext("2d", { alpha: false });
-const picker = document.getElementById("save-select");
 const fileInput = document.getElementById("save-file");
-const status = document.getElementById("status");
 
 const cam = new Camera();
 let T = null;
 let board = null;
 let dpr = 1;
+let shell = null;
+let panel = null;
+let view = {};
+let inspectRow = -1;   // a row, not a description: re-read it every time
 
 // A handle for the console and for headless tests. Not an API.
-const debug = window.gates = { cam, get board() { return board; }, redraw, renderMs: 0 };
+const debug = window.gates = {
+  cam, redraw, renderMs: 0,
+  get board() { return board; },
+  get shell() { return shell; },
+  get panel() { return panel; },
+  get inspectRow() { return inspectRow; },
+};
 
 let queued = false;
 function redraw() {
@@ -28,7 +42,8 @@ function redraw() {
   requestAnimationFrame(() => {
     queued = false;
     const t0 = performance.now();
-    render(ctx, board, cam, dpr);
+    const info = board ? board.describe(inspectRow) : null;
+    render(ctx, board, cam, dpr, { ...view, selected: info });
     debug.renderMs = performance.now() - t0;
   });
 }
@@ -42,18 +57,31 @@ function resize() {
   redraw();
 }
 
+// --- inspecting (the Hand) ------------------------------------------------
+
+function inspect(row) {
+  inspectRow = row;
+  panel.showStatus(board ? board.describe(row) : null);
+  redraw();
+}
+
+function onTap(sx, sy) {
+  if (!board || shell.state.mode !== "hand") return;
+  const [wx, wy] = cam.screenToWorld(sx, sy);
+  // A tap on bare board closes the window, as on the desktop.
+  inspect(board.entityAt(Math.floor(wx), Math.floor(wy)));
+}
+
+// --- saves ------------------------------------------------------------------
+
 async function show(name, bytes) {
-  status.textContent = `loading ${name}…`;
   try {
-    const t0 = performance.now();
     board = await Board.fromNpz(T, bytes);
     cam.frame(board.bounds);
-    const ms = (performance.now() - t0).toFixed(0);
-    status.textContent = `${name} · ${board.structs.length} machines · `
-      + `${board.belts.length} belts · ${board.unders.length} undergrounds · ${ms} ms`;
+    inspect(-1);
   } catch (err) {
     console.error(err);
-    status.textContent = `${name}: ${err.message}`;
+    alert(`${name}: ${err.message}`);
   }
   redraw();
 }
@@ -66,38 +94,62 @@ async function loadBundled(name) {
 
 async function init() {
   T = await (await fetch("types.json")).json();
+
+  shell = new Shell(T, {
+    controls: document.getElementById("controls"),
+    bar: document.getElementById("bar"),
+    swrow: document.getElementById("swrow"),
+    swatches: document.getElementById("swatches"),
+    left: document.getElementById("sw-left"),
+    right: document.getElementById("sw-right"),
+    picker: document.getElementById("picker"),
+  }, {
+    // Leaving the Hand puts the Status window away.
+    onChange: (s) => { if (s.mode !== "hand" && inspectRow >= 0) inspect(-1); },
+    onReset: () => console.info("reset: no simulation yet"),
+    onPause: (paused) => console.info(paused ? "paused" : "playing"),
+  });
+
+  panel = new Panel(document.getElementById("pane-host"), {
+    onLoadSave: (name) => loadBundled(name).catch(e => alert(e.message)),
+    onOpenFile: () => fileInput.click(),
+    onFit: () => { if (board) cam.frame(board.bounds); redraw(); },
+    onView: (v) => { view = v; redraw(); },
+    onAddStamp: () => shell.addStamp(),
+    onClearStamps: () => shell.clearStamps(),
+    onCloseStatus: () => inspect(-1),
+    onEmit: (row, v) => { board.setEmit(row, v); redraw(); },
+    onSeed: (row, on, v) => { board.setSeed(row, on, v); redraw(); },
+  });
+  view = { ...panel.view };
+
   resize();
   new ResizeObserver(resize).observe(canvas);
-  attachGestures(canvas, cam, redraw);
+  attachGestures(canvas, cam, redraw, onTap);
 
-  document.getElementById("fit").addEventListener("click", () => {
-    if (board) cam.frame(board.bounds);
-    redraw();
-  });
   fileInput.addEventListener("change", async () => {
     const f = fileInput.files[0];
     if (f) await show(f.name, await f.arrayBuffer());
     fileInput.value = "";
   });
-  picker.addEventListener("change", () => loadBundled(picker.value));
 
-  // The bundled saves are listed by the build (web/build.sh). Running from
-  // the bare web/ folder there is no list, and the file picker still works.
+  // Space toggles pause, as on the desktop -- through the shell's button so
+  // the icon cannot disagree with the state.
+  document.addEventListener("keydown", (e) => {
+    if (e.target instanceof HTMLInputElement) return;
+    if (e.code === "Space") { e.preventDefault(); document.getElementById("btn-play").click(); }
+  });
+
+  // The bundled saves are listed by web/build.sh. Served from the bare web/
+  // folder there is no list, and Open still works.
   let saves = [];
   try {
     const res = await fetch("saves/index.json");
     if (res.ok) saves = await res.json();
   } catch { /* no bundled saves */ }
-  for (const name of saves) picker.add(new Option(name, name));
-  picker.hidden = saves.length === 0;
-
   const first = saves.includes(DEFAULT_SAVE) ? DEFAULT_SAVE : saves[0];
-  if (first) {
-    picker.value = first;
-    await loadBundled(first).catch(e => { status.textContent = e.message; });
-  } else {
-    status.textContent = "open a .npz save";
-  }
+  panel.setSaves(saves, first);
+  if (first) await loadBundled(first).catch(e => alert(e.message));
 }
 
 init();

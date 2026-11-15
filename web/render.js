@@ -6,7 +6,7 @@
 // is that the two apps read as the same game, not that they match pixels.
 
 const COL = {
-  void: "#121217",
+  void: "#0b0c0f",
   bg: "#1f1f24",
   grid: "#383842",
   gridMajor: "#4d4d59",
@@ -21,6 +21,7 @@ const COL = {
   seedPos: "rgba(77,189,92,0.55)",
   seedNeg: "rgba(209,77,71,0.55)",
   label: "#fcfcff",
+  select: "#e8a33d",
 };
 
 // Below this zoom (CSS px per cell) detail is not drawn at all.
@@ -35,7 +36,12 @@ function fmtNumber(v) {
   return String(parseFloat(v.toPrecision(3)));
 }
 
-export function render(ctx, board, cam, dpr) {
+// `opts`: the View toggles ({ grid, ports, labels }) and `selected`, the
+// inspected entity's {x, y, w, h} or null.
+export const DEFAULT_VIEW = { grid: true, ports: true, labels: true };
+
+export function render(ctx, board, cam, dpr, opts = {}) {
+  const view = { ...DEFAULT_VIEW, ...opts };
   const z = cam.zoom;
   ctx.setTransform(1, 0, 0, 1, 0, 0);
   ctx.fillStyle = COL.void;
@@ -54,7 +60,7 @@ export function render(ctx, board, cam, dpr) {
   ctx.fillRect(0, 0, board.width, board.height);
 
   // Grid, under everything, so belts read as joined across cell edges.
-  if (z >= LOD.gridLines) {
+  if (view.grid && z >= LOD.gridLines) {
     const gx0 = Math.max(0, Math.floor(v.x0)), gx1 = Math.min(board.width, Math.ceil(v.x1));
     const gy0 = Math.max(0, Math.floor(v.y0)), gy1 = Math.min(board.height, Math.ceil(v.y1));
     for (const major of [false, true]) {
@@ -75,13 +81,23 @@ export function render(ctx, board, cam, dpr) {
 
   drawBelts(ctx, board, z, on, S);
   drawUnders(ctx, board, z, on, S);
-  drawStructs(ctx, board, z, px, on, S);
+  drawStructs(ctx, board, z, px, on, S, view.ports);
 
   ctx.strokeStyle = COL.border;
   ctx.lineWidth = 2 * px;
   ctx.strokeRect(0, 0, board.width, board.height);
 
-  if (z >= LOD.labels) drawLabels(ctx, board, cam, dpr, on);
+  // The inspected entity: an outline that stays a few pixels wide at any
+  // zoom, drawn over everything so it cannot be hidden by what it marks.
+  const sel = view.selected;
+  if (sel) {
+    const pad = 3 * px;
+    ctx.strokeStyle = COL.select;
+    ctx.lineWidth = 2.5 * px;
+    ctx.strokeRect(sel.x - pad, sel.y - pad, sel.w + 2 * pad, sel.h + 2 * pad);
+  }
+
+  if (view.labels && z >= LOD.labels) drawLabels(ctx, board, cam, dpr, on);
 }
 
 function drawBelts(ctx, board, z, on, S) {
@@ -189,7 +205,7 @@ function drawUnders(ctx, board, z, on, S) {
   ctx.stroke();
 }
 
-function drawStructs(ctx, board, z, px, on, S) {
+function drawStructs(ctx, board, z, px, on, S, ports) {
   const types = board.T.types;
   const inset = 0.05;
   for (const s of board.structs) {
@@ -202,7 +218,7 @@ function drawStructs(ctx, board, z, px, on, S) {
     ctx.strokeRect(s.x + inset, s.y + inset, s.w - 2 * inset, s.h - 2 * inset);
   }
 
-  if (z < LOD.ports) return;
+  if (!ports || z < LOD.ports) return;
   // Ports: blue triangles pointing in at inputs, red pointing out at outputs.
   const ins = new Path2D(), outs = new Path2D();
   for (const s of board.structs) {

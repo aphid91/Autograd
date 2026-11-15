@@ -10,6 +10,7 @@ OUT="${1:-$ROOT/_site}"
 rm -rf "$OUT"
 mkdir -p "$OUT/saves"
 cp "$ROOT"/web/index.html "$ROOT"/web/style.css "$ROOT"/web/*.js "$ROOT"/web/types.json "$OUT"/
+cp -r "$ROOT"/web/vendor "$OUT"/
 cp "$ROOT"/*.npz "$OUT/saves/"
 (cd "$OUT/saves" && ls *.npz) \
   | python3 -c 'import json, sys; print(json.dumps([l.strip() for l in sys.stdin]))' \

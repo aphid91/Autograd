@@ -8,8 +8,10 @@ copy/paste, move/rotate/flip, seeds and Source values, camera, toolbelt.
 Read the root CLAUDE.md for what the game *is*; most of its engineering
 notes are about the tick and do not apply here.
 
-Current state: **a static viewer.** It loads a save and lets you pan (one
-finger) and zoom (pinch, or the mouse wheel). No editing, no ticking.
+Current state: **a viewer with the phone shell around it.** It loads a save,
+pans (one finger) and zooms (pinch, or the wheel), and has the control
+layout the editor will use -- but the only board edits so far are a Source's
+emit value and a belt's seed, from the Status panel. No building, no ticking.
 
 ## Run it
 
@@ -21,6 +23,54 @@ bash web/build.sh && python3 -m http.server -d _site 8000
 `saves/index.json` for the save picker. On push to `Web`,
 `.github/workflows/pages.yml` does the same and deploys to GitHub Pages.
 `default.npz` is loaded at startup if it exists.
+
+## The phone shell
+
+Copied from Fluoddity's **sand mode** (`aphid91/fluoddity-web`, `sand.html`
+and `src/sand/sandUi.ts`), portrait "band" plan: the board, then a row of
+controls, then a scrolling swatch bar. The layout tokens and darkroom colours
+at the top of `style.css` are sand mode's; sizes are `N * var(--u)` at UI
+scale 1.15.
+
+- **Mode** (left): Build, Hand, Select. It decides what the swatch bar shows.
+  - **Build**: the toolbelt. Tap selects, tapping the held slot again puts it
+    down, **long press** (right-click on a mouse) opens the picker for that
+    slot, and the `+` swatch appends. Slots persist in localStorage.
+  - **Select**: Delete, Cut, Copy, Paste, then the stamp history, most recent
+    first. Tapping a stamp means "paste this one"; Paste alone takes the most
+    recent. No selection rectangle exists yet, so stamps come only from
+    the panel's Debug folder.
+  - **Hand**: the bar is empty (deferred). Tapping the board inspects: the
+    Status folder opens in the panel, and a tap on bare board closes it.
+- **Sim** (right): Reset (ctrl+R) and Play/Pause. Neither is wired to a
+  simulation; Play/Pause only swaps its icon. Space toggles it.
+- **Turn**: rotate CW, CCW, and flip. They act on what the hand holds: the
+  held tool in Build, the pasted stamp in Select. A swatch draws its tool **at
+  the orientation the next placement would have**, from the placed port
+  tables in `types.json`, so turning is visible with nothing on the board.
+  Flip is disabled on tools with no chirality (belts, Sink); on the
+  underground it swaps which end the next tap lays, as on the desktop.
+
+Three things worth knowing:
+
+- **A long press swallows exactly one click**: the one the finger's own
+  release produces. The first version used sand mode's 800 ms timeout, and
+  that ate a genuine quick tap made right after the picker closed. Now the
+  next pointerdown anywhere clears the flag.
+- **A slot is plain data** (`{ kind, type?, dir, flip }`), and the kind
+  strings are a compatibility surface because they live in localStorage. An
+  entry naming a machine this build lacks becomes an empty slot rather than
+  discarding the bar, the same rule the desktop's toolbar file follows.
+- **`ui.js` and `panel.js` only request.** They report intents through
+  callbacks and `main.js` applies them, so the board has one writer. That is
+  the desktop's panel/orchestrator split.
+
+The **Tweakpane** panel sits in the board's top-right corner, collapsed by
+default. It holds the saves, View toggles (grid, ports, labels), Debug, and
+the Status folder. Tweakpane is **vendored** (`vendor/`, MIT) rather than
+pulled from a CDN, which keeps the no-build, works-offline property. Status
+writes the same row fields the desktop's Status window does, plus the
+seed's `.z` bits, so a save edited here reads correctly there.
 
 ## Rules
 
@@ -51,11 +101,16 @@ bash web/build.sh && python3 -m http.server -d _site 8000
 
 | file | role |
 |---|---|
-| `index.html`, `style.css` | the page: top bar, canvas, status line |
-| `main.js` | wiring: load types, pick a save, resize, redraw |
+| `index.html`, `style.css` | the shell: board, controls row, swatch bar, picker sheet |
+| `main.js` | wiring: applies the shell's and panel's requests to the board; resize, redraw |
+| `ui.js` | the shell's state and DOM: modes, sim and turn buttons, swatches, long press, picker |
+| `tools.js` | the tool catalog (from `types.json`) and the swatch drawings |
+| `icons.js` | line icons as path data (mostly Lucide, ISC) |
+| `panel.js` | the Tweakpane panel: saves, View, Debug, Status |
+| `vendor/` | Tweakpane 4.0.5, vendored |
 | `npz.js` | `.npz` reader: zip directory + native `DecompressionStream` + `.npy` headers |
-| `board.js` | the save's arrays, validation, and derived render lists |
-| `camera.js` | camera (world +Y up, zoom in CSS px/cell) and pointer gestures |
+| `board.js` | the save's arrays, validation, derived render lists, `entityAt`/`describe`, and the two setting writers |
+| `camera.js` | camera (world +Y up, zoom in CSS px/cell), pointer gestures, and taps |
 | `render.js` | Canvas 2D drawing under a world transform; labels in screen space |
 | `types.json` | generated — do not edit |
 | `build.sh` | assembles `_site/` |
