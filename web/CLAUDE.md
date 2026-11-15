@@ -176,8 +176,14 @@ As the desktop draws them, because a design reads by it: the body, the
 **control overlay** -- a faint belt straight through each cell a channel
 passes unchanged (`Entity.PASS_THROUGH`) -- then the type's **glyph**
 (Shear's +, Mac's ×, Swap's Z, Floor's arrow...), then small port arrows.
-There are no type names; a Source shows its value instead of its dot once
-the number is big enough to read, and its dot below that.
+There are no type names; a Source shows its value instead of its dot, at
+every zoom the glyphs draw at (it was first cut off at legibility, which
+turned values into dots too early to be useful for finding a constant).
+
+The overlay is **belt-wide and opaque, with a thin dark edge**, so it reads
+as a belt running through the machine. The edge scales with the board
+(0.03 cells, at least half a pixel) so zoomed out it thins rather than
+striping every machine.
 
 - **The overlay's cells are exported**, not worked out here.
   `export_web_types.py` applies the shader's rule (an axis from

@@ -30,22 +30,24 @@ const COL = {
   // similar colour, not so much that zoomed out the ports are all you see.
   portEdge: "rgba(0,0,0,0.5)",
   mark: "#e0e6f0",            // the glyph: COL_STRUCT_MARK
-  pass: "rgba(117,120,133,0.82)",   // the control overlay: COL_BELT at PASS_ALPHA
-  passChevron: "rgba(189,194,209,0.82)",
+  pass: "#757885",            // the control overlay: belt-coloured, belt-wide,
+  passEdge: "#000000",        // with a thin dark edge so it reads over any body
+  passChevron: "#bdc2d1",
 };
 
 // Below this zoom (CSS px per cell) detail is not drawn at all.
 const LOD = { beltSolid: 4, gridLines: 6, chevrons: 10, ports: 8, labels: 22, marks: 5, portEdge: 14 };
 
 // A Source's number, in CSS px: 1.75x the first cut, bounded by the body's
-// width. Below 7 px it is not drawn and the Source shows its glyph instead,
-// as the desktop does -- a blank body would stop reading as a generator.
-const EMIT_SCALE = 0.56, EMIT_MIN_PX = 7;
+// width. It is drawn as far out as the glyphs are (LOD.marks), however small
+// that makes it -- a value still reads as "a number, roughly this long" well
+// after its digits stop being legible. Below that nothing but bodies draws.
+const EMIT_SCALE = 0.56;
 function emitSize(s, z) {
   const text = fmtNumber(s.emit);
   return Math.min(EMIT_SCALE * z, (s.w * z * 0.8) / (text.length * 0.62));
 }
-const emitShown = (s, z, labels) => s.emit !== null && labels && z >= LOD.labels && emitSize(s, z) >= EMIT_MIN_PX;
+const emitShown = (s, z, labels) => s.emit !== null && labels && z >= LOD.marks;
 
 import { structGlyph } from "./glyphs.js";
 
@@ -110,7 +112,7 @@ export function render(ctx, board, cam, dpr, opts = {}) {
   ctx.strokeRect(0, 0, board.width, board.height);
 
   const ghosts = (view.ghosts || [view.ghost]).filter(Boolean);
-  for (const g of ghosts) drawGhost(ctx, board.T, g, z, px, on, S, view.ports, view.labels && z >= LOD.labels);
+  for (const g of ghosts) drawGhost(ctx, board.T, g, z, px, on, S, view.ports, view.labels);
 
   // The inspected entity: an outline that stays a few pixels wide at any
   // zoom, drawn over everything so it cannot be hidden by what it marks.
@@ -122,7 +124,7 @@ export function render(ctx, board, cam, dpr, opts = {}) {
     ctx.strokeRect(sel.x - pad, sel.y - pad, sel.w + 2 * pad, sel.h + 2 * pad);
   }
 
-  if (view.labels && z >= LOD.labels) {
+  if (view.labels && z >= LOD.marks) {
     drawLabels(ctx, board.T, board.structs, cam, dpr, on);
     ctx.globalAlpha = 0.7;
     for (const g of ghosts) if (g.structs?.length) drawLabels(ctx, board.T, g.structs, cam, dpr, on);
@@ -340,9 +342,17 @@ function drawStructs(ctx, T, structs, z, px, on, S, ports, labels) {
       if (z >= LOD.chevrons) chevron(chev, cx, cy, f, 0.1);
     }
   }
+  // Belt-wide (0.34, the spine's width), over a slightly wider dark stroke
+  // that shows as an edge down each side. Butt caps, so the edge does not
+  // close the ends: the channel reads as continuing into the belts beyond.
   ctx.lineCap = "butt";
+  ctx.strokeStyle = COL.passEdge;
+  // The edge scales with the board (0.03 cells) down to half a pixel, so
+  // zoomed out it fades rather than striping every machine.
+  ctx.lineWidth = 0.34 + 2 * Math.max(0.5 * px, 0.03);
+  ctx.stroke(spine);
   ctx.strokeStyle = COL.pass;
-  ctx.lineWidth = 0.22;
+  ctx.lineWidth = 0.34;
   ctx.stroke(spine);
   ctx.strokeStyle = COL.passChevron;
   ctx.lineWidth = 0.06;
