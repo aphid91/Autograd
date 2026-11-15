@@ -1,21 +1,23 @@
 # web/ — the mobile board editor
 
 A phone-first web interface for building and editing Gates saves (`.npz`).
-It is **not** a port of the Python app. The Python app is the
-high-performance simulator (shader tick, wake lists, folding); this is where
-the *building* UX gets designed: structure placement, belt routing,
-copy/paste, move/rotate/flip, seeds and Source values, camera, toolbelt.
-Read the root CLAUDE.md for what the game *is*; most of its engineering
-notes are about the tick and do not apply here.
+The Python app is the high-performance simulator (shader tick, wake lists,
+folding); this is where the *building* UX gets designed: structure
+placement, belt routing, copy/paste, move/rotate/flip, seeds and Source
+values, camera, toolbelt. It also runs the simulation, as a plain port of
+the desktop's **CPU** tick (see "The simulation" below). Read the root
+CLAUDE.md for what the game *is*; most of its engineering notes are about
+the schedulers and the GPU, which do not apply here.
 
 Current state: **the phone shell, the belt planner, machine placement,
-per-instance settings, and select / cut / copy / paste.** It loads a save,
-pans (one finger) and zooms (pinch, or the wheel), lays belt runs
-(auto-tunnelling under obstacles), places machines and raw belts, edits a
-Source's emit value or a belt's seed, and selects, moves, turns, deletes,
-copies and pastes groups of entities.
-Nothing ticks, Underground has no tool flow of its own (the planner covers
-it), and edits are not saved back to a file.
+per-instance settings, select / cut / copy / paste, and the simulation.** It
+loads a save, pans (one finger) and zooms (pinch, or the wheel), lays belt
+runs (auto-tunnelling under obstacles), places machines and raw belts, edits
+a Source's emit value or a belt's seed, selects, moves, turns, deletes,
+copies and pastes groups of entities, and ticks the board -- items on belts,
+gates firing -- at a chosen rate.
+Underground has no tool flow of its own (the planner covers it), and edits
+are not saved back to a file.
 
 ## Run it
 
@@ -48,8 +50,14 @@ scale 1.15.
     number swatches), and a tap on bare board clears it. While Status shows a Source or
     a belt, the bar offers the number swatches (0, 1, −1, 2, 4, 8) for its
     emit value or seed; on a belt, tapping the lit number unseeds it.
-- **Sim** (right): Reset (ctrl+R) and Play/Pause. Neither is wired to a
-  simulation; Play/Pause only swaps its icon. Space toggles it.
+- **Sim** (right): Reset (the desktop's ctrl+R: tick 0, every item gone,
+  seeds back on, the factory untouched) and Play/Pause. Space toggles
+  play. It **starts paused**, and loading a save pauses it again. **Long
+  press Play/Pause** (right-click on a mouse) for the rate panel, just above
+  the Sim section: presets of 1, 5, 10 and 30 ticks a second, and Custom,
+  which opens a text box (0.1 to 240). It stays open until the next long
+  press or its × button, and shows the tick count. The rate persists with
+  the shell's localStorage; the panel's open state does not.
 - **Turn**: rotate CW, CCW, and flip. They act on what the hand holds: the
   held tool in Build (a stamp tool turns its stamp), the stamp being pasted,
   or the selection. A swatch draws its tool **at
@@ -368,6 +376,90 @@ exactly like a dead button. Space the moves about 16 ms apart and pause
 before lifting. The controls also carry `touch-action: manipulation`, which
 is harmless and removes double-tap arbitration.
 
+## The simulation
+
+[sim.js](sim.js) is a port of the desktop's **CPU** tick --
+`core/segments.py`, `core/belts.py`, `core/gates.py`, `core/tick.py` and the
+tick half of `engine.py` -- with every scheduler left out: no wake lists, no
+gate sleep, no constant folding, no GPU. The two optimisations kept are the
+closed-form belt (a run ticks in O(1) however many items are on it) and the
+gate prefilter (an occupancy test rejects gates that cannot act before the
+full firing rule runs). One module, no DOM, so Node can run it.
+
+**It matches the desktop tick for tick**, and
+[tools/check_web_sim.py](../tools/check_web_sim.py) is what says so: it runs
+the desktop's `Engine` (folding off, both sleep layers latched off, no GL)
+and `web/tests/sim_dump.mjs` on the same save, and compares every segment's
+id, ring counters, anchor, every item's entry tick and payload bits, and
+every gate's eight channel slots, after every tick. Every root save agrees
+for 200 ticks with a Reset halfway. Mutation-tested: numbering segments
+fresh on each rebuild fails just after the reset, and letting Merge consume
+both lanes fails on `cpu.npz` at tick 23. Two mutations it does **not**
+catch, both of them behaviour-neutral on today's boards: pushing before the
+pop (at spacing == speed the room test cannot see the pop), and applying
+direct hand-offs one at a time instead of from a snapshot (they differ only
+when two gates feed one Sink lane).
+
+Matching forced three details that would otherwise look arbitrary:
+
+- **Segment ids come from the desktop's allocator**: a free list popped from
+  the end and refilled in creation order on every rebuild. The belt phase
+  visits runs in id order, and a run that drains a gate first changes what a
+  later run sees, so the ids decide the result -- and they alternate between
+  ascending and descending scan order on each rebuild, exactly as the
+  desktop's do. A new `Sim` per loaded board, like a fresh desktop session.
+- **The rebuild scans y-major** (numpy's `nonzero()` order), so the same
+  cells become tails in the same order.
+- **Values are float32 at the same points**: gate channels live in the
+  save's own entity `Float32Array`, and ring payloads are `Float32Array`s.
+
+**The arithmetic is data.** `types.json` now carries a `sim` record per
+machine -- firing rule, port-to-channel maps, the `OPS` opcode table and
+Merge's `SELECT_RULE` -- and `evalOps()` is a port of `Entity.eval_ops()`.
+Nothing about a machine's semantics is written in JS; the desktop's
+self-check already pins `OPS` against every `fire()`.
+
+**Any edit is a fresh start.** `Board.derive()` ends every mutation, so it
+bumps `board.revision`; `Sim.sync()` (called at the top of every frame and
+every tick) sees it and rebuilds the index, flushes every item from every
+belt and every gate channel, and puts the seeds back on. That is the
+desktop's rule for a belt-network edit applied to *every* edit, including a
+Source's value, a seed, and lifting a selection off the board. The tick
+counter is left alone; Reset is what zeroes it.
+
+**The clock banks fractional ticks, not seconds.** `Clock.advance(dt)`
+adds `dt * rate` and spends the whole ticks; the remainder is `alpha`,
+which the renderer feeds to the closed form so items glide between ticks.
+Banking seconds and dividing (the desktop's way) left float residue that
+turned a whole tick into 0.9999 of one; the unit test caught it. A frame's
+dt is clamped to 0.25 s and the backlog to 240 ticks, so a backgrounded tab
+never freezes to catch up. **Rendering loops only while playing**; paused,
+the board is still redrawn on demand.
+
+### How items draw
+
+As the desktop's: a dark disc with a ring, **green above zero, red at or
+below**, its number on top once the zoom makes it legible (faded in over the
+shader's 6-10 px glyph band). Each item's position is the closed form at
+`tick + alpha`, never stored. An item at distance `s` along its run is drawn
+from the drawn cell nearest `s`: ahead of the centre along that cell's
+facing, behind it along the way the run came in -- so an item rounding a
+corner arrives from its own side, which the shader (drawing along the
+cell's facing only) does not quite do. Positions with no drawn cell in
+reach (an underground's buried tiles) draw nothing, and so does an item
+parked exactly at a blocked run's end, one cell past the last centre --
+both as on the desktop.
+
+A gate's **waiting zone** -- a result the belt would not take -- draws as
+the same disc squashed into the gap between the body and the cell edge, so
+back pressure is visible. Normally empty by the end of a tick.
+
+**Status** shows a live readout under the settings: a machine's input and
+output channels (`–` empty, `×` an output with nothing to take it, whose
+results are discarded), or a belt's run (its id, length, whether it is fed
+and drains, and the items on it, head first). Rewritten every frame; the
+panel touches the DOM only when the text changes.
+
 ## Rules
 
 - **No build step, no npm, no framework.** Plain ES modules and Canvas 2D.
@@ -385,24 +477,27 @@ is harmless and removes double-tap arbitration.
   `take_dir()` in `core/segments.py` (straight-through first, then CCW; the
   cell a belt outputs into is never its source). If the two disagree, the
   picture shows material going where it does not go.
-- **Redraw on demand.** Nothing runs in a loop; input calls `redraw()`, which
-  coalesces into one `requestAnimationFrame`. Every draw pass is one batched
-  path per family, culled to the viewport, with detail gated on zoom
+- **Redraw on demand while paused, loop while playing.** Input calls
+  `redraw()`, which coalesces into one `requestAnimationFrame`; the only
+  continuous frames are the ones advancing the clock. Every draw pass is one
+  batched path per family, culled to the viewport, with detail gated on zoom
   (`LOD` in `render.js`).
-- When the tick arrives: the closed-form belt transport and the simple gate
-  prefilter are the only optimisations wanted. No wake lists, no folding, no
-  GPU.
+- **The tick stays the desktop's CPU tick.** The closed-form belt transport
+  and the simple gate prefilter are the only optimisations wanted. No wake
+  lists, no folding, no GPU. A change to the desktop's tick semantics needs
+  the same change in `sim.js`, and `tools/check_web_sim.py` must still pass.
 
 ## Files
 
 | file | role |
 |---|---|
 | `index.html`, `style.css` | the shell: board, controls row, swatch bar, picker sheet |
-| `main.js` | wiring: applies the shell's and panel's requests to the board; resize, redraw |
+| `main.js` | wiring: applies the shell's and panel's requests to the board; resize, redraw, the play loop |
+| `sim.js` | the simulation: segment index, closed-form belts, gates, the clock -- the desktop's CPU tick |
 | `ui.js` | the shell's state and DOM: modes, sim and turn buttons, thumb pads, swatches, long press, picker |
 | `tools.js` | the tool catalog (from `types.json`) and the swatch drawings |
 | `icons.js` | line icons as path data (mostly Lucide, ISC) |
-| `panel.js` | the Tweakpane panel: saves, View, Debug, Status |
+| `panel.js` | the Tweakpane panel: saves, View, Debug, Status (with the live channel readout) |
 | `vendor/` | Tweakpane 4.0.5, vendored |
 | `npz.js` | `.npz` reader: zip directory + native `DecompressionStream` + `.npy` headers |
 | `board.js` | the save's arrays, validation, derived render lists, `entityAt`/`describe`, placing, erasing, capturing, and the two setting writers |
@@ -435,7 +530,18 @@ node --test web/tests/*.test.mjs
 ```
 
 Pure-JS tests (the planner, the placer, the stamp transforms, the run
-tracer) run in Node, with no npm and no browser.
+tracer, the closed form against the naive oracle, the opcodes, the clock)
+run in Node, with no npm and no browser. The whole tick against the
+desktop's is a separate, slower check (about 25 s for every save):
+
+```bash
+python tools/check_web_sim.py              # every root .npz, 200 ticks
+python tools/check_web_sim.py cpu.npz 500  # one save, longer
+```
+
+`segtrace.test.mjs` imports the Python app, and `core/tick_profile.py`'s
+import-time self-check is timing-based: run alongside the other suites it
+occasionally fails that import under load. Rerun the file alone.
 
 Playwright with phone emulation (`devices['Pixel 7']`) and CDP
 `Input.dispatchTouchEvent` drives real multi-touch. Check counts against

@@ -23,7 +23,8 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
 
 from core import cell, entity  # noqa: E402
-from core.entity import Entity, Belt, Underground, Source  # noqa: E402
+from core.entity import Entity, Belt, Underground, Source, Structure  # noqa: E402
+from core import belts, segments  # noqa: E402
 
 
 def kind_of(cls):
@@ -62,6 +63,26 @@ def pass_cells(cls, d, flipped, w, h, ins, outs):
     return out
 
 
+def sim_entry(cls):
+    """What the web tick needs to fire this type: the rule, the channels, the
+    arithmetic as opcodes. All of it read from the class, as glsl_types.py
+    reads it for the GPU kernels -- never restated by hand."""
+    if kind_of(cls) != "structure":
+        return None
+    if cls.OPS is None:
+        raise SystemExit(f"{cls.__name__} has no OPS table; the web tick cannot fire it")
+    return {
+        "fire_rule": cls.FIRE_RULE,
+        # Port index (the order of `inputs` / `outputs` below) -> channel.
+        "in_ch": [cls.in_channel(i) for i in range(len(cls.INPUTS))],
+        "out_ch": [cls.out_channel(i) for i in range(len(cls.OUTPUTS))],
+        "n_in": cls.in_channels(),
+        "n_out": cls.out_channels(),
+        "ops": [list(op) for op in cls.OPS],
+        "select": list(cls.SELECT_RULE) if cls.SELECT_RULE else None,
+    }
+
+
 def type_entry(cls):
     orient = {}
     for d in range(4):
@@ -84,6 +105,7 @@ def type_entry(cls):
         "chiral": bool(cls.is_chiral()) if kind_of(cls) == "structure" else False,
         "glyph": getattr(cls, "GLYPH", "none"),
         "orient": orient,
+        "sim": sim_entry(cls),
     }
 
 
@@ -126,6 +148,23 @@ def build():
             # MAX_GAP buried cells between them.
             "MAX_GAP": Underground.MAX_GAP,
             "MAX_SPAN": Underground.MAX_SPAN,
+        },
+        "sim": {
+            "UNIT": belts.UNIT,
+            "SPEED": belts.DEFAULT_SPEED,
+            "SPACING": belts.DEFAULT_SPACING,
+            "MIN_RING_CAP": segments.MIN_RING_CAP,
+            "MAX_SEGMENT_LEN": cell.MAX_SEGMENT_LEN,
+            "MAX_SEGMENT_ID": cell.MAX_SEGMENT_ID,
+            "GHOST_PENDING": cell.GHOST_PENDING,
+            "VALUE_LIMIT": entity.VALUE_LIMIT,
+            "MAX_CHANNELS": entity.MAX_CHANNELS,
+            "F_IN_VALUE": Entity.F_IN_VALUE, "F_IN_HELD": Entity.F_IN_HELD,
+            "F_OUT_VALUE": Entity.F_OUT_VALUE, "F_OUT_HELD": Entity.F_OUT_HELD,
+            "FIRE_ALL": Structure.FIRE_ALL, "FIRE_ANY": Structure.FIRE_ANY,
+            "FIRE_SELECT": Structure.FIRE_SELECT,
+            "OPS": {n: getattr(Structure, n) for n in dir(Structure)
+                    if n.startswith("OP_")},
         },
         "types": types,
     }

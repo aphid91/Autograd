@@ -33,7 +33,20 @@ const COL = {
   pass: "#757885",            // the control overlay: belt-coloured, belt-wide,
   passEdge: "#000000",        // with a thin dark edge so it reads over any body
   passChevron: "#bdc2d1",
+  // Items, from world.frag's COL_ITEM_*: a dark disc with a ring that says
+  // the sign -- green above zero, red at or below.
+  itemFill: "rgb(36,38,46)",
+  itemPos: "rgb(97,209,107)",
+  itemNeg: "rgb(230,92,87)",
+  itemNum: "rgb(247,250,255)",
+  itemHalo: "rgba(15,18,23,0.85)",
 };
+
+// world.frag's ITEM_RADIUS / ITEM_RING, and the waiting zone's squish.
+const ITEM = { r: 0.22, ring: 0.055, waitOffset: 0.44, waitSquish: 0.46 };
+// An item's number, as a fraction of a cell, and the zoom band it fades in
+// over -- the shader's glyph height (8 * 0.042 cells) and its 6..10 px fade.
+const ITEM_TEXT = { size: 0.3, glyph: 0.336, minPx: 6, goodPx: 10 };
 
 // Below this zoom (CSS px per cell) detail is not drawn at all.
 const LOD = { beltSolid: 4, gridLines: 6, chevrons: 10, ports: 8, labels: 22, marks: 5, portEdge: 14 };
@@ -118,6 +131,11 @@ export function render(ctx, board, cam, dpr, opts = {}) {
   const ghosts = (view.ghosts || [view.ghost]).filter(Boolean);
   for (const g of ghosts) drawGhost(ctx, board.T, g, z, px, on, S, view.ports, view.labels);
 
+  // Items last among the board's contents: cargo on a cell, over any tint,
+  // so a red wash never changes the colour that says an item's sign.
+  let cargo = null;
+  if (view.sim) cargo = drawItems(ctx, view.sim, view.alpha || 0, z, on, S);
+
   // The inspected entity: an outline that stays a few pixels wide at any
   // zoom, drawn over everything so it cannot be hidden by what it marks.
   const sel = view.selected;
@@ -127,6 +145,8 @@ export function render(ctx, board, cam, dpr, opts = {}) {
     ctx.lineWidth = 2.5 * px;
     ctx.strokeRect(sel.x - pad, sel.y - pad, sel.w + 2 * pad, sel.h + 2 * pad);
   }
+
+  if (cargo) drawItemLabels(ctx, cargo, cam, dpr);
 
   if (view.labels && z >= LOD.marks) {
     drawLabels(ctx, board.T, board.structs, cam, dpr, on);
@@ -439,4 +459,140 @@ function drawLabels(ctx, T, structs, cam, dpr, on) {
     const [sx, sy] = cam.worldToScreen(s.x + s.w / 2, s.y + s.h / 2);
     ctx.fillText(fmtNumber(s.emit), sx, sy);
   }
+}
+
+// --- items --------------------------------------------------------------------
+//
+// Positions are never stored: each is the closed form at the current tick
+// plus the clock's alpha, so items glide between ticks exactly as the sim
+// would put them (sim.positionOf). An item at distance s along its run is
+// drawn from the drawn cell nearest s: ahead of that cell's centre along its
+// facing, behind it along the way the run came in (so an item turning a
+// corner arrives from the side it came from). Positions with no drawn cell
+// within reach -- the buried tiles of an underground -- draw nothing, as on
+// the desktop.
+function drawItems(ctx, sim, alpha, z, on, S) {
+  const reach = 0.5 + ITEM.r;
+  const pos = [], neg = [], labels = [];
+  const text = textOpacity(z);
+  for (const seg of sim.segments.values()) {
+    if (seg.head === seg.tail) continue;
+    const b = seg.box;
+    if (!on(b.x0 - 1, b.y0 - 1, b.x1 - b.x0 + 2, b.y1 - b.y0 + 2)) continue;
+    const offs = seg.offs, n = offs.length;
+    for (let k = seg.head; k < seg.tail; k++) {
+      const s = sim.positionOf(seg, k, sim.tick, alpha) / sim.UNIT;
+      // The last drawn cell at or before s, then whichever of it and the
+      // next is nearer.
+      let lo = 0, hi = n - 1;
+      while (lo < hi) {
+        const mid = (lo + hi + 1) >> 1;
+        if (offs[mid] <= s) lo = mid; else hi = mid - 1;
+      }
+      let i = lo;
+      if (i + 1 < n && offs[i + 1] - s < s - offs[i]) i++;
+      const d = s - offs[i];
+      if (d > reach || d < -reach) continue;
+      const [cx, cy] = seg.cells[i];
+      let v = S[seg.dirs[i]];
+      if (d < 0 && i > 0) {
+        const [px, py] = seg.cells[i - 1];
+        if (Math.abs(cx - px) + Math.abs(cy - py) === 1) v = [cx - px, cy - py];
+      }
+      const x = cx + 0.5 + v[0] * d, y = cy + 0.5 + v[1] * d;
+      if (!on(x - 0.5, y - 0.5)) continue;
+      const value = seg.payload[k % seg.cap];
+      (value > 0 ? pos : neg).push(x, y);
+      if (text > 0) labels.push(x, y, value);
+    }
+  }
+  discs(ctx, pos, neg);
+
+  // Waiting zones: a gate's result the belt would not take, squashed into
+  // the gap between the body and the cell edge -- back pressure, made
+  // visible. Normally empty by the end of a tick, so nothing shows.
+  const wpos = [], wneg = [];
+  for (const g of sim.gates) {
+    for (const p of g.outFaces) {
+      if (!sim.outHeld(g.row, p.ch) || !on(p.x, p.y)) continue;
+      const f = S[p.face];
+      const x = p.x + 0.5 + f[0] * ITEM.waitOffset, y = p.y + 0.5 + f[1] * ITEM.waitOffset;
+      const value = sim.outValue(g.row, p.ch);
+      (value > 0 ? wpos : wneg).push(x, y, f[0] !== 0 ? 1 : 0);
+      if (text > 0) labels.push(x, y, value);
+    }
+  }
+  waiting(ctx, wpos, wneg);
+  return labels.length ? { labels, alpha: text } : null;
+}
+
+// Discs: the ring's colour as a full disc, then the dark interior over it.
+function discs(ctx, pos, neg) {
+  const r = ITEM.r, inner = ITEM.r - ITEM.ring;
+  for (const [pts, col] of [[pos, COL.itemPos], [neg, COL.itemNeg]]) {
+    if (!pts.length) continue;
+    ctx.beginPath();
+    for (let i = 0; i < pts.length; i += 2) { ctx.moveTo(pts[i] + r, pts[i + 1]); ctx.arc(pts[i], pts[i + 1], r, 0, Math.PI * 2); }
+    ctx.fillStyle = col;
+    ctx.fill();
+  }
+  if (!pos.length && !neg.length) return;
+  ctx.beginPath();
+  for (const pts of [pos, neg]) {
+    for (let i = 0; i < pts.length; i += 2) { ctx.moveTo(pts[i] + inner, pts[i + 1]); ctx.arc(pts[i], pts[i + 1], inner, 0, Math.PI * 2); }
+  }
+  ctx.fillStyle = COL.itemFill;
+  ctx.fill();
+}
+
+// The same disc, squashed along the face it is leaving through. Each entry
+// is (x, y, horizontal).
+function waiting(ctx, pos, neg) {
+  const r = ITEM.r, inner = ITEM.r - ITEM.ring, k = ITEM.waitSquish;
+  const ell = (path, x, y, h, rad) => {
+    const rx = h ? rad * k : rad, ry = h ? rad : rad * k;
+    path.moveTo(x + rx, y);
+    path.ellipse(x, y, rx, ry, 0, 0, Math.PI * 2);
+  };
+  for (const [pts, col] of [[pos, COL.itemPos], [neg, COL.itemNeg]]) {
+    if (!pts.length) continue;
+    ctx.beginPath();
+    for (let i = 0; i < pts.length; i += 3) ell(ctx, pts[i], pts[i + 1], pts[i + 2], r);
+    ctx.fillStyle = col;
+    ctx.fill();
+  }
+  if (!pos.length && !neg.length) return;
+  ctx.beginPath();
+  for (const pts of [pos, neg]) for (let i = 0; i < pts.length; i += 3) ell(ctx, pts[i], pts[i + 1], pts[i + 2], inner);
+  ctx.fillStyle = COL.itemFill;
+  ctx.fill();
+}
+
+// 0 when an item's number would be noise, 1 once it reads comfortably.
+function textOpacity(z) {
+  const px = ITEM_TEXT.glyph * z;
+  const t = Math.min(1, Math.max(0, (px - ITEM_TEXT.minPx) / (ITEM_TEXT.goodPx - ITEM_TEXT.minPx)));
+  return t * t * (3 - 2 * t);
+}
+
+// The numbers, in screen space (the world transform would mirror them),
+// with a dark halo so a digit spilling past the rim still reads.
+function drawItemLabels(ctx, cargo, cam, dpr) {
+  const { labels, alpha } = cargo;
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  ctx.textAlign = "center";
+  ctx.textBaseline = "middle";
+  ctx.font = `700 ${(ITEM_TEXT.size * cam.zoom).toFixed(1)}px system-ui, sans-serif`;
+  ctx.lineJoin = "round";
+  ctx.lineWidth = Math.max(2, 0.06 * cam.zoom);
+  ctx.globalAlpha = alpha;
+  ctx.strokeStyle = COL.itemHalo;
+  ctx.fillStyle = COL.itemNum;
+  for (let i = 0; i < labels.length; i += 3) {
+    const [sx, sy] = cam.worldToScreen(labels[i], labels[i + 1]);
+    const t = fmtNumber(labels[i + 2]);
+    ctx.strokeText(t, sx, sy);
+    ctx.fillText(t, sx, sy);
+  }
+  ctx.globalAlpha = 1;
 }

@@ -81,9 +81,20 @@ export class Panel {
     this.saveBinding.on("change", (ev) => this.cb.onLoadSave(ev.value));
   }
 
+  // The live readout's text, from main.js. A gate shows each channel's value
+  // ("–" empty, "×" an output with nothing to take it, so it discards);
+  // a belt shows its run and the items on it, head first.
+  setLive(text) {
+    if (!this.liveBinding || text === null || text === this.live.text) return;
+    this.live.text = text;
+    this.liveBinding.refresh();
+  }
+
   // Show `info` (from Board.describe) in the Status folder, or hide it.
   showStatus(info) {
     for (const child of [...this.status.children]) child.dispose();
+    this.live = null;
+    this.liveBinding = null;
     this.statusRow = info ? info.row : -1;
     this.status.hidden = !info;
     if (!info) return;
@@ -116,6 +127,19 @@ export class Panel {
       };
       this.status.addBinding(o, "seed", { label: "seed" }).on("change", push);
       this.status.addBinding(o, "value", { label: "seed value" }).on("change", push);
+    }
+    // The live readout: a gate's channels or a belt's run, rewritten by
+    // main.js every frame while the simulation runs (see setLive). A manual
+    // monitor (interval 0), refreshed only when the text actually changes.
+    if (info.td.kind === "structure" || info.td.kind === "belt" || info.td.kind === "under") {
+      this.live = { text: "" };
+      this.liveBinding = this.status.addBinding(this.live, "text", {
+        label: info.td.kind === "structure" ? "channels" : "run",
+        readonly: true, multiline: true, rows: 3, interval: 0,
+      });
+    } else {
+      this.live = null;
+      this.liveBinding = null;
     }
     this.status.addButton({ title: "Close" }).on("click", () => this.cb.onCloseStatus());
 

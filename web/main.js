@@ -3,7 +3,9 @@
 // place that applies them to the board -- the same split the desktop keeps
 // between its panel and its orchestrator.
 //
-// Rendering is on demand: nothing runs in a loop.
+// Rendering is on demand while the simulation is paused: input calls
+// redraw(), which coalesces into one frame. While it plays, each frame asks
+// for the next, banks real time on the clock and spends it in whole ticks.
 
 import { Board } from "./board.js";
 import { Camera, attachGestures } from "./camera.js";
@@ -17,6 +19,7 @@ import { makeStamp, mirrored, rotated, stampCells, subset } from "./stamp.js";
 import { emitMask, emitsWith, stampGhost } from "./ghost.js";
 import { traceRun } from "./segtrace.js";
 import { TUNE, setTune } from "./tune.js";
+import { Sim, Clock } from "./sim.js";
 
 const DEFAULT_SAVE = "default.npz";
 
@@ -32,6 +35,11 @@ let shell = null;
 let panel = null;
 let view = {};
 let inspectRow = -1;   // a row, not a description: re-read it every time
+// The simulation of the loaded board, and the clock that paces it. A new
+// Sim per board, as a fresh desktop session per load: segment ids come from
+// an allocator that outlives rebuilds, and the tick visits runs by id.
+let sim = null;
+const clock = new Clock();
 
 // The belt run being planned, or null. Plain data; planner.js turns it into
 // cells against the live board on every redraw, so the ghost can never show
@@ -71,6 +79,8 @@ let sel = null;
 const debug = window.gates = {
   cam, redraw, renderMs: 0,
   get board() { return board; },
+  get sim() { return sim; },
+  clock,
   get shell() { return shell; },
   get panel() { return panel; },
   get inspectRow() { return inspectRow; },
@@ -83,21 +93,79 @@ const debug = window.gates = {
 };
 
 let queued = false;
+let lastNow = null;    // the previous playing frame's time, or null
 function redraw() {
   if (queued) return;
   queued = true;
-  requestAnimationFrame(() => {
-    queued = false;
-    const t0 = performance.now();
-    const info = board ? board.describe(inspectRow) : null;
-    const ghosts = [
-      selGhost(),
-      run ? ghostOf(currentPlan()) : placeGhost(currentPlacement()),
-      boxRect ? { rect: boxRect } : null,
-    ];
-    render(ctx, board, cam, dpr, { ...view, selected: info, ghosts });
-    debug.renderMs = performance.now() - t0;
-  });
+  requestAnimationFrame(paint);
+}
+
+function paint(now) {
+  queued = false;
+  if (sim) {
+    // An edit since the last frame re-derives the runs and starts fresh --
+    // here rather than at each edit site, so no edit path can forget it.
+    sim.sync();
+    if (!clock.paused) {
+      // A stalled frame (a backgrounded tab) is clamped, and the clock caps
+      // the backlog too, so coming back never freezes to catch up.
+      const dt = lastNow === null ? 0 : Math.min(0.25, (now - lastNow) / 1000);
+      const n = clock.advance(dt);
+      for (let i = 0; i < n; i++) sim.step();
+    }
+    shell.setTick(sim.tick);
+    if (inspectRow >= 0) panel.setLive(liveText(inspectRow));
+  }
+  lastNow = sim && !clock.paused ? now : null;
+  const t0 = performance.now();
+  const info = board ? board.describe(inspectRow) : null;
+  const ghosts = [
+    selGhost(),
+    run ? ghostOf(currentPlan()) : placeGhost(currentPlacement()),
+    boxRect ? { rect: boxRect } : null,
+  ];
+  render(ctx, board, cam, dpr, { ...view, selected: info, ghosts, sim, alpha: clock.alpha });
+  debug.renderMs = performance.now() - t0;
+  if (sim && !clock.paused) redraw();
+}
+
+// What the Status pane's live readout says about a row: a gate's channels,
+// or the run a belt is on and what it carries. Recomputed every frame; the
+// panel touches the DOM only when the text changes.
+function liveText(row) {
+  const info = board?.describe(row);
+  if (!info || !sim) return null;
+  const fmt = (v) => (Number.isInteger(v) ? String(v) : String(parseFloat(v.toPrecision(4))));
+  if (info.td.kind === "structure") {
+    const g = sim.gateOf.get(row);
+    if (!g) return null;
+    const lines = [];
+    if (g.sim.n_in) {
+      const ins = [];
+      for (let c = 0; c < g.sim.n_in; c++) ins.push(`${c}: ${sim.inHeld(row, c) ? fmt(sim.inValue(row, c)) : "–"}`);
+      lines.push(`in   ${ins.join("   ")}`);
+    }
+    if (g.sim.n_out) {
+      const outs = [];
+      for (let c = 0; c < g.sim.n_out; c++) {
+        const dangling = !g.drains.includes(c);
+        outs.push(`${c}: ${sim.outHeld(row, c) ? fmt(sim.outValue(row, c)) : dangling ? "×" : "–"}`);
+      }
+      lines.push(`out  ${outs.join("   ")}`);
+    }
+    lines.push(`tick ${sim.tick}`);
+    return lines.join("\n");
+  }
+  const seg = sim.segmentAt(info.x, info.y);
+  if (!seg) return null;
+  const items = sim.items(seg);
+  const shown = items.slice(0, 12).map(it => fmt(it.value)).join(" ");
+  const ends = `${seg.srcPort ? "fed" : "unfed"} → ${seg.dstPort ? "drains" : "dangles"}`;
+  return [
+    `run ${seg.sid}: ${seg.length} long, ${items.length} item${items.length === 1 ? "" : "s"}`,
+    ends,
+    items.length ? `head→ ${shown}${items.length > 12 ? " …" : ""}` : "empty",
+  ].join("\n");
 }
 
 function resize() {
@@ -670,6 +738,9 @@ function rectOf(a, b) {
 async function show(name, bytes) {
   try {
     board = await Board.fromNpz(T, bytes);
+    sim = new Sim(T, board);
+    clock.reset();
+    shell.setPaused(true);   // a freshly loaded board waits to be started
     run = null;
     place = null;
     sel = null;
@@ -733,10 +804,14 @@ async function init() {
     onSelectCommand: (c) => selectCommand(c),
     // Tapping the stamp being pasted puts it away; any other starts pasting it.
     onPasteStamp: (id) => { if (shell.state.pasteStamp === id) exitPaste(); else enterPaste(id); },
-    onReset: () => console.info("reset: no simulation yet"),
-    onPause: (paused) => console.info(paused ? "paused" : "playing"),
+    // ctrl+R: tick 0, every item gone, seeds back on; the factory stays.
+    onReset: () => { if (sim) { sim.reset(); clock.reset(); } redraw(); },
+    onPause: (paused) => { clock.paused = paused; redraw(); },
+    onRate: (rate) => { clock.setRate(rate); redraw(); },
   });
   lastMode = shell.state.mode;
+  clock.setRate(shell.state.rate);
+  clock.paused = shell.state.paused;
 
   panel = new Panel(document.getElementById("pane-host"), {
     onLoadSave: (name) => loadBundled(name).catch(e => alert(e.message)),

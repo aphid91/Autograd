@@ -4,10 +4,11 @@
 //
 // This file owns UI STATE ONLY. It does not touch the board: it reports
 // intents through callbacks, the same way the desktop's panel only requests.
-// Nothing here is wired to a simulation yet -- Reset and Play/Pause just
-// report, and the turn buttons change the held tool's orientation.
+// Reset, Play/Pause and the tick rate report to main.js, which owns the
+// simulation; the turn buttons change the held tool's orientation.
 
 import { icon } from "./icons.js";
+import { RATE_MAX, RATE_MIN, RATE_PRESETS } from "./sim.js";
 import { CW, CCW, canFlip, catalog, isKnown, labelFor, sameTool, stampArt, toolArt, toolValue } from "./tools.js";
 import { copyStamp, mirrored, rotated } from "./stamp.js";
 
@@ -30,6 +31,9 @@ const DEFAULT_SLOTS = [
   { kind: "structure", type: "route" },
 ].map(s => ({ dir: 0, flip: false, ...s }));
 
+// A custom rate as the Custom button shows it: short, and never "0.30000004".
+function fmtRate(r) { return String(parseFloat(r.toPrecision(3))); }
+
 // localStorage can be absent or throw (private windows, blocked storage); the
 // shell must work without it, so every access is guarded.
 function loadStored() {
@@ -43,7 +47,7 @@ export class Shell {
   constructor(T, els, callbacks) {
     this.T = T;
     this.els = els;          // { controls, bar, swatches, swrow, left, right, picker }
-    this.cb = callbacks;     // { onChange(state), onReset(), onPause(paused) }
+    this.cb = callbacks;     // { onChange(state), onReset(), onPause(paused), onRate(tps) }
     // A long press is followed by its finger's release, which the browser
     // turns into a click. That one click is swallowed -- and only that one:
     // the next press anywhere clears the flag, so a quick tap after closing
@@ -66,7 +70,14 @@ export class Shell {
       selCount: 0,         // how many entities are selected (main.js says)
       pasteStamp: null,    // select mode: the stamp being pasted, by id
       stamps: [],          // most recent first; in-session, like the desktop
-      paused: false,
+      // The simulation starts paused, so loading a save never sets it going.
+      paused: true,
+      // Ticks per second. Persisted; a stored value out of range is dropped.
+      rate: Number.isFinite(saved.rate) && saved.rate >= RATE_MIN && saved.rate <= RATE_MAX ? saved.rate : 1,
+      // The rate panel above the Sim buttons, toggled by a long press on
+      // Play/Pause. Not persisted: it is opened to change something.
+      simPanel: false,
+      customOpen: false,   // the Custom entry row is showing
       // While main.js is planning something, what the bar should show:
       //   { kind: "belt", routeName, routeIcon }   a belt run
       //   { kind: "place", values }                a machine or raw belt;
@@ -88,7 +99,7 @@ export class Shell {
 
   changed() {
     const s = this.state;
-    store({ mode: s.mode, slots: s.slots, selected: s.selected });
+    store({ mode: s.mode, slots: s.slots, selected: s.selected, rate: s.rate });
     this.render();
     this.cb.onChange?.(s);
   }
@@ -135,6 +146,19 @@ export class Shell {
           <button type="button" class="b round reset" id="btn-reset" aria-label="Reset simulation" title="Reset (ctrl+R)">${icon("reset")}</button>
           <button type="button" class="b round" id="btn-play" aria-label="Pause"></button>
         </div>
+        <div class="simpanel" id="simpanel" data-open="false" role="dialog" aria-label="Simulation speed">
+          <div class="simpanel-head">
+            <span class="lbl">Ticks / sec</span>
+            <span class="simpanel-tick" id="sim-tick"></span>
+            <button type="button" class="b simpanel-x" id="sim-close" aria-label="Close">${icon("x")}</button>
+          </div>
+          <div class="simpanel-rates" id="sim-rates"></div>
+          <form class="simpanel-custom" id="sim-custom" data-open="false">
+            <input id="sim-custom-in" type="text" inputmode="decimal" autocomplete="off" spellcheck="false"
+                   aria-label="Custom ticks per second" placeholder="${RATE_MIN}–${RATE_MAX}">
+            <button type="submit" class="b simpanel-set">Set</button>
+          </form>
+        </div>
       </section>
       <section class="sec" id="turnsec">
         <div class="lbl">Turn</div>
@@ -157,11 +181,14 @@ export class Shell {
       modes.append(b);
     }
     c.querySelector("#btn-reset").addEventListener("click", () => this.cb.onReset?.());
-    c.querySelector("#btn-play").addEventListener("click", () => {
-      this.state.paused = !this.state.paused;
-      this.cb.onPause?.(this.state.paused);
-      this.render();
+    const play = c.querySelector("#btn-play");
+    play.addEventListener("click", () => {
+      if (this.swallowClick) { this.swallowClick = false; return; }
+      this.setPaused(!this.state.paused);
     });
+    // A long press (right-click on a mouse) toggles the rate panel.
+    this.wireHold(play, () => this.toggleSimPanel());
+    this.buildSimPanel();
     c.querySelector("#btn-cw").addEventListener("click", () => this.turn(CW));
     c.querySelector("#btn-ccw").addEventListener("click", () => this.turn(CCW));
     c.querySelector("#btn-flip").addEventListener("click", () => this.flip());
@@ -236,6 +263,84 @@ export class Shell {
     if (this.selecting) this.cb.onSelectFlip?.();
   }
 
+  // --- the simulation controls ---------------------------------------------
+
+  setPaused(paused) {
+    if (this.state.paused === paused) return;
+    this.state.paused = paused;
+    this.cb.onPause?.(paused);
+    this.render();
+  }
+
+  setRate(rate) {
+    this.state.rate = rate;
+    this.changed();
+    this.cb.onRate?.(rate);
+  }
+
+  toggleSimPanel(open = !this.state.simPanel) {
+    this.state.simPanel = open;
+    if (!open) this.state.customOpen = false;
+    this.render();
+  }
+
+  // The panel's buttons: a preset per rate, then Custom, which opens a text
+  // entry. The panel stays open until the next long press or its close
+  // button, so rates can be compared without reopening it.
+  buildSimPanel() {
+    const c = this.els.controls;
+    const rates = c.querySelector("#sim-rates");
+    for (const r of RATE_PRESETS) {
+      const b = document.createElement("button");
+      b.type = "button";
+      b.className = "b simpanel-rate";
+      b.dataset.rate = String(r);
+      b.textContent = String(r);
+      b.addEventListener("click", () => { this.state.customOpen = false; this.setRate(r); });
+      rates.append(b);
+    }
+    const custom = document.createElement("button");
+    custom.type = "button";
+    custom.className = "b simpanel-rate";
+    custom.id = "sim-custom-btn";
+    custom.textContent = "Custom";
+    custom.addEventListener("click", () => {
+      this.state.customOpen = !this.state.customOpen;
+      this.render();
+      if (this.state.customOpen) {
+        const input = c.querySelector("#sim-custom-in");
+        input.value = RATE_PRESETS.includes(this.state.rate) ? "" : String(this.state.rate);
+        input.removeAttribute("aria-invalid");
+        input.focus();
+      }
+    });
+    rates.append(custom);
+
+    const form = c.querySelector("#sim-custom");
+    const input = c.querySelector("#sim-custom-in");
+    form.addEventListener("submit", (e) => {
+      e.preventDefault();
+      const v = Number(input.value.trim().replace(",", "."));
+      if (!input.value.trim() || !Number.isFinite(v) || v < RATE_MIN || v > RATE_MAX) {
+        input.setAttribute("aria-invalid", "true");
+        return;
+      }
+      input.removeAttribute("aria-invalid");
+      input.blur();
+      this.setRate(v);
+    });
+    input.addEventListener("input", () => input.removeAttribute("aria-invalid"));
+    c.querySelector("#sim-close").addEventListener("click", () => this.toggleSimPanel(false));
+  }
+
+  // The tick counter in the panel's header. Cheap enough to call every frame:
+  // it touches the DOM only when the number changes.
+  setTick(tick) {
+    if (tick === this.shownTick) return;
+    this.shownTick = tick;
+    this.els.controls.querySelector("#sim-tick").textContent = `tick ${tick}`;
+  }
+
   // --- the swatch bar -------------------------------------------------------
 
   render() {
@@ -247,7 +352,18 @@ export class Shell {
     const play = c.querySelector("#btn-play");
     play.innerHTML = icon(s.paused ? "play" : "pause");
     play.setAttribute("aria-label", s.paused ? "Play" : "Pause");
-    play.title = s.paused ? "Play (space)" : "Pause (space)";
+    play.title = s.paused ? "Play (space) -- hold for speed" : "Pause (space) -- hold for speed";
+
+    const panel = c.querySelector("#simpanel");
+    panel.dataset.open = String(s.simPanel);
+    const preset = RATE_PRESETS.includes(s.rate);
+    for (const b of panel.querySelectorAll("[data-rate]")) {
+      b.dataset.selected = String(Number(b.dataset.rate) === s.rate);
+    }
+    const customBtn = panel.querySelector("#sim-custom-btn");
+    customBtn.dataset.selected = String(!preset || s.customOpen);
+    customBtn.textContent = preset ? "Custom" : `${fmtRate(s.rate)}`;
+    panel.querySelector("#sim-custom").dataset.open = String(s.customOpen);
 
     const planning = !!s.planning;
     const beltRun = s.planning?.kind === "belt";

@@ -416,7 +416,10 @@ export class Board {
 
   // --- derived render lists --------------------------------------------
 
+  // Every edit ends here, so this is also where the simulation learns the
+  // board changed: sim.js rebuilds (and starts fresh) when `revision` moves.
   derive() {
+    this.revision = (this.revision || 0) + 1;
     const { T } = this;
     const E = T.entity, C = T.cell;
     const belts = [], unders = [], structs = [];

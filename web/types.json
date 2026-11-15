@@ -57,6 +57,36 @@
   "MAX_GAP": 4,
   "MAX_SPAN": 5
  },
+ "sim": {
+  "UNIT": 256,
+  "SPEED": 256,
+  "SPACING": 256,
+  "MIN_RING_CAP": 4,
+  "MAX_SEGMENT_LEN": 65536,
+  "MAX_SEGMENT_ID": 32767,
+  "GHOST_PENDING": 1,
+  "VALUE_LIMIT": 16777216.0,
+  "MAX_CHANNELS": 4,
+  "F_IN_VALUE": 8,
+  "F_IN_HELD": 12,
+  "F_OUT_VALUE": 16,
+  "F_OUT_HELD": 20,
+  "FIRE_ALL": 0,
+  "FIRE_ANY": 1,
+  "FIRE_SELECT": 2,
+  "OPS": {
+   "OP_ADD": 2,
+   "OP_CONST": 9,
+   "OP_FLOOR": 6,
+   "OP_GATED": 8,
+   "OP_IN": 1,
+   "OP_MAC": 3,
+   "OP_MAX": 5,
+   "OP_NONE": 0,
+   "OP_RECIP": 4,
+   "OP_SEL": 7
+  }
+ },
  "types": {
   "1": {
    "name": "belt",
@@ -126,7 +156,8 @@
      "outputs": [],
      "pass": []
     }
-   }
+   },
+   "sim": null
   },
   "2": {
    "name": "swap",
@@ -544,6 +575,40 @@
       ]
      ]
     }
+   },
+   "sim": {
+    "fire_rule": 0,
+    "in_ch": [
+     0,
+     1,
+     2
+    ],
+    "out_ch": [
+     0,
+     1,
+     2
+    ],
+    "n_in": 3,
+    "n_out": 3,
+    "ops": [
+     [
+      1,
+      0
+     ],
+     [
+      7,
+      0,
+      2,
+      1
+     ],
+     [
+      7,
+      0,
+      1,
+      2
+     ]
+    ],
+    "select": null
    }
   },
   "3": {
@@ -842,6 +907,31 @@
       ]
      ]
     }
+   },
+   "sim": {
+    "fire_rule": 0,
+    "in_ch": [
+     0,
+     1
+    ],
+    "out_ch": [
+     0,
+     1
+    ],
+    "n_in": 2,
+    "n_out": 2,
+    "ops": [
+     [
+      1,
+      0
+     ],
+     [
+      2,
+      0,
+      1
+     ]
+    ],
+    "select": null
    }
   },
   "4": {
@@ -1260,6 +1350,38 @@
       ]
      ]
     }
+   },
+   "sim": {
+    "fire_rule": 0,
+    "in_ch": [
+     0,
+     1,
+     2
+    ],
+    "out_ch": [
+     0,
+     1,
+     2
+    ],
+    "n_in": 3,
+    "n_out": 3,
+    "ops": [
+     [
+      1,
+      0
+     ],
+     [
+      1,
+      1
+     ],
+     [
+      3,
+      0,
+      1,
+      2
+     ]
+    ],
+    "select": null
    }
   },
   "5": {
@@ -1462,6 +1584,29 @@
      ],
      "pass": []
     }
+   },
+   "sim": {
+    "fire_rule": 0,
+    "in_ch": [],
+    "out_ch": [
+     0,
+     1,
+     2
+    ],
+    "n_in": 0,
+    "n_out": 3,
+    "ops": [
+     [
+      9
+     ],
+     [
+      9
+     ],
+     [
+      9
+     ]
+    ],
+    "select": null
    }
   },
   "6": {
@@ -1864,6 +2009,24 @@
      "outputs": [],
      "pass": []
     }
+   },
+   "sim": {
+    "fire_rule": 1,
+    "in_ch": [
+     0,
+     0,
+     1,
+     1,
+     2,
+     2,
+     3,
+     3
+    ],
+    "out_ch": [],
+    "n_in": 4,
+    "n_out": 0,
+    "ops": [],
+    "select": null
    }
   },
   "7": {
@@ -1934,7 +2097,8 @@
      "outputs": [],
      "pass": []
     }
-   }
+   },
+   "sim": null
   },
   "8": {
    "name": "recip",
@@ -2104,6 +2268,24 @@
      ],
      "pass": []
     }
+   },
+   "sim": {
+    "fire_rule": 0,
+    "in_ch": [
+     0
+    ],
+    "out_ch": [
+     0
+    ],
+    "n_in": 1,
+    "n_out": 1,
+    "ops": [
+     [
+      4,
+      0
+     ]
+    ],
+    "select": null
    }
   },
   "9": {
@@ -2354,6 +2536,32 @@
      ],
      "pass": []
     }
+   },
+   "sim": {
+    "fire_rule": 0,
+    "in_ch": [
+     0,
+     1
+    ],
+    "out_ch": [
+     0,
+     1
+    ],
+    "n_in": 2,
+    "n_out": 2,
+    "ops": [
+     [
+      5,
+      0,
+      1
+     ],
+     [
+      5,
+      0,
+      1
+     ]
+    ],
+    "select": null
    }
   },
   "10": {
@@ -2524,6 +2732,24 @@
      ],
      "pass": []
     }
+   },
+   "sim": {
+    "fire_rule": 0,
+    "in_ch": [
+     0
+    ],
+    "out_ch": [
+     0
+    ],
+    "n_in": 1,
+    "n_out": 1,
+    "ops": [
+     [
+      6,
+      0
+     ]
+    ],
+    "select": null
    }
   },
   "11": {
@@ -2902,6 +3128,39 @@
       ]
      ]
     }
+   },
+   "sim": {
+    "fire_rule": 0,
+    "in_ch": [
+     0,
+     1
+    ],
+    "out_ch": [
+     0,
+     1,
+     2
+    ],
+    "n_in": 2,
+    "n_out": 3,
+    "ops": [
+     [
+      8,
+      1,
+      0,
+      0
+     ],
+     [
+      8,
+      1,
+      0,
+      1
+     ],
+     [
+      1,
+      1
+     ]
+    ],
+    "select": null
    }
   },
   "12": {
@@ -3280,6 +3539,37 @@
       ]
      ]
     }
+   },
+   "sim": {
+    "fire_rule": 2,
+    "in_ch": [
+     0,
+     1,
+     2
+    ],
+    "out_ch": [
+     0,
+     1
+    ],
+    "n_in": 3,
+    "n_out": 2,
+    "ops": [
+     [
+      7,
+      2,
+      0,
+      1
+     ],
+     [
+      1,
+      2
+     ]
+    ],
+    "select": [
+     2,
+     0,
+     1
+    ]
    }
   }
  }

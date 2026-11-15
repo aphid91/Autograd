@@ -135,7 +135,7 @@ html, body {
 /* The three sections share the row's width, as sand mode's band does: the
    round buttons shrink to fit their section rather than squeezing Mode. */
 #modesec { flex: 1 1 0; }
-#simsec { flex: 0.95 1 0; }
+#simsec { flex: 0.95 1 0; position: relative; }
 #turnsec { flex: 1 1 0; }
 
 .lbl {
@@ -538,3 +538,81 @@ html, body {
    red at or below. */
 .numsw.pos .swb { border-color: #4d9a58; }
 .numsw.neg .swb { border-color: #b2504a; }
+
+/* ----------------------------------------------------------------------
+   THE RATE PANEL: ticks per second, floated just above the Sim section.
+   A long press on Play/Pause toggles it; it stays open until the next
+   long press or its close button.
+   ---------------------------------------------------------------------- */
+.simpanel {
+  position: absolute;
+  bottom: calc(100% + var(--pad) * var(--u));
+  left: 50%;
+  transform: translateX(-50%);
+  width: calc(214 * var(--u));
+  max-width: calc(100vw - 2 * var(--pad) * var(--u));
+  box-sizing: border-box;
+  display: none;
+  flex-direction: column;
+  gap: calc(var(--btn-gap) * var(--u));
+  padding: calc(5 * var(--u));
+  background: var(--chrome);
+  border: var(--border) solid var(--edge);
+  border-radius: var(--r);
+  box-shadow: 0 calc(4 * var(--u)) calc(14 * var(--u)) rgba(0, 0, 0, 0.5);
+  z-index: 8;
+}
+.simpanel[data-open="true"] { display: flex; }
+.simpanel-head {
+  display: flex;
+  align-items: center;
+  gap: calc(6 * var(--u));
+  padding-left: calc(2 * var(--u));
+}
+.simpanel-tick {
+  flex: 1;
+  text-align: right;
+  font-size: calc(9 * var(--u));
+  color: var(--ink-dim);
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+.simpanel-x {
+  width: calc(24 * var(--u));
+  height: calc(24 * var(--u));
+  flex: 0 0 auto;
+}
+.simpanel-x svg { width: 60%; height: 60%; }
+.simpanel-rates {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr)) minmax(0, 1.6fr);
+  gap: calc(var(--btn-gap) * var(--u));
+}
+.simpanel-rate {
+  height: calc(32 * var(--u));
+  font-size: calc(11 * var(--u));
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+  overflow: hidden;
+}
+.simpanel-custom { display: none; gap: calc(var(--btn-gap) * var(--u)); margin: 0; }
+.simpanel-custom[data-open="true"] { display: flex; }
+.simpanel-custom input {
+  flex: 1;
+  min-width: 0;
+  height: calc(30 * var(--u));
+  box-sizing: border-box;
+  padding: 0 calc(8 * var(--u));
+  font: inherit;
+  /* 16px or more stops iOS zooming the page when the field takes focus. */
+  font-size: max(16px, calc(12 * var(--u)));
+  color: var(--ink);
+  background: var(--bg);
+  border: var(--border) solid var(--edge);
+  border-radius: var(--r);
+  -webkit-user-select: text;
+  user-select: text;
+}
+.simpanel-custom input:focus { outline: none; border-color: var(--accent); }
+.simpanel-custom input[aria-invalid="true"] { border-color: var(--danger); }
+.simpanel-set { padding: 0 calc(12 * var(--u)); height: calc(30 * var(--u)); }
