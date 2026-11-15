@@ -72,6 +72,7 @@ export class Shell {
     };
 
     this.buildControls();
+    this.buildThumbs();
     this.wireScroll();
     this.wirePicker();
     this.render();
@@ -145,6 +146,35 @@ export class Shell {
     c.querySelector("#btn-flip").addEventListener("click", () => this.flip());
   }
 
+  // The thumb pads: Turn's three buttons in the board's bottom corners while
+  // something is planned. Flip on a belt run toggles the route instead,
+  // since a run has nothing to mirror.
+  buildThumbs() {
+    this.thumbs = ["thumb-left", "thumb-right"].map(id => document.getElementById(id)).filter(Boolean);
+    for (const pad of this.thumbs) {
+      pad.innerHTML = `
+        <button type="button" class="b tp-flip" aria-label="Flip">${icon("flip")}</button>
+        <button type="button" class="b tp-ccw" aria-label="Rotate counter-clockwise">${icon("rotCcw")}</button>
+        <button type="button" class="b tp-cw" aria-label="Rotate clockwise">${icon("rotCw")}</button>`;
+      pad.querySelector(".tp-ccw").addEventListener("click", () => this.turn(CCW));
+      pad.querySelector(".tp-cw").addEventListener("click", () => this.turn(CW));
+      pad.querySelector(".tp-flip").addEventListener("click", () => {
+        if (this.state.planning?.kind === "belt") this.cb.onPlanRoute?.();
+        else this.flip();
+      });
+    }
+  }
+
+  renderThumbs() {
+    const p = this.state.planning;
+    const show = !!p;
+    const flippable = p?.kind === "belt" || (this.heldTool ? canFlip(this.T, this.heldTool) : !!this.activeStamp);
+    for (const pad of this.thumbs) {
+      pad.dataset.show = String(show);
+      pad.querySelector(".tp-flip").disabled = !flippable;
+    }
+  }
+
   setMode(m) {
     if (this.state.mode === m) return;
     this.state.mode = m;
@@ -214,6 +244,7 @@ export class Shell {
     // Re-rendering the same row must not throw away the player's scroll.
     if (sameRow) row.scrollLeft = keep;
     this.updateArrows();
+    this.renderThumbs();
   }
 
   swatch({ art, name, selected = false, secondary = false, empty = false, onTap, onHold, cls = "" }) {
