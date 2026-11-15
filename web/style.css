@@ -496,6 +496,13 @@ html, body {
   gap: calc(9 * var(--u)) calc(8 * var(--u));
   margin-left: calc(6 * var(--u));
 }
+#swatches[data-mode="inspect"] { gap: calc(8 * var(--u)); }
+.rowlabel {
+  color: var(--ink-dim);
+  font-size: calc(10 * var(--u));
+  letter-spacing: var(--label-spacing);
+  text-transform: uppercase;
+}
 .numsw { width: auto; }
 .numsw .sw-name { display: none; }
 .numsw .swb {

@@ -69,6 +69,8 @@ export class Shell {
       //                                            `values` null, or the
       //                                            number swatches to offer
       planning: null,
+      // Hand: { values, current } while Status shows a Source or a belt.
+      inspectValue: null,
     };
 
     this.buildControls();
@@ -230,7 +232,8 @@ export class Shell {
     c.querySelector("#btn-ccw").disabled = !live;
     c.querySelector("#btn-flip").disabled = !flippable;
 
-    const rowMode = planning ? s.planning.kind : s.mode;
+    const rowMode = planning ? s.planning.kind
+      : s.mode === "hand" && s.inspectValue ? "inspect" : s.mode;
     this.els.bar.dataset.mode = rowMode;
     const row = this.els.swatches;
     const keep = row.scrollLeft;
@@ -241,6 +244,7 @@ export class Shell {
     else if (planning) this.renderPlacing(row);
     else if (s.mode === "build") this.renderBuild(row);
     else if (s.mode === "select") this.renderSelect(row);
+    else if (s.mode === "hand") this.renderHand(row);
     // Re-rendering the same row must not throw away the player's scroll.
     if (sameRow) row.scrollLeft = keep;
     this.updateArrows();
@@ -329,20 +333,41 @@ export class Shell {
     const values = this.state.planning.values;
     const tool = this.heldTool;
     if (!values || !tool) return;
-    // Two rows of three, so Cancel, both rotations and all six numbers fit a
-    // phone's width without the row scrolling the buttons out of reach.
+    row.append(this.numberGrid(values, toolValue(tool), (v) => this.setValue(v)));
+  }
+
+  // Two rows of three number swatches, so they fit beside a few buttons
+  // without the row scrolling them out of reach. `current` is the lit one,
+  // or null for none.
+  numberGrid(values, current, onPick) {
     const grid = document.createElement("div");
     grid.className = "numgrid";
     for (const v of values) {
       const sw = this.swatch({
         art: `<span class="num">${v}</span>`, name: String(v), cls: `numsw ${v > 0 ? "pos" : "neg"}`,
-        selected: toolValue(tool) === v,
-        onTap: () => this.setValue(v),
+        selected: current === v,
+        onTap: () => onPick(v),
       });
       sw.dataset.value = String(v);
       grid.append(sw);
     }
-    row.append(grid);
+    return grid;
+  }
+
+  // The Hand: while Status is open on a Source or a belt, the bar offers
+  // its number -- the emit value, or the seed (tap the lit one to unseed).
+  renderHand(row) {
+    const iv = this.state.inspectValue;
+    if (!iv) return;
+    const label = document.createElement("span");
+    label.className = "rowlabel";
+    label.textContent = iv.kind === "emit" ? "Emits" : "Seed";
+    row.append(label, this.numberGrid(iv.values, iv.current, (v) => this.cb.onInspectValue?.(v)));
+  }
+
+  setInspectValue(iv) {
+    this.state.inspectValue = iv;
+    this.render();
   }
 
   // The held tool's number: a Source's emit value, or a raw belt's seed.

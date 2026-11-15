@@ -88,8 +88,39 @@ function resize() {
 
 function inspect(row) {
   inspectRow = row;
-  panel.showStatus(board ? board.describe(row) : null);
+  syncInspect();
+}
+
+// The Status pane and the Hand's number swatches both show the inspected
+// row; either can change its number, so both are refreshed after any edit.
+// The Status pane's own fields are not rebuilt on an edit made there: a
+// number field reports per keystroke and rebuilding would steal its focus.
+function syncInspect() {
+  panel.showStatus(board ? board.describe(inspectRow) : null);
+  shell.setInspectValue(handValueOf(inspectRow));
   redraw();
+}
+
+// What the Hand's number swatches show for a row: a Source's emit value or
+// a belt's seed (null when unseeded), or nothing for anything else.
+function handValueOf(row) {
+  const info = board?.describe(row);
+  if (!info) return null;
+  if (info.emit !== null) return { kind: "emit", values: VALUE_CHOICES, current: info.emit };
+  if (info.seedOn !== null) return { kind: "seed", values: VALUE_CHOICES, current: info.seedOn ? info.seedValue : null };
+  return null;
+}
+
+function setInspectValue(v) {
+  const info = board?.describe(inspectRow);
+  if (!info) return;
+  if (info.emit !== null) board.setEmit(inspectRow, v);
+  else if (info.seedOn !== null) {
+    // Tapping the lit number again unseeds the belt, as on the raw belt tool.
+    const off = info.seedOn && info.seedValue === v;
+    board.setSeed(inspectRow, !off, off ? info.seedValue : v);
+  }
+  syncInspect();
 }
 
 function onTap(sx, sy) {
@@ -367,6 +398,7 @@ async function init() {
     onPlanCancel: () => cancelRun(),
     onPlanBuild: () => commitRun(),
     onPlaceCancel: () => endPlace(),
+    onInspectValue: (v) => setInspectValue(v),
     onPlanRoute: () => {
       run.route = ROUTES[(ROUTES.indexOf(run.route) + 1) % ROUTES.length];
       shell.heldTool.route = run.route;   // the tool remembers its route
@@ -386,8 +418,8 @@ async function init() {
     onAddStamp: () => shell.addStamp(),
     onClearStamps: () => shell.clearStamps(),
     onCloseStatus: () => inspect(-1),
-    onEmit: (row, v) => { board.setEmit(row, v); redraw(); },
-    onSeed: (row, on, v) => { board.setSeed(row, on, v); redraw(); },
+    onEmit: (row, v) => { board.setEmit(row, v); shell.setInspectValue(handValueOf(row)); redraw(); },
+    onSeed: (row, on, v) => { board.setSeed(row, on, v); shell.setInspectValue(handValueOf(row)); redraw(); },
   });
   view = { ...panel.view };
 
