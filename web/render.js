@@ -188,18 +188,14 @@ function drawUnders(ctx, unders, z, on, S) {
   ctx.fillStyle = COL.underDot;
   ctx.fill();
 
-  // Each end: a body with a dark bar on its buried side -- the front of an
-  // entrance (diving), the back of an exit (surfacing).
+  // Each end: a funnel, full width on the surface side and narrowing toward
+  // the buried side -- the front of an entrance (diving), the back of an
+  // exit (surfacing) -- with a dark bar across the narrow mouth.
   ctx.beginPath();
   const bars = new Path2D();
   for (const u of unders) {
     if (!on(u.x, u.y)) continue;
-    ctx.rect(u.x + 0.12, u.y + 0.12, 0.76, 0.76);
-    const f = S[u.dir];
-    const s = u.exit ? -1 : 1;
-    const bx = u.x + 0.5 + f[0] * s * 0.3, by = u.y + 0.5 + f[1] * s * 0.3;
-    const hw = f[0] ? 0.08 : 0.38, hh = f[0] ? 0.38 : 0.08;
-    bars.rect(bx - hw, by - hh, hw * 2, hh * 2);
+    underFunnel(ctx, bars, u.x + 0.5, u.y + 0.5, S[u.dir], u.exit ? -1 : 1);
   }
   ctx.fillStyle = COL.under;
   ctx.fill();
@@ -214,6 +210,25 @@ function drawUnders(ctx, unders, z, on, S) {
   ctx.strokeStyle = COL.chevron;
   ctx.lineWidth = 0.07;
   ctx.stroke();
+}
+
+// One underground end centred on (cx, cy). `f` is the travel direction and
+// `s` +1 for an entrance, -1 for an exit, so f*s points at the buried side.
+// The swatch art in tools.js draws the same shape.
+const FUNNEL = { half: 0.38, wide: 0.38, narrow: 0.2, bar: 0.08 };
+function underFunnel(path, bars, cx, cy, f, s) {
+  const { half, wide, narrow, bar } = FUNNEL;
+  const ax = f[0] * s, ay = f[1] * s;   // toward the buried side
+  const sx = -ay, sy = ax;              // across
+  const pt = (along, across) => [cx + ax * along + sx * across, cy + ay * along + sy * across];
+  const q = [pt(-half, wide), pt(half, narrow), pt(half, -narrow), pt(-half, -wide)];
+  path.moveTo(...q[0]);
+  for (const p of q.slice(1)) path.lineTo(...p);
+  path.closePath();
+  const b = [pt(half - 2 * bar, narrow + 0.03), pt(half, narrow), pt(half, -narrow), pt(half - 2 * bar, -narrow - 0.03)];
+  bars.moveTo(...b[0]);
+  for (const p of b.slice(1)) bars.lineTo(...p);
+  bars.closePath();
 }
 
 // A planned run: the proposed belts and undergrounds translucent, cells the

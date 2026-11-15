@@ -116,12 +116,14 @@ export function toolArt(T, slot) {
   if (slot.kind === "under") {
     // The dark bar is the buried side: the front of an entrance, the back
     // of an exit. Flip on the tool swaps which end the next tap lays.
+    // Narrowing toward the buried side, as on the board (render.js).
     const [fx, fy] = STEP[d], s = slot.flip ? -1 : 1;
-    const bx = 0.5 + fx * s * 0.3, by = 0.5 + fy * s * 0.3;
-    const hw = fx ? 0.08 : 0.38, hh = fx ? 0.38 : 0.08;
+    const ax = fx * s, ay = fy * s, sx = -ay, sy = ax;
+    const pt = (al, ac) => `${0.5 + ax * al + sx * ac} ${0.5 + ay * al + sy * ac}`;
+    const body = `M${pt(-0.38, 0.38)}L${pt(0.38, 0.2)}L${pt(0.38, -0.2)}L${pt(-0.38, -0.38)}Z`;
+    const bar = `M${pt(0.22, 0.23)}L${pt(0.38, 0.2)}L${pt(0.38, -0.2)}L${pt(0.22, -0.23)}Z`;
     return frame(1, 1,
-      `<rect x="0.12" y="0.12" width="0.76" height="0.76" fill="#6b7380"/>` +
-      `<rect x="${bx - hw}" y="${by - hh}" width="${2 * hw}" height="${2 * hh}" fill="#3c414b"/>` +
+      `<path d="${body}" fill="#6b7380"/><path d="${bar}" fill="#3c414b"/>` +
       `<path d="${chevron(0.5, 0.5, d, 0.14)}" fill="none" stroke="#bdc2d1" stroke-width="0.08"/>`);
   }
   const td = typeOf(T, slot.type);

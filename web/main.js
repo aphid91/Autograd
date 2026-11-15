@@ -108,9 +108,11 @@ function onTap(sx, sy) {
     return;
   }
   if (shell.state.mode === "build" && beltHeld()) {
-    // The second tap places the run exactly as shown; it does not move the
-    // tip to where the finger landed.
-    if (run) commitRun();
+    // A tap on the tip turns it (straight, right, left). Any other second
+    // tap places the run exactly as shown; it does not move the tip to
+    // where the finger landed.
+    if (run && onCells(sx, sy, run.end[0], run.end[1], 1, 1)) { turnTip(run, true); redraw(); }
+    else if (run) commitRun();
     else if (x >= 0 && y >= 0 && x < board.width && y < board.height) startRun(x, y);
   }
 }
@@ -306,14 +308,18 @@ function placeOnce() {
   return true;
 }
 
-// Is screen point (sx, sy) on the ghost, or within GHOST_TAP_PX of it?
-function onGhost(sx, sy) {
-  const pl = currentPlacement();
-  if (!pl) return false;
-  const [x0, y1] = cam.worldToScreen(pl.origin[0], pl.origin[1] + pl.h);
-  const [x1, y0] = cam.worldToScreen(pl.origin[0] + pl.w, pl.origin[1]);
+// Is screen point (sx, sy) on the w x h cell box at (x, y), or within
+// GHOST_TAP_PX of it?
+function onCells(sx, sy, x, y, w, h) {
+  const [x0, y1] = cam.worldToScreen(x, y + h);
+  const [x1, y0] = cam.worldToScreen(x + w, y);
   const m = GHOST_TAP_PX;
   return sx >= x0 - m && sx <= x1 + m && sy >= y1 - m && sy <= y0 + m;
+}
+
+function onGhost(sx, sy) {
+  const pl = currentPlacement();
+  return !!pl && onCells(sx, sy, pl.origin[0], pl.origin[1], pl.w, pl.h);
 }
 
 // --- saves ------------------------------------------------------------------
