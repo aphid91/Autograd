@@ -449,3 +449,43 @@ html, body {
    arbitration. Without this a tap straight after a board drag could reach
    the button as pointerdown/pointerup and never become a click. */
 .b, .swb, .swarrow, .pick { touch-action: manipulation; }
+
+/* Placing a machine: compact buttons, then the number swatches. */
+#swatches[data-mode="place"] {
+  gap: calc(var(--btn-gap) * var(--u));
+  padding: 0 calc(6 * var(--u));
+  box-sizing: border-box;
+}
+.planbtn.compact {
+  flex: 0 0 auto;
+  width: calc(52 * var(--u));
+  height: calc((var(--sw-d) + 14) * var(--u));
+  font-size: calc(10 * var(--u));
+}
+.planbtn.compact svg { width: calc(20 * var(--u)); height: calc(20 * var(--u)); }
+.numgrid {
+  display: grid;
+  grid-template-columns: repeat(3, auto);
+  /* Room for the selection ring (4u outside the circle) on both rows: the
+     bar clips anything past its edge. */
+  gap: calc(9 * var(--u)) calc(8 * var(--u));
+  margin-left: calc(6 * var(--u));
+}
+.numsw { width: auto; }
+.numsw .sw-name { display: none; }
+.numsw .swb {
+  margin: 0;
+  padding: 0;
+  width: calc(29 * var(--u));
+  height: calc(29 * var(--u));
+}
+.numsw .num {
+  font-size: calc(12 * var(--u));
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+  color: var(--ink);
+}
+/* Rings by sign, matching the item discs on the desktop: green above zero,
+   red at or below. */
+.numsw.pos .swb { border-color: #4d9a58; }
+.numsw.neg .swb { border-color: #b2504a; }

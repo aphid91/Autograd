@@ -8,7 +8,7 @@
 // report, and the turn buttons change the held tool's orientation.
 
 import { icon } from "./icons.js";
-import { CW, CCW, canFlip, catalog, isKnown, labelFor, sameTool, stampArt, toolArt } from "./tools.js";
+import { CW, CCW, canFlip, catalog, isKnown, labelFor, sameTool, stampArt, toolArt, toolValue } from "./tools.js";
 
 const STORE_KEY = "gates.web.shell.v1";
 const LONG_PRESS_MS = 500;   // as sand mode
@@ -63,7 +63,12 @@ export class Shell {
       pasteStamp: null,    // ...and, for paste, which stamp
       stamps: [],          // most recent first; in-session, like the desktop
       paused: false,
-      planning: null,      // { routeName, routeIcon } while a belt run is planned
+      // While main.js is planning something, what the bar should show:
+      //   { kind: "belt", routeName, routeIcon }   a belt run
+      //   { kind: "place", values }                a machine or raw belt;
+      //                                            `values` null, or the
+      //                                            number swatches to offer
+      planning: null,
     };
 
     this.buildControls();
@@ -152,7 +157,9 @@ export class Shell {
   // pasted in Select. In Hand they will turn what is tapped -- deferred.
   turn(fn) {
     // While a run is planned the buttons turn its tip, not the tool.
-    if (this.state.planning) { this.cb.onPlanTurn?.(fn === CW); return; }
+    // While a belt run is planned the buttons turn its tip, not the tool.
+    // While placing, they turn the tool -- the ghost follows it.
+    if (this.state.planning?.kind === "belt") { this.cb.onPlanTurn?.(fn === CW); return; }
     const target = this.heldTool || this.activeStamp;
     if (!target) return;
     target.dir = fn(target.dir | 0);
@@ -160,7 +167,7 @@ export class Shell {
   }
 
   flip() {
-    if (this.state.planning) return;   // nothing to mirror on a belt run
+    if (this.state.planning?.kind === "belt") return;   // nothing to mirror on a run
     const tool = this.heldTool;
     if (tool) {
       if (!canFlip(this.T, tool)) return;
@@ -186,20 +193,22 @@ export class Shell {
     play.title = s.paused ? "Play (space)" : "Pause (space)";
 
     const planning = !!s.planning;
-    const live = planning || !!(this.heldTool || this.activeStamp);
-    const flippable = !planning && (this.heldTool ? canFlip(this.T, this.heldTool) : !!this.activeStamp);
+    const beltRun = s.planning?.kind === "belt";
+    const live = beltRun || !!(this.heldTool || this.activeStamp);
+    const flippable = !beltRun && (this.heldTool ? canFlip(this.T, this.heldTool) : !!this.activeStamp);
     c.querySelector("#btn-cw").disabled = !live;
     c.querySelector("#btn-ccw").disabled = !live;
     c.querySelector("#btn-flip").disabled = !flippable;
 
-    const rowMode = planning ? "plan" : s.mode;
+    const rowMode = planning ? s.planning.kind : s.mode;
     this.els.bar.dataset.mode = rowMode;
     const row = this.els.swatches;
     const keep = row.scrollLeft;
     const sameRow = row.dataset.mode === rowMode;
     row.replaceChildren();
     row.dataset.mode = rowMode;
-    if (planning) this.renderPlanning(row);
+    if (beltRun) this.renderPlanning(row);
+    else if (planning) this.renderPlacing(row);
     else if (s.mode === "build") this.renderBuild(row);
     else if (s.mode === "select") this.renderSelect(row);
     // Re-rendering the same row must not throw away the player's scroll.
@@ -267,6 +276,52 @@ export class Shell {
     btn("plan-cancel", "cancel", icon("x"), "Cancel", () => this.cb.onPlanCancel?.());
     btn("plan-route", "route", icon(p.routeIcon), p.routeName, () => this.cb.onPlanRoute?.());
     btn("plan-build", "build", icon("check"), "Build", () => this.cb.onPlanBuild?.());
+  }
+
+  // Placing a machine or a raw belt: Cancel, the two rotations, and -- for
+  // the two tools with a number to choose -- the number swatches. The
+  // rotations duplicate the Turn row on purpose: they sit under the thumb
+  // that is already in the bar.
+  renderPlacing(row) {
+    const btn = (id, cls, html, label, fn) => {
+      const b = document.createElement("button");
+      b.type = "button";
+      b.className = `b planbtn compact ${cls}`;
+      b.id = id;
+      b.innerHTML = `${html}<span>${label}</span>`;
+      b.addEventListener("click", fn);
+      row.append(b);
+    };
+    btn("place-cancel", "cancel", icon("x"), "Cancel", () => this.cb.onPlaceCancel?.());
+    btn("place-ccw", "", icon("rotCcw"), "Left", () => this.turn(CCW));
+    btn("place-cw", "", icon("rotCw"), "Right", () => this.turn(CW));
+    const values = this.state.planning.values;
+    const tool = this.heldTool;
+    if (!values || !tool) return;
+    // Two rows of three, so Cancel, both rotations and all six numbers fit a
+    // phone's width without the row scrolling the buttons out of reach.
+    const grid = document.createElement("div");
+    grid.className = "numgrid";
+    for (const v of values) {
+      const sw = this.swatch({
+        art: `<span class="num">${v}</span>`, name: String(v), cls: `numsw ${v > 0 ? "pos" : "neg"}`,
+        selected: toolValue(tool) === v,
+        onTap: () => this.setValue(v),
+      });
+      sw.dataset.value = String(v);
+      grid.append(sw);
+    }
+    row.append(grid);
+  }
+
+  // The held tool's number: a Source's emit value, or a raw belt's seed.
+  // A Source always has one; a raw belt may have none (no seed), so tapping
+  // its selected number again clears it.
+  setValue(v) {
+    const tool = this.heldTool;
+    if (!tool) return;
+    tool.value = tool.kind === "rawbelt" && toolValue(tool) === v ? null : v;
+    this.changed();
   }
 
   setPlanning(p) {

@@ -24,6 +24,7 @@ const COL = {
   select: "#e8a33d",
   handle: "rgba(232,163,61,0.28)",
   frustrated: "rgba(230,64,56,0.55)",
+  portEdge: "#000000",
 };
 
 // Below this zoom (CSS px per cell) detail is not drawn at all.
@@ -83,13 +84,13 @@ export function render(ctx, board, cam, dpr, opts = {}) {
 
   drawBelts(ctx, board.belts, z, on, S);
   drawUnders(ctx, board.unders, z, on, S);
-  drawStructs(ctx, board, z, px, on, S, view.ports);
+  drawStructs(ctx, board.T, board.structs, z, px, on, S, view.ports);
 
   ctx.strokeStyle = COL.border;
   ctx.lineWidth = 2 * px;
   ctx.strokeRect(0, 0, board.width, board.height);
 
-  if (view.ghost) drawGhost(ctx, view.ghost, z, px, on, S);
+  if (view.ghost) drawGhost(ctx, board.T, view.ghost, z, px, on, S, view.ports);
 
   // The inspected entity: an outline that stays a few pixels wide at any
   // zoom, drawn over everything so it cannot be hidden by what it marks.
@@ -101,7 +102,14 @@ export function render(ctx, board, cam, dpr, opts = {}) {
     ctx.strokeRect(sel.x - pad, sel.y - pad, sel.w + 2 * pad, sel.h + 2 * pad);
   }
 
-  if (view.labels && z >= LOD.labels) drawLabels(ctx, board, cam, dpr, on);
+  if (view.labels && z >= LOD.labels) {
+    drawLabels(ctx, board.T, board.structs, cam, dpr, on);
+    if (view.ghost?.structs?.length) {
+      ctx.globalAlpha = 0.7;
+      drawLabels(ctx, board.T, view.ghost.structs, cam, dpr, on);
+      ctx.globalAlpha = 1;
+    }
+  }
 }
 
 function drawBelts(ctx, belts, z, on, S) {
@@ -211,15 +219,17 @@ function drawUnders(ctx, unders, z, on, S) {
 // A planned run: the proposed belts and undergrounds translucent, cells the
 // run cannot have tinted red, and a ring on each draggable end -- the tip
 // solid, the start hollow, so the two read apart at a glance.
-function drawGhost(ctx, g, z, px, on, S) {
+function drawGhost(ctx, T, g, z, px, on, S, ports) {
   ctx.save();
   ctx.globalAlpha = 0.6;
-  drawBelts(ctx, g.belts, Math.max(z, LOD.chevrons), on, S);
-  drawUnders(ctx, g.unders, Math.max(z, LOD.chevrons), on, S);
+  // Seeded ghost belts tint like real ones; drawBelts does that itself.
+  drawBelts(ctx, g.belts || [], Math.max(z, LOD.chevrons), on, S);
+  drawUnders(ctx, g.unders || [], Math.max(z, LOD.chevrons), on, S);
+  if (g.structs) drawStructs(ctx, T, g.structs, Math.max(z, LOD.ports), px, on, S, ports);
   ctx.restore();
 
   ctx.beginPath();
-  for (const c of g.blocked) if (on(c.x, c.y)) ctx.rect(c.x, c.y, 1, 1);
+  for (const c of g.blocked || []) if (on(c.x, c.y)) ctx.rect(c.x, c.y, 1, 1);
   ctx.fillStyle = COL.frustrated;
   ctx.fill();
 
@@ -232,14 +242,23 @@ function drawGhost(ctx, g, z, px, on, S) {
     ctx.stroke();
     if (filled) { ctx.fillStyle = COL.handle; ctx.fill(); }
   };
-  ring(g.start, false);
-  ring(g.end, true);
+  if (g.start) ring(g.start, false);
+  if (g.end) ring(g.end, true);
+  // A placement ghost: an outline round the footprint, so the tap target
+  // reads as one thing even when part of it is tinted red.
+  if (g.box) {
+    ctx.strokeStyle = COL.select;
+    ctx.lineWidth = Math.max(0.05, 2 * px);
+    ctx.setLineDash([6 * px, 4 * px]);
+    ctx.strokeRect(g.box.x, g.box.y, g.box.w, g.box.h);
+    ctx.setLineDash([]);
+  }
 }
 
-function drawStructs(ctx, board, z, px, on, S, ports) {
-  const types = board.T.types;
+function drawStructs(ctx, T, structs, z, px, on, S, ports) {
+  const types = T.types;
   const inset = 0.05;
-  for (const s of board.structs) {
+  for (const s of structs) {
     if (!on(s.x, s.y, s.w, s.h)) continue;
     const c = types[s.type].colour || [0.5, 0.5, 0.5];
     ctx.fillStyle = css(c);
@@ -250,22 +269,30 @@ function drawStructs(ctx, board, z, px, on, S, ports) {
   }
 
   if (!ports || z < LOD.ports) return;
-  // Ports: blue triangles pointing in at inputs, red pointing out at outputs.
+  // Ports: blue triangles pointing in at inputs, red pointing out at outputs,
+  // each with a black outline so it reads against any body colour.
   const ins = new Path2D(), outs = new Path2D();
-  for (const s of board.structs) {
+  for (const s of structs) {
     if (!on(s.x, s.y, s.w, s.h)) continue;
     for (const [lx, ly, f] of s.o.inputs) port(ins, s.x + lx, s.y + ly, S[f], true);
     for (const [lx, ly, f] of s.o.outputs) port(outs, s.x + lx, s.y + ly, S[f], false);
   }
   ctx.fillStyle = COL.in; ctx.fill(ins);
   ctx.fillStyle = COL.out; ctx.fill(outs);
+  ctx.strokeStyle = COL.portEdge;
+  ctx.lineWidth = Math.max(1.2 * px, 0.03);
+  ctx.lineJoin = "miter";
+  ctx.stroke(ins);
+  ctx.stroke(outs);
 }
 
 function port(path, x, y, f, inward) {
   const cx = x + 0.5, cy = y + 0.5;
   const ex = cx + f[0] * 0.45, ey = cy + f[1] * 0.45;   // just inside the face
-  const sx = -f[1] * 0.13, sy = f[0] * 0.13;
-  const d = 0.16;
+  // 30% larger than the first cut (0.13 / 0.16), which read as specks on a
+  // phone. Still inside the cell: the tip sits on the face, not past it.
+  const sx = -f[1] * 0.169, sy = f[0] * 0.169;
+  const d = 0.208;
   // Inward: base on the face, tip inside. Outward: base inside, tip on face.
   const tip = inward ? [ex - f[0] * d, ey - f[1] * d] : [ex, ey];
   const base = inward ? [ex, ey] : [ex - f[0] * d, ey - f[1] * d];
@@ -277,16 +304,16 @@ function port(path, x, y, f, inward) {
 
 // Text is drawn in screen space: under the world transform it would be
 // mirrored by the y flip.
-function drawLabels(ctx, board, cam, dpr, on) {
+function drawLabels(ctx, T, structs, cam, dpr, on) {
   ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
   ctx.textAlign = "center";
   ctx.textBaseline = "middle";
   ctx.fillStyle = COL.label;
   const z = cam.zoom;
-  for (const s of board.structs) {
+  for (const s of structs) {
     if (!on(s.x, s.y, s.w, s.h)) continue;
     const text = s.emit !== null ? fmtNumber(s.emit)
-      : board.T.types[s.type].name.toUpperCase();
+      : T.types[s.type].name.toUpperCase();
     const size = Math.min(0.32 * z, (s.w * z * 0.8) / (text.length * 0.62));
     if (size < 7) continue;
     ctx.font = `600 ${size.toFixed(1)}px system-ui, sans-serif`;

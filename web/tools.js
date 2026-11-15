@@ -46,6 +46,20 @@ function typeOf(T, name) {
   return Object.values(T.types).find(t => t.name === name);
 }
 
+// The number a placement carries. A Source always emits something and
+// starts at 0 (Source.EMIT_VALUE); a raw belt starts with no seed (null).
+export const VALUE_CHOICES = [0, 1, -1, 2, 4, 8];
+
+export function hasValue(slot) {
+  return !!slot && (slot.kind === "rawbelt" || (slot.kind === "structure" && slot.type === "source"));
+}
+
+export function toolValue(slot) {
+  if (!hasValue(slot)) return null;
+  if (slot.kind === "rawbelt") return slot.value ?? null;
+  return slot.value ?? 0;
+}
+
 // Whether flip means anything for this tool. Belts have no ports; a machine
 // that mirrors onto itself (Sink) is achiral. The underground uses flip for
 // "which end does the next tap lay", as on the desktop.
@@ -74,7 +88,7 @@ function port(x, y, d, inward) {
   const [fx, fy] = STEP[d];
   const cx = x + 0.5, cy = y + 0.5;
   const ex = cx + fx * 0.45, ey = cy + fy * 0.45;
-  const sx = -fy * 0.15, sy = fx * 0.15, k = 0.2;
+  const sx = -fy * 0.195, sy = fx * 0.195, k = 0.26;
   const tip = inward ? [ex - fx * k, ey - fy * k] : [ex, ey];
   const base = inward ? [ex, ey] : [ex - fx * k, ey - fy * k];
   return `M${base[0] + sx} ${base[1] + sy}L${tip[0]} ${tip[1]}L${base[0] - sx} ${base[1] - sy}Z`;
@@ -119,7 +133,8 @@ export function toolArt(T, slot) {
   return frame(o.w, o.h,
     `<rect x="0.05" y="0.05" width="${o.w - 0.1}" height="${o.h - 0.1}" fill="${css(c)}" ` +
     `stroke="${css(c.map(v => v * 0.6))}" stroke-width="0.06"/>` +
-    `<path d="${ins}" fill="#5999f2"/><path d="${outs}" fill="#f2594d"/>`);
+    `<path d="${ins}" fill="#5999f2" stroke="#000" stroke-width="0.05"/>` +
+    `<path d="${outs}" fill="#f2594d" stroke="#000" stroke-width="0.05"/>`);
 }
 
 // A stamp has no picture yet, so it wears an asymmetric "F": the one glyph

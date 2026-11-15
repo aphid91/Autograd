@@ -8,11 +8,12 @@ copy/paste, move/rotate/flip, seeds and Source values, camera, toolbelt.
 Read the root CLAUDE.md for what the game *is*; most of its engineering
 notes are about the tick and do not apply here.
 
-Current state: **the phone shell, the belt planner, and per-instance
-settings.** It loads a save, pans (one finger) and zooms (pinch, or the
-wheel), lays belt runs (auto-tunnelling under obstacles), and edits a
-Source's emit value or a belt's seed from the Status panel. Machines are not
-placeable yet, nothing ticks, and edits are not saved back to a file.
+Current state: **the phone shell, the belt planner, machine placement and
+per-instance settings.** It loads a save, pans (one finger) and zooms (pinch,
+or the wheel), lays belt runs (auto-tunnelling under obstacles), places
+machines and raw belts, and edits a Source's emit value or a belt's seed.
+Nothing ticks, Underground has no tool flow of its own (the planner covers
+it), and edits are not saved back to a file.
 
 ## Run it
 
@@ -83,7 +84,7 @@ The gesture, with the Belt tool held:
 | input | idle | planning |
 |---|---|---|
 | tap | start a run on that cell | **build** the run exactly as shown |
-| one-finger drag | pan | move the run's **nearer end** |
+| one-finger drag | pan | move the run's **tip** |
 | two fingers | pan / zoom | pan / zoom, always |
 | rotate CW / CCW | turn the swatch | turn the **tip** |
 | flip | -- | nothing |
@@ -91,11 +92,11 @@ The gesture, with the Belt tool held:
 
 Four rules, each chosen over an obvious alternative:
 
-- **The end starts on the start, and a tie goes to the end**, so tap-then-
-  drag always pulls the tip off the start rather than dragging a one-cell
-  run around. Nearness is measured in screen space, from where the drag
-  began.
-- **A dragged end follows the finger's motion, not its position.** It never
+- **A drag only ever moves the tip.** The first version moved whichever end
+  was nearer the finger (the tip winning ties, so tap-then-drag always
+  pulled the tip off the start). In practice that read as confusing and
+  bought nothing, since Cancel and a fresh tap move the start just as well.
+- **A dragged tip follows the finger's motion, not its position.** It never
   jumps under the thumb, so you can drag from below the tip and keep it in
   view. The cost is that an end cannot be teleported: pan with two fingers
   and drag again.
@@ -112,8 +113,53 @@ A second finger mid-drag ends the drag where it is and becomes a pinch. If
 it then drops back to one finger, that finger does nothing (`dead` in
 `camera.js`), rather than resuming a drag from wherever it happens to be.
 
-The route (H-first, V-first, line) is stored on the tool slot, so it
-persists like the desktop builder's mode.
+The route (H-first or V-first) is stored on the tool slot, so it persists
+like the desktop builder's mode. `planner.js` still knows the staircase
+line, which the desktop offers, but the phone's Route button does not: it
+was dropped as not worth a button. A slot saved while it existed reads as
+H-first.
+
+### Placing machines and raw belts
+
+The other one-tap tools (every machine, and the raw belt) share one flow.
+The **ghost** is held as a continuous world point and the footprint is
+centred on it by `placer.js`, a port of `Entity.origin_for_cursor()` that is
+**tested against the Python function itself**. An even extent snaps to the
+nearest cell boundary, so a 2×1 moves every half cell, and rotation turns
+the footprint about its middle.
+
+| input | idle | placing |
+|---|---|---|
+| tap | start placing: ghost centred on the tap | **on the ghost** (or within 20 px of it): place it, and keep placing with the ghost where it is |
+| | | **anywhere else**: place it, then stop placing |
+| one-finger drag | pan | move the ghost, by the finger's motion |
+| two fingers | pan / zoom | pan / zoom |
+| the bar | swatches | Cancel, Left, Right, and number swatches for Source and raw belt |
+
+- **Both taps place only if every cell is free**, as the desktop's
+  `StructureBuilder` does, and the tap elsewhere stops placing **even when
+  the placement was refused**. So a blocked ghost never strands you in the
+  mode.
+- **Tapping the ghost leaves it where it is**, now over what it just built
+  and so tinted red. A row of machines is tap, nudge, tap, nudge.
+- **The 20 px margin** exists because a 1×2 machine at building zoom is a
+  small target, and a near miss would otherwise drop you out of placing
+  mid-row.
+- **The ghost reads the held tool on every redraw** (type, facing, flip,
+  number), so the Turn buttons and the number swatches show on it at once,
+  with no second copy of the tool to keep in step.
+- **The number swatches**: 0, 1, −1, 2, 4, 8, in a 3×2 grid so Cancel and
+  both rotations fit beside them without scrolling. They are the Source's
+  emit value (default 0, so one is always selected) or the raw belt's seed
+  (default **none**, meaning unseeded; tapping the selected number again
+  clears it). The choice is stored on the slot (`slot.value`), so it carries
+  to the next placement.
+
+`Board.spawnStructure()` stamps every cell with its offset within the
+**placed** footprint, as `Gameboard._stamp_footprint()` does. Checked by
+re-placing every machine on a board (1,026 of them, the save's own plus new
+ones) with the desktop's `spawn()` and comparing every cell and row field:
+no differences.
 
 ### Auto-undergrounds
 
@@ -210,6 +256,7 @@ is harmless and removes double-tap arbitration.
 | `camera.js` | camera (world +Y up, zoom in CSS px/cell), pointer gestures, and taps |
 | `render.js` | Canvas 2D drawing under a world transform; labels in screen space |
 | `planner.js` | belt-run geometry: paths, facings, the tip, auto-undergrounds |
+| `placer.js` | where a ghost's footprint sits: the port of `origin_for_cursor()` |
 | `tests/` | `node --test` suites for the pure modules |
 | `types.json` | generated — do not edit |
 | `build.sh` | assembles `_site/` |

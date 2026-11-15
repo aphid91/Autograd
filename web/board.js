@@ -143,6 +143,73 @@ export class Board {
     return row;
   }
 
+  // A raw belt with an optional seed. `seed` null means no seed; a number
+  // turns it on with that value, mirrored into .z as setSeed() does.
+  spawnBelt(x, y, dir, seed = null) {
+    const E = this.T.entity, C = this.T.cell;
+    const row = this.spawn1(C.TYPE_BELT, x, y, dir);
+    if (seed !== null) {
+      this.setField(row, E.F_SEED_ON, 1);
+      this.setField(row, E.F_SEED_VALUE, seed);
+      this.grid[(y * this.width + x) * 4 + 2] |= C.SEED_BIT | (seed > 0 ? C.SEED_POS_BIT : 0);
+    }
+    return row;
+  }
+
+  // The cells a machine of `type` would cover at `origin`, facing `dir`,
+  // and which of them are not free. The footprint fills its bounding box,
+  // so the box is the cell set (core/entity.py cells_for()).
+  footprint(type, [ox, oy], dir, flip) {
+    const o = this.T.types[type].orient[`${dir}${flip ? 1 : 0}`];
+    const cells = [], blocked = [];
+    for (let lx = 0; lx < o.w; lx++) {
+      for (let ly = 0; ly < o.h; ly++) {
+        const c = { x: ox + lx, y: oy + ly };
+        cells.push(c);
+        if (!this.isFree(c.x, c.y)) blocked.push(c);
+      }
+    }
+    return { o, cells, blocked };
+  }
+
+  // Place a machine, all or nothing: one blocked cell and nothing is built,
+  // as the desktop's StructureBuilder. Returns the row, or -1.
+  //
+  // Each cell's .y holds its offset within the PLACED footprint, which is
+  // what Gameboard._stamp_footprint() writes and what the desktop renderer
+  // un-places to find a port.
+  spawnStructure(type, origin, dir, flip, { emit = null } = {}) {
+    const E = this.T.entity, C = this.T.cell, S = E.STRIDE;
+    const { o, blocked } = this.footprint(type, origin, dir, flip);
+    if (blocked.length) return -1;
+    const [ox, oy] = origin;
+    const row = this.claimRow();
+    this.entities.fill(0, row * S, (row + 1) * S);
+    this.setField(row, E.F_ALIVE, 1);
+    this.setField(row, E.F_TYPE, type);
+    this.setField(row, E.F_ORIGIN_X, ox);
+    this.setField(row, E.F_ORIGIN_Y, oy);
+    this.setField(row, E.F_DIR, dir);
+    this.setField(row, E.F_W, o.w);
+    this.setField(row, E.F_H, o.h);
+    this.setField(row, E.F_FLIPPED, flip ? 1 : 0);
+    if (this.T.types[type].name === "source") this.setField(row, E.F_EMIT, emit ?? 0);
+    this.liveCount++;
+    const wordX = (dir << C.DIR_SHIFT) | (type << C.TYPE_SHIFT) | (row << C.ID_SHIFT);
+    const wordZ = flip ? C.FLIP_BIT : 0;
+    for (let lx = 0; lx < o.w; lx++) {
+      for (let ly = 0; ly < o.h; ly++) {
+        const i = ((oy + ly) * this.width + (ox + lx)) * 4;
+        this.grid[i] = wordX;
+        this.grid[i + 1] = (lx << C.LOCAL_SHIFT) | ly;
+        this.grid[i + 2] = wordZ;
+        this.grid[i + 3] = 0;
+      }
+    }
+    this.derive();
+    return row;
+  }
+
   // Link two underground ends, and mirror the pairing into both cells' .z.
   pairUnder(a, b) {
     const E = this.T.entity, C = this.T.cell;
