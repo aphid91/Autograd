@@ -53,6 +53,10 @@
   "F_UNDER_IS_EXIT": 8,
   "F_UNDER_PARTNER": 9
  },
+ "under": {
+  "MAX_GAP": 4,
+  "MAX_SPAN": 5
+ },
  "types": {
   "1": {
    "name": "belt",

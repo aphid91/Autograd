@@ -8,10 +8,11 @@ copy/paste, move/rotate/flip, seeds and Source values, camera, toolbelt.
 Read the root CLAUDE.md for what the game *is*; most of its engineering
 notes are about the tick and do not apply here.
 
-Current state: **a viewer with the phone shell around it.** It loads a save,
-pans (one finger) and zooms (pinch, or the wheel), and has the control
-layout the editor will use -- but the only board edits so far are a Source's
-emit value and a belt's seed, from the Status panel. No building, no ticking.
+Current state: **the phone shell, the belt planner, and per-instance
+settings.** It loads a save, pans (one finger) and zooms (pinch, or the
+wheel), lays belt runs (auto-tunnelling under obstacles), and edits a
+Source's emit value or a belt's seed from the Status panel. Machines are not
+placeable yet, nothing ticks, and edits are not saved back to a file.
 
 ## Run it
 
@@ -72,6 +73,102 @@ pulled from a CDN, which keeps the no-build, works-offline property. Status
 writes the same row fields the desktop's Status window does, plus the
 seed's `.z` bits, so a save edited here reads correctly there.
 
+## The belt planner
+
+[planner.js](planner.js) is the geometry, as pure functions over a
+`free(x, y)` predicate; `main.js` owns the gesture and the run state.
+
+The gesture, with the Belt tool held:
+
+| input | idle | planning |
+|---|---|---|
+| tap | start a run on that cell | **build** the run exactly as shown |
+| one-finger drag | pan | move the run's **nearer end** |
+| two fingers | pan / zoom | pan / zoom, always |
+| rotate CW / CCW | turn the swatch | turn the **tip** |
+| flip | -- | nothing |
+| the bar | swatches | Cancel / Route / Build |
+
+Four rules, each chosen over an obvious alternative:
+
+- **The end starts on the start, and a tie goes to the end**, so tap-then-
+  drag always pulls the tip off the start rather than dragging a one-cell
+  run around. Nearness is measured in screen space, from where the drag
+  began.
+- **A dragged end follows the finger's motion, not its position.** It never
+  jumps under the thumb, so you can drag from below the tip and keep it in
+  view. The cost is that an end cannot be teleported: pan with two fingers
+  and drag again.
+- **The tip is a turn, not a facing**: straight, left or right off the
+  run's travel direction, never back into it (the desktop's `_exit_turn`
+  rule). The buttons walk that ring, skipping "backwards". It is stored
+  relative, but **resets to straight whenever the tip moves to a new cell**.
+  A one-cell run has no travel direction, so there the buttons cycle all
+  four facings, starting from the swatch's own rotation.
+- **The second tap builds what is shown**, rather than moving the tip to
+  where the finger landed. Tapping is a confirmation, not an aim.
+
+A second finger mid-drag ends the drag where it is and becomes a pinch. If
+it then drops back to one finger, that finger does nothing (`dead` in
+`camera.js`), rather than resuming a drag from wherever it happens to be.
+
+The route (H-first, V-first, line) is stored on the tool slot, so it
+persists like the desktop builder's mode.
+
+### Auto-undergrounds
+
+A run that crosses occupied cells tunnels under them **when the geometry
+allows**, because placing underground ends by hand is clumsy on a phone.
+Otherwise blocked cells are skipped and tinted red, as on the desktop, and
+nothing is ever overwritten. A bridge from entrance `a` to exit `e` needs:
+
+- `a` and `e` on the run and free: the cells either side of a blocked
+  stretch, so an obstacle touching either end of the run is never bridged;
+- **every step from `a` to `e` in one direction**: the pair is a straight
+  span;
+- **the exit's own facing in that direction too.** An exit only surfaces
+  forward, so a run that turns on the cell straight after the crossing
+  cannot be bridged. This includes the tip's turn when the exit is the tip;
+- at most `Underground.MAX_GAP` (4) cells between them, exported in
+  `types.json` rather than copied.
+
+**Two obstacles one free cell apart are one obstacle.** Bridging them
+separately would need the first exit and the second entrance on that same
+cell, so they are bridged whole or not at all. Two free cells between them
+leave room for exit-then-entrance, and each is decided on its own.
+
+An entrance's input side is **not** constrained: an underground takes input
+from any side, as a belt does (`_incoming()` in core/segments.py).
+
+`tests/planner.test.mjs` pins each rule, and each was mutation-tested.
+Removing the straightness check at first passed everything, because every
+bent fixture also had its exit turned, so the exit rule refused it first. A
+staircase (Line route) bending inside the span with both ends facing east is
+the case that isolates it.
+
+### Placing is a port, and was checked against the desktop
+
+`Board.spawn1()`, `pairUnder()` and `buildPlan()` port `_claim_row()` (free
+list first, popped from the end; row 0 is never handed out), `spawn()`,
+`_stamp_footprint()` and `pair_under()`. A built board was copied into a
+Python `Gameboard`: rows and cells agreed, the free list held only dead rows,
+`SegmentIndex.audit()` reported nothing, and the crossing run came out as
+one segment through its underground pair.
+
+`buildPlan()` re-checks `isFree()` per cell and skips anything that has
+become occupied, so a stale plan can never overwrite. It pairs only ends
+that were both actually built, the dangling-partner rule the desktop
+enforces.
+
+### A testing trap: instant drags read as flings
+
+A test drag sent as a burst of moves with no time between them looked like a
+**fling** to Chrome, and the next tap anywhere was spent stopping it: the
+button got `pointerdown` and `pointerup` and never a `click`. It looked
+exactly like a dead button. Space the moves about 16 ms apart and pause
+before lifting. The controls also carry `touch-action: manipulation`, which
+is harmless and removes double-tap arbitration.
+
 ## Rules
 
 - **No build step, no npm, no framework.** Plain ES modules and Canvas 2D.
@@ -112,6 +209,8 @@ seed's `.z` bits, so a save edited here reads correctly there.
 | `board.js` | the save's arrays, validation, derived render lists, `entityAt`/`describe`, and the two setting writers |
 | `camera.js` | camera (world +Y up, zoom in CSS px/cell), pointer gestures, and taps |
 | `render.js` | Canvas 2D drawing under a world transform; labels in screen space |
+| `planner.js` | belt-run geometry: paths, facings, the tip, auto-undergrounds |
+| `tests/` | `node --test` suites for the pure modules |
 | `types.json` | generated — do not edit |
 | `build.sh` | assembles `_site/` |
 
@@ -125,6 +224,12 @@ finger landing or lifting mid-gesture never makes the view jump.
 time, for the console and headless tests.
 
 ## Testing
+
+```bash
+node --test web/tests/*.test.mjs
+```
+
+Pure-JS tests (the planner) run in Node, with no npm and no browser.
 
 Playwright with phone emulation (`devices['Pixel 7']`) and CDP
 `Input.dispatchTouchEvent` drives real multi-touch. Check counts against

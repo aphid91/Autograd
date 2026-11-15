@@ -56,65 +56,105 @@ export class Camera {
   }
 }
 
-// Touch / mouse / wheel -> camera. Pointer events cover all three input
-// kinds; `touch-action: none` on the element stops the browser claiming the
-// gestures for page scroll and page zoom.
+// Touch / mouse / wheel -> camera, plus the board's own one-finger gestures.
+// Pointer events cover all three input kinds; `touch-action: none` on the
+// element stops the browser claiming the gestures for scroll and page zoom.
 //
-// A TAP is a single pointer that went down and up without travelling past
-// TAP_SLOP or overlapping a second finger. It is decided on release, because
-// a press alone could still become a pan -- the same ambiguity the desktop
-// resolves with STATE_ARMED.
+// A gesture is decided, not assumed:
+//
+//   press  one finger is down and has not moved past TAP_SLOP. A press is
+//          ambiguous -- it may become a tap or a drag -- so nothing happens
+//          until it resolves (the desktop's STATE_ARMED).
+//   tap    the finger lifted while still a press.
+//   drag   it moved past TAP_SLOP while `hooks.drag.wants()` -- the belt
+//          planner moving an end of its run. Otherwise it is a
+//   pan    and moves the camera.
+//   pinch  a second finger landed: always the camera, whatever was going on.
+//          A drag in progress ends where it is, and does not snap back.
+//   dead   a pinch dropped back to one finger while the board wants drags.
+//          That finger does nothing, rather than surprising anyone by
+//          dragging the run's end from wherever it happens to be.
+//
+// A pan or drag is anchored at the PRESS, not at the moment the slop was
+// crossed, so the frames spent crossing it are part of the motion and the
+// grabbed thing does not lag the finger (the same reason the desktop anchors
+// a note drag at the press).
 const TAP_SLOP = 8;   // CSS px
 
-export function attachGestures(el, camera, onChange, onTap) {
+export function attachGestures(el, camera, onChange, hooks = {}) {
   const pts = new Map();   // pointerId -> [x, y] in element CSS px
-  let tap = null;          // { id, x, y } while a tap is still possible
+  let gesture = "idle";
+  let press = null;        // { id, x, y }
 
   const local = (e) => {
     const r = el.getBoundingClientRect();
     return [e.clientX - r.left, e.clientY - r.top];
   };
+  const wantsDrag = () => !!hooks.drag?.wants();
 
   el.addEventListener("pointerdown", (e) => {
     el.setPointerCapture(e.pointerId);
-    pts.set(e.pointerId, local(e));
-    const [x, y] = local(e);
-    tap = pts.size === 1 && e.button === 0 ? { id: e.pointerId, x, y } : null;
+    const p = local(e);
+    pts.set(e.pointerId, p);
+    if (pts.size === 1) {
+      gesture = e.button === 0 ? "press" : "pan";
+      press = { id: e.pointerId, x: p[0], y: p[1] };
+    } else {
+      if (gesture === "drag") hooks.drag.end();
+      gesture = "pinch";
+    }
   });
 
   el.addEventListener("pointermove", (e) => {
     if (!pts.has(e.pointerId)) return;
-    if (tap) {
-      const [x, y] = local(e);
-      if (Math.hypot(x - tap.x, y - tap.y) > TAP_SLOP) tap = null;
-    }
-    // Compare the first two active pointers before and after this move, so
-    // a finger joining or leaving never causes a jump: there is no baseline
-    // to go stale.
+    // Compare the first two pointers before and after this move, so a
+    // finger joining or leaving never makes the view jump.
     const ids = [...pts.keys()].slice(0, 2);
     const before = ids.map(id => pts.get(id));
-    pts.set(e.pointerId, local(e));
+    const p = local(e);
+    pts.set(e.pointerId, p);
     const after = ids.map(id => pts.get(id));
-    if (ids.length === 1) {
+
+    if (gesture === "press") {
+      if (Math.hypot(p[0] - press.x, p[1] - press.y) <= TAP_SLOP) return;
+      if (wantsDrag()) {
+        gesture = "drag";
+        hooks.drag.begin(press.x, press.y);
+      } else {
+        gesture = "pan";
+        camera.move([press.x, press.y], p, 1);
+        onChange();
+        return;
+      }
+    }
+    if (gesture === "drag") {
+      hooks.drag.move(p[0], p[1]);
+    } else if (gesture === "pan" && ids.length === 1) {
       camera.move(before[0], after[0], 1);
-    } else {
-      const mid = (p) => [(p[0][0] + p[1][0]) / 2, (p[0][1] + p[1][1]) / 2];
-      const dist = (p) => Math.hypot(p[0][0] - p[1][0], p[0][1] - p[1][1]);
+    } else if (gesture === "pinch" && ids.length >= 2) {
+      const mid = (q) => [(q[0][0] + q[1][0]) / 2, (q[0][1] + q[1][1]) / 2];
+      const dist = (q) => Math.hypot(q[0][0] - q[1][0], q[0][1] - q[1][1]);
       const d0 = dist(before);
       camera.move(mid(before), mid(after), d0 > 0 ? dist(after) / d0 : 1);
+    } else {
+      return;
     }
     onChange();
   });
 
-  el.addEventListener("pointerup", (e) => {
+  const lift = (e, cancelled) => {
+    if (!pts.has(e.pointerId)) return;
     pts.delete(e.pointerId);
-    if (tap && tap.id === e.pointerId) {
-      const [x, y] = local(e);
-      tap = null;
-      onTap?.(x, y);
+    if (gesture === "press" && !cancelled && press && press.id === e.pointerId) {
+      hooks.onTap?.(press.x, press.y);
+    } else if (gesture === "drag") {
+      hooks.drag.end();
     }
-  });
-  el.addEventListener("pointercancel", (e) => { pts.delete(e.pointerId); tap = null; });
+    if (pts.size === 0) gesture = "idle";
+    else if (gesture === "pinch" && pts.size === 1) gesture = wantsDrag() ? "dead" : "pan";
+  };
+  el.addEventListener("pointerup", (e) => lift(e, false));
+  el.addEventListener("pointercancel", (e) => lift(e, true));
 
   el.addEventListener("wheel", (e) => {
     e.preventDefault();

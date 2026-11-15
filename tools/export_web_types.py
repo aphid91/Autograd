@@ -91,6 +91,12 @@ def build():
             "F_UNDER_IS_EXIT": Underground.F_IS_EXIT,
             "F_UNDER_PARTNER": Underground.F_PARTNER,
         },
+        "under": {
+            # The longest pair: ends at most MAX_SPAN apart, so at most
+            # MAX_GAP buried cells between them.
+            "MAX_GAP": Underground.MAX_GAP,
+            "MAX_SPAN": Underground.MAX_SPAN,
+        },
         "types": types,
     }
 

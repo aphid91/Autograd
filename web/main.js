@@ -10,6 +10,7 @@ import { Camera, attachGestures } from "./camera.js";
 import { render } from "./render.js";
 import { Shell } from "./ui.js";
 import { Panel } from "./panel.js";
+import { ROUTE_NAMES, planRun, turnTip } from "./planner.js";
 
 const DEFAULT_SAVE = "default.npz";
 
@@ -26,6 +27,17 @@ let panel = null;
 let view = {};
 let inspectRow = -1;   // a row, not a description: re-read it every time
 
+// The belt run being planned, or null. Plain data; planner.js turns it into
+// cells against the live board on every redraw, so the ghost can never show
+// a plan computed against a board that has since changed.
+//   start, end   cells; the end starts ON the start
+//   route        0 H-first, 1 V-first, 2 line (persisted on the tool slot)
+//   tipTurn      the last belt's turn off the travel direction: 0/1/3
+//   singleDir    a one-cell run's facing; `defaultDir` is what it resets to
+let run = null;
+let grab = null;       // { which: "start" | "end", cell0, world0 } during a drag
+const ROUTE_ICONS = ["routeHV", "routeVH", "routeLine"];
+
 // A handle for the console and for headless tests. Not an API.
 const debug = window.gates = {
   cam, redraw, renderMs: 0,
@@ -33,6 +45,8 @@ const debug = window.gates = {
   get shell() { return shell; },
   get panel() { return panel; },
   get inspectRow() { return inspectRow; },
+  get run() { return run; },
+  plan: () => currentPlan(),
 };
 
 let queued = false;
@@ -43,7 +57,7 @@ function redraw() {
     queued = false;
     const t0 = performance.now();
     const info = board ? board.describe(inspectRow) : null;
-    render(ctx, board, cam, dpr, { ...view, selected: info });
+    render(ctx, board, cam, dpr, { ...view, selected: info, ghost: ghostOf(currentPlan()) });
     debug.renderMs = performance.now() - t0;
   });
 }
@@ -66,17 +80,128 @@ function inspect(row) {
 }
 
 function onTap(sx, sy) {
-  if (!board || shell.state.mode !== "hand") return;
+  if (!board) return;
   const [wx, wy] = cam.screenToWorld(sx, sy);
-  // A tap on bare board closes the window, as on the desktop.
-  inspect(board.entityAt(Math.floor(wx), Math.floor(wy)));
+  const x = Math.floor(wx), y = Math.floor(wy);
+  if (shell.state.mode === "hand") {
+    // A tap on bare board closes the window, as on the desktop.
+    inspect(board.entityAt(x, y));
+    return;
+  }
+  if (shell.state.mode === "build" && beltHeld()) {
+    // The second tap places the run exactly as shown; it does not move the
+    // tip to where the finger landed.
+    if (run) commitRun();
+    else if (x >= 0 && y >= 0 && x < board.width && y < board.height) startRun(x, y);
+  }
 }
+
+// --- planning a belt run --------------------------------------------------
+//
+// Tap starts a run on the tapped cell, a drag moves whichever end of it is
+// nearer the finger (the tip on a tie, so tap-then-drag always pulls the tip
+// off the start), and a second tap -- or Build -- places it. Two fingers stay
+// the camera throughout.
+
+const STEPS = [[1, 0], [0, 1], [-1, 0], [0, -1]];
+const dirToward = (from, to) => STEPS.findIndex(s => s[0] === to.x - from.x && s[1] === to.y - from.y);
+
+function beltHeld() {
+  const t = shell?.heldTool;
+  return !!t && t.kind === "belt";
+}
+
+function currentPlan() {
+  if (!run || !board) return null;
+  return planRun(run, (x, y) => board.isFree(x, y), T.under.MAX_GAP);
+}
+
+// The plan in the renderer's own shapes, so ghosts draw with the same code
+// as the real thing.
+function ghostOf(plan) {
+  if (!plan) return null;
+  const belts = [], unders = [], blocked = [];
+  plan.cells.forEach((c, i) => {
+    if (c.kind === "blocked") { blocked.push(c); return; }
+    if (c.kind === "buried") return;
+    if (c.kind === "entry" || c.kind === "exit") {
+      const pair = plan.pairs.find(([a]) => a === i);
+      const mate = pair ? plan.cells[pair[1]] : null;
+      unders.push({ x: c.x, y: c.y, dir: c.dir, exit: c.kind === "exit", span: mate ? [mate.x, mate.y] : null });
+      return;
+    }
+    // A belt's incoming arm: from the cell before it, if that one will exist
+    // and feed it; the first belt asks the board who feeds it now.
+    const prev = plan.cells[i - 1];
+    let inDir = -1;
+    if (!prev) inDir = board.incoming(c.x, c.y, c.dir);
+    else if (prev.kind !== "blocked" && prev.kind !== "buried" && prev.kind !== "entry") inDir = dirToward(c, prev);
+    belts.push({ x: c.x, y: c.y, dir: c.dir, inDir, seed: 0 });
+  });
+  return { belts, unders, blocked, start: run.start, end: run.end };
+}
+
+function syncPlanUI() {
+  shell.setPlanning(run ? { routeName: ROUTE_NAMES[run.route], routeIcon: ROUTE_ICONS[run.route] } : null);
+  redraw();
+}
+
+function startRun(x, y) {
+  const tool = shell.heldTool;
+  const dir = tool.dir | 0;
+  run = { start: [x, y], end: [x, y], route: tool.route | 0, tipTurn: 0, singleDir: dir, defaultDir: dir };
+  syncPlanUI();
+}
+
+function cancelRun() {
+  run = null;
+  grab = null;
+  syncPlanUI();
+}
+
+function commitRun() {
+  const plan = currentPlan();
+  if (plan) board.buildPlan(plan);
+  cancelRun();
+}
+
+const dragHooks = {
+  wants: () => !!run,
+  begin(sx, sy) {
+    // Whichever end is nearer the press, in screen space. `<=` gives a tie
+    // to the tip, which is what makes tap-then-drag pull the tip off the
+    // start rather than dragging the whole one-cell run.
+    const d = (c) => {
+      const [x, y] = cam.worldToScreen(c[0] + 0.5, c[1] + 0.5);
+      return Math.hypot(x - sx, y - sy);
+    };
+    const which = d(run.end) <= d(run.start) ? "end" : "start";
+    grab = { which, cell0: run[which].slice(), world0: cam.screenToWorld(sx, sy) };
+  },
+  move(sx, sy) {
+    if (!grab || !run) return;
+    // The grabbed end follows the finger's MOTION, not its position: it
+    // never jumps under the thumb, so the thumb never hides it.
+    const [wx, wy] = cam.screenToWorld(sx, sy);
+    const clamp = (v, hi) => Math.max(0, Math.min(hi - 1, v));
+    const nx = clamp(Math.floor(grab.cell0[0] + 0.5 + wx - grab.world0[0]), board.width);
+    const ny = clamp(Math.floor(grab.cell0[1] + 0.5 + wy - grab.world0[1]), board.height);
+    const cur = run[grab.which];
+    if (cur[0] === nx && cur[1] === ny) return;
+    run[grab.which] = [nx, ny];
+    // A tip on a new cell goes back to straight on.
+    if (grab.which === "end") { run.tipTurn = 0; run.singleDir = run.defaultDir; }
+    redraw();
+  },
+  end() { grab = null; },
+};
 
 // --- saves ------------------------------------------------------------------
 
 async function show(name, bytes) {
   try {
     board = await Board.fromNpz(T, bytes);
+    if (run) cancelRun();
     cam.frame(board.bounds);
     inspect(-1);
   } catch (err) {
@@ -104,8 +229,21 @@ async function init() {
     right: document.getElementById("sw-right"),
     picker: document.getElementById("picker"),
   }, {
-    // Leaving the Hand puts the Status window away.
-    onChange: (s) => { if (s.mode !== "hand" && inspectRow >= 0) inspect(-1); },
+    onChange: (s) => {
+      // Leaving the Hand puts the Status window away; leaving the belt tool
+      // abandons a run, as switching tools does on the desktop.
+      if (s.mode !== "hand" && inspectRow >= 0) inspect(-1);
+      if (run && !(s.mode === "build" && beltHeld())) cancelRun();
+    },
+    onPlanCancel: () => cancelRun(),
+    onPlanBuild: () => commitRun(),
+    onPlanRoute: () => {
+      run.route = (run.route + 1) % ROUTE_NAMES.length;
+      shell.heldTool.route = run.route;   // the tool remembers its route
+      shell.changed();
+      syncPlanUI();
+    },
+    onPlanTurn: (cw) => { turnTip(run, cw); redraw(); },
     onReset: () => console.info("reset: no simulation yet"),
     onPause: (paused) => console.info(paused ? "paused" : "playing"),
   });
@@ -125,7 +263,7 @@ async function init() {
 
   resize();
   new ResizeObserver(resize).observe(canvas);
-  attachGestures(canvas, cam, redraw, onTap);
+  attachGestures(canvas, cam, redraw, { onTap, drag: dragHooks });
 
   fileInput.addEventListener("change", async () => {
     const f = fileInput.files[0];

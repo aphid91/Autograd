@@ -19,6 +19,12 @@ export class Board {
     this.grid = arrays.grid.data;
     this.entities = arrays.entities.data;
     this.rows = arrays.entities.shape[0];
+    // The row allocator, exactly as core/gameboard.py keeps it: rows come
+    // off the free list first (popped from the end), then from next_row.
+    // Row 0 is never handed out -- it means "none" in cells and partners.
+    this.nextRow = arrays.next_row ? arrays.next_row.data[0] : 1;
+    this.freeRows = arrays.free_rows ? Array.from(arrays.free_rows.data) : [];
+    this.liveCount = arrays.live_count ? arrays.live_count.data[0] : 0;
     this.derive();
   }
 
@@ -87,6 +93,86 @@ export class Board {
       seedOn: td.kind === "belt" ? !!this.field(row, E.F_SEED_ON) : null,
       seedValue: td.kind === "belt" ? this.field(row, E.F_SEED_VALUE) : null,
     };
+  }
+
+  // --- placing things ----------------------------------------------------
+  // Ports of Gameboard._claim_row / spawn / _stamp_footprint and
+  // Engine.pair_under, so a board built here is the board the desktop would
+  // have built. Callers check isFree() first, as the desktop's do.
+
+  isFree(x, y) {
+    if (x < 0 || y < 0 || x >= this.width || y >= this.height) return false;
+    return this.cellType(this.cellX(x, y)) === this.T.cell.TYPE_EMPTY;
+  }
+
+  claimRow() {
+    if (this.freeRows.length) return this.freeRows.pop();
+    if (this.nextRow >= this.rows) this.grow();
+    return this.nextRow++;
+  }
+
+  // Doubling, as the desktop's _grow(). Ids are row indices, so nothing moves.
+  grow() {
+    const S = this.T.entity.STRIDE;
+    const next = new Float32Array(this.rows * 2 * S);
+    next.set(this.entities);
+    this.entities = next;
+    this.rows *= 2;
+    this.arrays.entities = { ...this.arrays.entities, shape: [this.rows, S], data: next };
+  }
+
+  // A 1x1 entity (belt or underground end). Returns its row.
+  spawn1(type, x, y, dir, { isExit = false } = {}) {
+    const E = this.T.entity, C = this.T.cell, S = E.STRIDE;
+    const row = this.claimRow();
+    this.entities.fill(0, row * S, (row + 1) * S);
+    this.setField(row, E.F_ALIVE, 1);
+    this.setField(row, E.F_TYPE, type);
+    this.setField(row, E.F_ORIGIN_X, x);
+    this.setField(row, E.F_ORIGIN_Y, y);
+    this.setField(row, E.F_DIR, dir);
+    this.setField(row, E.F_W, 1);
+    this.setField(row, E.F_H, 1);
+    if (type === C.TYPE_UNDER) this.setField(row, E.F_UNDER_IS_EXIT, isExit ? 1 : 0);
+    this.liveCount++;
+    const i = (y * this.width + x) * 4;
+    this.grid[i] = (dir << C.DIR_SHIFT) | (type << C.TYPE_SHIFT) | (row << C.ID_SHIFT);
+    this.grid[i + 1] = 0;   // local offset (0, 0)
+    this.grid[i + 2] = type === C.TYPE_UNDER && isExit ? C.UNDER_EXIT_BIT : 0;
+    this.grid[i + 3] = 0;   // segment membership: derived by the desktop
+    return row;
+  }
+
+  // Link two underground ends, and mirror the pairing into both cells' .z.
+  pairUnder(a, b) {
+    const E = this.T.entity, C = this.T.cell;
+    this.setField(a, E.F_UNDER_PARTNER, b);
+    this.setField(b, E.F_UNDER_PARTNER, a);
+    for (const r of [a, b]) {
+      const x = this.field(r, E.F_ORIGIN_X) | 0, y = this.field(r, E.F_ORIGIN_Y) | 0;
+      this.grid[(y * this.width + x) * 4 + 2] |= C.UNDER_PAIRED_BIT;
+    }
+  }
+
+  // Build a planner.js plan: belts, then each underground pair. Blocked and
+  // buried cells place nothing. Returns how many entities were placed.
+  buildPlan(plan) {
+    const C = this.T.cell;
+    const rows = new Map();   // path index -> row
+    plan.cells.forEach((c, i) => {
+      if (c.kind === "blocked" || c.kind === "buried") return;
+      if (!this.isFree(c.x, c.y)) return;   // the plan is stale; never overwrite
+      rows.set(i, c.kind === "belt"
+        ? this.spawn1(C.TYPE_BELT, c.x, c.y, c.dir)
+        : this.spawn1(C.TYPE_UNDER, c.x, c.y, c.dir, { isExit: c.kind === "exit" }));
+    });
+    // Only pair ends that both got built: a survivor pointing at a row that
+    // was never created is the dangling state the desktop guards against.
+    for (const [a, e] of plan.pairs) {
+      if (rows.has(a) && rows.has(e)) this.pairUnder(rows.get(a), rows.get(e));
+    }
+    this.derive();
+    return rows.size;
   }
 
   // --- per-instance settings ---------------------------------------------

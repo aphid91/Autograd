@@ -22,6 +22,8 @@ const COL = {
   seedNeg: "rgba(209,77,71,0.55)",
   label: "#fcfcff",
   select: "#e8a33d",
+  handle: "rgba(232,163,61,0.28)",
+  frustrated: "rgba(230,64,56,0.55)",
 };
 
 // Below this zoom (CSS px per cell) detail is not drawn at all.
@@ -79,13 +81,15 @@ export function render(ctx, board, cam, dpr, opts = {}) {
     }
   }
 
-  drawBelts(ctx, board, z, on, S);
-  drawUnders(ctx, board, z, on, S);
+  drawBelts(ctx, board.belts, z, on, S);
+  drawUnders(ctx, board.unders, z, on, S);
   drawStructs(ctx, board, z, px, on, S, view.ports);
 
   ctx.strokeStyle = COL.border;
   ctx.lineWidth = 2 * px;
   ctx.strokeRect(0, 0, board.width, board.height);
+
+  if (view.ghost) drawGhost(ctx, view.ghost, z, px, on, S);
 
   // The inspected entity: an outline that stays a few pixels wide at any
   // zoom, drawn over everything so it cannot be hidden by what it marks.
@@ -100,8 +104,7 @@ export function render(ctx, board, cam, dpr, opts = {}) {
   if (view.labels && z >= LOD.labels) drawLabels(ctx, board, cam, dpr, on);
 }
 
-function drawBelts(ctx, board, z, on, S) {
-  const belts = board.belts;
+function drawBelts(ctx, belts, z, on, S) {
 
   // Seeded cells are tinted by the seed's sign, under the belt itself.
   for (const sign of [1, -1]) {
@@ -159,10 +162,10 @@ function chevron(ctx, cx, cy, f, s) {
   ctx.lineTo(cx - f[0] * s - sx * s, cy - f[1] * s - sy * s);
 }
 
-function drawUnders(ctx, board, z, on, S) {
+function drawUnders(ctx, unders, z, on, S) {
   // The span: dots on the buried cells between a paired entrance and exit.
   ctx.beginPath();
-  for (const u of board.unders) {
+  for (const u of unders) {
     if (!u.span) continue;
     const [ex, ey] = u.span;
     const n = Math.abs(ex - u.x) + Math.abs(ey - u.y);
@@ -181,7 +184,7 @@ function drawUnders(ctx, board, z, on, S) {
   // entrance (diving), the back of an exit (surfacing).
   ctx.beginPath();
   const bars = new Path2D();
-  for (const u of board.unders) {
+  for (const u of unders) {
     if (!on(u.x, u.y)) continue;
     ctx.rect(u.x + 0.12, u.y + 0.12, 0.76, 0.76);
     const f = S[u.dir];
@@ -197,12 +200,40 @@ function drawUnders(ctx, board, z, on, S) {
 
   if (z < LOD.chevrons) return;
   ctx.beginPath();
-  for (const u of board.unders) {
+  for (const u of unders) {
     if (on(u.x, u.y)) chevron(ctx, u.x + 0.5, u.y + 0.5, S[u.dir], 0.12);
   }
   ctx.strokeStyle = COL.chevron;
   ctx.lineWidth = 0.07;
   ctx.stroke();
+}
+
+// A planned run: the proposed belts and undergrounds translucent, cells the
+// run cannot have tinted red, and a ring on each draggable end -- the tip
+// solid, the start hollow, so the two read apart at a glance.
+function drawGhost(ctx, g, z, px, on, S) {
+  ctx.save();
+  ctx.globalAlpha = 0.6;
+  drawBelts(ctx, g.belts, Math.max(z, LOD.chevrons), on, S);
+  drawUnders(ctx, g.unders, Math.max(z, LOD.chevrons), on, S);
+  ctx.restore();
+
+  ctx.beginPath();
+  for (const c of g.blocked) if (on(c.x, c.y)) ctx.rect(c.x, c.y, 1, 1);
+  ctx.fillStyle = COL.frustrated;
+  ctx.fill();
+
+  const ring = (c, filled) => {
+    const r = Math.max(0.42, 14 * px);
+    ctx.beginPath();
+    ctx.arc(c[0] + 0.5, c[1] + 0.5, r, 0, Math.PI * 2);
+    ctx.lineWidth = Math.max(0.06, 2.5 * px);
+    ctx.strokeStyle = COL.select;
+    ctx.stroke();
+    if (filled) { ctx.fillStyle = COL.handle; ctx.fill(); }
+  };
+  ring(g.start, false);
+  ring(g.end, true);
 }
 
 function drawStructs(ctx, board, z, px, on, S, ports) {
