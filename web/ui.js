@@ -9,6 +9,7 @@
 
 import { icon } from "./icons.js";
 import { CW, CCW, canFlip, catalog, isKnown, labelFor, sameTool, stampArt, toolArt, toolValue } from "./tools.js";
+import { copyStamp, mirrored, rotated } from "./stamp.js";
 
 const STORE_KEY = "gates.web.shell.v1";
 const LONG_PRESS_MS = 500;   // as sand mode
@@ -16,9 +17,11 @@ const LONG_PRESS_SLOP = 10;  // px a held finger may wander
 const STAMP_HISTORY = 12;
 
 export const MODES = ["build", "hand", "select"];
-export const ACTIONS = ["delete", "cut", "copy", "paste"];
-const ACTION_ICON = { delete: "trash", cut: "cut", copy: "copy", paste: "paste" };
-const ACTION_LABEL = { delete: "Delete", cut: "Cut", copy: "Copy", paste: "Paste" };
+// Select mode's bar: Box is a one-shot tool (the next drag is a rectangle);
+// the other three are COMMANDS on the current selection, not modes.
+export const COMMANDS = ["delete", "cut", "copy"];
+const COMMAND_ICON = { delete: "trash", cut: "cut", copy: "copy" };
+const COMMAND_LABEL = { delete: "Delete", cut: "Cut", copy: "Copy" };
 
 const DEFAULT_SLOTS = [
   { kind: "belt" }, { kind: "under" },
@@ -59,8 +62,9 @@ export class Shell {
       mode: MODES.includes(saved.mode) ? saved.mode : "build",
       slots,
       selected: Number.isInteger(saved.selected) && saved.selected < slots.length ? saved.selected : -1,
-      action: null,        // select mode: which of ACTIONS is up
-      pasteStamp: null,    // ...and, for paste, which stamp
+      boxArmed: false,     // select mode: the next drag is a box
+      selCount: 0,         // how many entities are selected (main.js says)
+      pasteStamp: null,    // select mode: the stamp being pasted, by id
       stamps: [],          // most recent first; in-session, like the desktop
       paused: false,
       // While main.js is planning something, what the bar should show:
@@ -94,11 +98,15 @@ export class Shell {
     return s.mode === "build" && s.selected >= 0 ? s.slots[s.selected] : null;
   }
 
-  // The stamp the turn buttons act on: the one Paste is holding.
+  // The stamp being pasted in Select, or null. `.stamp` is its geometry.
   get activeStamp() {
     const s = this.state;
-    if (s.mode !== "select" || s.action !== "paste") return null;
+    if (s.mode !== "select" || s.pasteStamp === null) return null;
     return s.stamps.find(t => t.id === s.pasteStamp) || null;
+  }
+
+  get selecting() {
+    return this.state.mode === "select" && this.state.pasteStamp === null && this.state.selCount > 0;
   }
 
   // --- the controls row ---------------------------------------------------
@@ -170,7 +178,7 @@ export class Shell {
   renderThumbs() {
     const p = this.state.planning;
     const show = !!p;
-    const flippable = p?.kind === "belt" || (this.heldTool ? canFlip(this.T, this.heldTool) : !!this.activeStamp);
+    const flippable = p?.kind === "belt" || (this.heldTool ? canFlip(this.T, this.heldTool) : !!this.activeStamp || this.selecting);
     for (const pad of this.thumbs) {
       pad.dataset.show = String(show);
       pad.querySelector(".tp-flip").disabled = !flippable;
@@ -181,26 +189,30 @@ export class Shell {
     if (this.state.mode === m) return;
     this.state.mode = m;
     // Leaving Select ends its gesture; the stamp history survives.
-    if (m !== "select") { this.state.action = null; this.state.pasteStamp = null; }
+    if (m !== "select") { this.state.pasteStamp = null; this.state.boxArmed = false; }
     this.changed();
   }
 
-  // R and F act on whatever the hand holds: a tool in Build, the stamp being
-  // pasted in Select. In Hand they will turn what is tapped -- deferred.
+  // R and F act on whatever the hand holds: a tool in Build (a stamp tool
+  // turns its stamp), the stamp being pasted, or the selection -- which
+  // main.js owns, so that one is a request.
   turn(fn) {
-    // While a run is planned the buttons turn its tip, not the tool.
     // While a belt run is planned the buttons turn its tip, not the tool.
     // While placing, they turn the tool -- the ghost follows it.
     if (this.state.planning?.kind === "belt") { this.cb.onPlanTurn?.(fn === CW); return; }
-    const target = this.heldTool || this.activeStamp;
-    if (!target) return;
-    target.dir = fn(target.dir | 0);
-    this.changed();
+    const cw = fn === CW;
+    const tool = this.heldTool;
+    if (tool?.kind === "stamp") { tool.stamp = rotated(this.T, tool.stamp, cw); this.changed(); return; }
+    if (tool) { tool.dir = fn(tool.dir | 0); this.changed(); return; }
+    const st = this.activeStamp;
+    if (st) { st.stamp = rotated(this.T, st.stamp, cw); this.changed(); return; }
+    if (this.selecting) this.cb.onSelectTurn?.(cw);
   }
 
   flip() {
     if (this.state.planning?.kind === "belt") return;   // nothing to mirror on a run
     const tool = this.heldTool;
+    if (tool?.kind === "stamp") { tool.stamp = mirrored(this.T, tool.stamp); this.changed(); return; }
     if (tool) {
       if (!canFlip(this.T, tool)) return;
       tool.flip = !tool.flip;
@@ -208,7 +220,8 @@ export class Shell {
       return;
     }
     const st = this.activeStamp;
-    if (st) { st.flip = !st.flip; this.changed(); }
+    if (st) { st.stamp = mirrored(this.T, st.stamp); this.changed(); return; }
+    if (this.selecting) this.cb.onSelectFlip?.();
   }
 
   // --- the swatch bar -------------------------------------------------------
@@ -226,8 +239,8 @@ export class Shell {
 
     const planning = !!s.planning;
     const beltRun = s.planning?.kind === "belt";
-    const live = beltRun || !!(this.heldTool || this.activeStamp);
-    const flippable = !beltRun && (this.heldTool ? canFlip(this.T, this.heldTool) : !!this.activeStamp);
+    const live = beltRun || !!(this.heldTool || this.activeStamp) || this.selecting;
+    const flippable = !beltRun && (this.heldTool ? canFlip(this.T, this.heldTool) : !!this.activeStamp || this.selecting);
     c.querySelector("#btn-cw").disabled = !live;
     c.querySelector("#btn-ccw").disabled = !live;
     c.querySelector("#btn-flip").disabled = !flippable;
@@ -387,51 +400,55 @@ export class Shell {
 
   renderSelect(row) {
     const s = this.state;
-    for (const a of ACTIONS) {
-      row.append(this.swatch({
-        art: icon(ACTION_ICON[a]), name: ACTION_LABEL[a], cls: `actsw act-${a}`,
-        selected: s.action === a,
-        onTap: () => {
-          if (s.action === a) { s.action = null; s.pasteStamp = null; }
-          else {
-            s.action = a;
-            // Paste defaults to the most recent stamp.
-            s.pasteStamp = a === "paste" ? (s.stamps[0]?.id ?? null) : null;
-          }
-          this.changed();
-        },
-      }));
+    row.append(this.swatch({
+      art: icon("box"), name: "Box", cls: "actsw act-box",
+      selected: s.boxArmed,
+      onTap: () => { s.boxArmed = !s.boxArmed; this.changed(); },
+    }));
+    for (const c of COMMANDS) {
+      const sw = this.swatch({
+        art: icon(COMMAND_ICON[c]), name: COMMAND_LABEL[c], cls: `actsw act-${c}`,
+        onTap: () => { if (s.selCount) this.cb.onSelectCommand?.(c); },
+      });
+      if (!s.selCount) sw.dataset.disabled = "true";
+      row.append(sw);
     }
+    // The history, most recent first. Tapping one pastes it.
     for (const st of s.stamps) {
       row.append(this.swatch({
-        art: stampArt(st), name: st.name, cls: "stampsw",
-        selected: s.action === "paste" && s.pasteStamp === st.id,
-        // Tapping a stamp is "paste this one".
-        onTap: () => {
-          if (s.action === "paste" && s.pasteStamp === st.id) { s.action = null; s.pasteStamp = null; }
-          else { s.action = "paste"; s.pasteStamp = st.id; }
-          this.changed();
-        },
+        art: stampArt(this.T, st.stamp), name: st.name, cls: "stampsw",
+        selected: s.pasteStamp === st.id,
+        onTap: () => this.cb.onPasteStamp?.(st.id),
       }));
     }
   }
 
-  // A cut or copy lands here, most recent first. Called by the board side
-  // once cut/copy exist; for now the debug panel calls it.
-  addStamp(name) {
+  // A cut or copy lands at the front of the history. Returns its id.
+  addStamp(stamp) {
     const s = this.state;
     const id = this.nextStampId++;
-    s.stamps.unshift({ id, name: name || `Stamp ${id}`, dir: 0, flip: false });
+    s.stamps.unshift({ id, name: `Stamp ${id}`, stamp: copyStamp(stamp) });
     s.stamps.length = Math.min(s.stamps.length, STAMP_HISTORY);
-    if (s.action === "paste" && !s.stamps.some(t => t.id === s.pasteStamp)) s.pasteStamp = s.stamps[0].id;
     this.changed();
     return id;
+  }
+
+  setPasting(id) {
+    this.state.pasteStamp = id;
+    this.state.boxArmed = false;
+    this.changed();
+  }
+
+  setSelection(n) {
+    if (this.state.selCount === n) return;
+    this.state.selCount = n;
+    this.render();
   }
 
   clearStamps() {
     const s = this.state;
     s.stamps = [];
-    if (s.action === "paste") s.pasteStamp = null;
+    s.pasteStamp = null;
     this.changed();
   }
 
@@ -499,7 +516,13 @@ export class Shell {
       slot === null ? "Add a tool" : `Slot ${slot + 1}`;
     const list = p.querySelector("#picker-list");
     list.replaceChildren();
-    for (const entry of catalog(this.T)) {
+    // The machines, then the stamp history: baking a stamp into a slot is
+    // how one from deep in the history is kept to hand.
+    const entries = [
+      ...catalog(this.T),
+      ...s.stamps.map(st => ({ kind: "stamp", label: st.name, stamp: st.stamp, name: st.name })),
+    ];
+    for (const entry of entries) {
       const b = document.createElement("button");
       b.type = "button";
       b.className = "pick";
@@ -507,7 +530,9 @@ export class Shell {
       b.innerHTML = `<span class="pick-art">${toolArt(this.T, { ...entry, dir: 0, flip: false })}</span>` +
                     `<span>${entry.label}</span>`;
       b.addEventListener("click", () => {
-        const tool = { kind: entry.kind, ...(entry.type ? { type: entry.type } : {}), dir: 0, flip: false };
+        const tool = entry.kind === "stamp"
+          ? { kind: "stamp", name: entry.name, stamp: copyStamp(entry.stamp), dir: 0, flip: false }
+          : { kind: entry.kind, ...(entry.type ? { type: entry.type } : {}), dir: 0, flip: false };
         if (slot === null) { s.slots.push(tool); s.selected = s.slots.length - 1; }
         else { s.slots[slot] = tool; s.selected = slot; }
         this.closePicker();

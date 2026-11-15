@@ -66,8 +66,9 @@ export class Camera {
 //          ambiguous -- it may become a tap or a drag -- so nothing happens
 //          until it resolves (the desktop's STATE_ARMED).
 //   tap    the finger lifted while still a press.
-//   drag   it moved past TAP_SLOP while `hooks.drag.wants()` -- the belt
-//          planner moving an end of its run. Otherwise it is a
+//   drag   it moved past TAP_SLOP while `hooks.drag.wants(x, y)` (x, y the
+//          press) -- moving a run's tip, a ghost, the selection, or a box
+//          selection. Otherwise it is a
 //   pan    and moves the camera.
 //   pinch  a second finger landed: always the camera, whatever was going on.
 //          A drag in progress ends where it is, and does not snap back.
@@ -90,7 +91,9 @@ export function attachGestures(el, camera, onChange, hooks = {}) {
     const r = el.getBoundingClientRect();
     return [e.clientX - r.left, e.clientY - r.top];
   };
-  const wantsDrag = () => !!hooks.drag?.wants();
+  // The press point lets the board claim a drag by where it began (the
+  // selection is dragged only from a selected entity).
+  const wantsDrag = (x, y) => !!hooks.drag?.wants(x, y);
 
   el.addEventListener("pointerdown", (e) => {
     el.setPointerCapture(e.pointerId);
@@ -117,7 +120,7 @@ export function attachGestures(el, camera, onChange, hooks = {}) {
 
     if (gesture === "press") {
       if (Math.hypot(p[0] - press.x, p[1] - press.y) <= TAP_SLOP) return;
-      if (wantsDrag()) {
+      if (wantsDrag(press.x, press.y)) {
         gesture = "drag";
         hooks.drag.begin(press.x, press.y);
       } else {

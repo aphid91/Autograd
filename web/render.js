@@ -24,6 +24,8 @@ const COL = {
   select: "#e8a33d",
   handle: "rgba(232,163,61,0.28)",
   frustrated: "rgba(230,64,56,0.55)",
+  lifted: "#5fd3e6",
+  liftedFill: "rgba(95,211,230,0.12)",
   portEdge: "#000000",
 };
 
@@ -90,7 +92,8 @@ export function render(ctx, board, cam, dpr, opts = {}) {
   ctx.lineWidth = 2 * px;
   ctx.strokeRect(0, 0, board.width, board.height);
 
-  if (view.ghost) drawGhost(ctx, board.T, view.ghost, z, px, on, S, view.ports);
+  const ghosts = (view.ghosts || [view.ghost]).filter(Boolean);
+  for (const g of ghosts) drawGhost(ctx, board.T, g, z, px, on, S, view.ports);
 
   // The inspected entity: an outline that stays a few pixels wide at any
   // zoom, drawn over everything so it cannot be hidden by what it marks.
@@ -104,11 +107,9 @@ export function render(ctx, board, cam, dpr, opts = {}) {
 
   if (view.labels && z >= LOD.labels) {
     drawLabels(ctx, board.T, board.structs, cam, dpr, on);
-    if (view.ghost?.structs?.length) {
-      ctx.globalAlpha = 0.7;
-      drawLabels(ctx, board.T, view.ghost.structs, cam, dpr, on);
-      ctx.globalAlpha = 1;
-    }
+    ctx.globalAlpha = 0.7;
+    for (const g of ghosts) if (g.structs?.length) drawLabels(ctx, board.T, g.structs, cam, dpr, on);
+    ctx.globalAlpha = 1;
   }
 }
 
@@ -266,6 +267,29 @@ function drawGhost(ctx, T, g, z, px, on, S, ports) {
     ctx.lineWidth = Math.max(0.05, 2 * px);
     ctx.setLineDash([6 * px, 4 * px]);
     ctx.strokeRect(g.box.x, g.box.y, g.box.w, g.box.h);
+    ctx.setLineDash([]);
+  }
+  // A selection: each lifted entity outlined, so it reads as picked up
+  // rather than as a plan.
+  if (g.outlines?.length) {
+    const pad = 1.5 * px;
+    ctx.beginPath();
+    for (const b of g.outlines) if (on(b.x, b.y, b.w, b.h)) ctx.rect(b.x + pad, b.y + pad, b.w - 2 * pad, b.h - 2 * pad);
+    ctx.fillStyle = COL.liftedFill;
+    ctx.fill();
+    ctx.strokeStyle = COL.lifted;
+    ctx.lineWidth = Math.max(0.04, 2 * px);
+    ctx.stroke();
+  }
+  // A box selection being dragged out: the cells it will touch.
+  if (g.rect) {
+    const r = g.rect;
+    ctx.fillStyle = COL.liftedFill;
+    ctx.fillRect(r.x, r.y, r.w, r.h);
+    ctx.strokeStyle = COL.lifted;
+    ctx.lineWidth = Math.max(0.05, 2 * px);
+    ctx.setLineDash([6 * px, 4 * px]);
+    ctx.strokeRect(r.x, r.y, r.w, r.h);
     ctx.setLineDash([]);
   }
 }

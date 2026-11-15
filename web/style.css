@@ -352,8 +352,8 @@ html, body {
 }
 .swb svg { width: 100%; height: 100%; }
 /* Tool art is drawn filled, not as a line icon. */
-.sw:not(.actsw):not(.addsw):not(.stampsw) .swb svg { stroke: none; }
-.actsw .swb, .addsw .swb, .stampsw .swb { padding: calc(10 * var(--u)); }
+.sw:not(.actsw):not(.addsw) .swb svg { stroke: none; }
+.actsw .swb, .addsw .swb { padding: calc(10 * var(--u)); }
 .addsw .swb { border-style: dashed; color: var(--ink-dim); background: transparent; }
 .act-delete .swb { color: #f08a84; }
 .act-cut .swb { color: #f0d27a; }
@@ -496,6 +496,9 @@ html, body {
   gap: calc(9 * var(--u)) calc(8 * var(--u));
   margin-left: calc(6 * var(--u));
 }
+/* A command with nothing selected to act on. */
+.sw[data-disabled="true"] .swb { opacity: 0.35; }
+
 #swatches[data-mode="inspect"] { gap: calc(8 * var(--u)); }
 .rowlabel {
   color: var(--ink-dim);

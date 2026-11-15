@@ -8,6 +8,8 @@
 // Machines come from types.json, so a new machine in core/entity.py appears
 // in the picker with no change here.
 
+import { isValidStamp, typeByName } from "./stamp.js";
+
 export const CW = (d) => (d + 3) % 4;    // directions are CCW quarter turns
 export const CCW = (d) => (d + 1) % 4;
 
@@ -28,10 +30,13 @@ export function catalog(T) {
 }
 
 export function sameTool(a, b) {
-  return a.kind === b.kind && (a.kind !== "structure" || a.type === b.type);
+  if (a.kind !== b.kind) return false;
+  if (a.kind === "stamp") return a.stamp === b.stamp;
+  return a.kind !== "structure" || a.type === b.type;
 }
 
 export function labelFor(T, slot) {
+  if (slot.kind === "stamp") return slot.name || "Stamp";
   const hit = catalog(T).find(c => sameTool(c, slot));
   return hit ? hit.label : "?";
 }
@@ -39,6 +44,7 @@ export function labelFor(T, slot) {
 // Does this slot still name something this build has? An entry naming a
 // machine that no longer exists costs that slot, not the whole bar.
 export function isKnown(T, slot) {
+  if (slot && slot.kind === "stamp") return isValidStamp(T, slot.stamp);
   return !!slot && catalog(T).some(c => sameTool(c, slot));
 }
 
@@ -64,7 +70,7 @@ export function toolValue(slot) {
 // that mirrors onto itself (Sink) is achiral. The underground uses flip for
 // "which end does the next tap lay", as on the desktop.
 export function canFlip(T, slot) {
-  if (slot.kind === "under") return true;
+  if (slot.kind === "under" || slot.kind === "stamp") return true;
   if (slot.kind !== "structure") return false;
   const td = typeOf(T, slot.type);
   return !!(td && td.chiral);
@@ -103,6 +109,7 @@ function frame(w, h, body) {
 }
 
 export function toolArt(T, slot) {
+  if (slot.kind === "stamp") return stampArt(T, slot.stamp);
   const d = slot.dir | 0;
   if (slot.kind === "belt" || slot.kind === "rawbelt") {
     const [fx, fy] = STEP[d];
@@ -139,15 +146,26 @@ export function toolArt(T, slot) {
     `<path d="${outs}" fill="#f2594d" stroke="#000" stroke-width="0.05"/>`);
 }
 
-// A stamp has no picture yet, so it wears an asymmetric "F": the one glyph
-// that shows rotation and mirroring at a glance.
-export function stampArt(stamp) {
-  const rot = -90 * (stamp.dir | 0);
-  const mir = stamp.flip ? " scale(1 -1)" : "";
-  return `<svg viewBox="0 0 24 24" aria-hidden="true">` +
-    `<rect x="2.5" y="2.5" width="19" height="19" rx="3" fill="none" stroke="currentColor" ` +
-    `stroke-width="1.4" stroke-dasharray="3 2.2"/>` +
-    `<g transform="rotate(${rot} 12 12)${mir ? " translate(0 24)" + mir : ""}">` +
-    `<path d="M9 18V6h7M9 12h5" fill="none" stroke="currentColor" stroke-width="2.2" ` +
-    `stroke-linecap="round" stroke-linejoin="round"/></g></svg>`;
+// A stamp drawn small: machines as their coloured bodies, belts as their
+// spines, underground ends as dark squares. Enough to tell two stamps apart
+// and to see which way one is turned.
+export function stampArt(T, stamp) {
+  if (!stamp || !stamp.entries) return "";
+  let body = "";
+  for (const e of stamp.entries) {
+    const t = typeByName(T, e.type);
+    if (!t) continue;
+    const o = t.td.orient[`${e.dir}${e.flip ? 1 : 0}`];
+    if (t.td.kind === "belt") {
+      const [fx, fy] = STEP[e.dir];
+      const cx = e.dx + 0.5, cy = e.dy + 0.5;
+      body += `<path d="M${cx - fx * 0.5} ${cy - fy * 0.5}L${cx + fx * 0.5} ${cy + fy * 0.5}" stroke="#757885" stroke-width="0.4"/>`;
+    } else if (t.td.kind === "under") {
+      body += `<rect x="${e.dx + 0.15}" y="${e.dy + 0.15}" width="0.7" height="0.7" fill="#6b7380"/>`;
+    } else {
+      const c = t.td.colour || [0.5, 0.5, 0.5];
+      body += `<rect x="${e.dx + 0.06}" y="${e.dy + 0.06}" width="${o.w - 0.12}" height="${o.h - 0.12}" fill="${css(c)}"/>`;
+    }
+  }
+  return frame(Math.max(1, stamp.w), Math.max(1, stamp.h), body);
 }

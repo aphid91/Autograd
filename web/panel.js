@@ -47,7 +47,6 @@ export class Panel {
     }
 
     const dbg = this.pane.addFolder({ title: "Debug", expanded: false });
-    dbg.addButton({ title: "Add test stamp" }).on("click", () => cb.onAddStamp());
     dbg.addButton({ title: "Clear stamps" }).on("click", () => cb.onClearStamps());
   }
 

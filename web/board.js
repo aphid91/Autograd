@@ -178,7 +178,7 @@ export class Board {
   // Each cell's .y holds its offset within the PLACED footprint, which is
   // what Gameboard._stamp_footprint() writes and what the desktop renderer
   // un-places to find a port.
-  spawnStructure(type, origin, dir, flip, { emit = null } = {}) {
+  spawnStructure(type, origin, dir, flip, { emit = null, derive = true } = {}) {
     const E = this.T.entity, C = this.T.cell, S = E.STRIDE;
     const { o, blocked } = this.footprint(type, origin, dir, flip);
     if (blocked.length) return -1;
@@ -206,7 +206,7 @@ export class Board {
         this.grid[i + 3] = 0;
       }
     }
-    this.derive();
+    if (derive) this.derive();
     return row;
   }
 
@@ -219,6 +219,138 @@ export class Board {
       const x = this.field(r, E.F_ORIGIN_X) | 0, y = this.field(r, E.F_ORIGIN_Y) | 0;
       this.grid[(y * this.width + x) * 4 + 2] |= C.UNDER_PAIRED_BIT;
     }
+  }
+
+  // Drop the link from whatever was paired with `row` (Engine.unpair_under):
+  // a surviving end left pointing at a freed row would draw a span to
+  // nothing, and could re-pair wrongly once the row is reused.
+  unpairUnder(row) {
+    const E = this.T.entity, C = this.T.cell;
+    if (!this.alive(row) || (this.field(row, E.F_TYPE) | 0) !== C.TYPE_UNDER) return;
+    const other = this.field(row, E.F_UNDER_PARTNER) | 0;
+    if (!other || !this.alive(other)) return;
+    if ((this.field(other, E.F_UNDER_PARTNER) | 0) !== row) return;
+    this.setField(other, E.F_UNDER_PARTNER, 0);
+    const x = this.field(other, E.F_ORIGIN_X) | 0, y = this.field(other, E.F_ORIGIN_Y) | 0;
+    this.grid[(y * this.width + x) * 4 + 2] &= ~C.UNDER_PAIRED_BIT;
+  }
+
+  alive(row) { return row > 0 && row < this.rows && !!this.field(row, this.T.entity.F_ALIVE); }
+
+  // Gameboard.despawn(): clear every cell, zero the row, free it.
+  despawn(row) {
+    const E = this.T.entity, S = E.STRIDE;
+    if (!this.alive(row)) return;
+    const x = this.field(row, E.F_ORIGIN_X) | 0, y = this.field(row, E.F_ORIGIN_Y) | 0;
+    const w = this.field(row, E.F_W) | 0, h = this.field(row, E.F_H) | 0;
+    for (let lx = 0; lx < w; lx++) {
+      for (let ly = 0; ly < h; ly++) this.grid.fill(0, ((y + ly) * this.width + x + lx) * 4, ((y + ly) * this.width + x + lx + 1) * 4);
+    }
+    this.entities.fill(0, row * S, (row + 1) * S);
+    this.freeRows.push(row);
+    this.liveCount--;
+  }
+
+  // Engine.erase() for a set of rows: unpair, despawn, derive once.
+  eraseRows(rows) {
+    for (const r of rows) { this.unpairUnder(r); this.despawn(r); }
+    this.derive();
+  }
+
+  // Rows as stamp entries in ABSOLUTE coordinates (dx, dy = the origin).
+  // An underground's partner becomes an index into the result when the
+  // partner is among `rows`, else null -- core/clipboard.py capture().
+  capture(rows) {
+    const E = this.T.entity, C = this.T.cell;
+    const index = new Map(rows.map((r, i) => [r, i]));
+    return rows.map((r) => {
+      const type = this.field(r, E.F_TYPE) | 0;
+      const td = this.T.types[type];
+      const partner = type === C.TYPE_UNDER ? this.field(r, E.F_UNDER_PARTNER) | 0 : 0;
+      return {
+        type: td.name,
+        dx: this.field(r, E.F_ORIGIN_X) | 0, dy: this.field(r, E.F_ORIGIN_Y) | 0,
+        dir: this.field(r, E.F_DIR) | 0, flip: !!this.field(r, E.F_FLIPPED),
+        exit: type === C.TYPE_UNDER && !!this.field(r, E.F_UNDER_IS_EXIT),
+        partner: partner && index.has(partner) ? index.get(partner) : null,
+        emit: td.name === "source" ? this.field(r, E.F_EMIT) : null,
+        seed: td.kind === "belt" && this.field(r, E.F_SEED_ON) ? this.field(r, E.F_SEED_VALUE) : null,
+      };
+    });
+  }
+
+  // Can entry `e` (a stamp entry) go at origin (x, y)? Returns its blocked
+  // cells; empty means yes.
+  entryBlocked(e, x, y) {
+    const t = this.typeId(e.type);
+    const o = this.T.types[t].orient[`${e.dir}${e.flip ? 1 : 0}`];
+    const out = [];
+    for (let lx = 0; lx < o.w; lx++) {
+      for (let ly = 0; ly < o.h; ly++) if (!this.isFree(x + lx, y + ly)) out.push({ x: x + lx, y: y + ly });
+    }
+    return out;
+  }
+
+  typeId(name) {
+    if (!this._typeIds) {
+      this._typeIds = new Map(Object.entries(this.T.types).map(([id, td]) => [td.name, Number(id)]));
+    }
+    return this._typeIds.get(name);
+  }
+
+  // Place stamp entries, each at its own absolute origin `at[i]`, PARTIALLY:
+  // every entry that fits is placed and any that clashes is skipped -- the
+  // desktop's shift-click paste. Then pairs: first the stamp's own (both
+  // ends placed), then each remaining unpaired end with its nearest
+  // candidate, the order Engine.commit_ghosts() uses so a pasted exit cannot
+  // be grabbed by an unrelated entrance at the paste site. Returns the set
+  // of indices placed.
+  placeEntries(entries, at) {
+    const C = this.T.cell;
+    const rows = new Map();
+    entries.forEach((e, i) => {
+      const [x, y] = at[i];
+      if (this.entryBlocked(e, x, y).length) return;
+      const t = this.typeId(e.type);
+      let row;
+      if (t === C.TYPE_BELT) row = this.spawnBelt(x, y, e.dir, e.seed ?? null);
+      else if (t === C.TYPE_UNDER) row = this.spawn1(t, x, y, e.dir, { isExit: e.exit });
+      else row = this.spawnStructure(t, [x, y], e.dir, e.flip, { emit: e.emit, derive: false });
+      rows.set(i, row);
+    });
+    const E = this.T.entity;
+    for (const [i, row] of rows) {
+      const p = entries[i].partner;
+      if (p !== null && p !== undefined && rows.has(p) && !this.field(row, E.F_UNDER_PARTNER)) {
+        this.pairUnder(row, rows.get(p));
+      }
+    }
+    for (const [i, row] of rows) {
+      if (this.typeId(entries[i].type) !== C.TYPE_UNDER || this.field(row, E.F_UNDER_PARTNER)) continue;
+      const mate = this.findUnderPartner(at[i][0], at[i][1], entries[i].dir, entries[i].exit);
+      if (mate > 0) this.pairUnder(row, mate);
+    }
+    this.derive();
+    return new Set(rows.keys());
+  }
+
+  // Engine.find_under_partner(): the nearest unpaired end of the opposite
+  // role with the same facing, looking upstream from a new exit and
+  // downstream from a new entrance. Nothing in between blocks.
+  findUnderPartner(x, y, dir, isExit) {
+    const E = this.T.entity, C = this.T.cell;
+    const [sx, sy] = C.DIR_STEPS[dir];
+    const sign = isExit ? -1 : 1;
+    for (let d = 1; d <= this.T.under.MAX_SPAN; d++) {
+      const cx = x + sx * sign * d, cy = y + sy * sign * d;
+      if (cx < 0 || cy < 0 || cx >= this.width || cy >= this.height) break;
+      const row = this.entityAt(cx, cy);
+      if (row < 0 || (this.field(row, E.F_TYPE) | 0) !== C.TYPE_UNDER) continue;
+      if (!!this.field(row, E.F_UNDER_IS_EXIT) === isExit) continue;
+      if ((this.field(row, E.F_DIR) | 0) !== dir || this.field(row, E.F_UNDER_PARTNER)) continue;
+      return row;
+    }
+    return -1;
   }
 
   // Build a planner.js plan: belts, then each underground pair. Blocked and
@@ -343,13 +475,13 @@ export class Board {
   // Which side a belt takes from: core/segments.py take_dir(). Straight
   // through first, then counter-clockwise from the facing. The cell we
   // output into is never a source.
-  incoming(x, y, facing) {
+  incoming(x, y, facing, emits = (nx, ny, d) => this.emitsToward(nx, ny, d)) {
     const S = this.T.cell.DIR_STEPS;
     let mask = 0;
     for (let d = 0; d < 4; d++) {
       if (d === facing) continue;
       const nx = x + S[d][0], ny = y + S[d][1];
-      if (this.emitsToward(nx, ny, (d + 2) % 4)) mask |= 1 << d;
+      if (emits(nx, ny, (d + 2) % 4)) mask |= 1 << d;
     }
     if (!mask) return -1;
     const behind = (facing + 2) % 4;

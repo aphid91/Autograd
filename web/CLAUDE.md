@@ -8,10 +8,12 @@ copy/paste, move/rotate/flip, seeds and Source values, camera, toolbelt.
 Read the root CLAUDE.md for what the game *is*; most of its engineering
 notes are about the tick and do not apply here.
 
-Current state: **the phone shell, the belt planner, machine placement and
-per-instance settings.** It loads a save, pans (one finger) and zooms (pinch,
-or the wheel), lays belt runs (auto-tunnelling under obstacles), places
-machines and raw belts, and edits a Source's emit value or a belt's seed.
+Current state: **the phone shell, the belt planner, machine placement,
+per-instance settings, and select / cut / copy / paste.** It loads a save,
+pans (one finger) and zooms (pinch, or the wheel), lays belt runs
+(auto-tunnelling under obstacles), places machines and raw belts, edits a
+Source's emit value or a belt's seed, and selects, moves, turns, deletes,
+copies and pastes groups of entities.
 Nothing ticks, Underground has no tool flow of its own (the planner covers
 it), and edits are not saved back to a file.
 
@@ -38,16 +40,17 @@ scale 1.15.
   - **Build**: the toolbelt. Tap selects, tapping the held slot again puts it
     down, **long press** (right-click on a mouse) opens the picker for that
     slot, and the `+` swatch appends. Slots persist in localStorage.
-  - **Select**: Delete, Cut, Copy, Paste, then the stamp history, most recent
-    first. Tapping a stamp means "paste this one"; Paste alone takes the most
-    recent. No selection rectangle exists yet, so stamps come only from
-    the panel's Debug folder.
-  - **Hand**: the bar is empty (deferred). Tapping the board inspects: the
-    Status folder opens in the panel, and a tap on bare board closes it.
+  - **Select**: Box, Delete, Cut, Copy, then the stamp history, most recent
+    first. See "Selecting" below.
+  - **Hand**: tapping the board inspects: the Status folder opens in the
+    panel, and a tap on bare board closes it. While Status shows a Source or
+    a belt, the bar offers the number swatches (0, 1, −1, 2, 4, 8) for its
+    emit value or seed; on a belt, tapping the lit number unseeds it.
 - **Sim** (right): Reset (ctrl+R) and Play/Pause. Neither is wired to a
   simulation; Play/Pause only swaps its icon. Space toggles it.
 - **Turn**: rotate CW, CCW, and flip. They act on what the hand holds: the
-  held tool in Build, the pasted stamp in Select. A swatch draws its tool **at
+  held tool in Build (a stamp tool turns its stamp), the stamp being pasted,
+  or the selection. A swatch draws its tool **at
   the orientation the next placement would have**, from the placed port
   tables in `types.json`, so turning is visible with nothing on the board.
   Flip is disabled on tools with no chirality (belts, Sink); on the
@@ -83,7 +86,8 @@ The gesture, with the Belt tool held:
 
 | input | idle | planning |
 |---|---|---|
-| tap | start a run on that cell | **build** the run exactly as shown |
+| tap | start a run on that cell | **on the tip** (or within 20 px): turn it, cycling straight, right, left |
+| | | **anywhere else**: **build** the run exactly as shown |
 | one-finger drag | pan | move the run's **tip** |
 | two fingers | pan / zoom | pan / zoom, always |
 | rotate CW / CCW | turn the swatch | turn the **tip** |
@@ -108,6 +112,12 @@ Four rules, each chosen over an obvious alternative:
   four facings, starting from the swatch's own rotation.
 - **The second tap builds what is shown**, rather than moving the tip to
   where the finger landed. Tapping is a confirmation, not an aim.
+
+**Thumb pads.** While anything is planned (a run, a placement, a paste) the
+Turn buttons appear again in both bottom corners of the board -- rotate
+left and right, flip above them -- so the thumb steering the ghost need not
+travel to the Turn row. On a belt run, flip toggles the route. Added in its
+own commit as an experiment.
 
 A second finger mid-drag ends the drag where it is and becomes a pinch. If
 it then drops back to one finger, that finger does nothing (`dead` in
@@ -155,11 +165,75 @@ the footprint about its middle.
   clears it). The choice is stored on the slot (`slot.value`), so it carries
   to the next placement.
 
+Underground ends draw **narrowing toward the buried side** (the front of an
+entrance, the back of an exit), on the board and on the swatch.
+
 `Board.spawnStructure()` stamps every cell with its offset within the
 **placed** footprint, as `Gameboard._stamp_footprint()` does. Checked by
 re-placing every machine on a board (1,026 of them, the save's own plus new
 ones) with the desktop's `spawn()` and comparing every cell and row field:
 no differences.
+
+## Selecting
+
+Select mode lifts entities **off the board**. A selected entity is deleted
+from the board and held in `sel`, a stamp at a pose; it draws as a ghost
+outlined in cyan. Deselecting places it back wherever the selection now is.
+
+| input | does |
+|---|---|
+| tap a board entity | select it |
+| tap a selected entity | deselect it, if it fits where it now is |
+| tap empty board | deselect everything that fits |
+| one-finger drag from a selected entity | move the whole selection |
+| one-finger drag elsewhere | pan |
+| Box, then a drag (from anywhere) | a rectangle: everything it touches toggles, then Box disarms |
+| Turn buttons | turn / mirror the selection as one stamp |
+| Delete | discard the selection |
+| Cut | the selection becomes a stamp, is discarded, and pasting starts |
+| Copy | the selection becomes a stamp and goes back down; if all of it fit, pasting starts |
+| a stamp swatch | paste it (tap it again to stop) |
+
+- **Deselecting is "if able", per entity.** Anything that does not fit
+  (moved onto something, say) stays selected, tinted red where it clashes.
+  So a deselect-all can leave a few behind, and Copy then does not start
+  pasting, leaving the player to deal with them.
+- **The Box toggles, and collects before it drops.** Board entities in the
+  rectangle are gathered first, then selected entities in it go back down,
+  then the gathered ones are lifted, so nothing the box just dropped is
+  picked straight back up.
+- **The pose is a continuous centre point**, like a placement ghost, so four
+  turns come back exactly where they started. It is re-centred on the
+  selection's box whenever the membership changes.
+- **Pasting never coexists with a selection.** Entering a paste puts the
+  selection down and deletes whatever of it could not go down.
+- **Leaving Select puts the selection down.** What does not fit stays lifted
+  and is still there on coming back.
+- **Underground pairs.** Lifting one end of a pair releases the other
+  (`Engine.unpair_under()`). Both ends lifted stay paired to each other.
+  Placing back pairs the stamp's own ends first, then each unpaired end
+  with its nearest candidate, the order `Engine.commit_ghosts()` uses.
+
+Pasting is the machine-placement flow with a stamp: tap for a ghost, drag
+it, tap the ghost to place and keep pasting, tap elsewhere to place and
+stop. It places **partially** (whatever fits, the desktop's shift-click),
+not all-or-nothing. The bar shows Cancel and the two rotations.
+
+A stamp from the history can be **baked into a toolbar slot** from the
+slot picker (long press), which lists the history after the machines. It
+then places in Build with the same flow, and its Turn buttons turn its own
+stamp. The stamp is stored in the slot, so it survives a reload; the
+history itself is in-session.
+
+[stamp.js](stamp.js) is the geometry, a port of `core/stamp.py`
+(`rotated()`, `mirrored()`), **tested against the Python methods
+themselves** on random stamps of every type and orientation.
+`Board.capture()` / `eraseRows()` / `placeEntries()` port the clipboard's
+capture, `Engine.erase()` and the paste commit. Checked by box-selecting
+147 entities of `cpu.npz` (with 4 underground pairs inside) and putting them
+back: the desktop's `SegmentIndex` found the same entities, the same 703
+segment lengths and the same 334 paired underground ends, with a clean
+audit; turned 180° and put back, still a clean audit.
 
 ### Auto-undergrounds
 
@@ -252,10 +326,12 @@ is harmless and removes double-tap arbitration.
 | `panel.js` | the Tweakpane panel: saves, View, Debug, Status |
 | `vendor/` | Tweakpane 4.0.5, vendored |
 | `npz.js` | `.npz` reader: zip directory + native `DecompressionStream` + `.npy` headers |
-| `board.js` | the save's arrays, validation, derived render lists, `entityAt`/`describe`, and the two setting writers |
+| `board.js` | the save's arrays, validation, derived render lists, `entityAt`/`describe`, placing, erasing, capturing, and the two setting writers |
 | `camera.js` | camera (world +Y up, zoom in CSS px/cell), pointer gestures, and taps |
 | `render.js` | Canvas 2D drawing under a world transform; labels in screen space |
 | `planner.js` | belt-run geometry: paths, facings, the tip, auto-undergrounds |
+| `stamp.js` | stamps: rotate and mirror (port of `core/stamp.py`), cells, subsets |
+| `ghost.js` | a stamp at a board position, in the renderer's shapes |
 | `placer.js` | where a ghost's footprint sits: the port of `origin_for_cursor()` |
 | `tests/` | `node --test` suites for the pure modules |
 | `types.json` | generated — do not edit |
@@ -276,7 +352,7 @@ time, for the console and headless tests.
 node --test web/tests/*.test.mjs
 ```
 
-Pure-JS tests (the planner) run in Node, with no npm and no browser.
+Pure-JS tests (the planner, the placer, the stamp transforms) run in Node, with no npm and no browser.
 
 Playwright with phone emulation (`devices['Pixel 7']`) and CDP
 `Input.dispatchTouchEvent` drives real multi-touch. Check counts against
