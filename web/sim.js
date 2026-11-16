@@ -58,6 +58,11 @@ export class Sim {
     this.gateOf = new Map();        // row -> gate record
     this.edges = [];                // direct gate-to-gate hand-offs
     this.stats = { rebuilds: 0, fired: 0, pushed: 0, popped: 0, direct: 0, destroyed: 0 };
+    // Bumped by every change to the simulation's state (a tick, a rebuild),
+    // so a forecast knows when it is stale.
+    this.version = 0;
+    this.rec = null;                // the forecast's event log, while one runs
+    this.fc = null;                 // the last forecast
     this.sync();
   }
 
@@ -258,6 +263,7 @@ export class Sim {
   sync() {
     if (this.board.revision === this.seen) return false;
     this.seen = this.board.revision;
+    this.version++;
     this.rebuild();
     this.flush();
     this.seed();
@@ -539,6 +545,7 @@ export class Sim {
 
   push(seg, payload, tick) {
     const slot = seg.tail % seg.cap;
+    if (this.rec) this.rec.slots.push([seg, slot, seg.enter[slot], seg.payload[slot]]);
     seg.enter[slot] = tick;
     seg.payload[slot] = payload;
     seg.tail++;
@@ -553,6 +560,7 @@ export class Sim {
     seg.anchor = Math.min(seg.anchor + this.speed, length);
     if (seg.head !== seg.tail && this.positionOf(seg, seg.head, tick) === length) {
       if (this.accept(seg, seg.payload[seg.head % seg.cap])) {
+        if (this.rec) this.rec.pops.set(seg, seg.payload[seg.head % seg.cap]);
         seg.head++;
         seg.anchor = Math.max(0, length - this.spacing);
         this.stats.popped++;
@@ -561,6 +569,7 @@ export class Sim {
     if (this.hasRoom(seg, tick)) {
       const v = this.offer(seg);
       if (v !== null) {
+        if (this.rec) this.rec.pushes.set(seg, v);
         this.push(seg, v, tick);
         this.took(seg);
       }
@@ -592,6 +601,7 @@ export class Sim {
   // One whole tick: structure phase, belt phase, then the counter.
   step() {
     this.sync();
+    this.version++;
     this.structurePhase();
     for (const seg of this.order) this.tickSegment(seg, this.tick);
     this.deliverDirect();
@@ -628,24 +638,29 @@ export class Sim {
       if (!drains.length) return false;
       const emit = this.f(row, this.T.entity.F_EMIT);
       const results = evalOps(this.T, s.ops, [], emit);
-      let produced = 0;
+      const produced = [];
       for (const c of drains) {
         if (this.outHeld(row, c) || c >= results.length || results[c] === null) continue;
         this.setOut(row, c, results[c]);
-        produced++;
+        produced.push(c);
       }
-      return produced > 0;
+      if (this.rec && produced.length) this.rec.fires.set(row, { values: [], results, consumed: [], produced });
+      return produced.length > 0;
     }
     for (const c of drains) if (this.outHeld(row, c)) return false;   // back pressure
     const values = [];
     for (let c = 0; c < s.n_in; c++) values.push(this.inHeld(row, c) ? this.inValue(row, c) : null);
     const results = evalOps(this.T, s.ops, values, 0);
-    for (const c of this.consumed(g, values)) if (this.inHeld(row, c)) this.clearIn(row, c);
+    const consumed = this.consumed(g, values).filter(c => this.inHeld(row, c));
+    for (const c of consumed) this.clearIn(row, c);
+    const produced = [];
     results.forEach((v, c) => {
       if (v === null) return;                           // declined: Route's other path
       if (!drains.includes(c)) { this.stats.destroyed++; return; }   // a dangling output is a sink
       this.setOut(row, c, v);
+      produced.push(c);
     });
+    if (this.rec) this.rec.fires.set(row, { values, results, consumed, produced });
     return true;
   }
 
@@ -684,9 +699,67 @@ export class Sim {
     }
     const values = live.map(e => this.outValue(e[0], e[1]));
     live.forEach((e, i) => this.setIn(e[2], e[3], values[i]));
+    if (this.rec) live.forEach((e, i) => this.rec.directs.push([e[0], e[1], e[2], e[3], values[i]]));
     for (const e of live) this.clearOut(e[0], e[1]);
     this.stats.direct += live.length;
     return live.length;
+  }
+
+  // --- the forecast ------------------------------------------------------------------
+  //
+  // What the NEXT step will do, from the state now: which runs pop their head
+  // into which gate, which gates fire (consuming what, producing what), which
+  // runs take a push and from where, and which direct hand-offs happen. The
+  // renderer animates those over the coming tick, so an item can be drawn
+  // moving into, through and out of a machine at the current alpha.
+  //
+  // It is the real step() run on the live state with an event log, then
+  // rolled back -- not a second copy of the rules, so it cannot disagree
+  // with the tick it predicts. Everything the step writes is restored: the
+  // entity table (every gate channel), each run's head/tail/anchor, the one
+  // ring slot each push writes (it may be the slot the popped head lived
+  // in), the tick, the stats and the version. Cached on `version`, so it
+  // costs one extra step per tick drawn, not per frame.
+  forecast() {
+    this.sync();
+    if (this.fc && this.fc.version === this.version) return this.fc;
+    const ent = this.board.entities.slice();
+    const segs = this.order.map(seg => [seg, seg.head, seg.tail, seg.anchor]);
+    const tick = this.tick, version = this.version, stats = { ...this.stats };
+    const rec = { pops: new Map(), pushes: new Map(), fires: new Map(), directs: [], slots: [] };
+    this.rec = rec;
+    try {
+      this.step();
+      // Where each pushed item is at the start of the tick after: usually a
+      // cell in, but a packed run can hold it short of that.
+      for (const [seg, v] of rec.pushes) {
+        rec.pushes.set(seg, { value: v, end: this.positionOf(seg, seg.tail - 1, this.tick, 0) / this.UNIT });
+      }
+    } finally {
+      this.rec = null;
+      this.board.entities.set(ent);
+      for (const [seg, h, t, a] of segs) { seg.head = h; seg.tail = t; seg.anchor = a; }
+      for (let i = rec.slots.length - 1; i >= 0; i--) {
+        const [seg, slot, e, p] = rec.slots[i];
+        seg.enter[slot] = e; seg.payload[slot] = p;
+      }
+      this.tick = tick;
+      this.version = version;
+      Object.assign(this.stats, stats);
+    }
+    // Indexed the ways the renderer asks: a push by the gate channel it came
+    // from, a hand-off by both ends.
+    const pushFrom = new Map(), directFrom = new Map(), directTo = new Map();
+    for (const [seg, push] of rec.pushes) {
+      const p = this.livePort(seg.srcPort);
+      if (p) pushFrom.set(`${p[0]}:${p[1]}`, { seg, ...push });
+    }
+    for (const d of rec.directs) {
+      directFrom.set(`${d[0]}:${d[1]}`, d);
+      directTo.set(`${d[2]}:${d[3]}`, d);
+    }
+    this.fc = { version, pops: rec.pops, pushes: rec.pushes, fires: rec.fires, pushFrom, directFrom, directTo };
+    return this.fc;
   }
 
   // --- reading it back ------------------------------------------------------------

@@ -470,21 +470,92 @@ the board is still redrawn on demand.
 
 ### How items draw
 
-As the desktop's: a dark disc with a ring, **green above zero, red at or
-below**, its number on top once the zoom makes it legible (faded in over the
-shader's 6-10 px glyph band). Each item's position is the closed form at
-`tick + alpha`, never stored. An item at distance `s` along its run is drawn
-from the drawn cell nearest `s`: ahead of the centre along that cell's
-facing, behind it along the way the run came in -- so an item rounding a
-corner arrives from its own side, which the shader (drawing along the
-cell's facing only) does not quite do. Positions with no drawn cell in
-reach (an underground's buried tiles) draw nothing, and so does an item
-parked exactly at a blocked run's end, one cell past the last centre --
-both as on the desktop.
+As the desktop's discs -- a dark disc with a ring, **green above zero, red
+at or below**, its number on top once the zoom makes it legible (faded in
+over the shader's 6-10 px glyph band) -- but **seen all the way through a
+machine**, not popping out of existence at a belt's end. Where every item
+is drawn is [flow.js](flow.js), a pure module over the sim; `render.js`
+only turns its points into discs. Drawn after the machines, so items sit
+over the control overlays.
 
-A gate's **waiting zone** -- a result the belt would not take -- draws as
-the same disc squashed into the gap between the body and the cell edge, so
-back pressure is visible. Normally empty by the end of a tick.
+**One path from belt to belt.** A run's head front edge is a machine's
+**in-edge**; from there an item goes to its input's **wait point**, then to
+an output's **out-edge**, which is the next run's back edge. Its value
+switches at the wait point, as if computed there:
+
+- **An input held in a machine sits at its wait point** -- the middle of
+  its path when every way out runs straight through (Shear's y waits on the
+  boundary between its cells), otherwise the centre of its own cell, so a
+  lane that turns or branches (Floor, Route's a, Merge's a and b, Swap's y
+  and z) waits before committing to a direction. No two lanes share one.
+- **A result held in an output zone sits on the out-edge**, an ordinary
+  disc half on the machine and half on the belt. (The desktop's squashed
+  waiting-zone disc is gone here.)
+- **A run blocked at a full input holds its head on the in-edge.**
+- **Which way out** an item takes is read from the machine's own opcodes
+  (`sourcesOf()` / `linkFor()`): the output whose value came from this
+  input on this fire. `LINKS` only says which input ports can reach which
+  output ports, as geometry; Route's choice and Swap's exchange are the
+  machine's. Swap's exchange cuts **diagonally** from the cell centre to
+  the other cell's port; everything else runs through cell centres. Sink is
+  legacy and has no links: what enters it vanishes at the edge. A Source's
+  results appear on its out-edge.
+
+**Belts draw half a cell back** (`pos - 0.5`). The closed form's 0 is the
+tail cell's centre and its length is one cell past the head's centre, inside
+the next machine; shifted, 0 is the tail's back edge (where a push enters)
+and the length is the head's front edge (where a blocked head waits), so a
+run's ends meet its machines exactly at their ports. The back half of the
+tail cell comes in from the feeding port's face. **Corners**: an item is
+carried by the cell whose centre is nearest, ahead of the centre along that
+cell's facing and behind it along the way the run came in, so it rounds a
+corner on the belt. (This was already so here; the desktop's shader draws
+along the cell's facing only, which is what makes items there vanish into a
+corner and reappear across it -- see `docs/item_flow_spec.md`.)
+
+**The tick is animated from its forecast.** `Sim.forecast()` runs the real
+`step()` on the live state with an event log -- pops, fires (consumed,
+produced), pushes (and where each pushed item lands), direct hand-offs --
+and rolls everything back: the entity table, each run's head/tail/anchor,
+the ring slots pushes wrote, the tick, the stats. Not a second copy of the
+rules, so it cannot disagree with the tick it predicts. Cached on
+`Sim.version` (bumped by every step and rebuild): one extra step per tick
+drawn, about 1 ms on `cpu.npz`, not per frame. Over the coming tick, at
+`alpha`:
+
+- a head that will pop moves from where it is to the in-edge and on to its
+  wait point;
+- an input that will be consumed moves from its wait point to its out-edge
+  and on -- onto the run that takes the push (as far as the closed form will
+  have it next tick), or into the next machine's wait point for a direct
+  hand-off; a result for a dangling output stops at the edge and is gone;
+- a held output that will be pushed or handed off does the same from the
+  edge; a Source's new item starts on the edge (and is not drawn until next
+  tick if it will not move, or it would sit on the item just leaving).
+
+Each covers its whole path at a constant speed. **Items speed up through
+machines**, and that is the tick, not the drawing: a hop costs one tick of
+latency, and on a saturated run the head pops while still a cell short
+(the step advances the anchor before testing the pop), so the last belt
+cell plus the first half of the machine, then the second half plus the
+first belt cell, each pass in one tick.
+
+Two overlaps are real states, not drawing bugs: a packed run's newest item
+at position 0 and a result waiting in the zone behind it are both "on the
+out-edge" for an instant; and a lane that turns along another's centre
+line (Route's a to the right output, Merge's a) crosses that lane's discs
+mid-tick.
+
+`tests/flow.test.mjs` pins it: every fire sends each consumed input down
+exactly one link and reaches each result exactly once (all machines, 200
+value sets); paths start on the in-edge, pass the wait point, end on the
+out-edge, and stay in the body at every orientation; the forecast equals
+the step it predicts and leaves no trace; a run is one unbroken path whose
+ends sit on its machines' port edges; and **the picture is continuous**:
+on six saves over 80 ticks, everything drawn at alpha 1 is drawn at the
+same place at the next tick's alpha 0. Mutation-tested: dropping the half
+shift, the push or hand-off continuation, the pop's start position, the
+corner rule or the tail's port direction each fails it.
 
 **Status** shows a live readout under the settings: a machine's input and
 output channels (`–` empty, `×` an output with nothing to take it, whose
@@ -555,7 +626,8 @@ asserting every array matches and exactly the edited value differs.
 |---|---|
 | `index.html`, `style.css` | the shell: board, controls row, swatch bar, picker sheet |
 | `main.js` | wiring: applies the shell's and panel's requests to the board; resize, redraw, the play loop |
-| `sim.js` | the simulation: segment index, closed-form belts, gates, the clock -- the desktop's CPU tick |
+| `sim.js` | the simulation: segment index, closed-form belts, gates, the clock -- the desktop's CPU tick; `forecast()` |
+| `flow.js` | where items are drawn: belt paths, the machines' internal links and wait points, the tick animated from the forecast |
 | `ui.js` | the shell's state and DOM: modes, sim and turn buttons, thumb pads, swatches, long press, picker |
 | `tools.js` | the tool catalog (from `types.json`) and the swatch drawings |
 | `icons.js` | line icons as path data (mostly Lucide, ISC) |

@@ -42,8 +42,8 @@ const COL = {
   itemHalo: "rgba(15,18,23,0.85)",
 };
 
-// world.frag's ITEM_RADIUS / ITEM_RING, and the waiting zone's squish.
-const ITEM = { r: 0.22, ring: 0.055, waitOffset: 0.44, waitSquish: 0.46 };
+// world.frag's ITEM_RADIUS / ITEM_RING.
+const ITEM = { r: 0.22, ring: 0.055 };
 // An item's number, as a fraction of a cell, and the zoom band it fades in
 // over -- the shader's glyph height (8 * 0.042 cells) and its 6..10 px fade.
 const ITEM_TEXT = { size: 0.3, glyph: 0.336, minPx: 6, goodPx: 10 };
@@ -65,6 +65,7 @@ const emitShown = (s, z, labels) => s.emit !== null && labels && z >= LOD.marks;
 
 import { structGlyph } from "./glyphs.js";
 import { TUNE } from "./tune.js";
+import { itemPoints } from "./flow.js";
 
 const css = (c) => `rgb(${(c[0] * 255) | 0},${(c[1] * 255) | 0},${(c[2] * 255) | 0})`;
 const shade = (c, k) => css(c.map(v => v * k));
@@ -464,66 +465,26 @@ function drawLabels(ctx, T, structs, cam, dpr, on) {
 
 // --- items --------------------------------------------------------------------
 //
-// Positions are never stored: each is the closed form at the current tick
-// plus the clock's alpha, so items glide between ticks exactly as the sim
-// would put them (sim.positionOf). An item at distance s along its run is
-// drawn from the drawn cell nearest s: ahead of that cell's centre along its
-// facing, behind it along the way the run came in (so an item turning a
-// corner arrives from the side it came from). Positions with no drawn cell
-// within reach -- the buried tiles of an underground -- draw nothing, as on
-// the desktop.
+// Where each item is drawn is flow.js's business: on its run (half a cell
+// back, so a run's ends meet its machines' ports), and through a machine
+// along its in -> wait -> out path, animated over the tick from the sim's
+// forecast. Here they only become discs. A result waiting in an output zone
+// is an ordinary disc on the out-edge, half on the machine and half on the
+// belt. Items draw after the machines, so over their control overlays.
 function drawItems(ctx, sim, alpha, z, on, S) {
-  const reach = 0.5 + ITEM.r;
-  const pos = [], neg = [], labels = [];
   const text = textOpacity(z);
-  for (const seg of sim.segments.values()) {
-    if (seg.head === seg.tail) continue;
-    const b = seg.box;
-    if (!on(b.x0 - 1, b.y0 - 1, b.x1 - b.x0 + 2, b.y1 - b.y0 + 2)) continue;
-    const offs = seg.offs, n = offs.length;
-    for (let k = seg.head; k < seg.tail; k++) {
-      const s = sim.positionOf(seg, k, sim.tick, alpha) / sim.UNIT;
-      // The last drawn cell at or before s, then whichever of it and the
-      // next is nearer.
-      let lo = 0, hi = n - 1;
-      while (lo < hi) {
-        const mid = (lo + hi + 1) >> 1;
-        if (offs[mid] <= s) lo = mid; else hi = mid - 1;
-      }
-      let i = lo;
-      if (i + 1 < n && offs[i + 1] - s < s - offs[i]) i++;
-      const d = s - offs[i];
-      if (d > reach || d < -reach) continue;
-      const [cx, cy] = seg.cells[i];
-      let v = S[seg.dirs[i]];
-      if (d < 0 && i > 0) {
-        const [px, py] = seg.cells[i - 1];
-        if (Math.abs(cx - px) + Math.abs(cy - py) === 1) v = [cx - px, cy - py];
-      }
-      const x = cx + 0.5 + v[0] * d, y = cy + 0.5 + v[1] * d;
-      if (!on(x - 0.5, y - 0.5)) continue;
-      const value = seg.payload[k % seg.cap];
-      (value > 0 ? pos : neg).push(x, y);
-      if (text > 0) labels.push(x, y, value);
-    }
+  const { pts } = itemPoints(sim, alpha, {
+    visible: (x0, y0, x1, y1) => on(x0, y0, x1 - x0, y1 - y0),
+    reach: 0.5 + ITEM.r,
+  });
+  const pos = [], neg = [], labels = [];
+  for (let i = 0; i < pts.length; i += 3) {
+    const x = pts[i], y = pts[i + 1], value = pts[i + 2];
+    if (!on(x - 0.5, y - 0.5)) continue;
+    (value > 0 ? pos : neg).push(x, y);
+    if (text > 0) labels.push(x, y, value);
   }
   discs(ctx, pos, neg);
-
-  // Waiting zones: a gate's result the belt would not take, squashed into
-  // the gap between the body and the cell edge -- back pressure, made
-  // visible. Normally empty by the end of a tick, so nothing shows.
-  const wpos = [], wneg = [];
-  for (const g of sim.gates) {
-    for (const p of g.outFaces) {
-      if (!sim.outHeld(g.row, p.ch) || !on(p.x, p.y)) continue;
-      const f = S[p.face];
-      const x = p.x + 0.5 + f[0] * ITEM.waitOffset, y = p.y + 0.5 + f[1] * ITEM.waitOffset;
-      const value = sim.outValue(g.row, p.ch);
-      (value > 0 ? wpos : wneg).push(x, y, f[0] !== 0 ? 1 : 0);
-      if (text > 0) labels.push(x, y, value);
-    }
-  }
-  waiting(ctx, wpos, wneg);
   return labels.length ? { labels, alpha: text } : null;
 }
 
@@ -542,29 +503,6 @@ function discs(ctx, pos, neg) {
   for (const pts of [pos, neg]) {
     for (let i = 0; i < pts.length; i += 2) { ctx.moveTo(pts[i] + inner, pts[i + 1]); ctx.arc(pts[i], pts[i + 1], inner, 0, Math.PI * 2); }
   }
-  ctx.fillStyle = COL.itemFill;
-  ctx.fill();
-}
-
-// The same disc, squashed along the face it is leaving through. Each entry
-// is (x, y, horizontal).
-function waiting(ctx, pos, neg) {
-  const r = ITEM.r, inner = ITEM.r - ITEM.ring, k = ITEM.waitSquish;
-  const ell = (path, x, y, h, rad) => {
-    const rx = h ? rad * k : rad, ry = h ? rad : rad * k;
-    path.moveTo(x + rx, y);
-    path.ellipse(x, y, rx, ry, 0, 0, Math.PI * 2);
-  };
-  for (const [pts, col] of [[pos, COL.itemPos], [neg, COL.itemNeg]]) {
-    if (!pts.length) continue;
-    ctx.beginPath();
-    for (let i = 0; i < pts.length; i += 3) ell(ctx, pts[i], pts[i + 1], pts[i + 2], r);
-    ctx.fillStyle = col;
-    ctx.fill();
-  }
-  if (!pos.length && !neg.length) return;
-  ctx.beginPath();
-  for (const pts of [pos, neg]) for (let i = 0; i < pts.length; i += 3) ell(ctx, pts[i], pts[i + 1], pts[i + 2], inner);
   ctx.fillStyle = COL.itemFill;
   ctx.fill();
 }
