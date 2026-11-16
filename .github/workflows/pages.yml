@@ -34,8 +34,14 @@ jobs:
       # never ship a types.json older than core/entity.py.
       - run: pip install numpy && python tools/export_web_types.py
       - run: bash web/build.sh _site
+      # Named per attempt: artifacts belong to the whole run, so a re-run
+      # would otherwise upload a second "github-pages" beside the first and
+      # deploy-pages refuses to choose between them.
       - uses: actions/upload-pages-artifact@v3
         with:
           path: _site
+          name: github-pages-${{ github.run_attempt }}
       - id: deployment
         uses: actions/deploy-pages@v4
+        with:
+          artifact_name: github-pages-${{ github.run_attempt }}
