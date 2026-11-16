@@ -412,6 +412,18 @@ export class Board {
     return rows.size;
   }
 
+  // Turn a placed belt to face `dir`, in place: the row is kept, so its seed
+  // travels with the turn, as the desktop's empty-hand R does
+  // (Engine._restamp_turned). The facing lives in the row and in the cell's
+  // .x, and both are written. Does not derive(): the caller's edit does.
+  turnBelt(row, dir) {
+    const E = this.T.entity, C = this.T.cell;
+    this.setField(row, E.F_DIR, dir);
+    const x = this.field(row, E.F_ORIGIN_X) | 0, y = this.field(row, E.F_ORIGIN_Y) | 0;
+    const i = (y * this.width + x) * 4;
+    this.grid[i] = (this.grid[i] & ~(C.DIR_MASK << C.DIR_SHIFT)) | (dir << C.DIR_SHIFT);
+  }
+
   // --- per-instance settings ---------------------------------------------
   // Same fields the desktop's Status window writes, so a save made here
   // loads there with the setting intact.

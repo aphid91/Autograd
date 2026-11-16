@@ -116,7 +116,7 @@ The gesture, with the Belt tool held:
 
 | input | idle | planning |
 |---|---|---|
-| tap | start a run on that cell | **on the tip** (or within 20 px): turn it, cycling straight, right, left |
+| tap | start a run on that cell, **including a placed belt** (see below) | **on the tip** (or within 20 px): turn it, cycling straight, right, left |
 | | | **anywhere else**: **build** the run exactly as shown |
 | one-finger drag | pan | move the run's **tip** |
 | two fingers | pan / zoom | pan / zoom, always |
@@ -142,6 +142,20 @@ Four rules, each chosen over an obvious alternative:
   four facings, starting from the swatch's own rotation.
 - **The second tap builds what is shown**, rather than moving the tip to
   where the finger landed. Tapping is a confirmation, not an aim.
+- **A run may start on a placed belt, and turns it.** With the planner
+  held, a tap on a belt (not an underground end, not a machine) starts a
+  run there instead of selecting it, and Build turns that belt to the run's
+  first step. So successive runs chain: stop one short, start the next on
+  its last belt, and that belt is re-aimed -- no need to aim a run's tip
+  before confirming. The turn is **in place** (`Board.turnBelt()`, the
+  desktop's empty-hand R): the row and its seed survive. The start cell
+  counts as free to the planner, and while planning the belt draws only as
+  the ghost, at its new facing. A one-cell run starts at the belt's own
+  facing, so Build with nothing turned changes nothing, and the tip buttons
+  re-aim the belt. If the planner tunnels from the very first cell (an
+  obstacle right after it), the belt is replaced by the entrance, seed and
+  all. The **tip** is unchanged: it still cannot land on anything. A long
+  press still selects the belt's run.
 
 **Thumb pads.** While anything is planned (a run, a placement, a paste) or
 a selection is held, the Turn buttons appear again in both bottom corners of the board -- rotate

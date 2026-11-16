@@ -50,6 +50,9 @@ const clock = new Clock();
 //                still knows the staircase line; the phone does not offer it
 //   tipTurn      the last belt's turn off the travel direction: 0/1/3
 //   singleDir    a one-cell run's facing; `defaultDir` is what it resets to
+//   over         the row of the placed belt the run starts on, or 0. That
+//                belt is turned to follow the run when it is built, rather
+//                than blocking it
 let run = null;
 // During a one-finger drag, what it is moving:
 //   { cell0, world0 }         a run's tip
@@ -125,7 +128,9 @@ function paint(now) {
     run ? ghostOf(currentPlan()) : placeGhost(currentPlacement()),
     boxRect ? { rect: boxRect } : null,
   ];
-  render(ctx, board, cam, dpr, { ...view, selected: info, ghosts, sim, alpha: clock.alpha });
+  // The belt a run starts on draws only as the run's ghost, at its new facing.
+  const hide = run?.over && overStart(run.start[0], run.start[1]) ? run.start : null;
+  render(ctx, board, cam, dpr, { ...view, selected: info, ghosts, sim, alpha: clock.alpha, hide });
   debug.renderMs = performance.now() - t0;
   if (sim && !clock.paused) redraw();
 }
@@ -269,7 +274,11 @@ function onTap(sx, sy) {
   // Idle: a tap on an entity selects it, whatever the hand holds; a tap on
   // empty board is the held tool's.
   const row = board.entityAt(x, y);
-  if (row >= 0) lift([row]);
+  // With the belt planner held, a tap on a placed belt starts a run FROM it:
+  // that belt is turned to follow the run on Build. Machines and underground
+  // ends still select; a long press still selects a belt's whole run.
+  if (row >= 0 && !tool && beltHeld() && isBeltRow(row)) startRun(x, y, row);
+  else if (row >= 0) lift([row]);
   else if (tool) startPlace(wx, wy);
   else if (beltHeld() && x >= 0 && y >= 0 && x < board.width && y < board.height) startRun(x, y);
 }
@@ -288,9 +297,19 @@ function beltHeld() {
   return !!t && t.kind === "belt";
 }
 
+function isBeltRow(row) {
+  return (board.field(row, T.entity.F_TYPE) | 0) === T.cell.TYPE_BELT;
+}
+
+// The run's start cell, when it is a placed belt the run will turn, counts
+// as free: the plan may claim it.
+function overStart(x, y) {
+  return !!run?.over && x === run.start[0] && y === run.start[1] && board.entityAt(x, y) === run.over;
+}
+
 function currentPlan() {
   if (!run || !board) return null;
-  return planRun(run, (x, y) => board.isFree(x, y), T.under.MAX_GAP);
+  return planRun(run, (x, y) => overStart(x, y) || board.isFree(x, y), T.under.MAX_GAP);
 }
 
 // The plan in the renderer's own shapes, so ghosts draw with the same code
@@ -313,17 +332,24 @@ function ghostOf(plan) {
     let inDir = -1;
     if (!prev) inDir = board.incoming(c.x, c.y, c.dir);
     else if (prev.kind !== "blocked" && prev.kind !== "buried" && prev.kind !== "entry") inDir = dirToward(c, prev);
-    belts.push({ x: c.x, y: c.y, dir: c.dir, inDir, seed: 0 });
+    // The placed belt a run starts on keeps its seed, so its ghost shows it.
+    let seed = 0;
+    if (i === 0 && run.over && overStart(c.x, c.y) && board.field(run.over, T.entity.F_SEED_ON)) {
+      seed = board.field(run.over, T.entity.F_SEED_VALUE) > 0 ? 1 : -1;
+    }
+    belts.push({ x: c.x, y: c.y, dir: c.dir, inDir, seed });
   });
   return { belts, unders, blocked, start: run.start, end: run.end };
 }
 
-function startRun(x, y) {
+function startRun(x, y, over = 0) {
   const tool = shell.heldTool;
-  const dir = tool.dir | 0;
+  // Starting on a placed belt, a one-cell run keeps that belt's facing until
+  // turned, so Build with nothing changed changes nothing.
+  const dir = over ? board.field(over, T.entity.F_DIR) | 0 : tool.dir | 0;
   // A slot saved while the line route existed may still say 2.
   const route = ROUTES.includes(tool.route) ? tool.route : ROUTE_H_FIRST;
-  run = { start: [x, y], end: [x, y], route, tipTurn: 0, singleDir: dir, defaultDir: dir };
+  run = { start: [x, y], end: [x, y], route, tipTurn: 0, singleDir: dir, defaultDir: dir, over };
   syncBar();
 }
 
@@ -344,6 +370,14 @@ function commitRun() {
       clearCells(blocked);
       plan = { ...plan, cells: plan.cells.map(c => (c.kind === "blocked" ? { ...c, kind: "belt" } : c)) };
     }
+  }
+  if (plan && run.over && overStart(run.start[0], run.start[1])) {
+    // The belt the run starts on: turned in place to its planned facing, so
+    // its row and seed survive. If the planner made it an underground
+    // entrance instead (an obstacle right after the start), it is replaced.
+    const c = plan.cells[0];
+    if (c.kind === "belt") board.turnBelt(run.over, c.dir);
+    else board.eraseRows([run.over]);
   }
   if (plan) board.buildPlan(plan);
   cancelRun();

@@ -120,7 +120,8 @@ export function render(ctx, board, cam, dpr, opts = {}) {
     }
   }
 
-  drawBelts(ctx, board.belts, z, on, S);
+  const hide = view.hide;
+  drawBelts(ctx, hide ? board.belts.filter(b => b.x !== hide[0] || b.y !== hide[1]) : board.belts, z, on, S);
   drawUnders(ctx, board.unders, z, on, S);
   drawStructs(ctx, board.T, board.structs, z, px, on, S, view.ports, view.labels);
 
