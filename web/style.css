@@ -497,7 +497,9 @@ html, body {
 }
 .planbtn.compact {
   flex: 0 0 auto;
-  width: calc(52 * var(--u));
+  /* 48, not the 52 it was: with a Source's custom-value box the placing
+     bar has to hold three buttons, six swatches and the box on a phone. */
+  width: calc(48 * var(--u));
   height: calc((var(--sw-d) + 14) * var(--u));
   font-size: calc(10 * var(--u));
 }
@@ -616,3 +618,28 @@ html, body {
 .simpanel-custom input:focus { outline: none; border-color: var(--accent); }
 .simpanel-custom input[aria-invalid="true"] { border-color: var(--danger); }
 .simpanel-set { padding: 0 calc(12 * var(--u)); height: calc(30 * var(--u)); }
+
+/* The custom-value box beside the number swatches (a Source's emit value):
+   a swatch-height field, lit like a selected swatch when it holds the value. */
+.numcustom { margin: 0 0 0 calc(4 * var(--u)); display: flex; align-items: center; flex: 0 0 auto; }
+.numcustom input {
+  width: calc(44 * var(--u));
+  height: calc(36 * var(--u));
+  box-sizing: border-box;
+  padding: 0 calc(3 * var(--u));
+  font: inherit;
+  /* 16px or more stops iOS zooming the page when the field takes focus. */
+  font-size: max(16px, calc(12 * var(--u)));
+  text-align: center;
+  font-variant-numeric: tabular-nums;
+  color: var(--ink);
+  background: var(--chrome-2);
+  border: var(--border) solid var(--edge);
+  border-radius: var(--r);
+  -webkit-user-select: text;
+  user-select: text;
+}
+.numcustom input::placeholder { color: var(--ink-dim); }
+.numcustom input:focus { outline: none; border-color: var(--accent); }
+.numcustom[data-selected="true"] input { background: var(--sel-bg); color: var(--sel-ink); border-color: var(--sel-edge); }
+.numcustom input[aria-invalid="true"] { border-color: var(--danger); }

@@ -37,6 +37,22 @@ export class Panel {
     board.addButton({ title: "Open .npz…" }).on("click", () => cb.onOpenFile());
     board.addButton({ title: "Fit board" }).on("click", () => cb.onFit());
 
+    // Browser saves: the board as it stands, kept in this browser under a
+    // name. The list below picks one to load, download as an .npz, or
+    // delete; picking alone does nothing, so choosing what to export never
+    // replaces the board in front of you.
+    board.addBlade({ view: "separator" });
+    this.local = { name: "", saved: "" };
+    this.nameBinding = board.addBinding(this.local, "name", { label: "name" });
+    this.localSaveBtn = board.addButton({ title: "Save to browser" });
+    this.localSaveBtn.on("click", () => cb.onSaveLocal(this.local.name.trim()));
+    this.localBinding = null;
+    this.localActions = [
+      board.addButton({ title: "Load saved" }).on("click", () => this.local.saved && cb.onLoadLocal(this.local.saved)),
+      board.addButton({ title: "Export .npz" }).on("click", () => this.local.saved && cb.onExportLocal(this.local.saved)),
+      board.addButton({ title: "Delete saved" }).on("click", () => this.local.saved && cb.onDeleteLocal(this.local.saved)),
+    ];
+
     this.view = { grid: true, ports: true, labels: true, ...this.prefs.view };
     const view = this.pane.addFolder({ title: "View", expanded: false });
     for (const [key, label] of [["grid", "grid lines"], ["ports", "ports"], ["labels", "source values"]]) {
@@ -88,6 +104,26 @@ export class Panel {
     if (!this.liveBinding || text === null || text === this.live.text) return;
     this.live.text = text;
     this.liveBinding.refresh();
+  }
+
+  // The name a browser save will take: the loaded board's, until edited.
+  setBoardName(name) {
+    this.local.name = name;
+    this.nameBinding.refresh();
+  }
+
+  // The browser saves, as a dropdown just under "Save to browser". Rebuilt
+  // whenever the list changes; `selected` stays picked if it still exists.
+  setLocalSaves(saves, selected = this.local.saved) {
+    if (this.localBinding) this.localBinding.dispose();
+    const names = saves.map(e => e.name);
+    this.local.saved = names.includes(selected) ? selected : (names[0] ?? "");
+    const options = names.length
+      ? Object.fromEntries(saves.map(e => [`${e.name}  (${Math.ceil(e.bytes / 1024)} KB)`, e.name]))
+      : { "(none yet)": "" };
+    const at = this.saveFolder.children.indexOf(this.localSaveBtn) + 1;
+    this.localBinding = this.saveFolder.addBinding(this.local, "saved", { label: "saved", options, index: at });
+    for (const b of this.localActions) b.disabled = !names.length;
   }
 
   // Show `info` (from Board.describe) in the Status folder, or hide it.

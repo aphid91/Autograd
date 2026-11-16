@@ -31,6 +31,16 @@ const DEFAULT_SLOTS = [
   { kind: "structure", type: "route" },
 ].map(s => ({ dir: 0, flip: false, ...s }));
 
+// A Source tool starts every session at 0 (Source.EMIT_VALUE). Its number
+// carries from one placement to the next within a session, which is what
+// makes a row of same-valued Sources quick to lay, but it is not restored
+// from storage: a value picked days ago and silently stamped onto every new
+// Source read as "the default is 1".
+function freshValue(slot) {
+  if (slot.kind === "structure" && slot.type === "source") delete slot.value;
+  return slot;
+}
+
 // A custom rate as the Custom button shows it: short, and never "0.30000004".
 function fmtRate(r) { return String(parseFloat(r.toPrecision(3))); }
 
@@ -60,7 +70,7 @@ export class Shell {
     // A bad entry costs one slot, never the bar; an unreadable file costs
     // nothing but the defaults.
     const slots = Array.isArray(saved.slots)
-      ? saved.slots.map(s => (isKnown(T, s) ? { dir: s.dir | 0, flip: !!s.flip, ...s } : null))
+      ? saved.slots.map(s => (isKnown(T, s) ? freshValue({ dir: s.dir | 0, flip: !!s.flip, ...s }) : null))
       : DEFAULT_SLOTS.map(s => ({ ...s }));
     this.state = {
       mode: MODES.includes(saved.mode) ? saved.mode : "build",
@@ -476,6 +486,44 @@ export class Shell {
     const tool = this.heldTool;
     if (!values || !tool) return;
     row.append(this.numberGrid(values, toolValue(tool), (v) => this.setValue(v)));
+    // A Source can emit anything: a box for a number the swatches lack.
+    if (tool.kind === "structure") row.append(this.customValue(values, toolValue(tool), (v) => this.setValue(v)));
+  }
+
+  // A text box beside the number swatches, for a Source value they do not
+  // offer. It shows the current value when that value is a custom one (and
+  // is lit, as a swatch would be), and is empty otherwise. It applies on
+  // Enter or when it loses focus, never per keystroke -- the bar re-renders
+  // on a change and would take the field away mid-number.
+  customValue(presets, current, onPick) {
+    const custom = current !== null && !presets.includes(current);
+    const wrap = document.createElement("form");
+    wrap.className = "numcustom";
+    wrap.dataset.selected = String(custom);
+    const input = document.createElement("input");
+    input.type = "text";
+    // The plain keyboard: iOS's decimal pad has no minus sign.
+    input.autocomplete = "off";
+    input.spellcheck = false;
+    input.placeholder = "other";
+    input.setAttribute("aria-label", "Custom value");
+    input.value = custom ? String(current) : "";
+    const apply = () => {
+      const t = input.value.trim().replace(",", ".");
+      if (!t) return;
+      const v = Number(t);
+      if (!Number.isFinite(v)) { input.setAttribute("aria-invalid", "true"); return; }
+      input.removeAttribute("aria-invalid");
+      // Stored as the float32 the entity row will hold, so the box and the
+      // board show the same number.
+      const f = Math.fround(v);
+      if (f !== current) onPick(f);
+    };
+    wrap.addEventListener("submit", (e) => { e.preventDefault(); input.blur(); });
+    input.addEventListener("change", apply);
+    input.addEventListener("input", () => input.removeAttribute("aria-invalid"));
+    wrap.append(input);
+    return wrap;
   }
 
   // Two rows of three number swatches, so they fit beside a few buttons
@@ -505,6 +553,7 @@ export class Shell {
     label.className = "rowlabel";
     label.textContent = iv.kind === "emit" ? "Emits" : "Seed";
     row.append(label, this.numberGrid(iv.values, iv.current, (v) => this.cb.onInspectValue?.(v)));
+    if (iv.kind === "emit") row.append(this.customValue(iv.values, iv.current, (v) => this.cb.onInspectValue?.(v)));
   }
 
   setInspectValue(iv) {

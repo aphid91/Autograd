@@ -16,8 +16,9 @@ runs (auto-tunnelling under obstacles), places machines and raw belts, edits
 a Source's emit value or a belt's seed, selects, moves, turns, deletes,
 copies and pastes groups of entities, and ticks the board -- items on belts,
 gates firing -- at a chosen rate.
-Underground has no tool flow of its own (the planner covers it), and edits
-are not saved back to a file.
+Boards save to the browser and export as `.npz` files the desktop loads
+(see "Saving" below). Underground has no tool flow of its own (the planner
+covers it).
 
 ## Run it
 
@@ -49,7 +50,9 @@ scale 1.15.
     panel is **not** opened for you -- a tap is often only to reach the
     number swatches), and a tap on bare board clears it. While Status shows a Source or
     a belt, the bar offers the number swatches (0, 1, −1, 2, 4, 8) for its
-    emit value or seed; on a belt, tapping the lit number unseeds it.
+    emit value or seed; on a belt, tapping the lit number unseeds it. A
+    Source also gets a **text box** after the swatches for any other value
+    (see "Placing machines and raw belts").
 - **Sim** (right): Reset (the desktop's ctrl+R: tick 0, every item gone,
   seeds back on, the factory untouched) and Play/Pause. Space toggles
   play. It **starts paused**, and loading a save pauses it again. **Long
@@ -191,6 +194,21 @@ the footprint about its middle.
   (default **none**, meaning unseeded; tapping the selected number again
   clears it). The choice is stored on the slot (`slot.value`), so it carries
   to the next placement.
+- **A Source's value is not restored on reload.** It carries from one
+  placement to the next within a session, but `freshValue()` drops it when
+  the bar is read back from localStorage, so every session's Source starts
+  at 0 (`Source.EMIT_VALUE`). Restoring it made a value picked days ago
+  read as "the default is 1". The raw belt's seed is still restored.
+- **A Source has a custom-value box** after its swatches, here and in the
+  Hand's bar. It shows (and is lit for) a value the swatches do not offer,
+  and applies on Enter or when it loses focus -- never per keystroke, since
+  the bar re-renders on a change and would take the field away mid-number.
+  The value is stored as the float32 the row will hold, so the box and the
+  board agree. It uses the plain keyboard because iOS's decimal pad has no
+  minus sign.
+- **Re-picking the value a Source already holds is not an edit.** Any edit
+  restarts the simulation (see "The simulation"), so the Hand's swatches and
+  box skip a write that would change nothing.
 
 Underground ends draw **narrowing toward the buried side** (the front of an
 entrance, the back of an exit), on the board and on the swatch.
@@ -460,6 +478,36 @@ results are discarded), or a belt's run (its id, length, whether it is fed
 and drains, and the items on it, head first). Rewritten every frame; the
 panel touches the DOM only when the text changes.
 
+## Saving
+
+The panel's **Board** folder saves the board **to this browser** under a
+name (the loaded board's, until edited), and keeps a list of those saves:
+pick one, then **Load saved**, **Export .npz** (a download) or **Delete
+saved**. Picking alone does nothing, so choosing what to export never
+replaces the board in front of you. Saving over an existing name asks first.
+
+- **A save is a real `.npz`**, written by `Board.toNpz()` in the layout
+  `core/persistence.py save()` uses: the same keys, `.w` zeroed (derived),
+  `next_row` / `free_rows` / `live_count` from the board's allocator, and
+  the annotations blob carried through untouched (this app does not draw
+  notes, but a save that passes through it must not lose them; a save that
+  predates notes gets `"[]"`, as the desktop writes). `npz.js` has the
+  writer: `.npy` headers, deflate through the native `CompressionStream`,
+  and a CRC-32 per member, which numpy checks.
+- **localStorage, base64, one key per save** plus an index key, in
+  [saves.js](saves.js). The quota is about 5 MB, and a deflated 512×512
+  board is tens of kilobytes (110 KB for `cpu.npz`), so dozens fit. A full
+  store is reported, not swallowed, and a failed write is not left listed.
+- **A lifted selection is put down before saving**, since lifted entities
+  are off the board. Anything that still does not fit is asked about rather
+  than silently left out of the file.
+- The simulation's items are **not** saved, as on the desktop: a loaded
+  board starts paused at tick 0 with its seeds on.
+
+`tests/npz.test.mjs` writes `cpu.npz` and `ram.npz` back out after an edit,
+reads them here, and loads them through the desktop's `persistence.load()`,
+asserting every array matches and exactly the edited value differs.
+
 ## Rules
 
 - **No build step, no npm, no framework.** Plain ES modules and Canvas 2D.
@@ -497,9 +545,10 @@ panel touches the DOM only when the text changes.
 | `ui.js` | the shell's state and DOM: modes, sim and turn buttons, thumb pads, swatches, long press, picker |
 | `tools.js` | the tool catalog (from `types.json`) and the swatch drawings |
 | `icons.js` | line icons as path data (mostly Lucide, ISC) |
-| `panel.js` | the Tweakpane panel: saves, View, Debug, Status (with the live channel readout) |
+| `panel.js` | the Tweakpane panel: bundled and browser saves, export, View, Debug, Status (with the live channel readout) |
 | `vendor/` | Tweakpane 4.0.5, vendored |
-| `npz.js` | `.npz` reader: zip directory + native `DecompressionStream` + `.npy` headers |
+| `npz.js` | `.npz` reader and writer: zip directory + native `DecompressionStream` / `CompressionStream` + `.npy` headers |
+| `saves.js` | browser saves: whole `.npz` files in localStorage, and their index |
 | `board.js` | the save's arrays, validation, derived render lists, `entityAt`/`describe`, placing, erasing, capturing, and the two setting writers |
 | `camera.js` | camera (world +Y up, zoom in CSS px/cell), pointer gestures, and taps |
 | `render.js` | Canvas 2D drawing under a world transform; labels in screen space |
@@ -530,8 +579,8 @@ node --test web/tests/*.test.mjs
 ```
 
 Pure-JS tests (the planner, the placer, the stamp transforms, the run
-tracer, the closed form against the naive oracle, the opcodes, the clock)
-run in Node, with no npm and no browser. The whole tick against the
+tracer, the closed form against the naive oracle, the opcodes, the clock,
+the `.npz` writer) run in Node, with no npm and no browser. The whole tick against the
 desktop's is a separate, slower check (about 25 s for every save):
 
 ```bash

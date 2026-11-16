@@ -5,7 +5,7 @@
 // rather than a translation, and the Python app and this one read each
 // other's files. Everything else here is *derived* and rebuilt by derive().
 
-import { readNpz } from "./npz.js";
+import { readNpz, writeNpz } from "./npz.js";
 
 export const FORMAT_VERSION = 1;
 
@@ -47,6 +47,28 @@ export class Board {
       throw new Error(`grid shape ${gs} does not match size ${w}x${h}`);
     }
     return new Board(T, a);
+  }
+
+  // The board as a save file, laid out as core/persistence.py save() writes
+  // it, so the desktop loads it and it loads here. Segment membership (.w)
+  // is derived and saved as zero, as the desktop does. The annotations blob
+  // is carried through untouched: this app does not draw notes, but a save
+  // that went through it must not lose them.
+  async toNpz() {
+    const E = this.T.entity;
+    const grid = this.grid.slice();
+    for (let i = 3; i < grid.length; i += 4) grid[i] = 0;
+    const notes = this.arrays.annotations?.data;
+    return writeNpz({
+      version: { descr: "<i4", shape: [1], data: new Int32Array([FORMAT_VERSION]) },
+      size: { descr: "<i4", shape: [2], data: new Int32Array([this.width, this.height]) },
+      grid: { descr: "<i4", shape: [this.height, this.width, 4], data: grid },
+      entities: { descr: "<f4", shape: [this.rows, E.STRIDE], data: this.entities },
+      annotations: { descr: "<U", shape: [], data: typeof notes === "string" ? notes : "[]" },
+      next_row: { descr: "<i4", shape: [1], data: new Int32Array([this.nextRow]) },
+      free_rows: { descr: "<i4", shape: [this.freeRows.length], data: new Int32Array(this.freeRows) },
+      live_count: { descr: "<i4", shape: [1], data: new Int32Array([this.liveCount]) },
+    });
   }
 
   // --- raw access -------------------------------------------------------

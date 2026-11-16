@@ -20,6 +20,7 @@ import { emitMask, emitsWith, stampGhost } from "./ghost.js";
 import { traceRun } from "./segtrace.js";
 import { TUNE, setTune } from "./tune.js";
 import { Sim, Clock } from "./sim.js";
+import { deleteSave, getSave, listSaves, putSave } from "./saves.js";
 
 const DEFAULT_SAVE = "default.npz";
 
@@ -218,7 +219,9 @@ function handValueOf(row) {
 function setInspectValue(v) {
   const info = board?.describe(inspectRow);
   if (!info) return;
-  if (info.emit !== null) board.setEmit(inspectRow, v);
+  // Setting the value already held is not a change: an edit restarts the
+  // simulation, and re-tapping the lit swatch should not.
+  if (info.emit !== null) { if (Math.fround(v) !== info.emit) board.setEmit(inspectRow, v); }
   else if (info.seedOn !== null) {
     // Tapping the lit number again unseeds the belt, as on the raw belt tool.
     const off = info.seedOn && info.seedValue === v;
@@ -738,6 +741,7 @@ function rectOf(a, b) {
 async function show(name, bytes) {
   try {
     board = await Board.fromNpz(T, bytes);
+    panel.setBoardName(name.replace(/\.npz$/i, ""));
     sim = new Sim(T, board);
     clock.reset();
     shell.setPaused(true);   // a freshly loaded board waits to be started
@@ -754,6 +758,55 @@ async function show(name, bytes) {
     alert(`${name}: ${err.message}`);
   }
   redraw();
+}
+
+// --- browser saves ----------------------------------------------------------
+
+// Save the board as it stands under `name`. A selection is lifted OFF the
+// board, so it is put down first (what fits goes back, as leaving Build
+// does); anything that still does not fit would be missing from the save,
+// so that is asked about rather than lost quietly.
+async function saveLocal(name) {
+  if (!board) return;
+  name = name || "board";
+  dropAll();
+  const lifted = sel ? sel.stamp.entries.length : 0;
+  if (lifted && !confirm(`${lifted} selected ${lifted === 1 ? "entity does" : "entities do"} not fit back on the board and will not be in the save. Save anyway?`)) return;
+  if (listSaves().some(e => e.name === name) && !confirm(`Replace the saved board "${name}"?`)) return;
+  try {
+    putSave(name, await board.toNpz());
+  } catch (err) {
+    alert(`Could not save "${name}": ${err.message}`);
+    return;
+  }
+  panel.setBoardName(name);
+  panel.setLocalSaves(listSaves(), name);
+}
+
+async function loadLocal(name) {
+  const bytes = getSave(name);
+  if (!bytes) { alert(`"${name}" is not in this browser's storage any more.`); panel.setLocalSaves(listSaves()); return; }
+  await show(name, bytes.buffer);
+}
+
+// Download a browser save as an .npz the desktop app can load.
+function exportLocal(name) {
+  const bytes = getSave(name);
+  if (!bytes) { alert(`"${name}" is not in this browser's storage any more.`); return; }
+  const url = URL.createObjectURL(new Blob([bytes], { type: "application/octet-stream" }));
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = /\.npz$/i.test(name) ? name : `${name}.npz`;
+  document.body.append(a);
+  a.click();
+  a.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 10000);
+}
+
+function deleteLocal(name) {
+  if (!confirm(`Delete the saved board "${name}" from this browser?`)) return;
+  deleteSave(name);
+  panel.setLocalSaves(listSaves());
 }
 
 async function loadBundled(name) {
@@ -823,7 +876,12 @@ async function init() {
     onCloseStatus: () => inspect(-1),
     onEmit: (row, v) => { board.setEmit(row, v); shell.setInspectValue(handValueOf(row)); redraw(); },
     onSeed: (row, on, v) => { board.setSeed(row, on, v); shell.setInspectValue(handValueOf(row)); redraw(); },
+    onSaveLocal: (name) => saveLocal(name),
+    onLoadLocal: (name) => loadLocal(name),
+    onExportLocal: (name) => exportLocal(name),
+    onDeleteLocal: (name) => deleteLocal(name),
   });
+  panel.setLocalSaves(listSaves());
   view = { ...panel.view };
   setTune(panel.dev);
 
