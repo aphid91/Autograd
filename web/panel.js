@@ -53,9 +53,9 @@ export class Panel {
       board.addButton({ title: "Delete saved" }).on("click", () => this.local.saved && cb.onDeleteLocal(this.local.saved)),
     ];
 
-    this.view = { grid: true, ports: true, labels: true, ...this.prefs.view };
+    this.view = { grid: true, ports: true, labels: true, seedTint: true, ...this.prefs.view };
     const view = this.pane.addFolder({ title: "View", expanded: false });
-    for (const [key, label] of [["grid", "grid lines"], ["ports", "ports"], ["labels", "source values"]]) {
+    for (const [key, label] of [["grid", "grid lines"], ["ports", "ports"], ["labels", "source values"], ["seedTint", "seed tint"]]) {
       view.addBinding(this.view, key, { label }).on("change", () => {
         this.prefs.view = { ...this.view };
         savePrefs(this.prefs);

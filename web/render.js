@@ -79,7 +79,7 @@ function fmtNumber(v) {
 
 // `opts`: the View toggles ({ grid, ports, labels }) and `selected`, the
 // inspected entity's {x, y, w, h} or null.
-export const DEFAULT_VIEW = { grid: true, ports: true, labels: true };
+export const DEFAULT_VIEW = { grid: true, ports: true, labels: true, seedTint: true };
 
 export function render(ctx, board, cam, dpr, opts = {}) {
   const view = { ...DEFAULT_VIEW, ...opts };
@@ -124,7 +124,7 @@ export function render(ctx, board, cam, dpr, opts = {}) {
 
   // Placed belts a run (or its copies) will turn draw only as the ghost.
   const hide = view.hide?.length ? new Set(view.hide.map(([x, y]) => `${x},${y}`)) : null;
-  drawBelts(ctx, hide ? board.belts.filter(b => !hide.has(`${b.x},${b.y}`)) : board.belts, z, on, S);
+  drawBelts(ctx, hide ? board.belts.filter(b => !hide.has(`${b.x},${b.y}`)) : board.belts, z, on, S, view.seedTint);
   drawUnders(ctx, board.unders, z, on, S);
   drawStructs(ctx, board.T, board.structs, z, px, on, S, view.ports, view.labels);
 
@@ -133,7 +133,7 @@ export function render(ctx, board, cam, dpr, opts = {}) {
   ctx.strokeRect(0, 0, board.width, board.height);
 
   const ghosts = (view.ghosts || [view.ghost]).filter(Boolean);
-  for (const g of ghosts) drawGhost(ctx, board.T, g, z, px, on, S, view.ports, view.labels);
+  for (const g of ghosts) drawGhost(ctx, board.T, g, z, px, on, S, view.ports, view.labels, view.seedTint);
 
   // Items last among the board's contents: cargo on a cell, over any tint,
   // so a red wash never changes the colour that says an item's sign.
@@ -164,10 +164,11 @@ export function render(ctx, board, cam, dpr, opts = {}) {
   }
 }
 
-function drawBelts(ctx, belts, z, on, S) {
+function drawBelts(ctx, belts, z, on, S, seedTint = true) {
 
-  // Seeded cells are tinted by the seed's sign, under the belt itself.
-  for (const sign of [1, -1]) {
+  // Seeded cells are tinted by the seed's sign, under the belt itself --
+  // unless the View folder's "seed tint" is off.
+  for (const sign of seedTint ? [1, -1] : []) {
     ctx.beginPath();
     for (const b of belts) if (b.seed === sign && on(b.x, b.y)) ctx.rect(b.x, b.y, 1, 1);
     ctx.fillStyle = sign > 0 ? COL.seedPos : COL.seedNeg;
@@ -286,11 +287,11 @@ function underFunnel(path, bars, cx, cy, f, s) {
 // A planned run: the proposed belts and undergrounds translucent, cells the
 // run cannot have tinted red, and a ring on each draggable end -- the tip
 // solid, the start hollow, so the two read apart at a glance.
-function drawGhost(ctx, T, g, z, px, on, S, ports, labels) {
+function drawGhost(ctx, T, g, z, px, on, S, ports, labels, seedTint = true) {
   ctx.save();
   ctx.globalAlpha = TUNE.ghostAlpha;
   // Seeded ghost belts tint like real ones; drawBelts does that itself.
-  drawBelts(ctx, g.belts || [], Math.max(z, LOD.chevrons), on, S);
+  drawBelts(ctx, g.belts || [], Math.max(z, LOD.chevrons), on, S, seedTint);
   drawUnders(ctx, g.unders || [], Math.max(z, LOD.chevrons), on, S);
   if (g.structs) drawStructs(ctx, T, g.structs, Math.max(z, LOD.ports), px, on, S, ports, labels);
   ctx.restore();

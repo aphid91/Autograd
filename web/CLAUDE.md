@@ -112,7 +112,8 @@ Three things worth knowing:
   the desktop's panel/orchestrator split.
 
 The **Tweakpane** panel sits in the board's top-right corner, collapsed by
-default. It holds the saves, View toggles (grid, ports, labels), Debug, and
+default. It holds the saves, View toggles (grid, ports, labels, seed tint --
+the green/red wash on seeded belts, ghosts included), Debug, and
 the Status folder. Tweakpane is **vendored** (`vendor/`, MIT) rather than
 pulled from a CDN, which keeps the no-build, works-offline property. Status
 writes the same row fields the desktop's Status window does, plus the
