@@ -11,6 +11,7 @@ import { icon } from "./icons.js";
 import { RATE_MAX, RATE_MIN, RATE_PRESETS } from "./sim.js";
 import { CW, CCW, canFlip, catalog, isKnown, labelFor, sameTool, stampArt, toolArt, toolValue } from "./tools.js";
 import { copyStamp, mirrored, rotated } from "./stamp.js";
+import { TABLES, TABLE_NAMES, parseTable } from "./indexer.js";
 
 const STORE_KEY = "gates.web.shell.v1";
 const LONG_PRESS_MS = 500;   // as sand mode
@@ -102,6 +103,10 @@ export class Shell {
       //            (tap the Build button) or "select" (the Vector swatch)
       //   count    how many copies, the original included
       vector: { on: false, picking: null, count: 2 },
+      // Indexing the selection: null, or the order its numbers follow --
+      // "selection" (the order things were selected) or "natural" (left to
+      // right, rows from the bottom up). main.js draws the numbers.
+      indexing: null,
     };
 
     this.buildControls();
@@ -531,6 +536,91 @@ export class Shell {
     }
   }
 
+  // While indexing, the bar is Done (stop, change nothing), the two orders,
+  // and Values -- the sheet that writes them. Selecting goes on as normal:
+  // taps add and remove, and the numbers follow.
+  renderIndexing(row) {
+    const s = this.state;
+    row.append(this.swatch({ art: icon("x"), name: "Done", cls: "actsw",
+      onTap: () => { s.indexing = null; this.changed(); } }));
+    row.append(this.swatch({ art: `<span class="swnum">1·2</span>`, name: "Tap order", cls: "actsw",
+      selected: s.indexing === "selection", onTap: () => { s.indexing = "selection"; this.changed(); } }));
+    row.append(this.swatch({ art: icon("box"), name: "Position", cls: "actsw",
+      selected: s.indexing === "natural", onTap: () => { s.indexing = "natural"; this.changed(); } }));
+    row.append(this.swatch({ art: icon("table"), name: "Values…", cls: "actsw",
+      onTap: () => this.openIndexSheet() }));
+  }
+
+  setIndexing(mode) {
+    if (this.state.indexing === mode) return;
+    this.state.indexing = mode;
+    this.render();
+  }
+
+  // The values sheet. The choice of table, a and b live here; main.js
+  // previews (onIndexPreview -> { n, text, error }) and applies.
+  openIndexSheet() {
+    const m = document.getElementById("indexsheet");
+    if (!m) return;
+    const st = this.indexSheet || (this.indexSheet = { kind: "ascending", file: null, fileName: "", seed: 1 });
+    const tables = m.querySelector("#index-tables"), extra = m.querySelector("#index-extra");
+    const ain = m.querySelector("#index-a"), bin = m.querySelector("#index-b");
+    const preview = m.querySelector("#index-preview"), apply = m.querySelector("#index-apply");
+    const fileIn = document.getElementById("index-file");
+    const num = (el, dflt) => { const v = Number(el.value.trim()); return el.value.trim() === "" ? dflt : v; };
+    const opts = () => ({ kind: st.kind, file: st.file, seed: st.seed, a: num(ain, 1), b: num(bin, 0) });
+    const refresh = () => {
+      tables.replaceChildren(...TABLES.map(k => {
+        const b = document.createElement("button");
+        b.type = "button"; b.className = "pick"; b.textContent = TABLE_NAMES[k];
+        b.dataset.current = String(k === st.kind);
+        b.onclick = () => { if (k === "file") fileIn.click(); else { st.kind = k; refresh(); } };
+        return b;
+      }));
+      extra.replaceChildren();
+      if (st.kind === "random") {
+        const r = document.createElement("button");
+        r.type = "button"; r.className = "b sheet-btn"; r.textContent = "Re-roll";
+        r.onclick = () => { st.seed = (st.seed * 1664525 + 1013904223) >>> 0; refresh(); };
+        extra.append(r);
+      } else if (st.kind === "file") {
+        extra.textContent = `${st.fileName} — ${st.file.length} value${st.file.length === 1 ? "" : "s"}, repeated to fill`;
+      }
+      const o = opts();
+      const bad = !Number.isFinite(o.a) || !Number.isFinite(o.b);
+      const res = bad ? { n: 0, error: "a and b must be numbers" } : this.cb.onIndexPreview?.(o) || { n: 0 };
+      preview.dataset.error = String(!!res.error);
+      preview.textContent = res.error || res.text || "";
+      apply.disabled = !!res.error || !res.n;
+      apply.textContent = res.n ? `Apply to ${res.n}` : "Apply";
+    };
+    fileIn.onchange = async () => {
+      const f = fileIn.files[0];
+      fileIn.value = "";
+      if (!f) return;
+      try {
+        st.file = parseTable(await f.text());
+        st.fileName = f.name;
+        st.kind = "file";
+      } catch (e) {
+        alert(`${f.name}: ${e.message}`);
+      }
+      refresh();
+    };
+    ain.oninput = refresh;
+    bin.oninput = refresh;
+    const close = () => { m.dataset.open = "false"; ain.blur(); bin.blur(); };
+    m.querySelector("#index-cancel").onclick = close;
+    m.onclick = (e) => { if (e.target === m) close(); };
+    apply.onclick = () => {
+      const o = opts();
+      close();
+      this.cb.onIndexApply?.(o);
+    };
+    refresh();
+    m.dataset.open = "true";
+  }
+
   setVector(v) {
     this.state.vector = { ...this.state.vector, ...v };
     this.render();
@@ -649,6 +739,7 @@ export class Shell {
 
   renderSelect(row) {
     const s = this.state;
+    if (s.indexing) { this.renderIndexing(row); return; }
     row.append(this.swatch({
       art: icon("box"), name: "Box", cls: "actsw act-box",
       selected: s.boxArmed,
@@ -663,6 +754,13 @@ export class Shell {
     });
     if (!s.selCount) vsw.dataset.disabled = "true";
     row.append(vsw);
+    // Index: number the selected Sources and belts, then give them values.
+    const isw = this.swatch({
+      art: icon("index"), name: "Index", cls: "actsw act-index",
+      onTap: () => { if (s.selCount && !s.pasteStamp) { s.indexing = "selection"; this.changed(); } },
+    });
+    if (!s.selCount || s.pasteStamp !== null) isw.dataset.disabled = "true";
+    row.append(isw);
     for (const c of COMMANDS) {
       const sw = this.swatch({
         art: icon(COMMAND_ICON[c]), name: COMMAND_LABEL[c], cls: `actsw act-${c}`,

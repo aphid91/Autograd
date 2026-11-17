@@ -154,6 +154,7 @@ export function render(ctx, board, cam, dpr, opts = {}) {
   }
 
   if (cargo) drawItemLabels(ctx, cargo, cam, dpr);
+  if (view.indexLabels?.length) drawIndexLabels(ctx, view.indexLabels, cam, dpr);
 
   if (view.labels && z >= LOD.marks) {
     drawLabels(ctx, board.T, board.structs, cam, dpr, on);
@@ -465,6 +466,26 @@ function drawLabels(ctx, T, structs, cam, dpr, on) {
     ctx.font = `600 ${size.toFixed(1)}px system-ui, sans-serif`;
     const [sx, sy] = cam.worldToScreen(s.x + s.w / 2, s.y + s.h / 2);
     ctx.fillText(fmtNumber(s.emit), sx, sy);
+  }
+}
+
+// Indexing: each indexed entity's number on a badge, in screen space so it
+// stays legible at any zoom.
+function drawIndexLabels(ctx, labels, cam, dpr) {
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  ctx.textAlign = "center";
+  ctx.textBaseline = "middle";
+  ctx.font = `700 12px system-ui, sans-serif`;
+  for (const { x, y, n } of labels) {
+    const [sx, sy] = cam.worldToScreen(x, y);
+    const t = String(n);
+    const w = Math.max(18, ctx.measureText(t).width + 10);
+    ctx.fillStyle = COL.vector;
+    ctx.beginPath();
+    ctx.roundRect(sx - w / 2, sy - 9, w, 18, 9);
+    ctx.fill();
+    ctx.fillStyle = "#0b0c0f";
+    ctx.fillText(t, sx, sy + 0.5);
   }
 }
 

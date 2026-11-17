@@ -60,6 +60,24 @@
   </div>
 </div>
 
+<div id="indexsheet" class="sheetwrap" data-open="false" role="dialog" aria-modal="true" aria-labelledby="indexsheet-title">
+  <div class="sheet">
+    <div class="sheet-head">
+      <span id="indexsheet-title">Index values</span>
+      <button type="button" class="b sheet-btn" id="index-cancel">Cancel</button>
+    </div>
+    <div id="index-tables" class="idx-tables"></div>
+    <div class="idx-row" id="index-extra"></div>
+    <div class="idx-row">
+      <label class="idx-ab">a · x <input id="index-a" type="text" inputmode="text" autocomplete="off" spellcheck="false" value="1"></label>
+      <label class="idx-ab">+ b <input id="index-b" type="text" inputmode="text" autocomplete="off" spellcheck="false" value="0"></label>
+    </div>
+    <div id="index-preview" class="idx-preview"></div>
+    <button type="button" class="b sheet-btn idx-apply" id="index-apply">Apply</button>
+  </div>
+</div>
+
+<input id="index-file" type="file" accept=".txt,.csv,text/plain,text/csv" hidden>
 <input id="save-file" type="file" accept=".npz" hidden>
 <script type="module" src="main.js"></script>
 </body>

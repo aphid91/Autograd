@@ -32,6 +32,8 @@ const P = {
   routeLine: ["M4 20h4v-4h4v-4h4V8h4", "M17 4h3v3"],
   right: ["M9 5l7 7-7 7"],
   minus: ["M5 12h14"],
+  index: ["M10 6h11", "M10 12h11", "M10 18h11", "M4 6h1v4", "M4 10h2", "M6 18H4c0-1 2-2 2-3s-1-1.5-2-1"],
+  table: ["M3 3h18v18H3z", "M3 9h18", "M3 15h18", "M9 3v18"],
   vector: ["M5 19 19 5", "M11 5h8v8", "M3 21h4"],
   // Build with a vector across it, bottom right to top left: the picker.
   buildVector: ["M15 12l-8.5 8.5a2.12 2.12 0 0 1-3-3L12 9", "M21 21 4.5 4.5", "M4 10V4h6"],

@@ -345,6 +345,7 @@ html, body {
   align-items: center;
   gap: calc(3 * var(--u));
 }
+.swnum { font-weight: 700; font-size: calc(12 * var(--u)); letter-spacing: 0.02em; }
 .swb {
   appearance: none;
   width: calc(var(--sw-d) * var(--u));
@@ -443,6 +444,25 @@ html, body {
   padding: 0 calc(14 * var(--u));
   font-size: calc(11 * var(--u));
 }
+/* The index sheet: the table choices, a and b, a preview, Apply. */
+.idx-tables { display: grid; grid-template-columns: repeat(4, 1fr); gap: calc(6 * var(--u)); }
+.idx-tables .pick { justify-content: center; height: calc(36 * var(--u)); }
+.idx-row { display: flex; gap: calc(8 * var(--u)); align-items: center; font-size: calc(11 * var(--u)); color: var(--ink-dim); }
+.idx-row:empty { display: none; }
+.idx-row .sheet-btn { flex: 0 0 auto; }
+.idx-ab { flex: 1 1 0; min-width: 0; display: flex; align-items: center; gap: calc(6 * var(--u)); color: var(--ink); }
+.idx-ab input {
+  flex: 1; min-width: 0; height: calc(34 * var(--u)); box-sizing: border-box;
+  padding: 0 calc(8 * var(--u)); background: var(--chrome-2); color: var(--ink);
+  border: var(--border) solid var(--edge); border-radius: var(--r); font: inherit; font-size: 16px;
+}
+.idx-preview {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: calc(10.5 * var(--u));
+  color: var(--ink); background: var(--chrome-2); border-radius: var(--r);
+  padding: calc(8 * var(--u)); white-space: pre-wrap; max-height: calc(110 * var(--u)); overflow-y: auto;
+}
+.idx-preview[data-error="true"] { color: var(--danger); }
+.idx-apply { color: var(--accent); border-color: var(--accent); }
 .sheet-btn.danger { color: var(--danger); border-color: color-mix(in srgb, var(--danger) 45%, var(--edge)); }
 #picker-list {
   display: grid;

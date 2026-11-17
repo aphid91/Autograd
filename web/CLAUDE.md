@@ -307,6 +307,31 @@ any is missing ends it. They are added chain step by chain step, the
 pattern's own order within a step -- a selection order, which indexing
 uses.
 
+### Indexing
+
+Giving a set of Sources and belts a number each, then a value from a table
+by that number -- a Source's constant, a belt's seed. One-shot: the order is
+not stored once applied. [indexer.js](indexer.js) is the pure part (orders,
+tables, the file parser, `a*x+b`), tested in `tests/indexer.test.mjs`.
+
+- **Index** on the selection bar starts it. The bar becomes Done / Tap order
+  / Position / Values…, and every selected Source and belt wears its number
+  (a badge in screen space). Selecting carries on as normal: in **tap
+  order**, tapping one off and on again sends it to the end, which is how
+  the order is fixed up; vectored selection adds a chain in step order.
+  **Position** is left to right along each row, rows from the bottom up.
+  Other selected entities are not numbered and keep their settings.
+- **Values…** opens a sheet: the table -- **Random** (a shuffle of
+  0..n-1, from a seed so the preview is what Apply writes; Re-roll), 
+  **Ascending** (0, 1, 2…), **Doubling** (1, 2, 4…, clamped at 2²⁴), or
+  **File…** (numbers separated by commas or whitespace, repeated to fill
+  the index; `D` is the default: 0 for a Source, no seed for a belt; any
+  other token rejects the file with its line) -- then **a** and **b**
+  (1 and 0), so the value is `a*x + b`, float32, clamped; a default stays a
+  default. A live preview lists the first dozen; **Apply to n** writes the
+  values into the lifted entries and puts the selection down: one edit,
+  one undo step.
+
 ### Placing machines and raw belts
 
 The other one-tap tools (every machine, and the raw belt) share one flow.
@@ -423,6 +448,7 @@ outlined in cyan. Deselecting places it back wherever the selection now is.
 | one-finger drag from a selected entity | move the whole selection |
 | one-finger drag elsewhere | pan |
 | Box, then a drag (from anywhere) | a rectangle: everything it touches is **added**, then Box disarms |
+| Index, then Values… | number the selected Sources and belts and write them values (see "Indexing") |
 | Vector, drag the offset, Confirm | add every repeat of the selection along the vector, until it breaks (see "Vectors") |
 | Turn buttons | turn / mirror the selection as one stamp |
 | Delete | discard the selection |
@@ -793,6 +819,7 @@ asserting every array matches and exactly the edited value differs.
 | `glyphs.js` | the machine glyphs, ports of the shader's `sd_*` marks |
 | `tune.js` | the Dev dials: defaults, panel spec, the live values |
 | `history.js` | undo, redo and the checkpoint, over board snapshots |
+| `indexer.js` | indexing: the orders, the value tables, the file parser, a·x+b |
 | `vector.js` | vectors: offsets, turns, the claims overlay, laying copies, following a chain |
 | `tests/` | `node --test` suites for the pure modules |
 | `types.json` | generated — do not edit |

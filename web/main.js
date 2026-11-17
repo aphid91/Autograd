@@ -21,6 +21,8 @@ import { traceRun } from "./segtrace.js";
 import { TUNE, setTune } from "./tune.js";
 import { Sim, Clock } from "./sim.js";
 import { History } from "./history.js";
+import { DEFAULT, naturalOrder, tableValues, finalValues } from "./indexer.js";
+import { entrySize } from "./stamp.js";
 import { Claims, followChain, offsets, layCopies, isZero, rotateVec, flipVec, moreCount, lessCount } from "./vector.js";
 import { deleteSave, getSave, listSaves, putSave } from "./saves.js";
 
@@ -163,7 +165,8 @@ function paint(now) {
   ];
   // The belt a run starts on draws only as the run's ghost, at its new facing.
   const hide = run ? runCopies().copies.filter(c => c.over).map(c => c.start) : null;
-  render(ctx, board, cam, dpr, { ...view, selected: info, ghosts, sim, alpha: clock.alpha, hide, vector: vectorMarks() });
+  render(ctx, board, cam, dpr, { ...view, selected: info, ghosts, sim, alpha: clock.alpha, hide, vector: vectorMarks(),
+                                indexLabels: indexLabels() });
   debug.renderMs = performance.now() - t0;
   if (sim && !clock.paused) redraw();
 }
@@ -381,6 +384,66 @@ function vectorMarks() {
   const n = vec.picking === "build" ? vec.count : 2;
   const cells = offsets(pickV(), n).map(([dx, dy]) => [vec.anchor[0] + dx, vec.anchor[1] + dy]);
   return { cells };
+}
+
+// --- indexing -------------------------------------------------------------------
+//
+// The selection's Index swatch numbers its Sources and belts -- in the order
+// they were selected, or by position (left to right, rows from the bottom
+// up) -- and the numbers are drawn on them while selecting goes on as
+// normal: tap one off and back on and it goes to the end. Values… then
+// writes each one the table's value for its number, a * x + b (a default,
+// D, is 0 for a Source and no seed for a belt), into the lifted entries,
+// and puts the selection down: one edit, one undo step. Indexing is one-shot:
+// the order is not kept anywhere once applied.
+
+// The indexed entries: { i (index into the selection), e (absolute entry) },
+// in index order.
+function indexed() {
+  if (!sel || !shell.state.indexing) return [];
+  const abs = selAbs();
+  const items = abs.map((e, i) => ({ i, e })).filter(({ e }) => e.type === "source" || e.type === "belt");
+  if (shell.state.indexing === "natural") {
+    return naturalOrder(items.map(({ e }) => ({ x: e.dx, y: e.dy }))).map(k => items[k]);
+  }
+  return items;
+}
+
+// Each indexed entity's number, at the middle of its footprint.
+function indexLabels() {
+  return indexed().map(({ e }, n) => {
+    const { w, h } = entrySize(T, e);
+    return { x: e.dx + w / 2, y: e.dy + h / 2, n };
+  });
+}
+
+function indexValues(o) {
+  const list = indexed();
+  const table = tableValues(o.kind, list.length, { file: o.file, seed: o.seed, limit: T.sim.VALUE_LIMIT });
+  return { list, values: finalValues(table, o.a, o.b, T.sim.VALUE_LIMIT) };
+}
+
+function indexPreview(o) {
+  const { list, values } = indexValues(o);
+  if (!list.length) return { n: 0, error: "Nothing indexed: select some Sources or belts." };
+  const fmt = (v) => (v === DEFAULT ? "default" : String(parseFloat(v.toPrecision(6))));
+  const lines = list.slice(0, 12).map(({ e }, n) => `#${n}  ${e.type === "source" ? "Source" : "belt  "}  ${fmt(values[n])}`);
+  if (list.length > 12) lines.push(`… and ${list.length - 12} more`);
+  return { n: list.length, text: lines.join("\n") };
+}
+
+function indexApply(o) {
+  const { list, values } = indexValues(o);
+  if (!list.length) return;
+  list.forEach(({ i, e }, n) => {
+    const entry = sel.stamp.entries[i];
+    const v = values[n];
+    if (e.type === "source") entry.emit = v === DEFAULT ? 0 : v;
+    else entry.seed = v;                 // null: no seed
+  });
+  shell.setIndexing(null);
+  dropAll();
+  redraw();
 }
 
 // --- vectored selection ------------------------------------------------------
@@ -875,8 +938,10 @@ function setSel(abs) {
     sel = { stamp, px: origin[0] + stamp.w / 2, py: origin[1] + stamp.h / 2 };
   }
   shell.setSelection(sel ? sel.stamp.entries.length : 0);
-  // Nothing left selected: the selection's picker has nothing to repeat.
+  // Nothing left selected: the selection's picker has nothing to repeat,
+  // and there is nothing left to index.
   if (!sel && vec.picking === "select") closePicker(false);
+  if (!sel) shell.setIndexing(null);
   syncHistory();
   redraw();
 }
@@ -1280,6 +1345,8 @@ async function init() {
     onVectorFlip: () => vectorFlip(),
     onVectorConfirm: () => confirmSelectVector(),
     onSelectVector: () => { if (vec.picking === "select") closePicker(false); else if (!vec.picking) openSelectPicker(); },
+    onIndexPreview: (o) => indexPreview(o),
+    onIndexApply: (o) => indexApply(o),
     onUndo: () => undo(),
     onRedo: () => redo(),
     onCheckpoint: () => checkpoint(),
