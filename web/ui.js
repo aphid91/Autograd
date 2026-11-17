@@ -745,6 +745,14 @@ export class Shell {
       selected: s.boxArmed,
       onTap: () => { s.boxArmed = !s.boxArmed; this.changed(); },
     }));
+    for (const c of COMMANDS) {
+      const sw = this.swatch({
+        art: icon(COMMAND_ICON[c]), name: COMMAND_LABEL[c], cls: `actsw act-${c}`,
+        onTap: () => { if (s.selCount) this.cb.onSelectCommand?.(c); },
+      });
+      if (!s.selCount) sw.dataset.disabled = "true";
+      row.append(sw);
+    }
     // Vector: repeat the selection along a vector for as long as the board
     // repeats it (main.js's vector picker, in its "select" form).
     const vsw = this.swatch({
@@ -761,14 +769,6 @@ export class Shell {
     });
     if (!s.selCount || s.pasteStamp !== null) isw.dataset.disabled = "true";
     row.append(isw);
-    for (const c of COMMANDS) {
-      const sw = this.swatch({
-        art: icon(COMMAND_ICON[c]), name: COMMAND_LABEL[c], cls: `actsw act-${c}`,
-        onTap: () => { if (s.selCount) this.cb.onSelectCommand?.(c); },
-      });
-      if (!s.selCount) sw.dataset.disabled = "true";
-      row.append(sw);
-    }
     // The history, most recent first. Tapping one pastes it.
     for (const st of s.stamps) {
       row.append(this.swatch({
