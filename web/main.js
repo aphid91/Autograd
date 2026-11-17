@@ -995,3 +995,10 @@ async function init() {
 }
 
 init();
+
+// Offline: the service worker caches the whole site on first load (sw.js).
+// Registration failing (a file:// page, a browser without workers) only
+// costs the offline copy.
+if ("serviceWorker" in navigator) {
+  navigator.serviceWorker.register("sw.js").catch(e => console.warn("no offline copy:", e));
+}

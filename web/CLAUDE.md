@@ -31,6 +31,31 @@ bash web/build.sh && python3 -m http.server -d _site 8000
 `.github/workflows/pages.yml` does the same and deploys to GitHub Pages.
 `default.npz` is loaded at startup if it exists.
 
+## Installing it, and offline
+
+The site is a **PWA**: `manifest.webmanifest` (name, standalone display,
+icons) and `sw.js`, a service worker that caches **every file of the
+site** -- the app, `types.json`, Tweakpane, the icons and every bundled save
+-- on first load and serves from that cache first. So once opened online,
+it installs (Chrome/Android: the install prompt or menu item; iOS Safari:
+Share, Add to Home Screen) and runs with no network at all.
+
+- **`build.sh` stamps the worker**: the precache list (every file in
+  `_site/`) and a version hashed from all their contents. A deploy that
+  changes anything changes `sw.js`, so the browser installs the new worker,
+  which caches the new set and deletes the old. It takes over at once, but
+  the open page keeps the code it loaded: **an update shows on the next
+  launch**, never mid-session. Served unbuilt, the worker caches nothing.
+- **Local dev**: after a rebuild, the first reload installs the new worker
+  and the second shows the change.
+- **Browser saves live with the installed app's storage.** On iOS a
+  home-screen app has its own storage, separate from Safari's, so boards
+  saved in Safari do not appear in the installed app -- export and open the
+  `.npz` instead.
+- The icons are drawn by `tools/make_web_icons.py` (committed PNGs; rerun
+  by hand to change them). The maskable one keeps its art inside the
+  central circle launchers crop to.
+
 ## The phone shell
 
 Copied from Fluoddity's **sand mode** (`aphid91/fluoddity-web`, `sand.html`
@@ -674,7 +699,8 @@ asserting every array matches and exactly the edited value differs.
 | `tune.js` | the Dev dials: defaults, panel spec, the live values |
 | `tests/` | `node --test` suites for the pure modules |
 | `types.json` | generated — do not edit |
-| `build.sh` | assembles `_site/` |
+| `build.sh` | assembles `_site/`, and stamps `sw.js` with its file list and version |
+| `sw.js`, `manifest.webmanifest`, `icons/` | the install and offline layer (see "Installing it, and offline") |
 
 The camera's one primitive is `move(from, to, scale)`: the world point under
 screen point `from` ends up under `to`. Drag, pinch and wheel are all that
