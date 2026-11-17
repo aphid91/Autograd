@@ -96,6 +96,12 @@ export class Shell {
       planning: null,
       // Hand: { values, current } while Status shows a Source or a belt.
       inspectValue: null,
+      // The vector (main.js owns it; see vector.js):
+      //   on       vectored building is on: what is built repeats along v
+      //   picking  the vector picker has the bar and the drags: "build"
+      //            (tap the Build button) or "select" (the Vector swatch)
+      //   count    how many copies, the original included
+      vector: { on: false, picking: null, count: 2 },
     };
 
     this.buildControls();
@@ -187,7 +193,11 @@ export class Shell {
       b.className = "b tool";
       b.dataset.mode = m;
       b.innerHTML = `${icon(m)}<span>${names[m]}</span>`;
-      b.addEventListener("click", () => this.setMode(m));
+      // Tapping Build while already in Build toggles the vector picker.
+      b.addEventListener("click", () => {
+        if (m === "build" && this.state.mode === "build") this.cb.onBuildTap?.();
+        else this.setMode(m);
+      });
       modes.append(b);
     }
     c.querySelector("#btn-reset").addEventListener("click", () => this.cb.onReset?.());
@@ -226,13 +236,18 @@ export class Shell {
       pad.innerHTML = `
         <button type="button" class="b tp-flip" aria-label="Flip">${icon("flip")}</button>
         <button type="button" class="b tp-ccw" aria-label="Rotate counter-clockwise">${icon("rotCcw")}</button>
-        <button type="button" class="b tp-cw" aria-label="Rotate clockwise">${icon("rotCw")}</button>`;
+        <button type="button" class="b tp-cw" aria-label="Rotate clockwise">${icon("rotCw")}</button>
+        <button type="button" class="b tp-less" aria-label="Fewer copies">${icon("minus")}</button>
+        <button type="button" class="b tp-more" aria-label="More copies">${icon("plus")}</button>`;
       pad.querySelector(".tp-ccw").addEventListener("click", () => this.turn(CCW));
       pad.querySelector(".tp-cw").addEventListener("click", () => this.turn(CW));
       pad.querySelector(".tp-flip").addEventListener("click", () => {
-        if (this.state.planning?.kind === "belt") this.cb.onPlanRoute?.();
+        if (this.state.vector.picking) this.cb.onVectorFlip?.();
+        else if (this.state.planning?.kind === "belt") this.cb.onPlanRoute?.();
         else this.flip();
       });
+      pad.querySelector(".tp-less").addEventListener("click", () => this.cb.onVectorCount?.(false));
+      pad.querySelector(".tp-more").addEventListener("click", () => this.cb.onVectorCount?.(true));
     }
   }
 
@@ -241,10 +256,13 @@ export class Shell {
     // Also while a selection is held, or a tool is held to turn before
     // placing: the pads are the only Turn buttons now (the row's became
     // Undo, Redo and Checkpoint).
-    const show = !!p || this.selecting || (this.state.mode === "build" && !!this.heldTool);
-    const flippable = p?.kind === "belt" || (this.heldTool ? canFlip(this.T, this.heldTool) : !!this.activeStamp || this.selecting);
+    const picking = this.state.vector.picking;
+    const show = !!picking || !!p || this.selecting || (this.state.mode === "build" && !!this.heldTool);
+    const flippable = !!picking || p?.kind === "belt" || (this.heldTool ? canFlip(this.T, this.heldTool) : !!this.activeStamp || this.selecting);
     for (const pad of this.thumbs) {
       pad.dataset.show = String(show);
+      // The vector picker for building adds a count row: fewer, more.
+      pad.dataset.count = String(picking === "build");
       pad.querySelector(".tp-flip").disabled = !flippable;
     }
   }
@@ -261,6 +279,8 @@ export class Shell {
   // turns its stamp), the stamp being pasted, or the selection -- which
   // main.js owns, so that one is a request.
   turn(fn) {
+    // While the vector picker is open, the buttons turn the vector.
+    if (this.state.vector.picking) { this.cb.onVectorTurn?.(fn === CW); return; }
     // While a belt run is planned the buttons turn its tip, not the tool.
     // While placing, they turn the tool -- the ghost follows it.
     if (this.state.planning?.kind === "belt") { this.cb.onPlanTurn?.(fn === CW); return; }
@@ -274,6 +294,7 @@ export class Shell {
   }
 
   flip() {
+    if (this.state.vector.picking) { this.cb.onVectorFlip?.(); return; }
     if (this.state.planning?.kind === "belt") return;   // nothing to mirror on a run
     const tool = this.heldTool;
     if (tool?.kind === "stamp") { tool.stamp = mirrored(this.T, tool.stamp); this.changed(); return; }
@@ -374,6 +395,15 @@ export class Shell {
     for (const b of c.querySelectorAll("[data-mode]")) {
       b.dataset.selected = String(b.dataset.mode === s.mode);
     }
+    // Build wears the vector: tinted while vectored building is on, and an
+    // arrow across the hammer while its picker is open.
+    const bb = c.querySelector('[data-mode="build"]');
+    const picking = s.vector.picking === "build";
+    bb.dataset.vector = String(s.vector.on || picking);
+    if (bb.dataset.picking !== String(picking)) {
+      bb.dataset.picking = String(picking);
+      bb.innerHTML = `${picking ? icon("buildVector") : icon("build")}<span>Build</span>`;
+    }
     const play = c.querySelector("#btn-play");
     play.innerHTML = icon(s.paused ? "play" : "pause");
     play.setAttribute("aria-label", s.paused ? "Play" : "Pause");
@@ -393,7 +423,7 @@ export class Shell {
     const planning = !!s.planning;
     const beltRun = s.planning?.kind === "belt";
 
-    const rowMode = planning ? s.planning.kind
+    const rowMode = s.vector.picking ? "vector" : planning ? s.planning.kind
       : s.mode === "hand" && s.inspectValue ? "inspect"
       : this.selectActive ? "select" : s.mode;
     this.els.bar.dataset.mode = rowMode;
@@ -402,7 +432,8 @@ export class Shell {
     const sameRow = row.dataset.mode === rowMode;
     row.replaceChildren();
     row.dataset.mode = rowMode;
-    if (beltRun) this.renderPlanning(row);
+    if (s.vector.picking) this.renderVector(row);
+    else if (beltRun) this.renderPlanning(row);
     else if (planning) this.renderPlacing(row);
     else if (this.selectActive) this.renderSelect(row);
     else if (s.mode === "build") this.renderBuild(row);
@@ -473,6 +504,36 @@ export class Shell {
     btn("plan-cancel", "cancel", icon("x"), "Cancel", () => this.cb.onPlanCancel?.());
     btn("plan-route", `route${p.forced ? " forced" : ""}`, icon(p.routeIcon), p.routeName, () => this.cb.onPlanRoute?.());
     btn("plan-build", "build", icon("check"), "Build", () => this.cb.onPlanBuild?.());
+  }
+
+  // The vector picker's bar. Building: Cancel (vectored building off),
+  // Reset (the offset back on the anchor), Less and More (halve or double
+  // the copies). Selecting: Cancel, Reset and Confirm -- that vector runs
+  // until the pattern stops repeating, so it has no count.
+  renderVector(row) {
+    const v = this.state.vector;
+    const btn = (id, cls, html, label, fn) => {
+      const b = document.createElement("button");
+      b.type = "button";
+      b.className = `b planbtn compact ${cls}`;
+      b.id = id;
+      b.innerHTML = `${html}<span>${label}</span>`;
+      b.addEventListener("click", fn);
+      row.append(b);
+    };
+    btn("vec-cancel", "cancel", icon("x"), "Cancel", () => this.cb.onVectorCancel?.());
+    btn("vec-reset", "", icon("reset"), "Reset", () => this.cb.onVectorReset?.());
+    if (v.picking === "build") {
+      btn("vec-less", "", icon("minus"), "Less", () => this.cb.onVectorCount?.(false));
+      btn("vec-more", "", icon("plus"), `More · ${v.count}`, () => this.cb.onVectorCount?.(true));
+    } else {
+      btn("vec-confirm", "build", icon("check"), "Confirm", () => this.cb.onVectorConfirm?.());
+    }
+  }
+
+  setVector(v) {
+    this.state.vector = { ...this.state.vector, ...v };
+    this.render();
   }
 
   // Placing a machine or a raw belt: Cancel, the two rotations, and -- for

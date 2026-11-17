@@ -27,6 +27,7 @@
   --ink: #d6d9e0;
   --ink-dim: #767c8a;
   --accent: #e8a33d;
+  --vec: #4cc7b6;          /* the vector: picker highlights, Build's tint */
   --accent-ink: #1a1305;
   --sel-bg: #2a2118;
   --sel-ink: #f0c078;
@@ -254,6 +255,13 @@ html, body {
 }
 .thumbpad .b svg { width: 52%; height: 52%; }
 .thumbpad .tp-flip { grid-column: 1 / span 2; justify-self: center; width: calc(34 * var(--u)); }
+/* The vector picker for building adds a third row: fewer, more copies. */
+.thumbpad .tp-less, .thumbpad .tp-more { display: none; }
+.thumbpad[data-count="true"] { grid-template-rows: repeat(3, calc(34 * var(--u))); }
+.thumbpad[data-count="true"] .tp-less, .thumbpad[data-count="true"] .tp-more { display: grid; color: var(--vec); }
+/* Build, tinted while vectored building is on. */
+.tool[data-mode="build"][data-vector="true"] { color: var(--vec); border-color: var(--vec); }
+.tool[data-mode="build"][data-vector="true"][data-selected="true"] { background: rgba(76, 199, 182, 0.14); }
 
 /* ----------------------------------------------------------------------
    THE SWATCH BAR: one scrolling row of round swatches. Its height is fixed
@@ -494,7 +502,9 @@ html, body {
 .b, .swb, .swarrow, .pick { touch-action: manipulation; }
 
 /* Placing a machine: compact buttons, then the number swatches. */
-#swatches[data-mode="place"] {
+#swatches[data-mode="vector"] .planbtn.compact { width: calc(64 * var(--u)); }
+#swatches[data-mode="vector"] .planbtn:not(.cancel) { color: var(--vec); }
+#swatches[data-mode="place"], #swatches[data-mode="vector"] {
   gap: calc(var(--btn-gap) * var(--u));
   padding: 0 calc(6 * var(--u));
   box-sizing: border-box;

@@ -241,6 +241,36 @@ line, which the desktop offers, but the phone's Route button does not: it
 was dropped as not worth a button. A slot saved while it existed reads as
 H-first.
 
+### Vectors
+
+[vector.js](vector.js) is the core, pure: offsets, the vector's turns, a
+**claims** overlay and the chain follow for vectored selection. With the
+vector on, whatever is built repeats at `k * v` for `k = 0 .. count-1`.
+
+**The picker.** Tap **Build while already in Build**: the hammer gets an
+arrow across it and the bar becomes Cancel / Reset / Less / More (× count).
+The thumb pads turn the vector instead of the tool -- rotate a quarter, flip
+negates x -- and gain a − / + row. The first drag after opening sets the
+**anchor** where it starts (highlighted, with every copy's cell outlined
+along the vector); each drag moves the offset by the finger's motion, so
+the offset never jumps under the thumb. Tapping Build again, or tapping the
+board, confirms: the picker closes and Build stays **tinted** (vectored
+building is on). Cancel closes it and turns vectored building off. The
+vector starts at (0, 0), which makes no copies; count starts at 2 and
+doubles up to 256 (`VEC_MAX`). Not persisted.
+
+**Copies are laid in sequence** (`layCopies`): copy `k` sees copies
+`0..k-1` as occupied, through the claims overlay over the board's own
+`isFree`, so they never land on each other. The original is always kept
+(red where blocked, as without a vector); a later copy is kept only if it
+fits **whole** -- a stamp copy that would only partly fit is dropped, not
+half-shown. Everything a placement shows reads the tool, so turning the
+tool re-lays the copies at once (a 2-wide Shear on a (1, 0) vector of 8
+ghosts as 4; turned 1×2, all 8). A tap on any copy places them all, in
+order, each re-checked against the board as the ones before it left it,
+with **one** re-derive for the lot; force build clears the way for the
+original only.
+
 ### Placing machines and raw belts
 
 The other one-tap tools (every machine, and the raw belt) share one flow.
@@ -726,6 +756,7 @@ asserting every array matches and exactly the edited value differs.
 | `glyphs.js` | the machine glyphs, ports of the shader's `sd_*` marks |
 | `tune.js` | the Dev dials: defaults, panel spec, the live values |
 | `history.js` | undo, redo and the checkpoint, over board snapshots |
+| `vector.js` | vectors: offsets, turns, the claims overlay, laying copies, following a chain |
 | `tests/` | `node --test` suites for the pure modules |
 | `types.json` | generated — do not edit |
 | `build.sh` | assembles `_site/`, and stamps `sw.js` with its file list and version |

@@ -21,6 +21,7 @@ import { traceRun } from "./segtrace.js";
 import { TUNE, setTune } from "./tune.js";
 import { Sim, Clock } from "./sim.js";
 import { History } from "./history.js";
+import { offsets, layCopies, isZero, rotateVec, flipVec, moreCount, lessCount } from "./vector.js";
 import { deleteSave, getSave, listSaves, putSave } from "./saves.js";
 
 const DEFAULT_SAVE = "default.npz";
@@ -90,6 +91,15 @@ let sel = null;
 const history = new History();
 let committed = -1;
 
+// THE VECTOR (vector.js). While `on`, what is built repeats at k * v for
+// k = 0 .. count-1, each copy laid in sequence and dropped if it does not fit.
+//   picking   null, or which picker is open: "build" (tap Build while in
+//             Build) or "select" (the selection's Vector swatch)
+//   v         the offset, in cells. Starts at (0, 0): no copies
+//   anchor    the cell the picker's highlights start from -- wherever the
+//             first drag after opening the picker began
+let vec = { on: false, picking: null, v: [0, 0], count: 2, anchor: null };
+
 // A handle for the console and for headless tests. Not an API.
 const debug = window.gates = {
   cam, redraw, renderMs: 0,
@@ -137,12 +147,12 @@ function paint(now) {
   const info = board ? board.describe(inspectRow) : null;
   const ghosts = [
     selGhost(),
-    run ? ghostOf(currentPlan()) : placeGhost(currentPlacement()),
+    ...(run ? [ghostOf(currentPlan())] : placements().map(placeGhost)),
     boxRect ? { rect: boxRect } : null,
   ];
   // The belt a run starts on draws only as the run's ghost, at its new facing.
   const hide = run?.over && overStart(run.start[0], run.start[1]) ? run.start : null;
-  render(ctx, board, cam, dpr, { ...view, selected: info, ghosts, sim, alpha: clock.alpha, hide });
+  render(ctx, board, cam, dpr, { ...view, selected: info, ghosts, sim, alpha: clock.alpha, hide, vector: vectorMarks() });
   debug.renderMs = performance.now() - t0;
   if (sim && !clock.paused) redraw();
 }
@@ -314,6 +324,57 @@ function setInspectValue(v) {
   syncInspect();
 }
 
+// --- the vector picker ------------------------------------------------------
+//
+// Tap Build while in Build to open it; the bar becomes Cancel / Reset /
+// Less / More and the thumb pads turn the vector (rotate a quarter, flip
+// negates x) and count (-, +). The first drag after opening sets the ANCHOR
+// where it starts; every drag moves the offset by the finger's motion.
+// Tapping Build again -- or tapping the board -- confirms: the picker
+// closes and vectored building stays on (Build stays tinted). Cancel closes
+// it and turns vectored building off. Whatever is being planned (a ghost,
+// a run) keeps showing, copies and all, while the vector changes.
+
+function syncVector() {
+  shell.setVector({ on: vec.on, picking: vec.picking, count: vec.count });
+  syncBar();
+}
+
+function openBuildPicker() {
+  vec.picking = "build";
+  vec.on = true;
+  vec.anchor = null;
+  grab = null;
+  syncVector();
+}
+
+// Close the picker. Building: confirmed keeps vectored building on; not
+// confirmed (Cancel) turns it off.
+function closePicker(confirmed) {
+  const which = vec.picking;
+  vec.picking = null;
+  vec.anchor = null;
+  grab = null;
+  if (which === "build" && !confirmed) vec.on = false;
+  syncVector();
+}
+
+function vectorTurn(cw) { vec.v = rotateVec(vec.v, cw); syncVector(); }
+function vectorFlip() { vec.v = flipVec(vec.v); syncVector(); }
+function vectorReset() { vec.v = [0, 0]; syncVector(); }
+function vectorCount(more) { vec.count = more ? moreCount(vec.count) : lessCount(vec.count); syncVector(); }
+
+// The picker's highlights: the anchor and each copy's cell along v.
+function vectorMarks() {
+  if (!vec.picking || !vec.anchor) return null;
+  const n = vec.picking === "build" ? vec.count : 2;
+  const cells = (isZero(vec.v) ? [[0, 0]] : offsets(vec.v, n)).map(([dx, dy]) => [vec.anchor[0] + dx, vec.anchor[1] + dy]);
+  return { cells };
+}
+
+// Vectored selection: see "the selection" below.
+function confirmSelectVector() { closePicker(true); }
+
 // --- taps -------------------------------------------------------------------
 
 function onTap(sx, sy) {
@@ -327,6 +388,8 @@ function onTap(sx, sy) {
     return;
   }
   if (mode !== "build") return;
+  // A tap while the picker is open confirms it, as Build does.
+  if (vec.picking) { if (vec.picking === "build") closePicker(true); else confirmSelectVector(); return; }
   const tool = placer();
   // Something already planned keeps the tap, even over an entity.
   if (place || shell.activeStamp) {
@@ -523,23 +586,60 @@ function typeIdOf(name) {
 function currentPlacement() {
   const tool = placer();
   if (!place || !board || !tool) return null;
+  const w = tool.kind === "stamp" ? tool.stamp.w : tool.kind === "rawbelt" ? 1 : orientOf(tool).w;
+  const h = tool.kind === "stamp" ? tool.stamp.h : tool.kind === "rawbelt" ? 1 : orientOf(tool).h;
+  return placementAt(tool, originFor(w, h, place.px, place.py));
+}
+
+function orientOf(tool) {
+  return T.types[typeIdOf(tool.type)].orient[`${tool.dir | 0}${tool.flip ? 1 : 0}`];
+}
+
+// The cells a placement would occupy, as [x, y].
+function placementCells(pl) {
+  if (pl.kind === "stamp") return stampCells(T, pl.tool.stamp, pl.origin[0], pl.origin[1]).map(([x, y]) => [x, y]);
+  const out = [];
+  for (let dx = 0; dx < pl.w; dx++) for (let dy = 0; dy < pl.h; dy++) out.push([pl.origin[0] + dx, pl.origin[1] + dy]);
+  return out;
+}
+
+// Is the vector making copies right now?
+const vectoring = () => vec.on && !isZero(vec.v);
+
+// Every placement a tap would make: the ghost, and with the vector on, its
+// copies at k * v -- each laid in sequence and dropped unless it fits whole
+// on the board as the earlier copies leave it. The original is always kept,
+// red where it is blocked, as without a vector.
+function placements() {
+  const base = currentPlacement();
+  if (!base) return [];
+  if (!vectoring()) return [base];
+  return layCopies(offsets(vec.v, vec.count), (x, y) => board.isFree(x, y), (off, claims) => {
+    const pl = off[0] || off[1] ? placementAt(base.tool, [base.origin[0] + off[0], base.origin[1] + off[1]]) : base;
+    const cells = placementCells(pl);
+    const ok = claims.fits(cells);
+    // A partly blocked original stamp still builds what fits.
+    const claim = ok ? cells : pl.kind === "stamp" ? cells.filter(([x, y]) => claims.free(x, y)) : [];
+    return { pl, cells, ok, claim };
+  }).map(c => c.pl);
+}
+
+// The placement of `tool` with its footprint's corner at `origin`.
+function placementAt(tool, origin) {
   if (tool.kind === "stamp") {
     const st = tool.stamp;
-    const origin = originFor(st.w, st.h, place.px, place.py);
     const at = st.entries.map(e => [origin[0] + e.dx, origin[1] + e.dy]);
     const ghost = stampGhost(board, st.entries, at);
     return { tool, kind: "stamp", origin, w: st.w, h: st.h, entries: st.entries, at, ghost, blocked: ghost.blocked };
   }
   const dir = tool.dir | 0, flip = !!tool.flip;
   if (tool.kind === "rawbelt") {
-    const origin = originFor(1, 1, place.px, place.py);
     const free = board.isFree(origin[0], origin[1]);
     return { tool, kind: "rawbelt", origin, dir, w: 1, h: 1, value: toolValue(tool),
              blocked: free ? [] : [{ x: origin[0], y: origin[1] }] };
   }
   const type = typeIdOf(tool.type);
   const o = T.types[type].orient[`${dir}${flip ? 1 : 0}`];
-  const origin = originFor(o.w, o.h, place.px, place.py);
   const { blocked } = board.footprint(type, origin, dir, flip);
   return { tool, kind: "structure", type, origin, dir, flip, w: o.w, h: o.h, o,
            value: toolValue(tool), blocked };
@@ -571,30 +671,33 @@ function endPlace() {
   syncBar();
 }
 
-// Build what the ghost shows. A machine or raw belt only if every cell is
-// free; a stamp, whatever of it fits. Returns whether anything was placed.
+// Build what the ghosts show: the original and every copy the vector kept,
+// in order, with one re-derive for the lot. A machine or raw belt only if
+// every cell is free; a stamp, whatever of it fits. Returns whether
+// anything was placed.
 function placeOnce() {
-  const pl = currentPlacement();
-  if (!pl) return false;
-  if (pl.kind === "stamp") {
-    const placed = board.placeEntries(pl.entries, pl.at);
-    redraw();
-    return placed.size > 0;
-  }
-  if (pl.blocked.length) {
-    // Force build clears the way for a machine or a raw belt. Not for a
-    // stamp, which already places whatever fits.
-    if (!TUNE.forceBuild) return false;
-    clearCells(pl.blocked);
+  const pls = placements();
+  let any = false;
+  pls.forEach((pl, k) => { if (placeOne(pl, k === 0)) any = true; });
+  if (any) board.derive();
+  redraw();
+  return any;
+}
+
+// One placement, without re-deriving. Each is checked against the board as
+// the ones before it left it. Force build clears the way for the original
+// machine or raw belt only -- never for a copy, and never for a stamp,
+// which already places whatever fits.
+function placeOne(pl, original) {
+  if (pl.kind === "stamp") return board.placeEntries(pl.entries, pl.at, { derive: false }).size > 0;
+  const blocked = placementCells(pl).filter(([x, y]) => !board.isFree(x, y));
+  if (blocked.length) {
+    if (!original || !TUNE.forceBuild) return false;
+    clearCells(blocked.map(([x, y]) => ({ x, y })));
   }
   const [x, y] = pl.origin;
-  if (pl.kind === "rawbelt") {
-    board.spawnBelt(x, y, pl.dir, pl.value);
-    board.derive();
-  } else {
-    board.spawnStructure(pl.type, pl.origin, pl.dir, pl.flip, { emit: pl.value });
-  }
-  redraw();
+  if (pl.kind === "rawbelt") board.spawnBelt(x, y, pl.dir, pl.value);
+  else board.spawnStructure(pl.type, pl.origin, pl.dir, pl.flip, { emit: pl.value, derive: false });
   return true;
 }
 
@@ -607,9 +710,9 @@ function onCells(sx, sy, x, y, w, h) {
   return sx >= x0 - m && sx <= x1 + m && sy >= y1 - m && sy <= y0 + m;
 }
 
+// On the ghost, or on any of its copies.
 function onGhost(sx, sy) {
-  const pl = currentPlacement();
-  return !!pl && onCells(sx, sy, pl.origin[0], pl.origin[1], pl.w, pl.h);
+  return placements().some(pl => onCells(sx, sy, pl.origin[0], pl.origin[1], pl.w, pl.h));
 }
 
 // --- the selection ----------------------------------------------------------
@@ -757,7 +860,7 @@ function enterPaste(id, pose = null) {
 // them instead. The run is traced over the board AND the selection
 // together, so a run that is partly lifted is still one run.
 function onLongPress(sx, sy) {
-  if (!board || shell.state.mode !== "build") return false;
+  if (!board || shell.state.mode !== "build" || vec.picking) return false;
   if (run || place || shell.activeStamp) return false;
   const [x, y] = cellUnder(sx, sy);
   const abs = sel ? selAbs() : [];
@@ -818,6 +921,7 @@ const dragHooks = {
   // (sx, sy): where the press was. Called with no point after a pinch drops
   // back to one finger, which never starts a selection drag of its own.
   wants(sx, sy) {
+    if (vec.picking) return sx !== undefined;
     if (run || place) return true;
     if (!shell.selecting) return false;
     if (sx === undefined) return false;
@@ -826,6 +930,13 @@ const dragHooks = {
   },
   begin(sx, sy) {
     const world0 = cam.screenToWorld(sx, sy);
+    if (vec.picking) {
+      // The first drag after opening the picker sets the anchor where it starts.
+      if (!vec.anchor) vec.anchor = [Math.floor(world0[0]), Math.floor(world0[1])];
+      grab = { vec: true, v0: vec.v.slice(), world0 };
+      redraw();
+      return;
+    }
     // A run's drag always moves its TIP. Moving the start too was tried and
     // read as confusing in practice: Cancel and re-tap is the way to move it.
     if (run) grab = { cell0: run.end.slice(), world0 };
@@ -843,6 +954,11 @@ const dragHooks = {
       return;
     }
     const dx = wx - grab.world0[0], dy = wy - grab.world0[1];
+    if (grab.vec) {
+      const v = [grab.v0[0] + Math.round(dx), grab.v0[1] + Math.round(dy)];
+      if (v[0] !== vec.v[0] || v[1] !== vec.v[1]) { vec.v = v; syncVector(); }
+      return;
+    }
     if (grab.sel) {
       if (!sel) return;
       sel.px = grab.p0[0] + dx;
@@ -992,6 +1108,8 @@ async function init() {
       if (s.mode !== "hand" && inspectRow >= 0) inspect(-1);
       if (run && !(s.mode === "build" && beltHeld())) { run = null; grab = null; }
       if (place && !placer()) { place = null; grab = null; }
+      // Leaving Build closes a picker, keeping the vector as it stands.
+      if (s.mode !== "build" && vec.picking) closePicker(true);
       // Leaving Build puts the selection down. Anything that does not fit
       // stays lifted, and is still there on coming back.
       const left = lastMode === "build" && s.mode !== "build";
@@ -1019,6 +1137,16 @@ async function init() {
     onReset: () => { if (sim) { sim.reset(); clock.reset(); } redraw(); },
     onPause: (paused) => { clock.paused = paused; redraw(); },
     onRate: (rate) => { clock.setRate(rate); redraw(); },
+    onBuildTap: () => {
+      if (vec.picking === "build") closePicker(true);
+      else if (!vec.picking) openBuildPicker();
+    },
+    onVectorCancel: () => closePicker(false),
+    onVectorReset: () => vectorReset(),
+    onVectorCount: (more) => vectorCount(more),
+    onVectorTurn: (cw) => vectorTurn(cw),
+    onVectorFlip: () => vectorFlip(),
+    onVectorConfirm: () => confirmSelectVector(),
     onUndo: () => undo(),
     onRedo: () => redo(),
     onCheckpoint: () => checkpoint(),

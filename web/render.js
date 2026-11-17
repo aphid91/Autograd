@@ -35,6 +35,7 @@ const COL = {
   passChevron: "#bdc2d1",
   // Items, from world.frag's COL_ITEM_*: a dark disc with a ring that says
   // the sign -- green above zero, red at or below.
+  vector: "#4cc7b6",           // the vector picker (style.css --vec)
   itemFill: "rgb(36,38,46)",
   itemPos: "rgb(97,209,107)",
   itemNeg: "rgb(230,92,87)",
@@ -137,6 +138,9 @@ export function render(ctx, board, cam, dpr, opts = {}) {
   // so a red wash never changes the colour that says an item's sign.
   let cargo = null;
   if (view.sim) cargo = drawItems(ctx, view.sim, view.alpha || 0, z, on, S);
+
+  // The vector picker's highlights, over the ghosts they move.
+  if (view.vector) drawVectorMarks(ctx, view.vector, px);
 
   // The inspected entity: an outline that stays a few pixels wide at any
   // zoom, drawn over everything so it cannot be hidden by what it marks.
@@ -461,6 +465,32 @@ function drawLabels(ctx, T, structs, cam, dpr, on) {
     const [sx, sy] = cam.worldToScreen(s.x + s.w / 2, s.y + s.h / 2);
     ctx.fillText(fmtNumber(s.emit), sx, sy);
   }
+}
+
+// The vector picker: the anchor cell filled, every copy's cell outlined, and
+// a line through their centres so the direction reads at a glance.
+function drawVectorMarks(ctx, marks, px) {
+  const cells = marks.cells;
+  if (!cells.length) return;
+  ctx.save();
+  ctx.lineWidth = 2 * px;
+  ctx.strokeStyle = COL.vector;
+  ctx.globalAlpha = 0.9;
+  if (cells.length > 1) {
+    ctx.beginPath();
+    ctx.moveTo(cells[0][0] + 0.5, cells[0][1] + 0.5);
+    for (const [x, y] of cells.slice(1)) ctx.lineTo(x + 0.5, y + 0.5);
+    ctx.setLineDash([4 * px, 4 * px]);
+    ctx.stroke();
+    ctx.setLineDash([]);
+  }
+  ctx.beginPath();
+  for (const [x, y] of cells) ctx.rect(x + 0.06, y + 0.06, 0.88, 0.88);
+  ctx.stroke();
+  ctx.globalAlpha = 0.35;
+  ctx.fillStyle = COL.vector;
+  ctx.fillRect(cells[0][0], cells[0][1], 1, 1);
+  ctx.restore();
 }
 
 // --- items --------------------------------------------------------------------

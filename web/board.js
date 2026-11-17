@@ -352,7 +352,7 @@ export class Board {
   // candidate, the order Engine.commit_ghosts() uses so a pasted exit cannot
   // be grabbed by an unrelated entrance at the paste site. Returns the set
   // of indices placed.
-  placeEntries(entries, at) {
+  placeEntries(entries, at, { derive = true } = {}) {
     const C = this.T.cell;
     const rows = new Map();
     entries.forEach((e, i) => {
@@ -377,7 +377,7 @@ export class Board {
       const mate = this.findUnderPartner(at[i][0], at[i][1], entries[i].dir, entries[i].exit);
       if (mate > 0) this.pairUnder(row, mate);
     }
-    this.derive();
+    if (derive) this.derive();
     return new Set(rows.keys());
   }
 
