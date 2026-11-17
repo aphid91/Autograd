@@ -654,6 +654,15 @@ export class Shell {
       selected: s.boxArmed,
       onTap: () => { s.boxArmed = !s.boxArmed; this.changed(); },
     }));
+    // Vector: repeat the selection along a vector for as long as the board
+    // repeats it (main.js's vector picker, in its "select" form).
+    const vsw = this.swatch({
+      art: icon("vector"), name: "Vector", cls: "actsw act-vector",
+      selected: s.vector.picking === "select",
+      onTap: () => { if (s.selCount) this.cb.onSelectVector?.(); },
+    });
+    if (!s.selCount) vsw.dataset.disabled = "true";
+    row.append(vsw);
     for (const c of COMMANDS) {
       const sw = this.swatch({
         art: icon(COMMAND_ICON[c]), name: COMMAND_LABEL[c], cls: `actsw act-${c}`,

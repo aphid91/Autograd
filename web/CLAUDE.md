@@ -292,6 +292,21 @@ is on copy 0's first leg -- copy 0's route doomed all the others. The bus is
 cached on the board revision, the run and the vector, since it is two full
 plannings of up to 256 runs.
 
+**Vectored selection** is separate from vectored building: the selection
+bar's **Vector** swatch opens the same picker in its "select" form, with
+its own offset (`vec.sv`, so it never disturbs the building vector). The
+anchor is a cell of the first selected entity, the offset starts on it,
+and the bar is Cancel / Reset / Confirm (no count: this vector runs until
+the pattern breaks). On Confirm -- or a tap on the board -- the selection
+as it now sits is the **pattern**, and `followChain()` steps along `v`:
+if the board holds the whole pattern again at `k * v` (`matchRow()`: same
+type, origin, facing, flip and underground role; a Source's value, a seed
+and pairing **ignored**, or indexing Sources that hold different numbers
+would stop at the first), those entities are added; the first `k` where
+any is missing ends it. They are added chain step by chain step, the
+pattern's own order within a step -- a selection order, which indexing
+uses.
+
 ### Placing machines and raw belts
 
 The other one-tap tools (every machine, and the raw belt) share one flow.
@@ -408,6 +423,7 @@ outlined in cyan. Deselecting places it back wherever the selection now is.
 | one-finger drag from a selected entity | move the whole selection |
 | one-finger drag elsewhere | pan |
 | Box, then a drag (from anywhere) | a rectangle: everything it touches is **added**, then Box disarms |
+| Vector, drag the offset, Confirm | add every repeat of the selection along the vector, until it breaks (see "Vectors") |
 | Turn buttons | turn / mirror the selection as one stamp |
 | Delete | discard the selection |
 | long press a belt or underground | select its whole run; if the whole run is already selected, deselect it |

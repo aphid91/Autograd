@@ -21,7 +21,7 @@ import { traceRun } from "./segtrace.js";
 import { TUNE, setTune } from "./tune.js";
 import { Sim, Clock } from "./sim.js";
 import { History } from "./history.js";
-import { Claims, offsets, layCopies, isZero, rotateVec, flipVec, moreCount, lessCount } from "./vector.js";
+import { Claims, followChain, offsets, layCopies, isZero, rotateVec, flipVec, moreCount, lessCount } from "./vector.js";
 import { deleteSave, getSave, listSaves, putSave } from "./saves.js";
 
 const DEFAULT_SAVE = "default.npz";
@@ -101,7 +101,13 @@ let committed = -1;
 //   v         the offset, in cells. Starts at (0, 0): no copies
 //   anchor    the cell the picker's highlights start from -- wherever the
 //             first drag after opening the picker began
-let vec = { on: false, picking: null, v: [0, 0], count: 2, anchor: null };
+//   sv        the selection picker's own offset, so picking one never
+//             disturbs the building vector
+let vec = { on: false, picking: null, v: [0, 0], count: 2, anchor: null, sv: [0, 0] };
+
+// The offset the open picker edits.
+const pickV = () => (vec.picking === "select" ? vec.sv : vec.v);
+function setPickV(v) { if (vec.picking === "select") vec.sv = v; else vec.v = v; }
 
 // A handle for the console and for headless tests. Not an API.
 const debug = window.gates = {
@@ -364,21 +370,70 @@ function closePicker(confirmed) {
   syncVector();
 }
 
-function vectorTurn(cw) { vec.v = rotateVec(vec.v, cw); syncVector(); }
-function vectorFlip() { vec.v = flipVec(vec.v); syncVector(); }
-function vectorReset() { vec.v = [0, 0]; syncVector(); }
+function vectorTurn(cw) { setPickV(rotateVec(pickV(), cw)); syncVector(); }
+function vectorFlip() { setPickV(flipVec(pickV())); syncVector(); }
+function vectorReset() { setPickV([0, 0]); syncVector(); }
 function vectorCount(more) { vec.count = more ? moreCount(vec.count) : lessCount(vec.count); syncVector(); }
 
 // The picker's highlights: the anchor and each copy's cell along v.
 function vectorMarks() {
   if (!vec.picking || !vec.anchor) return null;
   const n = vec.picking === "build" ? vec.count : 2;
-  const cells = (isZero(vec.v) ? [[0, 0]] : offsets(vec.v, n)).map(([dx, dy]) => [vec.anchor[0] + dx, vec.anchor[1] + dy]);
+  const cells = offsets(pickV(), n).map(([dx, dy]) => [vec.anchor[0] + dx, vec.anchor[1] + dy]);
   return { cells };
 }
 
-// Vectored selection: see "the selection" below.
-function confirmSelectVector() { closePicker(true); }
+// --- vectored selection ------------------------------------------------------
+//
+// The selection's Vector swatch opens the picker in its "select" form: the
+// anchor is a cell of one of the selected entities (the first), the offset
+// starts on it, and the bar is Cancel / Reset / Confirm. On Confirm (or a
+// tap on the board) the selection, as it now sits, is the PATTERN: if the
+// board holds the whole pattern again at 1 * v -- every entity of the same
+// type, facing and flip at the same place, settings (a Source's value, a
+// seed, underground pairing) ignored -- those are added, then at 2 * v, and
+// so on until the pattern breaks. Added in order, chain step by chain step
+// and the pattern's own order within a step, so it is a selection ORDER too.
+
+function openSelectPicker() {
+  if (!sel) return;
+  const first = selAbs()[0];
+  vec.picking = "select";
+  vec.sv = [0, 0];
+  vec.anchor = [first.dx, first.dy];
+  grab = null;
+  syncVector();
+}
+
+function confirmSelectVector() {
+  const v = vec.sv;
+  closePicker(true);
+  if (!sel || isZero(v)) return;
+  const pattern = selAbs();
+  const rows = [];
+  for (const off of followChain(v, (o) => {
+    const found = pattern.map(e => matchRow(e, e.dx + o[0], e.dy + o[1]));
+    if (found.some(r => r < 0)) return false;
+    rows.push(...found);
+    return true;
+  })) void off;
+  if (rows.length) lift(rows);
+}
+
+// The board row matching entry `e` with its origin at (x, y): same type,
+// facing, flip and underground role -- or -1. Settings are not compared.
+function matchRow(e, x, y) {
+  const row = board.entityAt(x, y);
+  if (row < 0) return -1;
+  const E = T.entity;
+  if ((board.field(row, E.F_ORIGIN_X) | 0) !== x || (board.field(row, E.F_ORIGIN_Y) | 0) !== y) return -1;
+  const type = board.field(row, E.F_TYPE) | 0;
+  if (T.types[type].name !== e.type) return -1;
+  if ((board.field(row, E.F_DIR) | 0) !== e.dir) return -1;
+  if (!!board.field(row, E.F_FLIPPED) !== !!e.flip) return -1;
+  if (type === T.cell.TYPE_UNDER && !!board.field(row, E.F_UNDER_IS_EXIT) !== !!e.exit) return -1;
+  return row;
+}
 
 // --- taps -------------------------------------------------------------------
 
@@ -820,6 +875,8 @@ function setSel(abs) {
     sel = { stamp, px: origin[0] + stamp.w / 2, py: origin[1] + stamp.h / 2 };
   }
   shell.setSelection(sel ? sel.stamp.entries.length : 0);
+  // Nothing left selected: the selection's picker has nothing to repeat.
+  if (!sel && vec.picking === "select") closePicker(false);
   syncHistory();
   redraw();
 }
@@ -1007,7 +1064,7 @@ const dragHooks = {
     if (vec.picking) {
       // The first drag after opening the picker sets the anchor where it starts.
       if (!vec.anchor) vec.anchor = [Math.floor(world0[0]), Math.floor(world0[1])];
-      grab = { vec: true, v0: vec.v.slice(), world0 };
+      grab = { vec: true, v0: pickV().slice(), world0 };
       redraw();
       return;
     }
@@ -1030,7 +1087,8 @@ const dragHooks = {
     const dx = wx - grab.world0[0], dy = wy - grab.world0[1];
     if (grab.vec) {
       const v = [grab.v0[0] + Math.round(dx), grab.v0[1] + Math.round(dy)];
-      if (v[0] !== vec.v[0] || v[1] !== vec.v[1]) { vec.v = v; syncVector(); }
+      const cur = pickV();
+      if (v[0] !== cur[0] || v[1] !== cur[1]) { setPickV(v); syncVector(); }
       return;
     }
     if (grab.sel) {
@@ -1221,6 +1279,7 @@ async function init() {
     onVectorTurn: (cw) => vectorTurn(cw),
     onVectorFlip: () => vectorFlip(),
     onVectorConfirm: () => confirmSelectVector(),
+    onSelectVector: () => { if (vec.picking === "select") closePicker(false); else if (!vec.picking) openSelectPicker(); },
     onUndo: () => undo(),
     onRedo: () => redo(),
     onCheckpoint: () => checkpoint(),
