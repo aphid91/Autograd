@@ -667,12 +667,20 @@ export class Shell {
   // --- long press -------------------------------------------------------------
   // Right-click on a mouse; on touch, holding still for LONG_PRESS_MS. The
   // release that follows a long press must not also count as a tap.
+  //
+  // A touch long press ALSO fires the browser's own contextmenu (Android
+  // Chrome, at about the same moment as our timer), so contextmenu acts only
+  // for a mouse. Acting on both ran onHold twice -- harmless for the
+  // picker, but the rate panel is a toggle, so it opened and shut at once
+  // unless the hold happened to land between the two.
   wireHold(b, onHold) {
-    b.addEventListener("contextmenu", (e) => { e.preventDefault(); onHold(); });
+    let touch = false;
+    b.addEventListener("contextmenu", (e) => { e.preventDefault(); if (!touch) onHold(); });
     let timer = null, x0 = 0, y0 = 0;
     const cancel = () => { if (timer !== null) clearTimeout(timer); timer = null; };
     b.addEventListener("pointerdown", (e) => {
-      if (e.pointerType === "mouse") return;
+      touch = e.pointerType !== "mouse";
+      if (!touch) return;
       x0 = e.clientX; y0 = e.clientY;
       cancel();
       timer = setTimeout(() => {
