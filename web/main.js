@@ -12,7 +12,7 @@ import { Camera, attachGestures } from "./camera.js";
 import { render } from "./render.js";
 import { Shell } from "./ui.js";
 import { Panel } from "./panel.js";
-import { ROUTE_NAMES, ROUTE_H_FIRST, ROUTE_V_FIRST, planRun, turnTip } from "./planner.js";
+import { ROUTE_NAMES, ROUTE_H_FIRST, ROUTE_V_FIRST, chooseRoute, turnTip } from "./planner.js";
 import { originFor } from "./placer.js";
 import { VALUE_CHOICES, hasValue, toolValue } from "./tools.js";
 import { makeStamp, mirrored, rotated, stampCells, subset } from "./stamp.js";
@@ -187,7 +187,13 @@ function resize() {
 // the run / placement / paste state from one place.
 function syncBar() {
   let p = null;
-  if (run) p = { kind: "belt", routeName: ROUTE_NAMES[run.route], routeIcon: ROUTE_ICONS[run.route] };
+  if (run) {
+    // The button names the route in use; dimmed when the other one was
+    // forced because only it gets through. A press still flips the
+    // player's preference, which shows again once both routes work.
+    const { route, forced } = routeChoice();
+    p = { kind: "belt", routeName: ROUTE_NAMES[route], routeIcon: ROUTE_ICONS[route], forced };
+  }
   else if (place || shell.activeStamp) p = { kind: "place", values: hasValue(placer()) ? VALUE_CHOICES : null };
   const cur = shell.state.planning;
   if (JSON.stringify(cur) !== JSON.stringify(p)) shell.setPlanning(p);
@@ -266,8 +272,20 @@ function onTap(sx, sy) {
     // A tap on the tip turns it (straight, right, left). Any other second
     // tap places the run exactly as shown; it does not move the tip to
     // where the finger landed.
-    if (onCells(sx, sy, run.end[0], run.end[1], 1, 1)) { turnTip(run, true); redraw(); }
-    else commitRun();
+    if (onCells(sx, sy, run.end[0], run.end[1], 1, 1)) {
+      // A one-cell run started on a placed belt: the tap means "that belt",
+      // so the run is dropped and the belt selected. Its rotate buttons
+      // still re-aim it, and a tap elsewhere still builds.
+      const one = run.start[0] === run.end[0] && run.start[1] === run.end[1];
+      if (one && run.over && overStart(run.start[0], run.start[1])) {
+        const row = run.over;
+        cancelRun();
+        lift([row]);
+        return;
+      }
+      turnTip(run, true);
+      redraw();
+    } else commitRun();
     return;
   }
   if (sel) { selectTap(x, y); return; }
@@ -307,9 +325,15 @@ function overStart(x, y) {
   return !!run?.over && x === run.start[0] && y === run.start[1] && board.entityAt(x, y) === run.over;
 }
 
+// The route actually taken, and its plan: see chooseRoute() in planner.js.
+// `free` counts the start cell when the run turns the belt it starts on.
+function routeChoice() {
+  return chooseRoute(run, (x, y) => overStart(x, y) || board.isFree(x, y), T.under.MAX_GAP);
+}
+
 function currentPlan() {
   if (!run || !board) return null;
-  return planRun(run, (x, y) => overStart(x, y) || board.isFree(x, y), T.under.MAX_GAP);
+  return routeChoice().plan;
 }
 
 // The plan in the renderer's own shapes, so ghosts draw with the same code
@@ -678,7 +702,19 @@ function onLongPress(sx, sy) {
   };
   const emits = emitsWith(board, emitMask(board, abs, at));
   const cells = traceRun(node, (cx, cy, d) => board.incoming(cx, cy, d, emits), x, y);
-  if (!cells.length) return false;
+  if (!cells.length) {
+    // A hold on a selected entity stays a press: a slow drag from it still
+    // moves the selection, as it always did.
+    if (sel && selIndexAt(x, y) >= 0) return false;
+    // Anywhere else but a belt, the hold arms a box selection at the press,
+    // drawn at once so the hold reads as having taken. The finger now drags
+    // the box out; lifting it without moving does nothing.
+    const world0 = cam.screenToWorld(sx, sy);
+    grab = { box: world0, held: [sx, sy] };
+    boxRect = rectOf(world0, world0);
+    redraw();
+    return "drag";
+  }
   const rows = cells.filter(c => c.row !== undefined).map(c => c.row);
   if (rows.length) lift(rows);
   else drop(cells.map(c => c.sel));
@@ -695,6 +731,9 @@ function exitPaste() {
 // --- one-finger drags -----------------------------------------------------
 // Whatever is dragged follows the finger's MOTION, not its position: it
 // never jumps under the thumb, so the thumb never hides it.
+
+// How far a held finger must move before its box counts as dragged (CSS px).
+const HELD_SLOP = 8;
 
 function cellUnder(sx, sy) {
   const [wx, wy] = cam.screenToWorld(sx, sy);
@@ -723,7 +762,12 @@ const dragHooks = {
   move(sx, sy) {
     if (!grab) return;
     const [wx, wy] = cam.screenToWorld(sx, sy);
-    if (grab.box) { boxRect = rectOf(grab.box, [wx, wy]); redraw(); return; }
+    if (grab.box) {
+      if (grab.held && Math.hypot(sx - grab.held[0], sy - grab.held[1]) > HELD_SLOP) grab.held = null;
+      boxRect = rectOf(grab.box, [wx, wy]);
+      redraw();
+      return;
+    }
     const dx = wx - grab.world0[0], dy = wy - grab.world0[1];
     if (grab.sel) {
       if (!sel) return;
@@ -747,9 +791,11 @@ const dragHooks = {
     // A tip on a new cell goes back to straight on.
     run.tipTurn = 0;
     run.singleDir = run.defaultDir;
-    redraw();
+    syncBar();
   },
   end() {
+    // A held box the finger never dragged out selects nothing.
+    if (grab?.box && grab.held) boxRect = null;
     if (grab?.box && boxRect) {
       const r = boxRect;
       boxRect = null;

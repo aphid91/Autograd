@@ -75,7 +75,9 @@ export class Camera {
 //   held   the press stayed still for LONG_PRESS_MS and `hooks.onLongPress`
 //          claimed it. The lift that follows does nothing, and neither do
 //          moves: the finger has had its say. A long press the board does
-//          not claim stays a press, so it can still end as a tap.
+//          not claim stays a press, so it can still end as a tap. The board
+//          may instead answer "drag": it has begun a drag at the press (a
+//          box selection), and the gesture becomes that drag.
 //   dead   a pinch dropped back to one finger while the board wants drags.
 //          That finger does nothing, rather than surprising anyone by
 //          dragging the run's end from wherever it happens to be.
@@ -113,10 +115,12 @@ export function attachGestures(el, camera, onChange, hooks = {}) {
       if (gesture === "press" && hooks.onLongPress) {
         holdTimer = setTimeout(() => {
           holdTimer = null;
-          if (gesture === "press" && hooks.onLongPress(press.x, press.y)) {
-            gesture = "held";
-            onChange();
-          }
+          if (gesture !== "press") return;
+          const claim = hooks.onLongPress(press.x, press.y);
+          // "drag": the board has started a drag of its own at the press
+          // (a box selection), and the finger's moves and lift are now its.
+          if (claim === "drag") { gesture = "drag"; onChange(); }
+          else if (claim) { gesture = "held"; onChange(); }
         }, LONG_PRESS_MS);
       }
     } else {

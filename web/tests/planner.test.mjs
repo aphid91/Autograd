@@ -5,7 +5,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import {
-  planPath, pathDirs, planRun, turnTip,
+  planPath, pathDirs, planRun, turnTip, chooseRoute,
   ROUTE_H_FIRST, ROUTE_V_FIRST, ROUTE_LINE,
 } from "../planner.js";
 
@@ -131,4 +131,49 @@ test("a bridge needs a straight span even when both ends face the same way", () 
   assert.equal(p.cells[3].dir, E);
   assert.equal(p.cells[6].dir, E);
   assert.deepEqual(p.pairs, []);
+});
+
+// Choosing H-first or V-first. The run is (0,0) -> (4,4): H-first goes east
+// along y=0 then north up x=4; V-first north up x=0 then east along y=4. A
+// cell on a corner cannot be tunnelled (a bridge never spans a corner), so
+// blocking (4,0) stops H-first and blocking (0,4) stops V-first.
+const square = (extra) => run([0, 0], [4, 4], extra);
+const pick = (r, ...occ) => chooseRoute(r, board(...occ), MAX_GAP);
+
+test("the player's route is kept while it gets through", () => {
+  assert.deepEqual([pick(square()).route, pick(square()).forced], [ROUTE_H_FIRST, false]);
+  const v = pick(square({ route: ROUTE_V_FIRST }));
+  assert.deepEqual([v.route, v.forced], [ROUTE_V_FIRST, false]);
+  // A tunnel counts as getting through: (2,0) is bridged, so H-first stays.
+  const t = pick(square(), [2, 0]);
+  assert.deepEqual([t.route, t.forced], [ROUTE_H_FIRST, false]);
+  assert.ok(t.plan.cells.some(c => c.kind === "entry"));
+});
+
+test("only the other route gets through: it is taken, and says so", () => {
+  const h = pick(square(), [4, 0]);
+  assert.deepEqual([h.route, h.forced], [ROUTE_V_FIRST, true]);
+  assert.equal(h.plan.cells[1].x, 0, "the plan is the V-first one");
+  const v = pick(square({ route: ROUTE_V_FIRST }), [0, 4]);
+  assert.deepEqual([v.route, v.forced], [ROUTE_H_FIRST, true]);
+});
+
+test("when neither gets through, the player's route stands", () => {
+  for (const route of [ROUTE_H_FIRST, ROUTE_V_FIRST]) {
+    const c = pick(square({ route }), [4, 0], [0, 4]);
+    assert.deepEqual([c.route, c.forced], [route, false]);
+  }
+});
+
+test("a blocked last cell is ignored -- the tip dragged onto the machine it feeds", () => {
+  // Both routes end on the occupied tip: neither is forced.
+  const tip = pick(square(), [4, 4]);
+  assert.deepEqual([tip.route, tip.forced], [ROUTE_H_FIRST, false]);
+  assert.equal(tip.plan.cells.at(-1).kind, "blocked", "it is still blocked, only not counted");
+  // H-first blocked mid-run as well: V-first, blocked only at its tip, wins.
+  const both = pick(square(), [4, 0], [4, 4]);
+  assert.deepEqual([both.route, both.forced], [ROUTE_V_FIRST, true]);
+  // Only the LAST cell is excused: H-first ending in two blocked cells fails.
+  const two = pick(square(), [4, 3], [4, 4]);
+  assert.deepEqual([two.route, two.forced], [ROUTE_V_FIRST, true]);
 });

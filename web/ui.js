@@ -461,7 +461,7 @@ export class Shell {
       row.append(b);
     };
     btn("plan-cancel", "cancel", icon("x"), "Cancel", () => this.cb.onPlanCancel?.());
-    btn("plan-route", "route", icon(p.routeIcon), p.routeName, () => this.cb.onPlanRoute?.());
+    btn("plan-route", `route${p.forced ? " forced" : ""}`, icon(p.routeIcon), p.routeName, () => this.cb.onPlanRoute?.());
     btn("plan-build", "build", icon("check"), "Build", () => this.cb.onPlanBuild?.());
   }
 

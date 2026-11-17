@@ -116,7 +116,7 @@ The gesture, with the Belt tool held:
 
 | input | idle | planning |
 |---|---|---|
-| tap | start a run on that cell, **including a placed belt** (see below) | **on the tip** (or within 20 px): turn it, cycling straight, right, left |
+| tap | start a run on that cell, **including a placed belt** (see below) | **on the tip** (or within 20 px): turn it, cycling straight, right, left -- or, on a one-cell run started on a belt, select that belt |
 | | | **anywhere else**: **build** the run exactly as shown |
 | one-finger drag | pan | move the run's **tip** |
 | two fingers | pan / zoom | pan / zoom, always |
@@ -156,6 +156,21 @@ Four rules, each chosen over an obvious alternative:
   obstacle right after it), the belt is replaced by the entrance, seed and
   all. The **tip** is unchanged: it still cannot land on anything. A long
   press still selects the belt's run.
+- **Tapping a one-cell run started on a belt selects that belt** instead of
+  turning the tip: the run is cancelled and the belt lifted, since a tap on
+  a belt you just tapped means the belt. The rotate buttons and thumb pads
+  still re-aim it, and a tap elsewhere still builds, so a one-cell re-aim
+  is still there -- just not by tapping the tip.
+- **The route switches itself when only the other one gets through.**
+  `chooseRoute()` plans the player's elbow first; if it leaves a cell
+  blocked and the other elbow does not, the other is used. A tunnel counts
+  as getting through, and **a blocked last cell is not counted**: dragging
+  the tip up onto the machine the run feeds is the common case, and it
+  must not swing the route. When both get through, or neither does, the
+  player's route stands. It is decided per plan and never stored: the
+  Route button names the route in use, **dimmed** when it was forced, and a
+  press still flips the stored preference, which shows again as soon as
+  both routes work.
 
 **Thumb pads.** While anything is planned (a run, a placement, a paste) or
 a selection is held, the Turn buttons appear again in both bottom corners of the board -- rotate
@@ -292,6 +307,7 @@ outlined in cyan. Deselecting places it back wherever the selection now is.
 | Turn buttons | turn / mirror the selection as one stamp |
 | Delete | discard the selection |
 | long press a belt or underground | select its whole run; if the whole run is already selected, deselect it |
+| long press anywhere else, then drag | a box from the press point, as Box does: everything it touches is **added**. The box corner shows the moment the hold registers; lifting without dragging selects nothing |
 | Cut | the selection becomes a stamp, and pasting starts with the ghost **exactly where the selection was** |
 | Copy | the selection becomes a stamp and goes back down; if all of it fit, pasting starts with the ghost over the originals |
 | a stamp swatch | paste it (tap it again to stop) |
@@ -326,8 +342,15 @@ outlined in cyan. Deselecting places it back wherever the selection now is.
   belt cell of `cpu.npz`, and was mutation-tested (dropping either the
   merge check or the underground jump fails it). Long press works in Build
   with nothing planned, and while selecting; elsewhere it is an ordinary
-  press. A long press on anything but a belt is an ordinary press too, so
-  it ends as a tap.
+  press.
+- **A long press anywhere but a belt arms a box** at the press, so a box
+  select needs no Box button and no first entity. `onLongPress` answers
+  `"drag"` and `camera.js` hands the finger's moves and lift to the drag
+  hooks, the same path the Box button's drag takes. The cost is that a
+  still hold off a belt no longer ends as a tap (it used to start a run or
+  a placement there); it does nothing. A hold on a **selected** entity is
+  the exception and stays a press, so a slow drag from it still moves the
+  selection.
 - **Underground pairs.** Lifting one end of a pair releases the other
   (`Engine.unpair_under()`). Both ends lifted stay paired to each other.
   Placing back pairs the stamp's own ends first, then each unpaired end
@@ -384,6 +407,10 @@ Removing the straightness check at first passed everything, because every
 bent fixture also had its exit turned, so the exit rule refused it first. A
 staircase (Line route) bending inside the span with both ends facing east is
 the case that isolates it.
+
+The same file pins the route choice: kept while it gets through (tunnels
+included), switched and flagged when only the other does, kept when neither
+does, and a blocked last cell -- only the last -- excused.
 
 ### Placing is a port, and was checked against the desktop
 

@@ -168,3 +168,28 @@ export function planRun(run, free, maxGap) {
   const cells = path.map(([x, y], i) => ({ x, y, dir: dirs[i], kind: kind[i] }));
   return { cells, pairs };
 }
+
+// --- choosing the route -----------------------------------------------------
+//
+// Does a plan get through? No cell left blocked -- a tunnel counts as
+// getting through -- except a blocked LAST cell, which is ignored: dragging
+// the tip up onto the machine a run is meant to feed is the common case, and
+// it must not swing the route.
+export function routeWorks(plan) {
+  const cells = plan.cells;
+  for (let i = 0; i < cells.length - 1; i++) if (cells[i].kind === "blocked") return false;
+  return true;
+}
+
+// The route a run takes: the player's (`run.route`), unless only the other
+// elbow gets through. Decided per plan and never stored, so the player's
+// choice comes back as soon as both work -- or neither does.
+// Returns { route, plan, forced }.
+export function chooseRoute(run, free, maxGap) {
+  const mine = planRun(run, free, maxGap);
+  if (routeWorks(mine)) return { route: run.route, plan: mine, forced: false };
+  const other = run.route === ROUTE_H_FIRST ? ROUTE_V_FIRST : ROUTE_H_FIRST;
+  const alt = planRun({ ...run, route: other }, free, maxGap);
+  if (routeWorks(alt)) return { route: other, plan: alt, forced: true };
+  return { route: run.route, plan: mine, forced: false };
+}
