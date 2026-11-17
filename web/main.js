@@ -12,7 +12,7 @@ import { Camera, attachGestures } from "./camera.js";
 import { render } from "./render.js";
 import { Shell } from "./ui.js";
 import { Panel } from "./panel.js";
-import { ROUTE_NAMES, ROUTE_H_FIRST, ROUTE_V_FIRST, chooseRoute, turnTip } from "./planner.js";
+import { ROUTE_NAMES, ROUTE_H_FIRST, ROUTE_V_FIRST, chooseRoute, planRun, routeWorks, turnTip } from "./planner.js";
 import { originFor } from "./placer.js";
 import { VALUE_CHOICES, hasValue, toolValue } from "./tools.js";
 import { makeStamp, mirrored, rotated, stampCells, subset } from "./stamp.js";
@@ -21,7 +21,7 @@ import { traceRun } from "./segtrace.js";
 import { TUNE, setTune } from "./tune.js";
 import { Sim, Clock } from "./sim.js";
 import { History } from "./history.js";
-import { offsets, layCopies, isZero, rotateVec, flipVec, moreCount, lessCount } from "./vector.js";
+import { Claims, offsets, layCopies, isZero, rotateVec, flipVec, moreCount, lessCount } from "./vector.js";
 import { deleteSave, getSave, listSaves, putSave } from "./saves.js";
 
 const DEFAULT_SAVE = "default.npz";
@@ -55,6 +55,9 @@ const clock = new Clock();
 //   over         the row of the placed belt the run starts on, or 0. That
 //                belt is turned to follow the run when it is built, rather
 //                than blocking it
+//   v0           the vector when the run began (vectored), or null. The
+//                copies' STARTS stay at k * v0 whatever the vector does
+//                after; their ENDS follow the current vector
 let run = null;
 // During a one-finger drag, what it is moving:
 //   { cell0, world0 }         a run's tip
@@ -147,11 +150,13 @@ function paint(now) {
   const info = board ? board.describe(inspectRow) : null;
   const ghosts = [
     selGhost(),
-    ...(run ? [ghostOf(currentPlan())] : placements().map(placeGhost)),
+    // The run's own start and tip are ringed; its copies are not.
+    ...(run ? runCopies().copies.map((c, k) => ({ ...ghostOf(c.plan, c.over), ...(k === 0 ? { start: c.start, end: c.end } : {}) }))
+        : placements().map(placeGhost)),
     boxRect ? { rect: boxRect } : null,
   ];
   // The belt a run starts on draws only as the run's ghost, at its new facing.
-  const hide = run?.over && overStart(run.start[0], run.start[1]) ? run.start : null;
+  const hide = run ? runCopies().copies.filter(c => c.over).map(c => c.start) : null;
   render(ctx, board, cam, dpr, { ...view, selected: info, ghosts, sim, alpha: clock.alpha, hide, vector: vectorMarks() });
   debug.renderMs = performance.now() - t0;
   if (sim && !clock.paused) redraw();
@@ -274,7 +279,7 @@ function syncBar() {
     // The button names the route in use; dimmed when the other one was
     // forced because only it gets through. A press still flips the
     // player's preference, which shows again once both routes work.
-    const { route, forced } = routeChoice();
+    const { route, forced } = runCopies();
     p = { kind: "belt", routeName: ROUTE_NAMES[route], routeIcon: ROUTE_ICONS[route], forced };
   }
   else if (place || shell.activeStamp) p = { kind: "place", values: hasValue(placer()) ? VALUE_CHOICES : null };
@@ -472,9 +477,73 @@ function currentPlan() {
   return routeChoice().plan;
 }
 
+// Every run a Build would lay: the run, and with the vector on, a copy per
+// k whose start is start + k * v0 (the vector the run began with) and whose
+// end is end + k * v (the vector now). So once a run has begun, picking a
+// new vector swings the copies' ENDS about their fixed starts: a bus laid
+// east and re-vectored north fans its tips up a column.
+//
+// Copies are planned in sequence over the claims of the ones before -- their
+// belts and underground ends; a tunnel's buried tiles stay free -- so a copy
+// may tunnel under an earlier one, and a copy that does not get through
+// (routeWorks: a blocked last cell excused) is dropped. Copy 0 always shows,
+// red where blocked. A copy whose start lands on a placed belt turns it, as
+// the run itself does.
+//
+// ONE ROUTE FOR THE WHOLE BUS, so it stays parallel -- and it is chosen for
+// the bus, not for copy 0 alone: the player's route, unless the other gets
+// strictly more of the copies through. (A bus whose starts sit in a row
+// can never go H-first along that row: every copy's start lies on copy 0's
+// first leg. Copy 0's own route would doom all the others.)
+// Returns { route, forced, copies: [{ plan, over, start, end }] }.
+function runCopies() {
+  if (!run || !board) return { route: run?.route, forced: false, copies: [] };
+  if (!vectoring()) {
+    const { route, forced, plan } = routeChoice();
+    return { route, forced, copies: [{ plan, over: run.over && overStart(run.start[0], run.start[1]) ? run.over : 0, start: run.start, end: run.end }] };
+  }
+  const key = `${board.revision}|${JSON.stringify(run)}|${vec.v}|${vec.count}`;
+  if (busCache?.key === key) return busCache.bus;
+  const mine = busFor(run.route);
+  const otherRoute = run.route === ROUTE_H_FIRST ? ROUTE_V_FIRST : ROUTE_H_FIRST;
+  const other = busFor(otherRoute);
+  const bus = other.through > mine.through
+    ? { route: otherRoute, forced: true, copies: other.copies }
+    : { route: run.route, forced: false, copies: mine.copies };
+  busCache = { key, bus };
+  return bus;
+}
+let busCache = null;
+
+// The bus laid on one route: its kept copies, and how many get through.
+function busFor(route) {
+  const v0 = run.v0 && !isZero(run.v0) ? run.v0 : vec.v;
+  const claims = new Claims((x, y) => board.isFree(x, y));
+  const copies = [];
+  let through = 0;
+  for (let k = 0; k < vec.count; k++) {
+    const start = [run.start[0] + k * v0[0], run.start[1] + k * v0[1]];
+    const end = [run.end[0] + k * vec.v[0], run.end[1] + k * vec.v[1]];
+    if (!inBoard(start) || !inBoard(end)) continue;
+    const row = board.entityAt(start[0], start[1]);
+    const over = k === 0 ? (run.over && overStart(start[0], start[1]) ? run.over : 0)
+                         : row >= 0 && isBeltRow(row) ? row : 0;
+    const free = (x, y) => (over && x === start[0] && y === start[1]) || claims.free(x, y);
+    const plan = planRun({ ...run, route, start, end, over }, free, T.under.MAX_GAP);
+    const ok = routeWorks(plan);
+    if (ok) through++;
+    if (k > 0 && !ok) continue;
+    claims.claim(plan.cells.filter(p => p.kind !== "blocked" && p.kind !== "buried").map(p => [p.x, p.y]));
+    copies.push({ plan, over, start, end });
+  }
+  return { copies, through };
+}
+
+const inBoard = ([x, y]) => x >= 0 && y >= 0 && x < board.width && y < board.height;
+
 // The plan in the renderer's own shapes, so ghosts draw with the same code
 // as the real thing.
-function ghostOf(plan) {
+function ghostOf(plan, over = run?.over && overStart(run.start[0], run.start[1]) ? run.over : 0) {
   if (!plan) return null;
   const belts = [], unders = [], blocked = [];
   plan.cells.forEach((c, i) => {
@@ -494,12 +563,12 @@ function ghostOf(plan) {
     else if (prev.kind !== "blocked" && prev.kind !== "buried" && prev.kind !== "entry") inDir = dirToward(c, prev);
     // The placed belt a run starts on keeps its seed, so its ghost shows it.
     let seed = 0;
-    if (i === 0 && run.over && overStart(c.x, c.y) && board.field(run.over, T.entity.F_SEED_ON)) {
-      seed = board.field(run.over, T.entity.F_SEED_VALUE) > 0 ? 1 : -1;
+    if (i === 0 && over && board.field(over, T.entity.F_SEED_ON)) {
+      seed = board.field(over, T.entity.F_SEED_VALUE) > 0 ? 1 : -1;
     }
     belts.push({ x: c.x, y: c.y, dir: c.dir, inDir, seed });
   });
-  return { belts, unders, blocked, start: run.start, end: run.end };
+  return { belts, unders, blocked };
 }
 
 function startRun(x, y, over = 0) {
@@ -509,7 +578,8 @@ function startRun(x, y, over = 0) {
   const dir = over ? board.field(over, T.entity.F_DIR) | 0 : tool.dir | 0;
   // A slot saved while the line route existed may still say 2.
   const route = ROUTES.includes(tool.route) ? tool.route : ROUTE_H_FIRST;
-  run = { start: [x, y], end: [x, y], route, tipTurn: 0, singleDir: dir, defaultDir: dir, over };
+  run = { start: [x, y], end: [x, y], route, tipTurn: 0, singleDir: dir, defaultDir: dir, over,
+          v0: vectoring() ? vec.v.slice() : null };
   syncBar();
 }
 
@@ -520,26 +590,30 @@ function cancelRun() {
 }
 
 function commitRun() {
-  let plan = currentPlan();
-  // Force build: what blocks the run is deleted and the run goes down over
-  // it. Only the cells the run could not have -- not the ones it tunnels
-  // under, which it never wanted.
-  if (plan && TUNE.forceBuild) {
-    const blocked = plan.cells.filter(c => c.kind === "blocked");
-    if (blocked.length) {
-      clearCells(blocked);
-      plan = { ...plan, cells: plan.cells.map(c => (c.kind === "blocked" ? { ...c, kind: "belt" } : c)) };
+  const { copies } = runCopies();
+  copies.forEach(({ plan, over }, k) => {
+    // Force build: what blocks the run is deleted and the run goes down
+    // over it. Only the cells the run could not have -- not the ones it
+    // tunnels under, which it never wanted -- and only for the run itself:
+    // a copy that does not get through was never kept.
+    if (k === 0 && TUNE.forceBuild) {
+      const blocked = plan.cells.filter(c => c.kind === "blocked");
+      if (blocked.length) {
+        clearCells(blocked);
+        plan = { ...plan, cells: plan.cells.map(c => (c.kind === "blocked" ? { ...c, kind: "belt" } : c)) };
+      }
     }
-  }
-  if (plan && run.over && overStart(run.start[0], run.start[1])) {
-    // The belt the run starts on: turned in place to its planned facing, so
-    // its row and seed survive. If the planner made it an underground
-    // entrance instead (an obstacle right after the start), it is replaced.
-    const c = plan.cells[0];
-    if (c.kind === "belt") board.turnBelt(run.over, c.dir);
-    else board.eraseRows([run.over]);
-  }
-  if (plan) board.buildPlan(plan);
+    if (over && board.entityAt(plan.cells[0].x, plan.cells[0].y) === over) {
+      // The belt a run starts on: turned in place to its planned facing, so
+      // its row and seed survive. If the planner made it an underground
+      // entrance instead (an obstacle right after the start), it is replaced.
+      const c = plan.cells[0];
+      if (c.kind === "belt") board.turnBelt(over, c.dir);
+      else board.eraseRows([over]);
+    }
+    board.buildPlan(plan, { derive: false });
+  });
+  if (copies.length) board.derive();
   cancelRun();
 }
 

@@ -122,8 +122,9 @@ export function render(ctx, board, cam, dpr, opts = {}) {
     }
   }
 
-  const hide = view.hide;
-  drawBelts(ctx, hide ? board.belts.filter(b => b.x !== hide[0] || b.y !== hide[1]) : board.belts, z, on, S);
+  // Placed belts a run (or its copies) will turn draw only as the ghost.
+  const hide = view.hide?.length ? new Set(view.hide.map(([x, y]) => `${x},${y}`)) : null;
+  drawBelts(ctx, hide ? board.belts.filter(b => !hide.has(`${b.x},${b.y}`)) : board.belts, z, on, S);
   drawUnders(ctx, board.unders, z, on, S);
   drawStructs(ctx, board.T, board.structs, z, px, on, S, view.ports, view.labels);
 

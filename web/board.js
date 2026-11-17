@@ -418,7 +418,7 @@ export class Board {
 
   // Build a planner.js plan: belts, then each underground pair. Blocked and
   // buried cells place nothing. Returns how many entities were placed.
-  buildPlan(plan) {
+  buildPlan(plan, { derive = true } = {}) {
     const C = this.T.cell;
     const rows = new Map();   // path index -> row
     plan.cells.forEach((c, i) => {
@@ -433,7 +433,7 @@ export class Board {
     for (const [a, e] of plan.pairs) {
       if (rows.has(a) && rows.has(e)) this.pairUnder(rows.get(a), rows.get(e));
     }
-    this.derive();
+    if (derive) this.derive();
     return rows.size;
   }
 

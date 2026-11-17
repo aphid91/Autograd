@@ -271,6 +271,27 @@ order, each re-checked against the board as the ones before it left it,
 with **one** re-derive for the lot; force build clears the way for the
 original only.
 
+**Belt runs.** A run begun with the vector on remembers it (`run.v0`):
+copy `k` starts at `start + k * v0` and ends at `end + k * v` with `v` the
+vector **now**. So a run's copies are a bus whose starts stay put while
+re-picking the vector mid-run swings their ends -- a bus laid east, its
+vector turned to point down its own column, fans out as nested corners;
+turned the other way it twists, and the copies that cannot get through
+drop out. (A run begun without a vector takes the current one for its
+starts too.) Copies are planned in sequence over the claims of the ones
+before -- belts and underground ends; buried tiles stay free, so a copy may
+tunnel under an earlier one -- and a copy that does not get through
+(`routeWorks`, the blocked last cell excused) is dropped; copy 0 always
+shows, ringed, red where blocked. A copy starting on a placed belt turns it.
+
+**One route for the whole bus, chosen for the bus**: the player's, unless
+the other gets strictly more copies through. Choosing for copy 0 alone was
+the first version and it was wrong in the common case: a bus whose starts
+sit in one row can never go along that row first, since every copy's start
+is on copy 0's first leg -- copy 0's route doomed all the others. The bus is
+cached on the board revision, the run and the vector, since it is two full
+plannings of up to 256 runs.
+
 ### Placing machines and raw belts
 
 The other one-tap tools (every machine, and the raw belt) share one flow.
