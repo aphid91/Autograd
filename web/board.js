@@ -143,6 +143,31 @@ export class Board {
     this.arrays.entities = { ...this.arrays.entities, shape: [this.rows, S], data: next };
   }
 
+  // --- undo -------------------------------------------------------------
+  // The whole editable state, copied: the grid, the entity table and the
+  // row allocator. Everything else on a Board is derived from these. About
+  // 5 MB on a 512x512 board, which is why history.js keeps only a few.
+  snapshot() {
+    return {
+      grid: this.grid.slice(), entities: this.entities.slice(), rows: this.rows,
+      nextRow: this.nextRow, freeRows: this.freeRows.slice(), liveCount: this.liveCount,
+    };
+  }
+
+  // Put a snapshot back (copied again, so the snapshot stays reusable for a
+  // later redo) and re-derive -- an edit like any other.
+  restore(s) {
+    const S = this.T.entity.STRIDE;
+    this.grid.set(s.grid);
+    this.entities = s.entities.slice();
+    this.rows = s.rows;
+    this.arrays.entities = { ...this.arrays.entities, shape: [this.rows, S], data: this.entities };
+    this.nextRow = s.nextRow;
+    this.freeRows = s.freeRows.slice();
+    this.liveCount = s.liveCount;
+    this.derive();
+  }
+
   // A 1x1 entity (belt or underground end). Returns its row.
   spawn1(type, x, y, dir, { isExit = false } = {}) {
     const E = this.T.entity, C = this.T.cell, S = E.STRIDE;

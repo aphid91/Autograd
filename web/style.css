@@ -137,6 +137,8 @@ html, body {
 #modesec { flex: 1 1 0; }
 #simsec { flex: 0.95 1 0; position: relative; }
 #turnsec { flex: 1 1 0; }
+/* Checkpoint changes nothing on the board, so the button acknowledges it. */
+#btn-checkpoint[data-flash="true"] { border-color: var(--accent); color: var(--accent); }
 
 .lbl {
   font-size: calc(var(--label-fs) * var(--u));

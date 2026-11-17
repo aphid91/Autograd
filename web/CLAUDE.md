@@ -86,9 +86,12 @@ scale 1.15.
   which opens a text box (0.1 to 240). It stays open until the next long
   press or its × button, and shows the tick count. The rate persists with
   the shell's localStorage; the panel's open state does not.
-- **Turn**: rotate CW, CCW, and flip. They act on what the hand holds: the
-  held tool in Build (a stamp tool turns its stamp), the stamp being pasted,
-  or the selection. A swatch draws its tool **at
+- **Edit**: Undo, Redo and Checkpoint (ctrl+Z, ctrl+shift+Z / ctrl+Y on a
+  keyboard). See "Undo" below. Turning lives on the **thumb pads** in the
+  board's corners, which show whenever there is something to turn: a held
+  tool, a run, a ghost or a selection. Rotate CW, CCW, and flip act on what
+  the hand holds: the held tool in Build (a stamp tool turns its stamp),
+  the stamp being pasted, or the selection. A swatch draws its tool **at
   the orientation the next placement would have**, from the placed port
   tables in `types.json`, so turning is visible with nothing on the board.
   Flip is disabled on tools with no chirality (belts, Sink); on the
@@ -114,6 +117,31 @@ the Status folder. Tweakpane is **vendored** (`vendor/`, MIT) rather than
 pulled from a CDN, which keeps the no-build, works-offline property. Status
 writes the same row fields the desktop's Status window does, plus the
 seed's `.z` bits, so a save edited here reads correctly there.
+
+### Undo
+
+[history.js](history.js) keeps **states, not edits**: each entry is a whole
+`Board.snapshot()` (grid, entity table, row allocator -- about 5 MB on a
+512×512 board), so restoring cannot half-apply anything and no edit needs an
+inverse. It keeps `UNDO_DEPTH` (3) steps behind the current state, one
+constant.
+
+- **The checkpoint** is one more state, just before the oldest: undo from
+  the oldest step restores it, and redo walks forward through the history
+  again from there. It is set when a board loads and whenever Checkpoint is
+  pressed (which puts a selection down first). An edit made while on the
+  checkpoint starts the history afresh from it.
+- **Only stable states are recorded**: nothing lifted. A selection's
+  entities are off the board, so select, move, put down is **one** step,
+  committed when the selection ends -- and Undo while something is lifted
+  throws that change away, back to the current state. `recordStep()` runs
+  every frame and commits when the board's revision moved, so everything
+  one gesture does (force build clearing the way, then building) is one
+  step.
+- Restoring drops whatever was in progress (a run, a ghost, a selection)
+  and is an edit like any other, so the simulation starts fresh.
+- `tests/history.test.mjs` covers the walk, the depth, the checkpoint
+  landing and the truncation after an undo.
 
 ### The Dev folder
 
@@ -197,8 +225,8 @@ Four rules, each chosen over an obvious alternative:
   press still flips the stored preference, which shows again as soon as
   both routes work.
 
-**Thumb pads.** While anything is planned (a run, a placement, a paste) or
-a selection is held, the Turn buttons appear again in both bottom corners of the board -- rotate
+**Thumb pads.** While anything is planned (a run, a placement, a paste), a
+tool is held, or a selection is held, the Turn buttons appear in both bottom corners of the board -- rotate
 left and right, flip above them -- so the thumb steering the ghost need not
 travel to the Turn row. On a belt run, flip toggles the route. Added in its
 own commit as an experiment.
@@ -697,6 +725,7 @@ asserting every array matches and exactly the edited value differs.
 | `placer.js` | where a ghost's footprint sits: the port of `origin_for_cursor()` |
 | `glyphs.js` | the machine glyphs, ports of the shader's `sd_*` marks |
 | `tune.js` | the Dev dials: defaults, panel spec, the live values |
+| `history.js` | undo, redo and the checkpoint, over board snapshots |
 | `tests/` | `node --test` suites for the pure modules |
 | `types.json` | generated — do not edit |
 | `build.sh` | assembles `_site/`, and stamps `sw.js` with its file list and version |

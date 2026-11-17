@@ -31,6 +31,8 @@ const P = {
   routeVH: ["M6 4v12a2 2 0 0 0 2 2h12", "M17 15l3 3-3 3"],
   routeLine: ["M4 20h4v-4h4v-4h4V8h4", "M17 4h3v3"],
   right: ["M9 5l7 7-7 7"],
+  undo: ["M9 14 4 9l5-5", "M4 9h10.5a5.5 5.5 0 0 1 0 11H11"],
+  checkpoint: ["M4 15s1-1 4-1 5 2 8 2 4-1 4-1V3s-1 1-4 1-5-2-8-2-4 1-4 1z", "M4 22v-7"],
 };
 
 // Extra non-path children, as markup.
@@ -46,8 +48,8 @@ const EXTRA = {
 // `mirror` draws the icon reflected left-right: rotate-CCW is rotate-CW seen
 // in a mirror, which keeps the pair visibly one family.
 export function icon(name, { mirror = false } = {}) {
-  const base = name === "rotCcw" ? "rotCw" : name;
+  const base = name === "rotCcw" ? "rotCw" : name === "redo" ? "undo" : name;
   const paths = (P[base] || []).map(d => `<path d="${d}"/>`).join("");
-  const flip = mirror || name === "rotCcw" ? ' transform="matrix(-1 0 0 1 24 0)"' : "";
+  const flip = mirror || name === "rotCcw" || name === "redo" ? ' transform="matrix(-1 0 0 1 24 0)"' : "";
   return `<svg viewBox="0 0 24 24" aria-hidden="true"><g${flip}>${paths}${EXTRA[base] || ""}</g></svg>`;
 }

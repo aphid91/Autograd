@@ -171,11 +171,11 @@ export class Shell {
         </div>
       </section>
       <section class="sec" id="turnsec">
-        <div class="lbl">Turn</div>
+        <div class="lbl">Edit</div>
         <div class="turnrow">
-          <button type="button" class="b round small" id="btn-cw" aria-label="Rotate clockwise">${icon("rotCw")}</button>
-          <button type="button" class="b round small" id="btn-ccw" aria-label="Rotate counter-clockwise">${icon("rotCcw")}</button>
-          <button type="button" class="b round small" id="btn-flip" aria-label="Flip">${icon("flip")}</button>
+          <button type="button" class="b round small" id="btn-undo" aria-label="Undo" title="Undo">${icon("undo")}</button>
+          <button type="button" class="b round small" id="btn-redo" aria-label="Redo" title="Redo">${icon("redo")}</button>
+          <button type="button" class="b round small" id="btn-checkpoint" aria-label="Checkpoint" title="Checkpoint: undo from the oldest step comes back here">${icon("checkpoint")}</button>
         </div>
       </section>`;
 
@@ -199,9 +199,22 @@ export class Shell {
     // A long press (right-click on a mouse) toggles the rate panel.
     this.wireHold(play, () => this.toggleSimPanel());
     this.buildSimPanel();
-    c.querySelector("#btn-cw").addEventListener("click", () => this.turn(CW));
-    c.querySelector("#btn-ccw").addEventListener("click", () => this.turn(CCW));
-    c.querySelector("#btn-flip").addEventListener("click", () => this.flip());
+    c.querySelector("#btn-undo").addEventListener("click", () => this.cb.onUndo?.());
+    c.querySelector("#btn-redo").addEventListener("click", () => this.cb.onRedo?.());
+    const cp = c.querySelector("#btn-checkpoint");
+    cp.addEventListener("click", () => {
+      this.cb.onCheckpoint?.();
+      // The press changes nothing visible on the board, so the button says so.
+      cp.dataset.flash = "true";
+      setTimeout(() => { cp.dataset.flash = "false"; }, 450);
+    });
+  }
+
+  // What Undo and Redo can do now (main.js owns the history).
+  setHistory(canUndo, canRedo) {
+    const c = this.els.controls;
+    c.querySelector("#btn-undo").disabled = !canUndo;
+    c.querySelector("#btn-redo").disabled = !canRedo;
   }
 
   // The thumb pads: Turn's three buttons in the board's bottom corners while
@@ -225,8 +238,10 @@ export class Shell {
 
   renderThumbs() {
     const p = this.state.planning;
-    // Also while a selection is held: turning it wants a thumb too.
-    const show = !!p || this.selecting;
+    // Also while a selection is held, or a tool is held to turn before
+    // placing: the pads are the only Turn buttons now (the row's became
+    // Undo, Redo and Checkpoint).
+    const show = !!p || this.selecting || (this.state.mode === "build" && !!this.heldTool);
     const flippable = p?.kind === "belt" || (this.heldTool ? canFlip(this.T, this.heldTool) : !!this.activeStamp || this.selecting);
     for (const pad of this.thumbs) {
       pad.dataset.show = String(show);
@@ -377,11 +392,6 @@ export class Shell {
 
     const planning = !!s.planning;
     const beltRun = s.planning?.kind === "belt";
-    const live = beltRun || !!(this.heldTool || this.activeStamp) || this.selecting;
-    const flippable = !beltRun && (this.heldTool ? canFlip(this.T, this.heldTool) : !!this.activeStamp || this.selecting);
-    c.querySelector("#btn-cw").disabled = !live;
-    c.querySelector("#btn-ccw").disabled = !live;
-    c.querySelector("#btn-flip").disabled = !flippable;
 
     const rowMode = planning ? s.planning.kind
       : s.mode === "hand" && s.inspectValue ? "inspect"

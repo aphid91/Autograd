@@ -20,6 +20,7 @@ import { emitMask, emitsWith, stampGhost } from "./ghost.js";
 import { traceRun } from "./segtrace.js";
 import { TUNE, setTune } from "./tune.js";
 import { Sim, Clock } from "./sim.js";
+import { History } from "./history.js";
 import { deleteSave, getSave, listSaves, putSave } from "./saves.js";
 
 const DEFAULT_SAVE = "default.npz";
@@ -79,6 +80,16 @@ let place = null;
 //   { stamp, px, py }
 let sel = null;
 
+// Undo, redo and the checkpoint (history.js). A state is a board snapshot,
+// and only STABLE states are recorded: nothing lifted. A selection is a
+// change in progress -- its entities are off the board -- so lifting,
+// moving and putting down is one step, committed when the selection ends,
+// and Undo while something is lifted throws that change away. `committed`
+// is the board revision the history's current state was taken at; any
+// other revision with nothing lifted is a new step.
+const history = new History();
+let committed = -1;
+
 // A handle for the console and for headless tests. Not an API.
 const debug = window.gates = {
   cam, redraw, renderMs: 0,
@@ -121,6 +132,7 @@ function paint(now) {
     if (inspectRow >= 0) panel.setLive(liveText(inspectRow));
   }
   lastNow = sim && !clock.paused ? now : null;
+  recordStep();
   const t0 = performance.now();
   const info = board ? board.describe(inspectRow) : null;
   const ghosts = [
@@ -133,6 +145,67 @@ function paint(now) {
   render(ctx, board, cam, dpr, { ...view, selected: info, ghosts, sim, alpha: clock.alpha, hide });
   debug.renderMs = performance.now() - t0;
   if (sim && !clock.paused) redraw();
+}
+
+// --- undo ------------------------------------------------------------------
+
+// Commit the board as a new step if it changed since the last one and is
+// stable. Called every frame, so all the edits one gesture makes in one go
+// (clearing the way, then building) are one step.
+function recordStep() {
+  if (!board || sel || board.revision === committed) return;
+  history.commit(board.snapshot());
+  committed = board.revision;
+  syncHistory();
+}
+
+function syncHistory() {
+  // Something lifted is an uncommitted change Undo can throw away.
+  shell.setHistory(!!sel || (!!board && board.revision !== committed) || history.canUndo, history.canRedo);
+}
+
+// Put a history state back. Whatever was in progress -- a run, a ghost, a
+// lifted selection -- is dropped: it belonged to the board being replaced.
+function restoreState(state) {
+  run = null;
+  place = null;
+  grab = null;
+  boxRect = null;
+  sel = null;
+  shell.setSelection(0);
+  if (shell.state.pasteStamp !== null) shell.setPasting(null);
+  board.restore(state);
+  committed = board.revision;
+  if (inspectRow >= 0 && !board.describe(inspectRow)) inspect(-1);
+  else syncInspect();
+  syncBar();
+  syncHistory();
+}
+
+function undo() {
+  if (!board) return;
+  // An uncommitted change (something lifted, or an edit not yet recorded)
+  // is undone first, back to the current state.
+  if (sel || board.revision !== committed) { restoreState(history.current); return; }
+  const s = history.undo();
+  if (s) restoreState(s);
+}
+
+function redo() {
+  if (!board) return;
+  if (sel || board.revision !== committed) return;
+  const s = history.redo();
+  if (s) restoreState(s);
+}
+
+// The checkpoint is the board as it stands. Something lifted is put down
+// first, so the checkpoint is a whole board.
+function checkpoint() {
+  if (!board) return;
+  dropAll();
+  recordStep();
+  history.setCheckpoint(history.current);
+  syncHistory();
 }
 
 // What the Status pane's live readout says about a row: a gate's channels,
@@ -570,6 +643,7 @@ function setSel(abs) {
     sel = { stamp, px: origin[0] + stamp.w / 2, py: origin[1] + stamp.h / 2 };
   }
   shell.setSelection(sel ? sel.stamp.entries.length : 0);
+  syncHistory();
   redraw();
 }
 
@@ -830,6 +904,10 @@ async function show(name, bytes) {
     sel = null;
     shell.setSelection(0);
     if (shell.state.pasteStamp !== null) shell.setPasting(null);
+    // A loaded board is a fresh history, and its own checkpoint.
+    history.reset(board.snapshot());
+    committed = board.revision;
+    syncHistory();
     syncBar();
     cam.frame(board.bounds);
     inspect(-1);
@@ -941,6 +1019,9 @@ async function init() {
     onReset: () => { if (sim) { sim.reset(); clock.reset(); } redraw(); },
     onPause: (paused) => { clock.paused = paused; redraw(); },
     onRate: (rate) => { clock.setRate(rate); redraw(); },
+    onUndo: () => undo(),
+    onRedo: () => redo(),
+    onCheckpoint: () => checkpoint(),
   });
   lastMode = shell.state.mode;
   clock.setRate(shell.state.rate);
@@ -980,6 +1061,9 @@ async function init() {
   document.addEventListener("keydown", (e) => {
     if (e.target instanceof HTMLInputElement) return;
     if (e.code === "Space") { e.preventDefault(); document.getElementById("btn-play").click(); }
+    // ctrl+Z / ctrl+shift+Z (or ctrl+Y) for a keyboard.
+    if ((e.ctrlKey || e.metaKey) && e.code === "KeyZ") { e.preventDefault(); if (e.shiftKey) redo(); else undo(); }
+    if ((e.ctrlKey || e.metaKey) && e.code === "KeyY") { e.preventDefault(); redo(); }
   });
 
   // The bundled saves are listed by web/build.sh. Served from the bare web/
