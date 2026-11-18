@@ -1161,6 +1161,24 @@ function selectTurn(cw) {
   redraw();
 }
 
+// Reverse the selection's belts and undergrounds, in place: a belt turns to
+// face the other way (its cell, seed and row-to-be unchanged); an
+// underground end swaps entrance for exit AND reverses, as the desktop's
+// empty-hand R does to a placed pair -- the exit is downstream of the
+// entrance by position, so swapping the role alone would leave it upstream
+// of its own entrance. Pairs inside the selection reverse together and stay
+// paired. Machines are not touched. The selection stays lifted, so the
+// change lands when it is put down -- one undo step.
+function selectReverse() {
+  if (!sel) return;
+  sel.stamp.entries = sel.stamp.entries.map(e => {
+    if (e.type === "belt") return { ...e, dir: (e.dir + 2) % 4 };
+    if (e.type === "under") return { ...e, dir: (e.dir + 2) % 4, exit: !e.exit };
+    return e;
+  });
+  redraw();
+}
+
 function selectFlip() {
   if (!sel) return;
   sel.stamp = mirrored(T, sel.stamp);
@@ -1577,6 +1595,7 @@ async function init() {
     onPlanTurn: (cw) => { turnTip(run, cw); redraw(); },
     onSelectTurn: (cw) => selectTurn(cw),
     onSelectFlip: () => selectFlip(),
+    onSelectReverse: () => selectReverse(),
     onSelectCommand: (c) => selectCommand(c),
     // Tapping the stamp being pasted puts it away; any other starts pasting it.
     onPasteStamp: (id) => { if (shell.state.pasteStamp === id) exitPaste(); else enterPaste(id); },

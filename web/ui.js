@@ -828,6 +828,14 @@ export class Shell {
     });
     if (!s.selCount || s.pasteStamp !== null) isw.dataset.disabled = "true";
     row.append(isw);
+    // Reverse: every selected belt and underground faces the other way, in
+    // place; machines are left alone.
+    const rsw = this.swatch({
+      art: icon("reverse"), name: "Reverse", cls: "actsw act-reverse",
+      onTap: () => { if (s.selCount) this.cb.onSelectReverse?.(); },
+    });
+    if (!s.selCount) rsw.dataset.disabled = "true";
+    row.append(rsw);
     // The history, most recent first. Tapping one pastes it.
     for (const st of s.stamps) {
       row.append(this.swatch({

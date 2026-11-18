@@ -535,6 +535,7 @@ outlined in cyan. Deselecting places it back wherever the selection now is.
 | one-finger drag elsewhere | pan |
 | Box, then a drag (from anywhere) | a rectangle: everything it touches is **added**, then Box disarms |
 | Index, then Values… | number the selected Sources and belts and write them values (see "Indexing") |
+| Reverse | every selected belt and underground faces the other way, in place; machines untouched (see below) |
 | Vector, drag the offset, Confirm | add every repeat of the selection along the vector, until it breaks (see "Vectors") |
 | Turn buttons | turn / mirror the selection as one stamp |
 | Delete | discard the selection |
@@ -583,6 +584,14 @@ outlined in cyan. Deselecting places it back wherever the selection now is.
   a placement there); it does nothing. A hold on a **selected** entity is
   the exception and stays a press, so a slow drag from it still moves the
   selection.
+- **Reverse** turns the selection's belts round where they stand -- cell,
+  seed and all -- and swaps each underground end's role **and** facing
+  (the desktop's empty-hand R on a pair: the exit is downstream of the
+  entrance by position, so swapping the role alone would leave it upstream
+  of its own entrance). A pair inside the selection reverses together and
+  stays paired. Machines are left alone, so a whole subtree can be
+  reversed in one go and its machines turned by hand. It changes the
+  lifted entries; the selection going down is the edit, one undo step.
 - **Underground pairs.** Lifting one end of a pair releases the other
   (`Engine.unpair_under()`). Both ends lifted stay paired to each other.
   Placing back pairs the stamp's own ends first, then each unpaired end

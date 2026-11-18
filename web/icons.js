@@ -32,6 +32,7 @@ const P = {
   routeLine: ["M4 20h4v-4h4v-4h4V8h4", "M17 4h3v3"],
   right: ["M9 5l7 7-7 7"],
   minus: ["M5 12h14"],
+  reverse: ["M8 3 4 7l4 4", "M4 7h16", "M16 21l4-4-4-4", "M20 17H4"],
   index: ["M10 6h11", "M10 12h11", "M10 18h11", "M4 6h1v4", "M4 10h2", "M6 18H4c0-1 2-2 2-3s-1-1.5-2-1"],
   table: ["M3 3h18v18H3z", "M3 9h18", "M3 15h18", "M9 3v18"],
   vector: ["M5 19 19 5", "M11 5h8v8", "M3 21h4"],
