@@ -61,20 +61,24 @@ export class Board {
   // is derived and saved as zero, as the desktop does. The annotations blob
   // is carried through untouched: this app does not draw notes, but a save
   // that went through it must not lose them.
-  async toNpz() {
+  // `snap`, if given, is a Board.snapshot() to write instead of the board as
+  // it stands -- the autosave writes the last stable state, never a
+  // selection half-lifted off the board.
+  async toNpz(snap = null) {
     const E = this.T.entity;
-    const grid = this.grid.slice();
+    const src = snap || this;
+    const grid = src.grid.slice();
     for (let i = 3; i < grid.length; i += 4) grid[i] = 0;
-    const notes = JSON.stringify(this.notes);
+    const notes = snap ? snap.notes : JSON.stringify(this.notes);
     return writeNpz({
       version: { descr: "<i4", shape: [1], data: new Int32Array([FORMAT_VERSION]) },
       size: { descr: "<i4", shape: [2], data: new Int32Array([this.width, this.height]) },
       grid: { descr: "<i4", shape: [this.height, this.width, 4], data: grid },
-      entities: { descr: "<f4", shape: [this.rows, E.STRIDE], data: this.entities },
+      entities: { descr: "<f4", shape: [src.rows, E.STRIDE], data: src.entities },
       annotations: { descr: "<U", shape: [], data: notes },
-      next_row: { descr: "<i4", shape: [1], data: new Int32Array([this.nextRow]) },
-      free_rows: { descr: "<i4", shape: [this.freeRows.length], data: new Int32Array(this.freeRows) },
-      live_count: { descr: "<i4", shape: [1], data: new Int32Array([this.liveCount]) },
+      next_row: { descr: "<i4", shape: [1], data: new Int32Array([src.nextRow]) },
+      free_rows: { descr: "<i4", shape: [src.freeRows.length], data: new Int32Array(src.freeRows) },
+      live_count: { descr: "<i4", shape: [1], data: new Int32Array([src.liveCount]) },
     });
   }
 

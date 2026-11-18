@@ -191,6 +191,7 @@ function recordStep() {
   history.commit(board.snapshot());
   committed = editKey();
   syncHistory();
+  prepareSave();
 }
 
 function syncHistory() {
@@ -1389,6 +1390,9 @@ async function show(name, bytes) {
     history.reset(board.snapshot());
     noteEdit = -1;
     committed = editKey();
+    boardName = name.replace(/\.npz$/i, "");
+    loadGen++;
+    prepareSave();
     syncHistory();
     syncBar();
     cam.frame(board.bounds);
@@ -1398,6 +1402,79 @@ async function show(name, bytes) {
     alert(`${name}: ${err.message}`);
   }
   redraw();
+}
+
+// --- autosave and the save on close -------------------------------------------
+//
+// Two browser saves the app keeps by itself, listed with the others:
+//   "auto save"  every AUTOSAVE_MS, when the board changed since the last one
+//   "exitsave"   whenever the app is hidden -- closed, switched away from,
+//                the screen locked. On a phone that is the only warning a
+//                close gives, and nothing asynchronous can be relied on to
+//                finish in it, so the save's bytes are PREPARED ahead of time
+//                (compressed after every committed step) and the hide only
+//                writes them, synchronously, to localStorage.
+// Both write the history's current state -- the last stable board -- so a
+// selection half-lifted off the board is saved where it was picked up. On
+// opening, the exitsave is loaded, unless the auto save is newer; each
+// remembers the name of the board it holds.
+const AUTOSAVE_MS = 30000;
+const AUTO_NAME = "auto save", EXIT_NAME = "exitsave";
+let boardName = "";
+let loadGen = 0;          // which load the prepared bytes belong to
+let ready = null;         // { key, bytes }: the current state, compressed
+let preparing = false;
+let autosavedKey = null;
+const saveKey = () => `${loadGen}:${committed}`;
+
+async function prepareSave() {
+  if (!board || preparing) return;
+  const key = saveKey();
+  if (ready?.key === key) return;
+  preparing = true;
+  try {
+    ready = { key, bytes: new Uint8Array(await board.toNpz(history.current)), name: boardName };
+  } catch (e) {
+    console.warn("could not prepare the autosave:", e);
+  } finally {
+    preparing = false;
+  }
+  if (saveKey() !== key) prepareSave();   // it moved on while compressing
+}
+
+function writeAuto(name) {
+  if (!ready) return false;
+  try {
+    putSave(name, ready.bytes, { board: ready.name });
+    return true;
+  } catch (e) {
+    console.warn(`${name} failed:`, e);
+    return false;
+  }
+}
+
+function autosave() {
+  if (!ready || ready.key === autosavedKey) return;
+  if (writeAuto(AUTO_NAME)) {
+    autosavedKey = ready.key;
+    panel.setLocalSaves(listSaves());
+  }
+}
+
+function exitSave() {
+  // Commit whatever was edited this very frame, if the board is stable; its
+  // bytes may not be ready (compressing is asynchronous), in which case the
+  // state one step back is written -- the price of saving with no warning.
+  recordStep();
+  writeAuto(EXIT_NAME);
+}
+
+// The save to open with: the exitsave, unless the auto save is newer.
+function resumeSave() {
+  const saves = listSaves();
+  const exit = saves.find(e => e.name === EXIT_NAME), auto = saves.find(e => e.name === AUTO_NAME);
+  if (auto && (!exit || (auto.savedAt || 0) > (exit.savedAt || 0))) return auto;
+  return exit || null;
 }
 
 // --- browser saves ----------------------------------------------------------
@@ -1420,13 +1497,17 @@ async function saveLocal(name) {
     return;
   }
   panel.setBoardName(name);
+  boardName = name;
   panel.setLocalSaves(listSaves(), name);
 }
 
 async function loadLocal(name) {
   const bytes = getSave(name);
   if (!bytes) { alert(`"${name}" is not in this browser's storage any more.`); panel.setLocalSaves(listSaves()); return; }
-  await show(name, bytes.buffer);
+  // An autosave opens under the name of the board it holds, so saving it
+  // again does not write over the autosave itself.
+  const entry = listSaves().find(e => e.name === name);
+  await show(entry?.board || name, bytes.buffer);
 }
 
 // Download a browser save as an .npz the desktop app can load.
@@ -1572,7 +1653,14 @@ async function init() {
   } catch { /* no bundled saves */ }
   const first = saves.includes(DEFAULT_SAVE) ? DEFAULT_SAVE : saves[0];
   panel.setSaves(saves, first);
-  if (first) await loadBundled(first).catch(e => alert(e.message));
+  // Pick up where the last session left off, if it saved anything.
+  const resume = resumeSave();
+  if (resume) await loadLocal(resume.name);
+  else if (first) await loadBundled(first).catch(e => alert(e.message));
+
+  setInterval(autosave, AUTOSAVE_MS);
+  document.addEventListener("visibilitychange", () => { if (document.visibilityState === "hidden") exitSave(); });
+  window.addEventListener("pagehide", exitSave);
 }
 
 init();

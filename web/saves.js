@@ -36,9 +36,11 @@ function fromBase64(text) {
 
 // Store `bytes` under `name`, replacing a save of the same name. Throws with
 // a readable message when the browser refuses (quota, storage off).
-export function putSave(name, bytes) {
+// `meta` is kept in the index beside it (the autosaves record which board
+// they are of).
+export function putSave(name, bytes, meta = {}) {
   const index = readIndex().filter(e => e.name !== name);
-  index.push({ name, savedAt: Date.now(), bytes: bytes.length });
+  index.push({ ...meta, name, savedAt: Date.now(), bytes: bytes.length });
   try {
     localStorage.setItem(ITEM_KEY(name), toBase64(bytes));
     localStorage.setItem(INDEX_KEY, JSON.stringify(index));

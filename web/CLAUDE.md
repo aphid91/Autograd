@@ -859,6 +859,22 @@ replaces the board in front of you. Saving over an existing name asks first.
   than silently left out of the file.
 - The simulation's items are **not** saved, as on the desktop: a loaded
   board starts paused at tick 0 with its seeds on.
+- **Two saves keep themselves**, listed with the rest: **auto save**, every
+  30 s (`AUTOSAVE_MS`) when the board changed since the last one, and
+  **exitsave**, whenever the app is hidden -- closed, switched away from,
+  the screen locked. A phone gives no other warning of a close, and nothing
+  asynchronous can be relied on to finish in that moment, so the save's
+  bytes are **prepared ahead of time** (compressed after every committed
+  undo step, `prepareSave()`) and the hide only writes them, synchronously.
+  An edit made in the last few milliseconds before a close may miss it
+  (still compressing), and the previous step is saved instead.
+- **Both write the history's current state** -- the last stable board,
+  `Board.toNpz(snapshot)` -- so a selection half-lifted off the board is
+  saved where it was picked up, not missing.
+- **Opening the app loads the exitsave, unless the auto save is newer**,
+  and either opens under the name of the board it holds (kept in its index
+  entry), so saving it again does not write over the autosave. With
+  neither, the bundled default loads as before.
 
 `tests/npz.test.mjs` writes `cpu.npz` and `ram.npz` back out after an edit,
 reads them here, and loads them through the desktop's `persistence.load()`,
