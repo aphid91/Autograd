@@ -585,7 +585,14 @@ outlined in cyan. Deselecting places it back wherever the selection now is.
   the exception and stays a press, so a slow drag from it still moves the
   selection.
 - **Reverse** turns the selection's belts round where they stand -- cell,
-  seed and all -- and swaps each underground end's role **and** facing
+  seed and all. **A belt faces what fed it**, not the reverse of where it
+  pointed: at a corner those differ (fed from the west, facing north, it
+  must face west, not south), and turning every belt round broke a
+  reversed run at each turn -- the first version did exactly that. Feeders
+  are read from the selection as it was, all before any changes, through
+  the run tracer's emit mask (the selection is lifted off the board); a
+  belt fed by nothing selected -- a run's tail -- just turns round. It
+  swaps each underground end's role **and** facing
   (the desktop's empty-hand R on a pair: the exit is downstream of the
   entrance by position, so swapping the role alone would leave it upstream
   of its own entrance). A pair inside the selection reverses together and

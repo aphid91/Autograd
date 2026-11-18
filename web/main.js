@@ -1161,19 +1161,34 @@ function selectTurn(cw) {
   redraw();
 }
 
-// Reverse the selection's belts and undergrounds, in place: a belt turns to
-// face the other way (its cell, seed and row-to-be unchanged); an
-// underground end swaps entrance for exit AND reverses, as the desktop's
-// empty-hand R does to a placed pair -- the exit is downstream of the
-// entrance by position, so swapping the role alone would leave it upstream
-// of its own entrance. Pairs inside the selection reverse together and stay
-// paired. Machines are not touched. The selection stays lifted, so the
-// change lands when it is put down -- one undo step.
+// Reverse the selection's belts and undergrounds, in place: items run the
+// other way along the same cells. A belt turns to face WHAT FED IT -- at a
+// corner that is the side it came in by, not the reverse of where it was
+// pointing (a corner fed from the west and facing north must face west,
+// not south, or the reversed run breaks at every turn). A belt whose feeder
+// is not in the selection (a run's tail) simply turns round. Feeders are
+// read from the selection as it was, all at once, before any is changed --
+// through the same emit mask the run tracer uses, since the selection is
+// lifted off the board. An underground end swaps entrance for exit AND
+// reverses, as the desktop's empty-hand R does to a placed pair. Machines
+// are not touched. The change lands when the selection goes down.
 function selectReverse() {
   if (!sel) return;
-  sel.stamp.entries = sel.stamp.entries.map(e => {
-    if (e.type === "belt") return { ...e, dir: (e.dir + 2) % 4 };
-    if (e.type === "under") return { ...e, dir: (e.dir + 2) % 4, exit: !e.exit };
+  const abs = selAbs();
+  const at = abs.map(e => [e.dx, e.dy]);
+  const mine = emitMask(board, abs, at);
+  const W = board.width;
+  // Only the selection's own entries count as feeders.
+  const emits = (nx, ny, d) => { const k = ny * W + nx; return mine.has(k) && !!(mine.get(k) & (1 << d)); };
+  const dirs = abs.map(e => {
+    if (e.type === "under") return (e.dir + 2) % 4;
+    if (e.type !== "belt") return e.dir;
+    const from = board.incoming(e.dx, e.dy, e.dir, emits);
+    return from >= 0 ? from : (e.dir + 2) % 4;
+  });
+  sel.stamp.entries = sel.stamp.entries.map((e, i) => {
+    if (e.type === "belt") return { ...e, dir: dirs[i] };
+    if (e.type === "under") return { ...e, dir: dirs[i], exit: !e.exit };
     return e;
   });
   redraw();
