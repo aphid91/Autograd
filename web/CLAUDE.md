@@ -166,7 +166,15 @@ ports and values stay, ghosts keep their own colours):
 **Belt status colours** do the same for belts, per run (segment), in
 `beltStatus()`: **red** empty; **yellow** stalled -- the head item is at the
 run's end and will not leave on the coming tick (the forecast has no pop),
-so items are stuck on it; **green** carrying and moving. Underground ends
+so items are stuck on it; **green** carrying and moving. **Stalled but
+moving: green** (on by default) keeps a stalled run green while anything on
+it still moves -- an item is pushed on this tick, or its newest item is
+still closing up (items pack from the head, so if the newest has stopped
+they all have: one closed-form comparison per run). So yellow means
+static, and a run a gate takes from every other tick does not flicker.
+Traced on a sparse run hitting a dead end: yellow at the tick its head
+arrives without the check, at the tick the last item packs with it.
+Underground ends
 take their run's colour too, and the dots over a buried span a lighter wash
 of it. The seed tint still draws under.
 

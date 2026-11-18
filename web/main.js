@@ -266,7 +266,8 @@ function gateStatus() {
 // View > belt status colours, per run (segment), in the state on screen:
 // RED empty; YELLOW stalled -- its head item is at the end and will not
 // leave on the coming tick (the forecast has no pop), so items are stuck on
-// it; GREEN otherwise (carrying, and moving). Returns (x, y) -> colour.
+// it (and, by default, nothing on it is moving either -- see below); GREEN
+// otherwise (carrying, and moving). Returns (x, y) -> colour.
 const BELT_STATUS_COL = { empty: "rgb(176,72,66)", stalled: "rgb(214,180,58)", moving: "rgb(80,160,92)" };
 function beltStatus() {
   if (!sim) return null;
@@ -276,7 +277,18 @@ function beltStatus() {
   for (const seg of sim.segments.values()) {
     let st = "moving";
     if (seg.head === seg.tail) st = "empty";
-    else if (sim.positionOf(seg, seg.head, sim.tick) >= seg.length * sim.UNIT && !F.pops.has(seg)) st = "stalled";
+    else if (sim.positionOf(seg, seg.head, sim.tick) >= seg.length * sim.UNIT && !F.pops.has(seg)) {
+      st = "stalled";
+      // View > "stalled but moving: green": a stalled run whose items are
+      // still moving -- one is pushed on this tick, or the newest is still
+      // closing up (items pack from the head, so if the newest has stopped
+      // they all have) -- is not static, and reads green. O(1) per run.
+      if (view.beltActive !== false) {
+        const k = seg.tail - 1;
+        const moving = sim.positionOf(seg, k, sim.tick, 1) > sim.positionOf(seg, k, sim.tick, 0);
+        if (moving || F.pushes.has(seg)) st = "moving";
+      }
+    }
     bySid.set(seg.sid, BELT_STATUS_COL[st]);
   }
   const W = board.width;
