@@ -30,7 +30,9 @@ for (const save of ["cpu.npz", "ram.npz"]) {
     // A save from before notes existed has no annotations entry; writing one
     // holding "[]" is what the desktop's own save does.
     if (!before.annotations) assert.equal(after.annotations.data, "[]");
-    else assert.equal(after.annotations.data, before.annotations.data);
+    // Labels are re-written from the parsed records, so compare the records:
+    // the same notes, whatever whitespace the writer put between them.
+    else assert.deepEqual(JSON.parse(after.annotations.data), JSON.parse(before.annotations.data));
     delete after.annotations;
     delete before.annotations;
     assert.deepEqual(Object.keys(after).sort(), Object.keys(before).sort());
