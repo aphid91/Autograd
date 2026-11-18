@@ -117,3 +117,21 @@ export function isValidStamp(T, s) {
   return !!s && Array.isArray(s.entries) && s.entries.length > 0 &&
     s.entries.every(e => e && typeByName(T, e.type));
 }
+
+// The machines with a natural inverse, and what Reverse makes of each. Every
+// one is a half turn about the footprint's centre, which leaves the box (and
+// so the origin) where it was and puts each input port exactly where an
+// output was, and vice versa. Swap and Reciprocal are their own inverses;
+// Merge and Route are each other's: a Route turned half round has Merge's
+// ports with every direction reversed, and its control polarity lines up --
+// Merge takes lane `a` when c > 0, and the turned Route sends a positive
+// control's value back out of that very cell. The half turn commutes with
+// the mirror, so a flipped machine keeps its flip.
+// Pinned by tests/stamp.test.mjs, which runs values through a gate and its
+// reverse and asserts they come back out where they went in.
+const INVERSE = { swap: "swap", recip: "recip", merge: "route", route: "merge" };
+
+export function reversedGate(e) {
+  const type = INVERSE[e.type];
+  return type ? { ...e, type, dir: (e.dir + 2) % 4 } : e;
+}

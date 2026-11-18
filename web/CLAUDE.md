@@ -535,7 +535,7 @@ outlined in cyan. Deselecting places it back wherever the selection now is.
 | one-finger drag elsewhere | pan |
 | Box, then a drag (from anywhere) | a rectangle: everything it touches is **added**, then Box disarms |
 | Index, then Values… | number the selected Sources and belts and write them values (see "Indexing") |
-| Reverse | every selected belt and underground faces the other way, in place; machines untouched (see below) |
+| Reverse | every selected belt and underground faces the other way, in place; Swap and Reciprocal turn half round, Merge and Route swap for each other (see below) |
 | Vector, drag the offset, Confirm | add every repeat of the selection along the vector, until it breaks (see "Vectors") |
 | Turn buttons | turn / mirror the selection as one stamp |
 | Delete | discard the selection |
@@ -596,9 +596,27 @@ outlined in cyan. Deselecting places it back wherever the selection now is.
   (the desktop's empty-hand R on a pair: the exit is downstream of the
   entrance by position, so swapping the role alone would leave it upstream
   of its own entrance). A pair inside the selection reverses together and
-  stays paired. Machines are left alone, so a whole subtree can be
-  reversed in one go and its machines turned by hand. It changes the
-  lifted entries; the selection going down is the edit, one undo step.
+  stays paired. It changes the lifted entries; the selection going down is
+  the edit, one undo step.
+- **Reverse inverts the machines that have an inverse**
+  (`reversedGate()` in stamp.js). Swap and Reciprocal turn half round, and
+  Merge and Route each become the other, turned half round. A half turn
+  keeps the box, and so the origin, where it was, and puts every input
+  port exactly where an output was. The point is a tree of these: send
+  signals out through it, then copy it and Reverse the copy to undo every
+  swap and route. That only works if the control polarity lines up too, and
+  it does: Merge takes lane `a` when `c > 0`, and the turned Route sends a
+  positive control's value back out of that same cell. A half turn
+  commutes with the mirror, so a flipped machine keeps its flip. Every
+  other machine is left alone.
+
+  `tests/stamp.test.mjs` runs values through each gate, joins each output
+  port to the reversed gate's input on the same cell and face, and asserts
+  every value comes back out of the port it went in by. It covers every
+  orientation and both control signs. It is mutation-tested: no turn, a
+  turn plus a mirror, and Merge/Route kept as themselves all fail. The
+  turn-plus-mirror case **passed** at first, because the test looked up
+  the reversed gate's orientation with the original flip and not its own.
 - **Underground pairs.** Lifting one end of a pair releases the other
   (`Engine.unpair_under()`). Both ends lifted stay paired to each other.
   Placing back pairs the stamp's own ends first, then each unpaired end
@@ -875,9 +893,11 @@ replaces the board in front of you. Saving over an existing name asks first.
   than silently left out of the file.
 - The simulation's items are **not** saved, as on the desktop: a loaded
   board starts paused at tick 0 with its seeds on.
-- **Two saves keep themselves**, listed with the rest: **auto save**, every
-  30 s (`AUTOSAVE_MS`) when the board changed since the last one, and
-  **exitsave**, whenever the app is hidden -- closed, switched away from,
+- **Four saves keep themselves**, listed with the rest. Three timed tiers
+  (`AUTOSAVES`): **auto save** every 30 s, **autosave5** every 5 min and
+  **autosave15** every 15 min. Each writes when the board has changed since
+  that tier last wrote, so the slow two are older copies to fall back on.
+  The fourth is **exitsave**, whenever the app is hidden -- closed, switched away from,
   the screen locked. A phone gives no other warning of a close, and nothing
   asynchronous can be relied on to finish in that moment, so the save's
   bytes are **prepared ahead of time** (compressed after every committed
@@ -887,10 +907,18 @@ replaces the board in front of you. Saving over an existing name asks first.
 - **Both write the history's current state** -- the last stable board,
   `Board.toNpz(snapshot)` -- so a selection half-lifted off the board is
   saved where it was picked up, not missing.
+- **Nothing is written until the board has been edited this session**: no
+  tier and no exitsave (`edited`, set by `recordStep()`; loading a board
+  does not count). Opening the app used to clobber the saves it was opened
+  to choose between: the resumed board overwrote an older autosave before
+  the player got round to loading it. A session that only looks, or only
+  loads, leaves every save as it found it. The cost is that loading a
+  board and closing without an edit resumes the previous one next time.
 - **Opening the app loads the exitsave, unless the auto save is newer**,
   and either opens under the name of the board it holds (kept in its index
   entry), so saving it again does not write over the autosave. With
-  neither, the bundled default loads as before.
+  neither, the bundled default loads as before. The 5- and 15-minute tiers
+  are never resumed; they are loaded by hand.
 
 `tests/npz.test.mjs` writes `cpu.npz` and `ram.npz` back out after an edit,
 reads them here, and loads them through the desktop's `persistence.load()`,

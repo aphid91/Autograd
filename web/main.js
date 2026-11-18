@@ -15,7 +15,7 @@ import { Panel } from "./panel.js";
 import { ROUTE_NAMES, ROUTE_H_FIRST, ROUTE_V_FIRST, chooseRoute, planRun, routeWorks, turnTip } from "./planner.js";
 import { originFor } from "./placer.js";
 import { VALUE_CHOICES, hasValue, toolValue } from "./tools.js";
-import { makeStamp, mirrored, rotated, stampCells, subset } from "./stamp.js";
+import { makeStamp, mirrored, reversedGate, rotated, stampCells, subset } from "./stamp.js";
 import { emitMask, emitsWith, stampGhost } from "./ghost.js";
 import { traceRun } from "./segtrace.js";
 import { TUNE, setTune } from "./tune.js";
@@ -190,6 +190,7 @@ function recordStep() {
   if (grab?.note || noteEdit >= 0) return;
   history.commit(board.snapshot());
   committed = editKey();
+  edited = true;   // the autosaves may write from now on
   syncHistory();
   prepareSave();
 }
@@ -1170,8 +1171,11 @@ function selectTurn(cw) {
 // read from the selection as it was, all at once, before any is changed --
 // through the same emit mask the run tracer uses, since the selection is
 // lifted off the board. An underground end swaps entrance for exit AND
-// reverses, as the desktop's empty-hand R does to a placed pair. Machines
-// are not touched. The change lands when the selection goes down.
+// reverses, as the desktop's empty-hand R does to a placed pair. The machines
+// with a natural inverse turn into it (reversedGate(): Swap and Reciprocal
+// half-turn, Merge and Route trade places and half-turn), so a copied tree of
+// them, reversed, undoes what the original did; other machines are not
+// touched. The change lands when the selection goes down.
 function selectReverse() {
   if (!sel) return;
   const abs = selAbs();
@@ -1189,7 +1193,7 @@ function selectReverse() {
   sel.stamp.entries = sel.stamp.entries.map((e, i) => {
     if (e.type === "belt") return { ...e, dir: dirs[i] };
     if (e.type === "under") return { ...e, dir: dirs[i], exit: !e.exit };
-    return e;
+    return reversedGate(e);
   });
   redraw();
 }
@@ -1439,8 +1443,10 @@ async function show(name, bytes) {
 
 // --- autosave and the save on close -------------------------------------------
 //
-// Two browser saves the app keeps by itself, listed with the others:
-//   "auto save"  every AUTOSAVE_MS, when the board changed since the last one
+// Browser saves the app keeps by itself, listed with the others:
+//   "auto save"  every 30 s, when the board changed since that slot's last
+//   "autosave5"  every 5 min, likewise -- an older copy to fall back on
+//   "autosave15" every 15 min, likewise
 //   "exitsave"   whenever the app is hidden -- closed, switched away from,
 //                the screen locked. On a phone that is the only warning a
 //                close gives, and nothing asynchronous can be relied on to
@@ -1450,14 +1456,25 @@ async function show(name, bytes) {
 // Both write the history's current state -- the last stable board -- so a
 // selection half-lifted off the board is saved where it was picked up. On
 // opening, the exitsave is loaded, unless the auto save is newer; each
-// remembers the name of the board it holds.
-const AUTOSAVE_MS = 30000;
+// remembers the name of the board it holds. The two slower tiers are
+// backups loaded by hand; resuming never picks them.
+//
+// NOTHING is written -- no tier, no exitsave -- until the player has edited
+// the board this session. Opening the app must not clobber the saves it was
+// opened to choose between: an old autosave could otherwise be overwritten
+// by whatever the app resumed before the player got round to loading it.
+// Loading a board is not an edit.
 const AUTO_NAME = "auto save", EXIT_NAME = "exitsave";
+const AUTOSAVES = [
+  { name: AUTO_NAME, ms: 30 * 1000 },
+  { name: "autosave5", ms: 5 * 60 * 1000 },
+  { name: "autosave15", ms: 15 * 60 * 1000 },
+];
+let edited = false;       // has the player changed the board this session?
 let boardName = "";
 let loadGen = 0;          // which load the prepared bytes belong to
 let ready = null;         // { key, bytes }: the current state, compressed
 let preparing = false;
-let autosavedKey = null;
 const saveKey = () => `${loadGen}:${committed}`;
 
 async function prepareSave() {
@@ -1476,7 +1493,7 @@ async function prepareSave() {
 }
 
 function writeAuto(name) {
-  if (!ready) return false;
+  if (!ready || !edited) return false;
   try {
     putSave(name, ready.bytes, { board: ready.name });
     return true;
@@ -1486,10 +1503,11 @@ function writeAuto(name) {
   }
 }
 
-function autosave() {
-  if (!ready || ready.key === autosavedKey) return;
-  if (writeAuto(AUTO_NAME)) {
-    autosavedKey = ready.key;
+// One tier's tick: write if the board moved on since this tier last wrote.
+function autosave(tier) {
+  if (!ready || ready.key === tier.key) return;
+  if (writeAuto(tier.name)) {
+    tier.key = ready.key;
     panel.setLocalSaves(listSaves());
   }
 }
@@ -1692,7 +1710,7 @@ async function init() {
   if (resume) await loadLocal(resume.name);
   else if (first) await loadBundled(first).catch(e => alert(e.message));
 
-  setInterval(autosave, AUTOSAVE_MS);
+  for (const tier of AUTOSAVES) setInterval(() => autosave(tier), tier.ms);
   document.addEventListener("visibilitychange", () => { if (document.visibilityState === "hidden") exitSave(); });
   window.addEventListener("pagehide", exitSave);
 }

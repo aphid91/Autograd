@@ -84,3 +84,63 @@ test("subset renumbers partners and drops links to entries that left", () => {
   const kept = subset([e(2), e(null), e(0), e(4), e(3)], (i) => i !== 1 && i !== 4);
   assert.deepEqual(kept.map(k => k.partner), [1, 0, null]);
 });
+
+// Reverse on a gate: run values in through a machine, feed what comes out
+// into its reverse (an output port and the input port on the same cell and
+// face are joined), and every value must come back out of the port it went
+// in by. That is the whole claim -- for every orientation, both control
+// signs, and Merge/Route in both directions.
+test("a reversed gate undoes the gate, port for port", async () => {
+  const { reversedGate } = await import("../stamp.js");
+  const byName = Object.fromEntries(Object.values(T.types).map(t => [t.name, t]));
+  const key = p => p.join(",");
+  // One fire of `td` at orientation `o`: { "x,y,face": value } in -> out.
+  function fire(td, o, given) {
+    const { sim } = td;
+    const ch = new Array(sim.n_in).fill(null);
+    o.inputs.forEach((p, i) => { if (key(p) in given) ch[sim.in_ch[i]] = given[key(p)]; });
+    const out = {};
+    o.outputs.forEach((p, i) => {
+      const [op, ...a] = sim.ops[i];
+      const v = op === 1 ? ch[a[0]]
+        : op === 4 ? 1 / ch[a[0]]
+        : op === 7 ? (ch[a[0]] > 0 ? ch[a[1]] : ch[a[2]])
+        : op === 8 ? ((ch[a[0]] > 0) === !!a[2] ? ch[a[1]] : null)
+        : (() => { throw new Error(`op ${op}`); })();
+      if (v !== null && v !== undefined) out[key(p)] = v;
+    });
+    return out;
+  }
+  let checked = 0;
+  for (const name of ["swap", "recip", "merge", "route"]) {
+    for (let dir = 0; dir < 4; dir++) {
+      for (const flip of [false, true]) {
+        for (const control of [2.5, -1.5]) {
+          const e = { type: name, dx: 0, dy: 0, dir, flip };
+          const r = reversedGate(e);
+          const a = byName[e.type], b = byName[r.type];
+          const oa = a.orient[`${dir}${flip ? 1 : 0}`], ob = b.orient[`${r.dir}${r.flip ? 1 : 0}`];
+          // The port sets swap roles exactly.
+          assert.deepEqual(new Set(ob.inputs.map(key)), new Set(oa.outputs.map(key)), `${name} ${dir}${flip}`);
+          assert.deepEqual(new Set(ob.outputs.map(key)), new Set(oa.inputs.map(key)), `${name} ${dir}${flip}`);
+          // Distinct values in; the control (the one the select ops read) gets `control`.
+          const given = {};
+          oa.inputs.forEach((p, i) => { given[key(p)] = 10 + i; });
+          const ctl = a.sim.ops.find(o => o[0] === 7 || o[0] === 8);
+          if (ctl) {
+            const i = a.sim.in_ch.indexOf(ctl[1]);
+            given[key(oa.inputs[i])] = control;
+          } else if (name === "recip") given[key(oa.inputs[0])] = 4;
+          const back = fire(b, ob, fire(a, oa, given));
+          assert.ok(Object.keys(back).length > 0, `${name}: nothing came back`);
+          // A Merge keeps the lane it did not select, so its reverse returns
+          // only what was sent; everything that does come back is in place.
+          for (const [k, v] of Object.entries(back)) assert.equal(v, given[k], `${name} ${dir}${flip} c=${control} at ${k}`);
+          if (name !== "merge") assert.equal(Object.keys(back).length, oa.inputs.length);
+          checked++;
+        }
+      }
+    }
+  }
+  assert.equal(checked, 64);
+});
