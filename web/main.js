@@ -1307,7 +1307,6 @@ const dragHooks = {
     if (run || place) return true;
     if (!shell.selecting) return false;
     if (sx === undefined) return false;
-    if (shell.state.boxArmed) return true;
     return selIndexAt(...cellUnder(sx, sy)) >= 0;
   },
   begin(sx, sy) {
@@ -1330,7 +1329,6 @@ const dragHooks = {
     // read as confusing in practice: Cancel and re-tap is the way to move it.
     if (run) grab = { cell0: run.end.slice(), world0 };
     else if (place) grab = { p0: [place.px, place.py], world0 };
-    else if (shell.state.boxArmed) { grab = { box: world0 }; boxRect = rectOf(world0, world0); }
     else if (sel) grab = { sel: true, p0: [sel.px, sel.py], world0 };
   },
   move(sx, sy) {
@@ -1393,9 +1391,6 @@ const dragHooks = {
       const r = boxRect;
       boxRect = null;
       boxAdd(r);
-      // Box is one-shot: after its rectangle, back to plain selecting.
-      shell.state.boxArmed = false;
-      shell.changed();
     }
     grab = null;
     redraw();
