@@ -166,8 +166,9 @@ ports and values stay, ghosts keep their own colours):
 **Belt status colours** do the same for belts, per run (segment), in
 `beltStatus()`: **red** empty; **yellow** stalled -- the head item is at the
 run's end and will not leave on the coming tick (the forecast has no pop),
-so items are stuck on it; **green** carrying and moving. Belt spines only:
-underground ends keep their own colour. The seed tint still draws under.
+so items are stuck on it; **green** carrying and moving. Underground ends
+take their run's colour too, and the dots over a buried span a lighter wash
+of it. The seed tint still draws under.
 
 ### Pan momentum
 

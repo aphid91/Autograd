@@ -137,7 +137,7 @@ export function render(ctx, board, cam, dpr, opts = {}) {
   // run being planned still draw).
   if (view.belts !== false) {
     drawBelts(ctx, hide ? board.belts.filter(b => !hide.has(`${b.x},${b.y}`)) : board.belts, z, on, S, view.seedTint, view.beltTint || null);
-    drawUnders(ctx, board.unders, z, on, S);
+    drawUnders(ctx, board.unders, z, on, S, view.beltTint || null);
   }
   // View > sources off: Sources are not drawn (there are hundreds on a
   // computer, and they hide the machines worth looking at). Still there.
@@ -253,7 +253,30 @@ function chevron(ctx, cx, cy, f, s) {
   ctx.lineTo(cx - f[0] * s - sx * s, cy - f[1] * s - sy * s);
 }
 
-function drawUnders(ctx, unders, z, on, S) {
+// `tint`: View > belt status colours, as for belts -- an end and its span
+// take their run's colour (the span in a lighter wash of it).
+function drawUnders(ctx, unders, z, on, S, tint = null) {
+  const colOf = (u) => tint?.(u.x, u.y) || null;
+  const groups = new Map();
+  for (const u of unders) {
+    const c = colOf(u);
+    if (!groups.has(c)) groups.set(c, []);
+    groups.get(c).push(u);
+  }
+  for (const [c, list] of groups) drawUnderGroup(ctx, list, on, S, c);
+
+  if (z < LOD.chevrons) return;
+  ctx.beginPath();
+  for (const u of unders) {
+    if (on(u.x, u.y)) chevron(ctx, u.x + 0.5, u.y + 0.5, S[u.dir], 0.12);
+  }
+  ctx.strokeStyle = COL.chevron;
+  ctx.lineWidth = 0.07;
+  ctx.stroke();
+}
+
+// One colour's worth of underground ends and spans; `col` null is their own.
+function drawUnderGroup(ctx, unders, on, S, col) {
   // The span: dots on the buried cells between a paired entrance and exit.
   ctx.beginPath();
   for (const u of unders) {
@@ -268,8 +291,10 @@ function drawUnders(ctx, unders, z, on, S) {
       ctx.arc(x + 0.5, y + 0.5, 0.07, 0, Math.PI * 2);
     }
   }
-  ctx.fillStyle = COL.underDot;
+  ctx.fillStyle = col || COL.underDot;
+  ctx.globalAlpha = col ? 0.7 : 1;
   ctx.fill();
+  ctx.globalAlpha = 1;
 
   // Each end: a funnel, full width on the surface side and narrowing toward
   // the buried side -- the front of an entrance (diving), the back of an
@@ -280,19 +305,10 @@ function drawUnders(ctx, unders, z, on, S) {
     if (!on(u.x, u.y)) continue;
     underFunnel(ctx, bars, u.x + 0.5, u.y + 0.5, S[u.dir], u.exit ? -1 : 1);
   }
-  ctx.fillStyle = COL.under;
+  ctx.fillStyle = col || COL.under;
   ctx.fill();
   ctx.fillStyle = COL.underDark;
   ctx.fill(bars);
-
-  if (z < LOD.chevrons) return;
-  ctx.beginPath();
-  for (const u of unders) {
-    if (on(u.x, u.y)) chevron(ctx, u.x + 0.5, u.y + 0.5, S[u.dir], 0.12);
-  }
-  ctx.strokeStyle = COL.chevron;
-  ctx.lineWidth = 0.07;
-  ctx.stroke();
 }
 
 // One underground end centred on (cx, cy). `f` is the travel direction and
