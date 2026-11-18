@@ -12,6 +12,7 @@ import { RATE_MAX, RATE_MIN, RATE_PRESETS } from "./sim.js";
 import { CW, CCW, canFlip, catalog, isKnown, labelFor, sameTool, stampArt, toolArt, toolValue } from "./tools.js";
 import { copyStamp, mirrored, rotated } from "./stamp.js";
 import { TABLES, TABLE_NAMES, parseTable } from "./indexer.js";
+import { PALETTE, SIZE_NAMES, css as noteCss } from "./notes.js";
 
 const STORE_KEY = "gates.web.shell.v1";
 const LONG_PRESS_MS = 500;   // as sand mode
@@ -262,7 +263,8 @@ export class Shell {
     // placing: the pads are the only Turn buttons now (the row's became
     // Undo, Redo and Checkpoint).
     const picking = this.state.vector.picking;
-    const show = !!picking || !!p || this.selecting || (this.state.mode === "build" && !!this.heldTool);
+    const turnable = !!this.heldTool && this.heldTool.kind !== "label";   // a label has nothing to turn
+    const show = !!picking || !!p || this.selecting || (this.state.mode === "build" && turnable);
     const flippable = !!picking || p?.kind === "belt" || (this.heldTool ? canFlip(this.T, this.heldTool) : !!this.activeStamp || this.selecting);
     for (const pad of this.thumbs) {
       pad.dataset.show = String(show);
@@ -619,6 +621,52 @@ export class Shell {
     };
     refresh();
     m.dataset.open = "true";
+  }
+
+  // The label editor. `note` is { text, size, colour }; every change is
+  // reported at once through onChange (main.js re-fits the box and redraws,
+  // so the label updates under the sheet), Delete through onDelete, and the
+  // sheet closing through onClose.
+  openNoteEditor(note, { onChange, onDelete, onClose }) {
+    const m = document.getElementById("notesheet");
+    if (!m) return;
+    const text = m.querySelector("#note-text");
+    const sizes = m.querySelector("#note-sizes"), colours = m.querySelector("#note-colours");
+    const cur = { ...note };
+    const opts = () => {
+      sizes.replaceChildren(...SIZE_NAMES.map((name, i) => {
+        const b = document.createElement("button");
+        b.type = "button"; b.className = "pick"; b.textContent = name;
+        b.dataset.current = String(cur.size === i);
+        b.onclick = () => { cur.size = i; onChange({ size: i }); opts(); };
+        return b;
+      }));
+      colours.replaceChildren(...PALETTE.map(([name], i) => {
+        const b = document.createElement("button");
+        b.type = "button"; b.className = "pick"; b.title = name;
+        b.innerHTML = `<span class="dot" style="background:${noteCss(i)}"></span>`;
+        b.dataset.current = String(cur.colour === i);
+        b.onclick = () => { cur.colour = i; onChange({ colour: i }); opts(); };
+        return b;
+      }));
+    };
+    text.value = cur.text || "";
+    text.oninput = () => onChange({ text: text.value });
+    let closed = false;
+    const close = () => {
+      if (closed) return;
+      closed = true;
+      m.dataset.open = "false";
+      text.blur();
+      onClose?.();
+    };
+    m.querySelector("#note-done").onclick = close;
+    m.onclick = (e) => { if (e.target === m) close(); };
+    m.querySelector("#note-delete").onclick = () => { closed = true; m.dataset.open = "false"; text.blur(); onDelete?.(); };
+    opts();
+    m.dataset.open = "true";
+    // Focus after the sheet is shown, so a phone raises its keyboard.
+    setTimeout(() => text.focus(), 50);
   }
 
   setVector(v) {

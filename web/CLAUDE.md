@@ -112,8 +112,9 @@ Three things worth knowing:
   the desktop's panel/orchestrator split.
 
 The **Tweakpane** panel sits in the board's top-right corner, collapsed by
-default. It holds the saves, View toggles (grid, ports, labels, seed tint --
-the green/red wash on seeded belts, ghosts included), Debug, and
+default. It holds the saves, View toggles (grid, ports, source values, seed
+tint -- the green/red wash on seeded belts, ghosts included -- labels, and
+pan momentum), Debug, and
 the Status folder. Tweakpane is **vendored** (`vendor/`, MIT) rather than
 pulled from a CDN, which keeps the no-build, works-offline property. Status
 writes the same row fields the desktop's Status window does, plus the
@@ -143,6 +144,45 @@ constant.
   and is an edit like any other, so the simulation starts fresh.
 - `tests/history.test.mjs` covers the walk, the depth, the checkpoint
   landing and the truncation after an undo.
+
+### Pan momentum
+
+A one-finger pan released while moving keeps gliding, slowing exponentially
+(`camera.js`: time constant 325 ms, about iOS's own feel). The release
+velocity is measured over the pan's last 90 ms, so a finger that stopped
+before lifting does not fling; any touch catches the glide. View > **pan
+momentum** turns it off.
+
+### Labels
+
+The desktop's text-box annotations, read from and written back to the
+save's `annotations` blob in the desktop's own record
+(`{ kind: "text", colour, size, text, rect: [x, y, w, h] }`, world cells,
+top-left anchor), so labels made on either side show on the other.
+[notes.js](notes.js) is the model; the desktop's freehand strokes are kept
+and written back untouched, not drawn.
+
+- **The Label tool** (in the slot picker) takes every tap: on a label it
+  opens the editor, anywhere else -- over machines too, labelling them is
+  the point -- it makes a new label there and opens the editor. A drag
+  from a label moves it; elsewhere it pans. In the **Hand**, a tap on a
+  label edits it before the entity under it is inspected: labels draw over
+  the board, so they win, as on the desktop.
+- **The editor** is a sheet: the text (any length, newlines kept), size
+  S / M / L (the desktop's 0.5 / 0.9 / 1.6 cells) and the desktop's six
+  colours, live on the board behind it. New labels start at the last size
+  and colour picked. A label left empty when the editor closes is removed.
+- **The box is fitted to the text** on every edit. The desktop wraps text at
+  the box width, so a fitted box reads the same there. No resize grip.
+- Drawn like the desktop's: a faint box in the label's colour, the text
+  wrapped and clipped to it, zooming with the board; below 6 px only the
+  box. View > **labels** hides them, and hidden labels take no taps.
+- **One undo step per edit**: a label's own revision (`board.notesRev`) is
+  part of the history's key, so moving or editing one is undoable without
+  restarting the simulation, and a drag or an open editor is held back as
+  a change in progress until it ends (otherwise every frame of a drag was
+  a step).
+- Not yet: labels do not travel with a selection, copy or paste.
 
 ### The Dev folder
 
@@ -748,9 +788,9 @@ replaces the board in front of you. Saving over an existing name asks first.
 - **A save is a real `.npz`**, written by `Board.toNpz()` in the layout
   `core/persistence.py save()` uses: the same keys, `.w` zeroed (derived),
   `next_row` / `free_rows` / `live_count` from the board's allocator, and
-  the annotations blob carried through untouched (this app does not draw
-  notes, but a save that passes through it must not lose them; a save that
-  predates notes gets `"[]"`, as the desktop writes). `npz.js` has the
+  the annotations blob re-written from `board.notes` -- the labels as
+  edited here, and the desktop's strokes untouched (a save that predates
+  notes gets `"[]"`, as the desktop writes). `npz.js` has the
   writer: `.npy` headers, deflate through the native `CompressionStream`,
   and a CRC-32 per member, which numpy checks.
 - **localStorage, base64, one key per save** plus an index key, in
@@ -820,6 +860,7 @@ asserting every array matches and exactly the edited value differs.
 | `glyphs.js` | the machine glyphs, ports of the shader's `sd_*` marks |
 | `tune.js` | the Dev dials: defaults, panel spec, the live values |
 | `history.js` | undo, redo and the checkpoint, over board snapshots |
+| `notes.js` | labels: the desktop's text-box records, hit-testing, wrapping, fitting a box to its text |
 | `indexer.js` | indexing: the orders, the value tables, the file parser, a·x+b |
 | `vector.js` | vectors: offsets, turns, the claims overlay, laying copies, following a chain |
 | `tests/` | `node --test` suites for the pure modules |

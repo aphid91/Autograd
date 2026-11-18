@@ -6,6 +6,7 @@
 // other's files. Everything else here is *derived* and rebuilt by derive().
 
 import { readNpz, writeNpz } from "./npz.js";
+import { parseNotes } from "./notes.js";
 
 export const FORMAT_VERSION = 1;
 
@@ -25,6 +26,12 @@ export class Board {
     this.nextRow = arrays.next_row ? arrays.next_row.data[0] : 1;
     this.freeRows = arrays.free_rows ? Array.from(arrays.free_rows.data) : [];
     this.liveCount = arrays.live_count ? arrays.live_count.data[0] : 0;
+    // The desktop's annotations (notes.js): text boxes this app draws and
+    // edits, and anything else (strokes) carried through untouched. Their
+    // own revision, because a label edit is not a board edit: it must not
+    // restart the simulation, but it is an undo step.
+    this.notes = parseNotes(arrays.annotations?.data);
+    this.notesRev = 0;
     this.derive();
   }
 
@@ -58,13 +65,13 @@ export class Board {
     const E = this.T.entity;
     const grid = this.grid.slice();
     for (let i = 3; i < grid.length; i += 4) grid[i] = 0;
-    const notes = this.arrays.annotations?.data;
+    const notes = JSON.stringify(this.notes);
     return writeNpz({
       version: { descr: "<i4", shape: [1], data: new Int32Array([FORMAT_VERSION]) },
       size: { descr: "<i4", shape: [2], data: new Int32Array([this.width, this.height]) },
       grid: { descr: "<i4", shape: [this.height, this.width, 4], data: grid },
       entities: { descr: "<f4", shape: [this.rows, E.STRIDE], data: this.entities },
-      annotations: { descr: "<U", shape: [], data: typeof notes === "string" ? notes : "[]" },
+      annotations: { descr: "<U", shape: [], data: notes },
       next_row: { descr: "<i4", shape: [1], data: new Int32Array([this.nextRow]) },
       free_rows: { descr: "<i4", shape: [this.freeRows.length], data: new Int32Array(this.freeRows) },
       live_count: { descr: "<i4", shape: [1], data: new Int32Array([this.liveCount]) },
@@ -151,6 +158,7 @@ export class Board {
     return {
       grid: this.grid.slice(), entities: this.entities.slice(), rows: this.rows,
       nextRow: this.nextRow, freeRows: this.freeRows.slice(), liveCount: this.liveCount,
+      notes: JSON.stringify(this.notes),
     };
   }
 
@@ -165,6 +173,8 @@ export class Board {
     this.nextRow = s.nextRow;
     this.freeRows = s.freeRows.slice();
     this.liveCount = s.liveCount;
+    this.notes = JSON.parse(s.notes);
+    this.notesRev++;
     this.derive();
   }
 

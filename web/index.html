@@ -77,6 +77,21 @@
   </div>
 </div>
 
+<div id="notesheet" class="sheetwrap" data-open="false" role="dialog" aria-modal="true" aria-labelledby="notesheet-title">
+  <div class="sheet">
+    <div class="sheet-head">
+      <span id="notesheet-title">Label</span>
+      <button type="button" class="b sheet-btn" id="note-done">Done</button>
+    </div>
+    <textarea id="note-text" rows="3" autocomplete="off" spellcheck="false" aria-label="Label text" placeholder="Label text"></textarea>
+    <div class="idx-row">
+      <div id="note-sizes" class="note-opts"></div>
+      <div id="note-colours" class="note-opts"></div>
+    </div>
+    <button type="button" class="b sheet-btn danger" id="note-delete">Delete label</button>
+  </div>
+</div>
+
 <input id="index-file" type="file" accept=".txt,.csv,text/plain,text/csv" hidden>
 <input id="save-file" type="file" accept=".npz" hidden>
 <script type="module" src="main.js"></script>

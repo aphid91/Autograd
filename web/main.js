@@ -23,6 +23,7 @@ import { Sim, Clock } from "./sim.js";
 import { History } from "./history.js";
 import { DEFAULT, naturalOrder, tableValues, finalValues } from "./indexer.js";
 import { entrySize } from "./stamp.js";
+import { noteAt, fitRect, sizeOf } from "./notes.js";
 import { Claims, followChain, offsets, layCopies, isZero, rotateVec, flipVec, moreCount, lessCount } from "./vector.js";
 import { deleteSave, getSave, listSaves, putSave } from "./saves.js";
 
@@ -166,7 +167,7 @@ function paint(now) {
   // The belt a run starts on draws only as the run's ghost, at its new facing.
   const hide = run ? runCopies().copies.filter(c => c.over).map(c => c.start) : null;
   render(ctx, board, cam, dpr, { ...view, selected: info, ghosts, sim, alpha: clock.alpha, hide, vector: vectorMarks(),
-                                indexLabels: indexLabels() });
+                                indexLabels: indexLabels(), noteSel: noteEdit });
   debug.renderMs = performance.now() - t0;
   if (sim && !clock.paused) redraw();
 }
@@ -176,16 +177,23 @@ function paint(now) {
 // Commit the board as a new step if it changed since the last one and is
 // stable. Called every frame, so all the edits one gesture makes in one go
 // (clearing the way, then building) are one step.
+// The board's edit key: entities and labels both. A label edit is an undo
+// step but not a board edit -- it must not restart the simulation.
+const editKey = () => `${board.revision}/${board.notesRev}`;
+
 function recordStep() {
-  if (!board || sel || board.revision === committed) return;
+  if (!board || sel || editKey() === committed) return;
+  // A label being dragged or typed into is a change in progress too: one
+  // step when the drag ends or the editor closes, not one per frame.
+  if (grab?.note || noteEdit >= 0) return;
   history.commit(board.snapshot());
-  committed = board.revision;
+  committed = editKey();
   syncHistory();
 }
 
 function syncHistory() {
   // Something lifted is an uncommitted change Undo can throw away.
-  shell.setHistory(!!sel || (!!board && board.revision !== committed) || history.canUndo, history.canRedo);
+  shell.setHistory(!!sel || (!!board && editKey() !== committed) || history.canUndo, history.canRedo);
 }
 
 // Put a history state back. Whatever was in progress -- a run, a ghost, a
@@ -199,7 +207,8 @@ function restoreState(state) {
   shell.setSelection(0);
   if (shell.state.pasteStamp !== null) shell.setPasting(null);
   board.restore(state);
-  committed = board.revision;
+  noteEdit = -1;
+  committed = editKey();
   if (inspectRow >= 0 && !board.describe(inspectRow)) inspect(-1);
   else syncInspect();
   syncBar();
@@ -210,14 +219,14 @@ function undo() {
   if (!board) return;
   // An uncommitted change (something lifted, or an edit not yet recorded)
   // is undone first, back to the current state.
-  if (sel || board.revision !== committed) { restoreState(history.current); return; }
+  if (sel || editKey() !== committed) { restoreState(history.current); return; }
   const s = history.undo();
   if (s) restoreState(s);
 }
 
 function redo() {
   if (!board) return;
-  if (sel || board.revision !== committed) return;
+  if (sel || editKey() !== committed) return;
   const s = history.redo();
   if (s) restoreState(s);
 }
@@ -386,6 +395,81 @@ function vectorMarks() {
   return { cells };
 }
 
+// --- labels -----------------------------------------------------------------------
+//
+// The desktop's text-box annotations (notes.js). With the Label tool held:
+// a tap on empty board (or over machines -- labelling them is the point)
+// makes a label there and opens its editor; a tap on a label edits it; a
+// drag from a label moves it. In the Hand, a tap on a label edits it too,
+// before the entity under it is inspected: labels draw over the board, so
+// they win the tap, as on the desktop. A label's box is fitted to its text
+// on every edit (the desktop wraps at the box width, so it reads the same
+// there). Hidden labels (View > labels) take no taps.
+
+let noteEdit = -1;    // the label being edited, by index, or -1
+let lastNote = { size: 1, colour: 0 };   // what a new label starts as
+const measureCtx = document.createElement("canvas").getContext("2d");
+
+const labelHeld = () => shell?.state.mode === "build" && shell.heldTool?.kind === "label" && !vec.picking;
+const notesOn = () => view.notes !== false;
+
+function noteHit(sx, sy) {
+  if (!board || !notesOn()) return -1;
+  const [wx, wy] = cam.screenToWorld(sx, sy);
+  return noteAt(board.notes, wx, wy);
+}
+
+// A string's width in cells at a label's text size.
+function measureFor(n) {
+  measureCtx.font = "600 100px system-ui, sans-serif";
+  const s = sizeOf(n);
+  return (t) => (measureCtx.measureText(t).width / 100) * s;
+}
+
+function refit(i) {
+  const n = board.notes[i];
+  n.rect = fitRect(n, measureFor(n));
+}
+
+function touchNotes() { board.notesRev++; redraw(); }
+
+function createNote(wx, wy) {
+  const n = { kind: "text", colour: lastNote.colour, size: lastNote.size, text: "", rect: [wx, wy, 1, 1] };
+  board.notes.push(n);
+  editNote(board.notes.length - 1, true);
+}
+
+// Open the editor on label i. A label left empty when the editor closes is
+// removed: an empty label nobody can read is litter.
+function editNote(i, fresh = false) {
+  noteEdit = i;
+  refit(i);
+  touchNotes();
+  const n = board.notes[i];
+  shell.openNoteEditor({ text: n.text, size: n.size, colour: n.colour }, {
+    onChange: (c) => {
+      Object.assign(n, c);
+      if (c.size !== undefined || c.colour !== undefined) lastNote = { size: n.size, colour: n.colour };
+      refit(board.notes.indexOf(n));
+      touchNotes();
+    },
+    onDelete: () => { removeNote(n); },
+    onClose: () => {
+      noteEdit = -1;
+      if (!String(n.text).trim()) removeNote(n);
+      else touchNotes();
+    },
+  });
+  void fresh;
+}
+
+function removeNote(n) {
+  const i = board.notes.indexOf(n);
+  if (i >= 0) board.notes.splice(i, 1);
+  noteEdit = -1;
+  touchNotes();
+}
+
 // --- indexing -------------------------------------------------------------------
 //
 // The selection's Index swatch numbers its Sources and belts -- in the order
@@ -506,6 +590,9 @@ function onTap(sx, sy) {
   const x = Math.floor(wx), y = Math.floor(wy);
   const mode = shell.state.mode;
   if (mode === "hand") {
+    // A label wins the tap: it draws over the board.
+    const ni = noteHit(sx, sy);
+    if (ni >= 0) { editNote(ni); return; }
     // A tap on bare board closes the window, as on the desktop.
     inspect(board.entityAt(x, y));
     return;
@@ -513,6 +600,14 @@ function onTap(sx, sy) {
   if (mode !== "build") return;
   // A tap while the picker is open confirms it, as Build does.
   if (vec.picking) { if (vec.picking === "build") closePicker(true); else confirmSelectVector(); return; }
+  // The Label tool takes every tap: one on a label edits it, anywhere else
+  // makes a new one there -- over machines too.
+  if (labelHeld()) {
+    if (!notesOn()) return;
+    const ni = noteHit(sx, sy);
+    if (ni >= 0) editNote(ni); else createNote(wx, wy);
+    return;
+  }
   const tool = placer();
   // Something already planned keeps the tap, even over an entity.
   if (place || shell.activeStamp) {
@@ -1118,6 +1213,7 @@ const dragHooks = {
   // back to one finger, which never starts a selection drag of its own.
   wants(sx, sy) {
     if (vec.picking) return sx !== undefined;
+    if (labelHeld()) return sx !== undefined && noteHit(sx, sy) >= 0;
     if (run || place) return true;
     if (!shell.selecting) return false;
     if (sx === undefined) return false;
@@ -1126,6 +1222,11 @@ const dragHooks = {
   },
   begin(sx, sy) {
     const world0 = cam.screenToWorld(sx, sy);
+    if (labelHeld()) {
+      const i = noteHit(sx, sy);
+      if (i >= 0) grab = { note: board.notes[i], r0: board.notes[i].rect.slice(), world0 };
+      return;
+    }
     if (vec.picking) {
       // The first drag after opening the picker sets the anchor where it starts.
       if (!vec.anchor) vec.anchor = [Math.floor(world0[0]), Math.floor(world0[1])];
@@ -1150,6 +1251,14 @@ const dragHooks = {
       return;
     }
     const dx = wx - grab.world0[0], dy = wy - grab.world0[1];
+    if (grab.note) {
+      // A label moves with the finger, kept to a thousandth of a cell as the
+      // desktop saves it.
+      const r = (v) => Math.round(v * 1000) / 1000;
+      grab.note.rect = [r(grab.r0[0] + dx), r(grab.r0[1] + dy), grab.r0[2], grab.r0[3]];
+      touchNotes();
+      return;
+    }
     if (grab.vec) {
       const v = [grab.v0[0] + Math.round(dx), grab.v0[1] + Math.round(dy)];
       const cur = pickV();
@@ -1219,7 +1328,8 @@ async function show(name, bytes) {
     if (shell.state.pasteStamp !== null) shell.setPasting(null);
     // A loaded board is a fresh history, and its own checkpoint.
     history.reset(board.snapshot());
-    committed = board.revision;
+    noteEdit = -1;
+    committed = editKey();
     syncHistory();
     syncBar();
     cam.frame(board.bounds);
@@ -1376,7 +1486,7 @@ async function init() {
 
   resize();
   new ResizeObserver(resize).observe(canvas);
-  attachGestures(canvas, cam, redraw, { onTap, onLongPress, drag: dragHooks });
+  attachGestures(canvas, cam, redraw, { onTap, onLongPress, drag: dragHooks, momentum: () => view.momentum !== false });
 
   fileInput.addEventListener("change", async () => {
     const f = fileInput.files[0];

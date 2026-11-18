@@ -22,6 +22,8 @@ export function catalog(T) {
     { kind: "belt", label: "Belt" },
     { kind: "rawbelt", label: "Raw belt" },
     { kind: "under", label: "Underground" },
+    // Text labels (notes.js): not an entity, never on the grid.
+    { kind: "label", label: "Label" },
   ];
   for (const td of Object.values(T.types)) {
     if (td.kind !== "structure") continue;
@@ -111,6 +113,12 @@ function frame(w, h, body) {
 
 export function toolArt(T, slot) {
   if (slot.kind === "stamp") return stampArt(T, slot.stamp);
+  if (slot.kind === "label") {
+    // A label: a yellow box with a T in it, as the board draws one.
+    return `<svg viewBox="0 0 24 24" aria-hidden="true">` +
+      `<rect x="3" y="5" width="18" height="14" rx="1.5" fill="none" stroke="#ffd933" stroke-width="1.4" opacity="0.6"/>` +
+      `<path d="M8 9h8M12 9v7" stroke="#ffd933" stroke-width="2" stroke-linecap="round" fill="none"/></svg>`;
+  }
   const d = slot.dir | 0;
   if (slot.kind === "belt" || slot.kind === "rawbelt") {
     const [fx, fy] = STEP[d];

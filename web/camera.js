@@ -87,6 +87,16 @@ export class Camera {
 // grabbed thing does not lag the finger (the same reason the desktop anchors
 // a note drag at the press).
 const TAP_SLOP = 8;   // CSS px
+
+// Momentum: a one-finger pan released while moving keeps gliding, slowing
+// exponentially. The release velocity is measured over the last MOMENTUM_WINDOW
+// ms of the pan (so a finger that stopped before lifting does not fling), and
+// the glide ends below MOMENTUM_STOP px/ms or at the next touch. TAU is the
+// decay time constant: about iOS's own scroll feel.
+const MOMENTUM_WINDOW = 90;     // ms
+const MOMENTUM_MIN = 0.25;      // px/ms to start a glide at all
+const MOMENTUM_STOP = 0.02;     // px/ms to end one
+const MOMENTUM_TAU = 325;       // ms
 const LONG_PRESS_MS = 500;   // as the toolbar's long press
 
 export function attachGestures(el, camera, onChange, hooks = {}) {
@@ -95,6 +105,35 @@ export function attachGestures(el, camera, onChange, hooks = {}) {
   let press = null;        // { id, x, y }
   let holdTimer = null;
   const cancelHold = () => { if (holdTimer !== null) clearTimeout(holdTimer); holdTimer = null; };
+
+  // The pan's recent positions, for the release velocity, and the glide in
+  // progress (its animation frame), if any.
+  let trail = [];
+  let glide = null;
+  const stopGlide = () => { if (glide !== null) cancelAnimationFrame(glide); glide = null; };
+  const startGlide = () => {
+    const now = performance.now();
+    const recent = trail.filter(([t]) => now - t <= MOMENTUM_WINDOW);
+    trail = [];
+    if (recent.length < 2 || !hooks.momentum?.()) return;
+    const [t0, x0, y0] = recent[0], [t1, x1, y1] = recent[recent.length - 1];
+    const dt = t1 - t0;
+    if (dt <= 0) return;
+    let vx = (x1 - x0) / dt, vy = (y1 - y0) / dt;
+    if (Math.hypot(vx, vy) < MOMENTUM_MIN) return;
+    let last = now;
+    const step = (t) => {
+      const h = Math.min(50, t - last);
+      last = t;
+      const p = [x1, y1];
+      camera.move(p, [p[0] + vx * h, p[1] + vy * h], 1);
+      const k = Math.exp(-h / MOMENTUM_TAU);
+      vx *= k; vy *= k;
+      onChange();
+      glide = Math.hypot(vx, vy) >= MOMENTUM_STOP ? requestAnimationFrame(step) : null;
+    };
+    glide = requestAnimationFrame(step);
+  };
 
   const local = (e) => {
     const r = el.getBoundingClientRect();
@@ -105,6 +144,7 @@ export function attachGestures(el, camera, onChange, hooks = {}) {
   const wantsDrag = (x, y) => !!hooks.drag?.wants(x, y);
 
   el.addEventListener("pointerdown", (e) => {
+    stopGlide();   // a touch catches a gliding board
     el.setPointerCapture(e.pointerId);
     const p = local(e);
     pts.set(e.pointerId, p);
@@ -149,6 +189,7 @@ export function attachGestures(el, camera, onChange, hooks = {}) {
       } else {
         gesture = "pan";
         camera.move([press.x, press.y], p, 1);
+        trail = [[performance.now(), p[0], p[1]]];
         onChange();
         return;
       }
@@ -157,6 +198,8 @@ export function attachGestures(el, camera, onChange, hooks = {}) {
       hooks.drag.move(p[0], p[1]);
     } else if (gesture === "pan" && ids.length === 1) {
       camera.move(before[0], after[0], 1);
+      trail.push([performance.now(), after[0][0], after[0][1]]);
+      if (trail.length > 32) trail.shift();
     } else if (gesture === "pinch" && ids.length >= 2) {
       const mid = (q) => [(q[0][0] + q[1][0]) / 2, (q[0][1] + q[1][1]) / 2];
       const dist = (q) => Math.hypot(q[0][0] - q[1][0], q[0][1] - q[1][1]);
@@ -176,6 +219,8 @@ export function attachGestures(el, camera, onChange, hooks = {}) {
       hooks.onTap?.(press.x, press.y);
     } else if (gesture === "drag") {
       hooks.drag.end();
+    } else if (gesture === "pan" && !cancelled && pts.size === 0) {
+      startGlide();
     }
     if (pts.size === 0) gesture = "idle";
     else if (gesture === "pinch" && pts.size === 1) gesture = wantsDrag() ? "dead" : "pan";

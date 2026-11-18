@@ -67,6 +67,7 @@ const emitShown = (s, z, labels) => s.emit !== null && labels && z >= LOD.marks;
 import { structGlyph } from "./glyphs.js";
 import { TUNE } from "./tune.js";
 import { itemPoints } from "./flow.js";
+import { css as noteCss, isText, sizeOf, wrap, PAD, LINE } from "./notes.js";
 
 const css = (c) => `rgb(${(c[0] * 255) | 0},${(c[1] * 255) | 0},${(c[2] * 255) | 0})`;
 const shade = (c, k) => css(c.map(v => v * k));
@@ -154,6 +155,7 @@ export function render(ctx, board, cam, dpr, opts = {}) {
   }
 
   if (cargo) drawItemLabels(ctx, cargo, cam, dpr);
+  if (view.notes !== false && board.notes?.length) drawNotes(ctx, board.notes, cam, dpr, view.noteSel ?? -1);
   if (view.indexLabels?.length) drawIndexLabels(ctx, view.indexLabels, cam, dpr);
 
   if (view.labels && z >= LOD.marks) {
@@ -468,6 +470,41 @@ function drawLabels(ctx, T, structs, cam, dpr, on) {
     const [sx, sy] = cam.worldToScreen(s.x + s.w / 2, s.y + s.h / 2);
     ctx.fillText(fmtNumber(s.emit), sx, sy);
   }
+}
+
+// Labels (notes.js), as the desktop's annotation layer draws them: a faint
+// box in the label's colour and its text wrapped to the box's width and
+// clipped to it, sized in world cells so they zoom with the board. Over
+// everything, in screen space. Below 6 px the text is noise and only the
+// box shows; the selected label gets a solid outline.
+function drawNotes(ctx, notes, cam, dpr, selected) {
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  ctx.textBaseline = "top";
+  ctx.textAlign = "left";
+  const W = cam.w, H = cam.h;
+  notes.forEach((n, i) => {
+    if (!isText(n)) return;
+    const [x, y, w, h] = n.rect;
+    const [sx0, sy0] = cam.worldToScreen(x, y);
+    const [sx1, sy1] = cam.worldToScreen(x + w, y - h);
+    if (sx1 < 0 || sy1 < 0 || sx0 > W || sy0 > H) return;
+    const sel = i === selected;
+    ctx.lineWidth = sel ? 2 : 1;
+    ctx.strokeStyle = noteCss(n.colour, sel ? 0.95 : 0.35);
+    ctx.strokeRect(sx0, sy0, sx1 - sx0, sy1 - sy0);
+    const px = sizeOf(n) * cam.zoom;
+    if (!n.text || px < 6) return;
+    ctx.save();
+    ctx.beginPath();
+    ctx.rect(sx0, sy0, sx1 - sx0, sy1 - sy0);
+    ctx.clip();
+    ctx.font = `600 ${px.toFixed(1)}px system-ui, sans-serif`;
+    ctx.fillStyle = noteCss(n.colour, 1);
+    const pad = PAD * px;
+    const lines = wrap(n.text, (sx1 - sx0) - 2 * pad, (t) => ctx.measureText(t).width);
+    lines.forEach((l, k) => ctx.fillText(l, sx0 + pad, sy0 + pad + k * LINE * px));
+    ctx.restore();
+  });
 }
 
 // Indexing: each indexed entity's number on a badge, in screen space so it
