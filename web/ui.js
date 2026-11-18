@@ -20,8 +20,8 @@ const LONG_PRESS_SLOP = 10;  // px a held finger may wander
 const STAMP_HISTORY = 12;
 
 export const MODES = ["build", "hand"];
-// Select mode's bar: Box is a one-shot tool (the next drag is a rectangle);
-// the other three are COMMANDS on the current selection, not modes.
+// Select mode's bar: COMMANDS on the current selection, not modes. A box
+// select is a long press off a belt, then a drag (main.js).
 export const COMMANDS = ["delete", "cut", "copy"];
 const COMMAND_ICON = { delete: "trash", cut: "cut", copy: "copy" };
 const COMMAND_LABEL = { delete: "Delete", cut: "Cut", copy: "Copy" };
@@ -89,7 +89,6 @@ export class Shell {
       mode: MODES.includes(saved.mode) ? saved.mode : "build",
       slots,
       selected: Number.isInteger(saved.selected) && saved.selected < slots.length ? saved.selected : -1,
-      boxArmed: false,     // select mode: the next drag is a box
       selCount: 0,         // how many entities are selected (main.js says)
       pasteStamp: null,    // select mode: the stamp being pasted, by id
       stamps: [],          // most recent first; in-session, like the desktop
@@ -289,7 +288,7 @@ export class Shell {
     if (this.state.mode === m) return;
     this.state.mode = m;
     // Leaving Build ends a paste or a Box; the stamp history survives.
-    if (m !== "build") { this.state.pasteStamp = null; this.state.boxArmed = false; }
+    if (m !== "build") this.state.pasteStamp = null;
     this.changed();
   }
 
@@ -799,11 +798,6 @@ export class Shell {
   renderSelect(row) {
     const s = this.state;
     if (s.indexing) { this.renderIndexing(row); return; }
-    row.append(this.swatch({
-      art: icon("box"), name: "Box", cls: "actsw act-box",
-      selected: s.boxArmed,
-      onTap: () => { s.boxArmed = !s.boxArmed; this.changed(); },
-    }));
     for (const c of COMMANDS) {
       const sw = this.swatch({
         art: icon(COMMAND_ICON[c]), name: COMMAND_LABEL[c], cls: `actsw act-${c}`,
@@ -889,7 +883,6 @@ export class Shell {
 
   setPasting(id) {
     this.state.pasteStamp = id;
-    this.state.boxArmed = false;
     this.changed();
   }
 
@@ -897,8 +890,6 @@ export class Shell {
     const s = this.state;
     if (s.selCount === n) return;
     s.selCount = n;
-    // Nothing left to add to: a Box armed for this selection goes with it.
-    if (!n) s.boxArmed = false;
     this.render();
   }
 
