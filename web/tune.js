@@ -19,6 +19,20 @@ export const TUNE_DEFAULTS = {
   gridOpacity: 1,        // the grid lines
   ghostAlpha: 0.6,       // planned and selected ghosts
   tapMarginPx: 20,       // how near a ghost or a run's tip a tap counts as on it
+  // Zoom thresholds, in CSS px per cell: below each, that detail is not
+  // drawn (render.js's LOD reads these live).
+  lodBeltSolid: 4,       // belts become solid squares
+  lodGrid: 6,            // grid lines
+  lodMarks: 5,           // machine glyphs and Source values
+  lodPorts: 8,           // port arrows
+  lodPortEdge: 14,       // the ports' outline
+  lodChevrons: 10,       // belt chevrons
+  // Text fades, in px of text height rather than zoom (legibility is what
+  // they are about): item numbers fade in between min and good; a label's
+  // text is hidden below its min.
+  itemTextMin: 6,
+  itemTextGood: 10,
+  noteTextMin: 6,
 };
 
 // What the panel shows, in order: [key, label, { min, max, step }] for a
@@ -37,6 +51,18 @@ export const TUNE_SPEC = [
   ["gridOpacity", "grid", { min: 0, max: 1, step: 0.05 }],
   ["ghostAlpha", "ghost opacity", { min: 0.1, max: 1, step: 0.05 }],
   ["tapMarginPx", "tap margin px", { min: 0, max: 60, step: 1 }],
+  // A divider, then the zoom thresholds.
+  ["---", "zoom thresholds (px/cell)"],
+  ["lodBeltSolid", "solid belts below", { min: 0, max: 40, step: 0.5 }],
+  ["lodGrid", "grid from", { min: 0, max: 40, step: 0.5 }],
+  ["lodMarks", "glyphs, values from", { min: 0, max: 40, step: 0.5 }],
+  ["lodPorts", "ports from", { min: 0, max: 40, step: 0.5 }],
+  ["lodPortEdge", "port edges from", { min: 0, max: 60, step: 0.5 }],
+  ["lodChevrons", "chevrons from", { min: 0, max: 60, step: 0.5 }],
+  ["---", "text fades (px of text)"],
+  ["itemTextMin", "item numbers start", { min: 0, max: 30, step: 0.5 }],
+  ["itemTextGood", "item numbers full", { min: 0.5, max: 40, step: 0.5 }],
+  ["noteTextMin", "label text from", { min: 0, max: 30, step: 0.5 }],
 ];
 
 export const TUNE = { ...TUNE_DEFAULTS };

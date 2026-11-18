@@ -55,6 +55,17 @@ function store(data) {
   try { localStorage.setItem(STORE_KEY, JSON.stringify(data)); } catch { /* not persisted */ }
 }
 
+// Close a sheet on a tap on its dimmed backdrop -- but only when the press
+// also began there. A tap on the board that OPENS a sheet is followed, on a
+// phone, by the browser's own click a moment later, by which time the sheet
+// is up: that click lands on the backdrop, and closing on it shut every
+// sheet the instant it opened (a new label vanished as it appeared).
+function closeOnBackdrop(m, close) {
+  let down = false;
+  m.onpointerdown = (e) => { down = e.target === m; };
+  m.onclick = (e) => { if (e.target === m && down) close(); down = false; };
+}
+
 export class Shell {
   constructor(T, els, callbacks) {
     this.T = T;
@@ -613,7 +624,7 @@ export class Shell {
     bin.oninput = refresh;
     const close = () => { m.dataset.open = "false"; ain.blur(); bin.blur(); };
     m.querySelector("#index-cancel").onclick = close;
-    m.onclick = (e) => { if (e.target === m) close(); };
+    closeOnBackdrop(m, close);
     apply.onclick = () => {
       const o = opts();
       close();
@@ -661,7 +672,7 @@ export class Shell {
       onClose?.();
     };
     m.querySelector("#note-done").onclick = close;
-    m.onclick = (e) => { if (e.target === m) close(); };
+    closeOnBackdrop(m, close);
     m.querySelector("#note-delete").onclick = () => { closed = true; m.dataset.open = "false"; text.blur(); onDelete?.(); };
     opts();
     m.dataset.open = "true";
@@ -858,7 +869,7 @@ export class Shell {
     m.querySelector("#stampmenu-rename").onclick = rename;
     name.onkeydown = (e) => { if (e.key === "Enter") rename(); if (e.key === "Escape") close(); };
     m.querySelector("#stampmenu-cancel").onclick = close;
-    m.onclick = (e) => { if (e.target === m) close(); };
+    closeOnBackdrop(m, close);
     m.querySelector("#stampmenu-delete").onclick = () => {
       close();
       s.stamps = s.stamps.filter(t => t.id !== id);

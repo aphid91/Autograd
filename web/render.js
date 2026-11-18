@@ -47,10 +47,18 @@ const COL = {
 const ITEM = { r: 0.22, ring: 0.055 };
 // An item's number, as a fraction of a cell, and the zoom band it fades in
 // over -- the shader's glyph height (8 * 0.042 cells) and its 6..10 px fade.
-const ITEM_TEXT = { size: 0.3, glyph: 0.336, minPx: 6, goodPx: 10 };
+const ITEM_TEXT = { size: 0.3, glyph: 0.336 };   // its fade band: TUNE.itemTextMin..itemTextGood
 
 // Below this zoom (CSS px per cell) detail is not drawn at all.
-const LOD = { beltSolid: 4, gridLines: 6, chevrons: 10, ports: 8, labels: 22, marks: 5, portEdge: 14 };
+// Live from the Dev folder's zoom thresholds (tune.js).
+const LOD = {
+  get beltSolid() { return TUNE.lodBeltSolid; },
+  get gridLines() { return TUNE.lodGrid; },
+  get chevrons() { return TUNE.lodChevrons; },
+  get ports() { return TUNE.lodPorts; },
+  get marks() { return TUNE.lodMarks; },
+  get portEdge() { return TUNE.lodPortEdge; },
+};
 
 // A Source's number, in CSS px: 1.75x the first cut, bounded by the body's
 // width. It is drawn as far out as the glyphs are (LOD.marks), however small
@@ -155,7 +163,7 @@ export function render(ctx, board, cam, dpr, opts = {}) {
   }
 
   if (cargo) drawItemLabels(ctx, cargo, cam, dpr);
-  if (view.notes !== false && board.notes?.length) drawNotes(ctx, board.notes, cam, dpr, view.noteSel ?? -1);
+  if (view.notes !== false && board.notes?.length) drawNotes(ctx, board.notes, cam, dpr, view.noteSel ?? -1, !!view.noteGrips);
   if (view.indexLabels?.length) drawIndexLabels(ctx, view.indexLabels, cam, dpr);
 
   if (view.labels && z >= LOD.marks) {
@@ -477,7 +485,7 @@ function drawLabels(ctx, T, structs, cam, dpr, on) {
 // clipped to it, sized in world cells so they zoom with the board. Over
 // everything, in screen space. Below 6 px the text is noise and only the
 // box shows; the selected label gets a solid outline.
-function drawNotes(ctx, notes, cam, dpr, selected) {
+function drawNotes(ctx, notes, cam, dpr, selected, grips = false) {
   ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
   ctx.textBaseline = "top";
   ctx.textAlign = "left";
@@ -492,8 +500,19 @@ function drawNotes(ctx, notes, cam, dpr, selected) {
     ctx.lineWidth = sel ? 2 : 1;
     ctx.strokeStyle = noteCss(n.colour, sel ? 0.95 : 0.35);
     ctx.strokeRect(sx0, sy0, sx1 - sx0, sy1 - sy0);
+    // With the Label tool held, the resize grip: a right angle in the
+    // bottom-right corner, sized in screen px like its hit area (main.js).
+    if (grips) {
+      ctx.save();
+      ctx.strokeStyle = noteCss(n.colour, 0.9);
+      ctx.lineWidth = 2.5;
+      ctx.beginPath();
+      ctx.moveTo(sx1 - 12, sy1 - 3); ctx.lineTo(sx1 - 3, sy1 - 3); ctx.lineTo(sx1 - 3, sy1 - 12);
+      ctx.stroke();
+      ctx.restore();
+    }
     const px = sizeOf(n) * cam.zoom;
-    if (!n.text || px < 6) return;
+    if (!n.text || px < TUNE.noteTextMin) return;
     ctx.save();
     ctx.beginPath();
     ctx.rect(sx0, sy0, sx1 - sx0, sy1 - sy0);
@@ -600,7 +619,8 @@ function discs(ctx, pos, neg) {
 // 0 when an item's number would be noise, 1 once it reads comfortably.
 function textOpacity(z) {
   const px = ITEM_TEXT.glyph * z;
-  const t = Math.min(1, Math.max(0, (px - ITEM_TEXT.minPx) / (ITEM_TEXT.goodPx - ITEM_TEXT.minPx)));
+  const lo = TUNE.itemTextMin, hi = Math.max(lo + 0.01, TUNE.itemTextGood);
+  const t = Math.min(1, Math.max(0, (px - lo) / (hi - lo)));
   return t * t * (3 - 2 * t);
 }
 

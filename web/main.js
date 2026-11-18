@@ -23,7 +23,7 @@ import { Sim, Clock } from "./sim.js";
 import { History } from "./history.js";
 import { DEFAULT, naturalOrder, tableValues, finalValues } from "./indexer.js";
 import { entrySize } from "./stamp.js";
-import { noteAt, fitRect, sizeOf } from "./notes.js";
+import { noteAt, gripAt, newRect, MIN_W, MIN_H } from "./notes.js";
 import { Claims, followChain, offsets, layCopies, isZero, rotateVec, flipVec, moreCount, lessCount } from "./vector.js";
 import { deleteSave, getSave, listSaves, putSave } from "./saves.js";
 
@@ -167,7 +167,7 @@ function paint(now) {
   // The belt a run starts on draws only as the run's ghost, at its new facing.
   const hide = run ? runCopies().copies.filter(c => c.over).map(c => c.start) : null;
   render(ctx, board, cam, dpr, { ...view, selected: info, ghosts, sim, alpha: clock.alpha, hide, vector: vectorMarks(),
-                                indexLabels: indexLabels(), noteSel: noteEdit });
+                                indexLabels: indexLabels(), noteSel: noteEdit, noteGrips: labelHeld() });
   debug.renderMs = performance.now() - t0;
   if (sim && !clock.paused) redraw();
 }
@@ -405,10 +405,14 @@ function vectorMarks() {
 // they win the tap, as on the desktop. A label's box is fitted to its text
 // on every edit (the desktop wraps at the box width, so it reads the same
 // there). Hidden labels (View > labels) take no taps.
+//
+// A new label gets a default-sized box (it is not fitted to its text: the
+// player sizes it). With the Label tool held every label wears a grip at
+// its bottom-right corner; a drag from the grip resizes, the top-left
+// staying put, and a drag from anywhere else on the box moves it.
 
 let noteEdit = -1;    // the label being edited, by index, or -1
 let lastNote = { size: 1, colour: 0 };   // what a new label starts as
-const measureCtx = document.createElement("canvas").getContext("2d");
 
 const labelHeld = () => shell?.state.mode === "build" && shell.heldTool?.kind === "label" && !vec.picking;
 const notesOn = () => view.notes !== false;
@@ -419,22 +423,18 @@ function noteHit(sx, sy) {
   return noteAt(board.notes, wx, wy);
 }
 
-// A string's width in cells at a label's text size.
-function measureFor(n) {
-  measureCtx.font = "600 100px system-ui, sans-serif";
-  const s = sizeOf(n);
-  return (t) => (measureCtx.measureText(t).width / 100) * s;
+// Is screen point (sx, sy) on a label's resize grip? The grip is sized and
+// hit in screen pixels, so it is the same size at every zoom.
+function gripHit(sx, sy) {
+  if (!board || !notesOn()) return -1;
+  return gripAt(board.notes, (x, y) => cam.worldToScreen(x, y), sx, sy, GRIP_PX);
 }
-
-function refit(i) {
-  const n = board.notes[i];
-  n.rect = fitRect(n, measureFor(n));
-}
+const GRIP_PX = 22;
 
 function touchNotes() { board.notesRev++; redraw(); }
 
 function createNote(wx, wy) {
-  const n = { kind: "text", colour: lastNote.colour, size: lastNote.size, text: "", rect: [wx, wy, 1, 1] };
+  const n = { kind: "text", colour: lastNote.colour, size: lastNote.size, text: "", rect: newRect(wx, wy, lastNote.size) };
   board.notes.push(n);
   editNote(board.notes.length - 1, true);
 }
@@ -443,14 +443,12 @@ function createNote(wx, wy) {
 // removed: an empty label nobody can read is litter.
 function editNote(i, fresh = false) {
   noteEdit = i;
-  refit(i);
   touchNotes();
   const n = board.notes[i];
   shell.openNoteEditor({ text: n.text, size: n.size, colour: n.colour }, {
     onChange: (c) => {
       Object.assign(n, c);
       if (c.size !== undefined || c.colour !== undefined) lastNote = { size: n.size, colour: n.colour };
-      refit(board.notes.indexOf(n));
       touchNotes();
     },
     onDelete: () => { removeNote(n); },
@@ -1213,7 +1211,7 @@ const dragHooks = {
   // back to one finger, which never starts a selection drag of its own.
   wants(sx, sy) {
     if (vec.picking) return sx !== undefined;
-    if (labelHeld()) return sx !== undefined && noteHit(sx, sy) >= 0;
+    if (labelHeld()) return sx !== undefined && (gripHit(sx, sy) >= 0 || noteHit(sx, sy) >= 0);
     if (run || place) return true;
     if (!shell.selecting) return false;
     if (sx === undefined) return false;
@@ -1223,8 +1221,10 @@ const dragHooks = {
   begin(sx, sy) {
     const world0 = cam.screenToWorld(sx, sy);
     if (labelHeld()) {
-      const i = noteHit(sx, sy);
-      if (i >= 0) grab = { note: board.notes[i], r0: board.notes[i].rect.slice(), world0 };
+      // The grip first: grabbing the corner must never read as grabbing the box.
+      const g = gripHit(sx, sy);
+      const i = g >= 0 ? g : noteHit(sx, sy);
+      if (i >= 0) grab = { note: board.notes[i], r0: board.notes[i].rect.slice(), world0, resize: g >= 0 };
       return;
     }
     if (vec.picking) {
@@ -1255,7 +1255,12 @@ const dragHooks = {
       // A label moves with the finger, kept to a thousandth of a cell as the
       // desktop saves it.
       const r = (v) => Math.round(v * 1000) / 1000;
-      grab.note.rect = [r(grab.r0[0] + dx), r(grab.r0[1] + dy), grab.r0[2], grab.r0[3]];
+      const [x0, y0, w0, h0] = grab.r0;
+      // Resizing: the top-left stays put; world +Y is up and the box hangs
+      // down from it, so dragging the grip down (dy < 0) makes it taller.
+      grab.note.rect = grab.resize
+        ? [x0, y0, r(Math.max(MIN_W, w0 + dx)), r(Math.max(MIN_H, h0 - dy))]
+        : [r(x0 + dx), r(y0 + dy), w0, h0];
       touchNotes();
       return;
     }

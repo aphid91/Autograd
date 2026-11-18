@@ -72,6 +72,28 @@ export function wrap(text, maxW, measure) {
   return out;
 }
 
+// A new label's box, top-left at (x, y): room for a few words at its size.
+export const MIN_W = 1, MIN_H = 0.6;
+export function newRect(x, y, size) {
+  const s = TEXT_SIZES[size] ?? TEXT_SIZES[1];
+  const r = (v) => Math.round(v * 1000) / 1000;
+  return [r(x), r(y), r(Math.max(4, 8 * s)), r((LINE + 2 * PAD) * s * 1.5)];
+}
+
+// The topmost label whose resize grip -- its bottom-right corner, a square
+// `px` across in screen space -- holds screen point (sx, sy), or -1.
+// `toScreen(x, y)` maps a world point to the screen.
+export function gripAt(notes, toScreen, sx, sy, px) {
+  for (let i = notes.length - 1; i >= 0; i--) {
+    const n = notes[i];
+    if (!isText(n)) continue;
+    const [x, y, w, h] = n.rect;
+    const [cx, cy] = toScreen(x + w, y - h);
+    if (sx >= cx - px && sx <= cx + px * 0.4 && sy >= cy - px && sy <= cy + px * 0.4) return i;
+  }
+  return -1;
+}
+
 // Size a box to its text: as wide as its widest line, as tall as its lines,
 // plus padding. `measure(s)` is a string's width in cells at this size. The
 // desktop wraps at the box width, so a box fitted here reads the same there.

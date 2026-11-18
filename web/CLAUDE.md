@@ -164,19 +164,24 @@ and written back untouched, not drawn.
 
 - **The Label tool** (in the slot picker) takes every tap: on a label it
   opens the editor, anywhere else -- over machines too, labelling them is
-  the point -- it makes a new label there and opens the editor. A drag
-  from a label moves it; elsewhere it pans. In the **Hand**, a tap on a
+  the point -- it makes a new label there, a **default-sized** box with its
+  top-left at the tap, and opens the editor. With the tool held every label
+  wears a **grip** at its bottom-right corner: a drag from the grip
+  resizes (top-left fixed; the grip is sized and hit in screen pixels, and
+  is checked before the body so a corner grab never moves the box), a drag
+  from anywhere else on the box moves it, and a drag off any label pans. In the **Hand**, a tap on a
   label edits it before the entity under it is inspected: labels draw over
   the board, so they win, as on the desktop.
 - **The editor** is a sheet: the text (any length, newlines kept), size
   S / M / L (the desktop's 0.5 / 0.9 / 1.6 cells) and the desktop's six
   colours, live on the board behind it. New labels start at the last size
   and colour picked. A label left empty when the editor closes is removed.
-- **The box is fitted to the text** on every edit. The desktop wraps text at
-  the box width, so a fitted box reads the same there. No resize grip.
+- **The player sizes the box**; the text wraps to its width and is clipped
+  to it, as the desktop draws it, so a label reads the same on both.
+  (`fitRect()` in notes.js fits a box to its text and is not used today.)
 - Drawn like the desktop's: a faint box in the label's colour, the text
-  wrapped and clipped to it, zooming with the board; below 6 px only the
-  box. View > **labels** hides them, and hidden labels take no taps.
+  wrapped and clipped to it, zooming with the board; below
+  Dev > text fades > "label text from" (6 px of text) only the box. View > **labels** hides them, and hidden labels take no taps.
 - **One undo step per edit**: a label's own revision (`board.notesRev`) is
   part of the history's key, so moving or editing one is undoable without
   restarting the simulation, and a drag or an open editor is held back as
@@ -193,6 +198,13 @@ Source value's size, grid opacity, ghost opacity, and the tap margin round
 a ghost or a run's tip. Scales multiply the shipped value, so 1 is always
 "as shipped", and **Reset dials** puts them all back. They persist with the
 panel's preferences; a stored key this build does not know is ignored.
+
+Below a divider, two sub-folders of **zoom thresholds**: the zoom (CSS px
+per cell) below which belts turn to solid squares, and from which the grid,
+glyphs and Source values, ports, port edges and belt chevrons draw; and the
+**text fades**, in px of text height (what legibility depends on) -- item
+numbers fading in between two values, and a label's text appearing from
+one. `render.js`'s `LOD` reads them live through getters.
 
 **Force build** makes the builder tools win: a blocked machine or raw belt
 deletes whatever is in its way and is placed, and a belt run deletes what
@@ -612,6 +624,18 @@ one segment through its underground pair.
 become occupied, so a stale plan can never overwrite. It pairs only ends
 that were both actually built, the dangling-partner rule the desktop
 enforces.
+
+### A sheet must not close on the tap that opened it
+
+A sheet (the label editor, the index values, the stamp menu) closes on a
+tap on its dimmed backdrop -- but only when the **press began there**
+(`closeOnBackdrop()` in ui.js). A tap on the board that opens a sheet is
+followed on a phone by the browser's own synthesized click a moment
+later, by which time the sheet is up, so that click lands on the
+backdrop: closing on any backdrop click shut the label editor the instant
+it opened, and an empty new label was then removed -- a box that showed
+for one frame. A mouse test does not reproduce it; a touch test
+(`devices['Pixel 7']`, `touchscreen.tap`) does.
 
 ### A testing trap: instant drags read as flings
 

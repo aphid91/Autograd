@@ -73,8 +73,15 @@ export class Panel {
       cb.onTune({ ...this.dev });
     };
     const devBindings = [];
+    // A "---" entry is a divider with a heading.
+    let group = dev;
     for (const [key, label, opts] of TUNE_SPEC) {
-      devBindings.push(dev.addBinding(this.dev, key, { label, ...(opts || {}) }).on("change", pushDev));
+      if (key === "---") {
+        dev.addBlade({ view: "separator" });
+        group = dev.addFolder({ title: label, expanded: false });
+        continue;
+      }
+      devBindings.push(group.addBinding(this.dev, key, { label, ...(opts || {}) }).on("change", pushDev));
     }
     dev.addButton({ title: "Reset dials" }).on("click", () => {
       Object.assign(this.dev, TUNE_DEFAULTS);
