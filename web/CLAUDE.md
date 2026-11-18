@@ -115,7 +115,8 @@ The **Tweakpane** panel sits in the board's top-right corner, collapsed by
 default. It holds the saves, View toggles (grid, ports, source values, seed
 tint -- the green/red wash on seeded belts, ghosts included -- labels, pan
 momentum, items, belts (placed belts and underground ends; a planned run's
-ghost still draws) and **gate status colours**), Debug, and
+ghost still draws), sources (hidden, not removed), **gate status colours**
+and **belt status colours**), Debug, and
 the Status folder. Tweakpane is **vendored** (`vendor/`, MIT) rather than
 pulled from a CDN, which keeps the no-build, works-offline property. Status
 writes the same row fields the desktop's Status window does, plus the
@@ -161,6 +162,12 @@ ports and values stay, ghosts keep their own colours):
   and the lane that control selects is not starved, nor is a Sink with any
   lane fed, and a Source (no inputs) never starves.
 - **green, running**: neither.
+
+**Belt status colours** do the same for belts, per run (segment), in
+`beltStatus()`: **red** empty; **yellow** stalled -- the head item is at the
+run's end and will not leave on the coming tick (the forecast has no pop),
+so items are stuck on it; **green** carrying and moving. Belt spines only:
+underground ends keep their own colour. The seed tint still draws under.
 
 ### Pan momentum
 

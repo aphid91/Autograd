@@ -136,10 +136,13 @@ export function render(ctx, board, cam, dpr, opts = {}) {
   // View > belts off hides placed belts and underground ends (ghosts of a
   // run being planned still draw).
   if (view.belts !== false) {
-    drawBelts(ctx, hide ? board.belts.filter(b => !hide.has(`${b.x},${b.y}`)) : board.belts, z, on, S, view.seedTint);
+    drawBelts(ctx, hide ? board.belts.filter(b => !hide.has(`${b.x},${b.y}`)) : board.belts, z, on, S, view.seedTint, view.beltTint || null);
     drawUnders(ctx, board.unders, z, on, S);
   }
-  drawStructs(ctx, board.T, board.structs, z, px, on, S, view.ports, view.labels, view.gateTint || null);
+  // View > sources off: Sources are not drawn (there are hundreds on a
+  // computer, and they hide the machines worth looking at). Still there.
+  const structs = view.sources === false ? board.structs.filter(s => board.T.types[s.type].name !== "source") : board.structs;
+  drawStructs(ctx, board.T, structs, z, px, on, S, view.ports, view.labels, view.gateTint || null);
 
   ctx.strokeStyle = COL.border;
   ctx.lineWidth = 2 * px;
@@ -171,14 +174,23 @@ export function render(ctx, board, cam, dpr, opts = {}) {
   if (view.indexLabels?.length) drawIndexLabels(ctx, view.indexLabels, cam, dpr);
 
   if (view.labels && z >= LOD.marks) {
-    drawLabels(ctx, board.T, board.structs, cam, dpr, on);
+    drawLabels(ctx, board.T, structs, cam, dpr, on);
     ctx.globalAlpha = 0.7;
     for (const g of ghosts) if (g.structs?.length) drawLabels(ctx, board.T, g.structs, cam, dpr, on);
     ctx.globalAlpha = 1;
   }
 }
 
-function drawBelts(ctx, belts, z, on, S, seedTint = true) {
+// `tint`: View > belt status colours -- (x, y) -> a colour, or null for the
+// belt's own (main.js decides empty / stalled / moving, per run).
+function drawBelts(ctx, belts, z, on, S, seedTint = true, tint = null) {
+  // One batched path per colour, as before when there is one colour.
+  const groups = new Map();
+  for (const b of belts) {
+    const c = tint?.(b.x, b.y) || COL.belt;
+    if (!groups.has(c)) groups.set(c, []);
+    groups.get(c).push(b);
+  }
 
   // Seeded cells are tinted by the seed's sign, under the belt itself --
   // unless the View folder's "seed tint" is off.
@@ -192,30 +204,34 @@ function drawBelts(ctx, belts, z, on, S, seedTint = true) {
   if (z < LOD.beltSolid) {
     // Zoomed far out a belt is a few pixels; a solid square reads better
     // than a hairline and costs one rect.
-    ctx.beginPath();
-    for (const b of belts) if (on(b.x, b.y)) ctx.rect(b.x + 0.2, b.y + 0.2, 0.6, 0.6);
-    ctx.fillStyle = COL.belt;
-    ctx.fill();
+    for (const [col, list] of groups) {
+      ctx.beginPath();
+      for (const b of list) if (on(b.x, b.y)) ctx.rect(b.x + 0.2, b.y + 0.2, 0.6, 0.6);
+      ctx.fillStyle = col;
+      ctx.fill();
+    }
     return;
   }
 
   // The spine: in-edge -> centre -> out-edge. With no source the spine runs
   // straight through, so an isolated belt fills its cell.
-  ctx.beginPath();
-  for (const b of belts) {
-    if (!on(b.x, b.y)) continue;
-    const cx = b.x + 0.5, cy = b.y + 0.5;
-    const o = S[b.dir];
-    const i = b.inDir >= 0 ? S[b.inDir] : [-o[0], -o[1]];
-    ctx.moveTo(cx + i[0] * 0.5, cy + i[1] * 0.5);
-    ctx.lineTo(cx, cy);
-    ctx.lineTo(cx + o[0] * 0.5, cy + o[1] * 0.5);
-  }
-  ctx.strokeStyle = COL.belt;
   ctx.lineWidth = 0.34 * TUNE.beltWidth;
   ctx.lineJoin = "round";
   ctx.lineCap = "butt";
-  ctx.stroke();
+  for (const [col, list] of groups) {
+    ctx.beginPath();
+    for (const b of list) {
+      if (!on(b.x, b.y)) continue;
+      const cx = b.x + 0.5, cy = b.y + 0.5;
+      const o = S[b.dir];
+      const i = b.inDir >= 0 ? S[b.inDir] : [-o[0], -o[1]];
+      ctx.moveTo(cx + i[0] * 0.5, cy + i[1] * 0.5);
+      ctx.lineTo(cx, cy);
+      ctx.lineTo(cx + o[0] * 0.5, cy + o[1] * 0.5);
+    }
+    ctx.strokeStyle = col;
+    ctx.stroke();
+  }
 
   if (z < LOD.chevrons) return;
   ctx.beginPath();

@@ -168,7 +168,8 @@ function paint(now) {
   const hide = run ? runCopies().copies.filter(c => c.over).map(c => c.start) : null;
   render(ctx, board, cam, dpr, { ...view, selected: info, ghosts, sim, alpha: clock.alpha, hide, vector: vectorMarks(),
                                 indexLabels: indexLabels(), noteSel: noteEdit, noteGrips: labelHeld(),
-                                gateTint: view.gateStatus ? gateStatus() : null });
+                                gateTint: view.gateStatus ? gateStatus() : null,
+                                beltTint: view.beltStatus ? beltStatus() : null });
   debug.renderMs = performance.now() - t0;
   if (sim && !clock.paused) redraw();
 }
@@ -260,6 +261,26 @@ function gateStatus() {
     out.set(g.row, blocked ? STATUS_COL.blocked : starved ? STATUS_COL.starved : STATUS_COL.running);
   }
   return out;
+}
+
+// View > belt status colours, per run (segment), in the state on screen:
+// RED empty; YELLOW stalled -- its head item is at the end and will not
+// leave on the coming tick (the forecast has no pop), so items are stuck on
+// it; GREEN otherwise (carrying, and moving). Returns (x, y) -> colour.
+const BELT_STATUS_COL = { empty: "rgb(176,72,66)", stalled: "rgb(214,180,58)", moving: "rgb(80,160,92)" };
+function beltStatus() {
+  if (!sim) return null;
+  sim.sync();
+  const F = sim.forecast();
+  const bySid = new Map();
+  for (const seg of sim.segments.values()) {
+    let st = "moving";
+    if (seg.head === seg.tail) st = "empty";
+    else if (sim.positionOf(seg, seg.head, sim.tick) >= seg.length * sim.UNIT && !F.pops.has(seg)) st = "stalled";
+    bySid.set(seg.sid, BELT_STATUS_COL[st]);
+  }
+  const W = board.width;
+  return (x, y) => bySid.get(sim.segAt[y * W + x]) || null;
 }
 
 // What the Status pane's live readout says about a row: a gate's channels,
