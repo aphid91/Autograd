@@ -167,7 +167,8 @@ function paint(now) {
   // The belt a run starts on draws only as the run's ghost, at its new facing.
   const hide = run ? runCopies().copies.filter(c => c.over).map(c => c.start) : null;
   render(ctx, board, cam, dpr, { ...view, selected: info, ghosts, sim, alpha: clock.alpha, hide, vector: vectorMarks(),
-                                indexLabels: indexLabels(), noteSel: noteEdit, noteGrips: labelHeld() });
+                                indexLabels: indexLabels(), noteSel: noteEdit, noteGrips: labelHeld(),
+                                gateTint: view.gateStatus ? gateStatus() : null });
   debug.renderMs = performance.now() - t0;
   if (sim && !clock.paused) redraw();
 }
@@ -239,6 +240,26 @@ function checkpoint() {
   recordStep();
   history.setCheckpoint(history.current);
   syncHistory();
+}
+
+// View > gate status colours: each machine's body coloured by what it is
+// doing in the state on screen. BLOCKED (yellow) when an output with
+// somewhere to go is holding a result it could not hand on -- that wins,
+// since the gate made something that cannot leave; STARVED (red) when it
+// does not have what its own firing rule needs (a Merge needs its control
+// and the lane that selects, a Sink any one lane; a Source never starves);
+// RUNNING (green) otherwise. Dangling outputs discard and never block.
+const STATUS_COL = { blocked: [0.86, 0.72, 0.18], starved: [0.78, 0.26, 0.24], running: [0.27, 0.66, 0.33] };
+function gateStatus() {
+  const out = new Map();
+  if (!sim) return out;
+  sim.sync();
+  for (const g of sim.gates) {
+    const blocked = g.drains.some(c => sim.outHeld(g.row, c));
+    const starved = g.sim.n_in > 0 && !sim.inputsReady(g);
+    out.set(g.row, blocked ? STATUS_COL.blocked : starved ? STATUS_COL.starved : STATUS_COL.running);
+  }
+  return out;
 }
 
 // What the Status pane's live readout says about a row: a gate's channels,

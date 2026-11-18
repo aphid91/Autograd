@@ -133,9 +133,13 @@ export function render(ctx, board, cam, dpr, opts = {}) {
 
   // Placed belts a run (or its copies) will turn draw only as the ghost.
   const hide = view.hide?.length ? new Set(view.hide.map(([x, y]) => `${x},${y}`)) : null;
-  drawBelts(ctx, hide ? board.belts.filter(b => !hide.has(`${b.x},${b.y}`)) : board.belts, z, on, S, view.seedTint);
-  drawUnders(ctx, board.unders, z, on, S);
-  drawStructs(ctx, board.T, board.structs, z, px, on, S, view.ports, view.labels);
+  // View > belts off hides placed belts and underground ends (ghosts of a
+  // run being planned still draw).
+  if (view.belts !== false) {
+    drawBelts(ctx, hide ? board.belts.filter(b => !hide.has(`${b.x},${b.y}`)) : board.belts, z, on, S, view.seedTint);
+    drawUnders(ctx, board.unders, z, on, S);
+  }
+  drawStructs(ctx, board.T, board.structs, z, px, on, S, view.ports, view.labels, view.gateTint || null);
 
   ctx.strokeStyle = COL.border;
   ctx.lineWidth = 2 * px;
@@ -147,7 +151,7 @@ export function render(ctx, board, cam, dpr, opts = {}) {
   // Items last among the board's contents: cargo on a cell, over any tint,
   // so a red wash never changes the colour that says an item's sign.
   let cargo = null;
-  if (view.sim) cargo = drawItems(ctx, view.sim, view.alpha || 0, z, on, S);
+  if (view.sim && view.items !== false) cargo = drawItems(ctx, view.sim, view.alpha || 0, z, on, S);
 
   // The vector picker's highlights, over the ghosts they move.
   if (view.vector) drawVectorMarks(ctx, view.vector, px);
@@ -356,12 +360,14 @@ function drawGhost(ctx, T, g, z, px, on, S, ports, labels, seedTint = true) {
   }
 }
 
-function drawStructs(ctx, T, structs, z, px, on, S, ports, labels) {
+// `tint`: View > gate status colours -- a Map of row to colour that
+// replaces the body colour (main.js decides starved / blocked / running).
+function drawStructs(ctx, T, structs, z, px, on, S, ports, labels, tint = null) {
   const types = T.types;
   const inset = 0.05;
   for (const s of structs) {
     if (!on(s.x, s.y, s.w, s.h)) continue;
-    const c = types[s.type].colour || [0.5, 0.5, 0.5];
+    const c = (tint && s.row !== undefined && tint.get(s.row)) || types[s.type].colour || [0.5, 0.5, 0.5];
     ctx.fillStyle = css(c);
     ctx.fillRect(s.x + inset, s.y + inset, s.w - 2 * inset, s.h - 2 * inset);
     ctx.strokeStyle = shade(c, 0.6);

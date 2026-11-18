@@ -113,8 +113,9 @@ Three things worth knowing:
 
 The **Tweakpane** panel sits in the board's top-right corner, collapsed by
 default. It holds the saves, View toggles (grid, ports, source values, seed
-tint -- the green/red wash on seeded belts, ghosts included -- labels, and
-pan momentum), Debug, and
+tint -- the green/red wash on seeded belts, ghosts included -- labels, pan
+momentum, items, belts (placed belts and underground ends; a planned run's
+ghost still draws) and **gate status colours**), Debug, and
 the Status folder. Tweakpane is **vendored** (`vendor/`, MIT) rather than
 pulled from a CDN, which keeps the no-build, works-offline property. Status
 writes the same row fields the desktop's Status window does, plus the
@@ -144,6 +145,22 @@ constant.
   and is an edit like any other, so the simulation starts fresh.
 - `tests/history.test.mjs` covers the walk, the depth, the checkpoint
   landing and the truncation after an undo.
+
+### Gate status colours
+
+View > **gate status colours** replaces each machine's body colour with what
+it is doing in the state on screen (`gateStatus()` in main.js; glyphs,
+ports and values stay, ghosts keep their own colours):
+
+- **yellow, blocked**: an output with somewhere to go is holding a result it
+  could not hand on. This wins over starved -- the machine already made
+  something that cannot leave, and that downstream jam is the thing to
+  chase. Dangling outputs discard their results and never block.
+- **red, starved**: it does not have what **its own firing rule** needs
+  (`Sim.inputsReady()`), not "an input is empty": a Merge with its control
+  and the lane that control selects is not starved, nor is a Sink with any
+  lane fed, and a Source (no inputs) never starves.
+- **green, running**: neither.
 
 ### Pan momentum
 
