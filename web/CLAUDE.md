@@ -82,8 +82,8 @@ scale 1.15.
   seeds back on, the factory untouched) and Play/Pause. Space toggles
   play. It **starts paused**, and loading a save pauses it again. **Long
   press Play/Pause** (right-click on a mouse) for the rate panel, just above
-  the Sim section: presets of 1, 5, 10 and 30 ticks a second, and Custom,
-  which opens a text box (0.1 to 240). It stays open until the next long
+  the Sim section: presets of 1, 5, 30 and 240 ticks a second, and Custom,
+  which opens a text box (0.1 to 10000). It stays open until the next long
   press or its × button, and shows the tick count. The rate persists with
   the shell's localStorage; the panel's open state does not.
 - **Edit**: Undo, Redo and Checkpoint (ctrl+Z, ctrl+shift+Z / ctrl+Y on a
@@ -115,8 +115,9 @@ The **Tweakpane** panel sits in the board's top-right corner, collapsed by
 default. It holds the saves, View toggles (grid, ports, source values, seed
 tint -- the green/red wash on seeded belts, ghosts included -- labels, pan
 momentum, items, belts (placed belts and underground ends; a planned run's
-ghost still draws), sources (hidden, not removed), **gate status colours**
-and **belt status colours**), Debug, and
+ghost still draws), sources (hidden, not removed), **gate status colours**,
+**belt status colours** and an **fps counter** -- frames and ticks per
+second actually achieved, over half-second windows, bottom-left of the board), Debug, and
 the Status folder. Tweakpane is **vendored** (`vendor/`, MIT) rather than
 pulled from a CDN, which keeps the no-build, works-offline property. Status
 writes the same row fields the desktop's Status window does, plus the
@@ -751,8 +752,13 @@ adds `dt * rate` and spends the whole ticks; the remainder is `alpha`,
 which the renderer feeds to the closed form so items glide between ticks.
 Banking seconds and dividing (the desktop's way) left float residue that
 turned a whole tick into 0.9999 of one; the unit test caught it. A frame's
-dt is clamped to 0.25 s and the backlog to 240 ticks, so a backgrounded tab
-never freezes to catch up. **Rendering loops only while playing**; paused,
+dt is clamped to 0.25 s and the backlog to 240 ticks or a quarter second's
+worth at the rate, whichever is more, so a backgrounded tab never freezes to
+catch up -- a flat 240 would have capped 10000 tps at 240 ticks a frame.
+`paint()` also stops stepping after `STEP_BUDGET_MS` (12 ms) of a frame and
+drops the rest, so a rate the board cannot sustain runs as fast as it can
+rather than starving frames into a growing backlog; the fps counter's tps is
+the rate actually reached. **Rendering loops only while playing**; paused,
 the board is still redrawn on demand.
 
 ### How items draw

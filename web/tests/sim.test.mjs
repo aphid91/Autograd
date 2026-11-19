@@ -119,4 +119,10 @@ test("the clock spends banked time in whole ticks and keeps the remainder", () =
   assert.equal(c.advance(0.5), 1);
   assert.equal(c.advance(1000), 240, "a stall is capped");
   assert.equal(c.alpha, 0);
+  // A fast rate is capped at a quarter second's worth, not at 240 a frame.
+  c.setRate(10000);
+  assert.equal(c.advance(1 / 60), 166);
+  assert.equal(c.advance(1000), 2500, "a stall at a fast rate is capped too");
+  c.setRate(1e9);
+  assert.equal(c.rate, 10000, "the rate is clamped");
 });

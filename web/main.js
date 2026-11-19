@@ -131,6 +131,27 @@ const debug = window.gates = {
 
 let queued = false;
 let lastNow = null;    // the previous playing frame's time, or null
+// Stepping stops after this many ms of a frame and drops the rest of the
+// ticks due, so a rate the board cannot sustain slows the sim instead of
+// starving the frame (and every later frame, as the backlog grows).
+const STEP_BUDGET_MS = 12;
+
+// View > fps counter: frames and ticks counted over a half-second window.
+const fpsEl = document.getElementById("fps");
+const fpsWin = { t0: null, frames: 0, ticks: 0 };
+function countFrame(now, ticks) {
+  if (!view.fps) { fpsEl.hidden = true; fpsWin.t0 = null; return; }
+  fpsEl.hidden = false;
+  // Paused, frames are drawn only on demand, so a rate would mean nothing.
+  if (!sim || clock.paused) { fpsEl.textContent = "paused"; fpsWin.t0 = null; return; }
+  if (fpsWin.t0 === null) { Object.assign(fpsWin, { t0: now, frames: 0, ticks: 0 }); return; }
+  fpsWin.frames++; fpsWin.ticks += ticks;
+  const dt = now - fpsWin.t0;
+  if (dt >= 500) {
+    fpsEl.textContent = `${Math.round(fpsWin.frames * 1000 / dt)} fps · ${Math.round(fpsWin.ticks * 1000 / dt)} tps`;
+    Object.assign(fpsWin, { t0: now, frames: 0, ticks: 0 });
+  }
+}
 function redraw() {
   if (queued) return;
   queued = true;
@@ -139,6 +160,7 @@ function redraw() {
 
 function paint(now) {
   queued = false;
+  let ran = 0;
   if (sim) {
     // An edit since the last frame re-derives the runs and starts fresh --
     // here rather than at each edit site, so no edit path can forget it.
@@ -148,12 +170,17 @@ function paint(now) {
       // the backlog too, so coming back never freezes to catch up.
       const dt = lastNow === null ? 0 : Math.min(0.25, (now - lastNow) / 1000);
       const n = clock.advance(dt);
-      for (let i = 0; i < n; i++) sim.step();
+      const t0 = performance.now();
+      for (; ran < n; ran++) {
+        if (ran > 0 && performance.now() - t0 > STEP_BUDGET_MS) { clock.dropped += n - ran; break; }
+        sim.step();
+      }
     }
     shell.setTick(sim.tick);
     if (inspectRow >= 0) panel.setLive(liveText(inspectRow));
   }
   lastNow = sim && !clock.paused ? now : null;
+  countFrame(now, ran);
   recordStep();
   const t0 = performance.now();
   const info = board ? board.describe(inspectRow) : null;

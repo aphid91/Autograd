@@ -786,11 +786,13 @@ export class Sim {
 // ticks happen at any frame rate. `alpha` is the leftover fraction, which
 // the renderer feeds to the closed form so items glide between ticks.
 
-export const RATE_PRESETS = [1, 5, 10, 30];
+export const RATE_PRESETS = [1, 5, 30, 240];
 export const RATE_MIN = 0.1;
-export const RATE_MAX = 240;
+export const RATE_MAX = 10000;
 // A frame that arrives after a long stall (a backgrounded tab) runs at most
-// this many ticks and drops the rest, rather than freezing to catch up.
+// this many ticks -- or a quarter second's worth at the current rate, if that
+// is more -- and drops the rest, rather than freezing to catch up. A flat 240
+// would cap a fast rate at 240 ticks a frame whatever the rate asked for.
 const MAX_CATCHUP = 240;
 
 export class Clock {
@@ -812,9 +814,10 @@ export class Clock {
     if (this.paused) return 0;
     this.frac += Math.max(0, dt) * this.rate;
     let due = Math.floor(this.frac);
-    if (due > MAX_CATCHUP) {
-      this.dropped += due - MAX_CATCHUP;
-      due = MAX_CATCHUP;
+    const cap = Math.max(MAX_CATCHUP, Math.ceil(this.rate / 4));
+    if (due > cap) {
+      this.dropped += due - cap;
+      due = cap;
       this.frac = 0;
     } else {
       this.frac -= due;
