@@ -141,7 +141,10 @@ export function render(ctx, board, cam, dpr, opts = {}) {
   }
   // View > sources off: Sources are not drawn (there are hundreds on a
   // computer, and they hide the machines worth looking at). Still there.
-  const structs = view.sources === false ? board.structs.filter(s => board.T.types[s.type].name !== "source") : board.structs;
+  // View > gates off hides every machine, Sources included -- for a look at
+  // the belts underneath. Still there, and still tappable.
+  const structs = view.gates === false ? []
+    : view.sources === false ? board.structs.filter(s => board.T.types[s.type].name !== "source") : board.structs;
   drawStructs(ctx, board.T, structs, z, px, on, S, view.ports, view.labels, view.gateTint || null);
 
   ctx.strokeStyle = COL.border;
@@ -171,6 +174,25 @@ export function render(ctx, board, cam, dpr, opts = {}) {
 
   if (cargo) drawItemLabels(ctx, cargo, cam, dpr);
   if (view.notes !== false && board.notes?.length) drawNotes(ctx, board.notes, cam, dpr, view.noteSel ?? -1, !!view.noteGrips);
+  // Labels lifted into a selection, or about to be pasted: ghosted, and a
+  // selected one outlined as a lifted entity is.
+  for (const g of view.ghostNotes || []) {
+    ctx.save();
+    ctx.globalAlpha = TUNE.ghostAlpha;
+    drawNotes(ctx, g.notes, cam, dpr, -1);
+    ctx.restore();
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    ctx.strokeStyle = g.lifted ? COL.lifted : COL.select;
+    ctx.lineWidth = 2;
+    if (!g.lifted) ctx.setLineDash([6, 4]);
+    for (const n of g.notes) {
+      const [x, y, w, h] = n.rect;
+      const [sx0, sy0] = cam.worldToScreen(x, y);
+      const [sx1, sy1] = cam.worldToScreen(x + w, y - h);
+      ctx.strokeRect(sx0 - 2, sy0 - 2, sx1 - sx0 + 4, sy1 - sy0 + 4);
+    }
+    ctx.setLineDash([]);
+  }
   if (view.indexLabels?.length) drawIndexLabels(ctx, view.indexLabels, cam, dpr);
 
   if (view.labels && z >= LOD.marks) {

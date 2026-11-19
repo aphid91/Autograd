@@ -67,14 +67,14 @@ export class Board {
   async toNpz(snap = null) {
     const E = this.T.entity;
     const src = snap || this;
-    const grid = src.grid.slice();
+    const grid = snap ? expandGrid(snap, this.grid.length) : this.grid.slice();
     for (let i = 3; i < grid.length; i += 4) grid[i] = 0;
     const notes = snap ? snap.notes : JSON.stringify(this.notes);
     return writeNpz({
       version: { descr: "<i4", shape: [1], data: new Int32Array([FORMAT_VERSION]) },
       size: { descr: "<i4", shape: [2], data: new Int32Array([this.width, this.height]) },
       grid: { descr: "<i4", shape: [this.height, this.width, 4], data: grid },
-      entities: { descr: "<f4", shape: [src.rows, E.STRIDE], data: src.entities },
+      entities: { descr: "<f4", shape: [src.rows, E.STRIDE], data: snap ? expandEntities(snap, E.STRIDE) : src.entities },
       annotations: { descr: "<U", shape: [], data: notes },
       next_row: { descr: "<i4", shape: [1], data: new Int32Array([src.nextRow]) },
       free_rows: { descr: "<i4", shape: [src.freeRows.length], data: new Int32Array(src.freeRows) },
@@ -156,11 +156,30 @@ export class Board {
 
   // --- undo -------------------------------------------------------------
   // The whole editable state, copied: the grid, the entity table and the
-  // row allocator. Everything else on a Board is derived from these. About
-  // 5 MB on a 512x512 board, which is why history.js keeps only a few.
+  // row allocator. Everything else on a Board is derived from these. The
+  // grid is kept SPARSE -- the occupied cells' indices and their four words
+  // -- since a 512x512 grid is 4 MB and nearly all of it zero; a dense copy
+  // made each snapshot about 6 MB, and 16 of them (history.js) too much for
+  // a phone. Sparse, and with the entity table's zero tail trimmed,
+  // cpu.npz's is about 0.6 MB.
   snapshot() {
+    const g = this.grid, n = g.length >> 2;
+    let count = 0;
+    for (let c = 0; c < n; c++) {
+      const i = c << 2;
+      if (g[i] | g[i + 1] | g[i + 2] | g[i + 3]) count++;
+    }
+    const cells = new Int32Array(count), words = new Int32Array(count * 4);
+    for (let c = 0, k = 0; c < n; c++) {
+      const i = c << 2;
+      if (g[i] | g[i + 1] | g[i + 2] | g[i + 3]) {
+        cells[k] = c;
+        words.set(g.subarray(i, i + 4), k * 4);
+        k++;
+      }
+    }
     return {
-      grid: this.grid.slice(), entities: this.entities.slice(), rows: this.rows,
+      cells, words, entities: this.entities.slice(0, usedLength(this.entities)), rows: this.rows,
       nextRow: this.nextRow, freeRows: this.freeRows.slice(), liveCount: this.liveCount,
       notes: JSON.stringify(this.notes),
     };
@@ -170,8 +189,10 @@ export class Board {
   // later redo) and re-derive -- an edit like any other.
   restore(s) {
     const S = this.T.entity.STRIDE;
-    this.grid.set(s.grid);
-    this.entities = s.entities.slice();
+    this.grid.fill(0);
+    scatterGrid(s, this.grid);
+    this.entities = new Float32Array(s.rows * S);
+    this.entities.set(s.entities);
     this.rows = s.rows;
     this.arrays.entities = { ...this.arrays.entities, shape: [this.rows, S], data: this.entities };
     this.nextRow = s.nextRow;
@@ -584,4 +605,33 @@ export class Board {
     }
     return -1;
   }
+}
+
+// The entity table grows by doubling, so its tail is mostly zero rows: a
+// snapshot keeps it only up to the last non-zero value.
+// Compared as bits, so a -0 is kept.
+function usedLength(a) {
+  const bits = new Uint32Array(a.buffer, a.byteOffset, a.length);
+  let n = a.length;
+  while (n > 0 && bits[n - 1] === 0) n--;
+  return n;
+}
+
+function expandEntities(s, stride) {
+  const out = new Float32Array(s.rows * stride);
+  out.set(s.entities);
+  return out;
+}
+
+// A snapshot's sparse grid (Board.snapshot()) written into `grid`, which
+// must already be zero.
+function scatterGrid(s, grid) {
+  const { cells, words } = s;
+  for (let k = 0; k < cells.length; k++) grid.set(words.subarray(k * 4, k * 4 + 4), cells[k] * 4);
+}
+
+function expandGrid(s, length) {
+  const grid = new Int32Array(length);
+  scatterGrid(s, grid);
+  return grid;
 }

@@ -70,3 +70,26 @@ print("ok")
     }
   });
 }
+
+// Undo keeps the grid sparse (Board.snapshot()). Restoring must give back
+// the grid word for word -- all four words of every cell, including the
+// ones a dense copy would have had for free -- and a snapshot must save
+// exactly as the board it was taken from.
+test("a sparse snapshot restores and saves exactly", async () => {
+  const board = await Board.fromNpz(T, buf(readFileSync(join(root, "cpu.npz"))));
+  const grid0 = board.grid.slice(), ents0 = board.entities.slice();
+  const snap = board.snapshot();
+  assert.ok(snap.cells.length > 0 && snap.cells.length < board.grid.length / 4);
+  const saved0 = Buffer.from(await board.toNpz());
+  // Edit: erase a machine and change a Source.
+  const s = board.structs.find(x => x.emit !== null);
+  board.setEmit(s.row, 9);
+  board.eraseRows([board.structs.find(x => x.row !== s.row).row]);
+  assert.notDeepEqual(board.grid, grid0);
+  assert.deepEqual(Buffer.from(await board.toNpz(snap)), saved0);
+  board.restore(snap);
+  assert.deepEqual(board.grid, grid0);
+  assert.deepEqual(board.entities, ents0);
+  board.restore(snap);   // reusable for a later redo
+  assert.deepEqual(board.grid, grid0);
+});

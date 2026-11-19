@@ -69,7 +69,7 @@ scale 1.15.
     down, **long press** (right-click on a mouse) opens the picker for that
     slot, and the `+` swatch appends. Slots persist in localStorage.
     Tapping an existing entity **selects** it, whatever the hand holds, and
-    the bar becomes the selection's: Box, Delete, Cut, Copy, then the stamp
+    the bar becomes the selection's: Delete, Cut, Copy, then the stamp
     history, most recent first. See "Selecting" below.
   - **Hand**: tapping the board inspects: the Status folder fills in (the
     panel is **not** opened for you -- a tap is often only to reach the
@@ -115,9 +115,13 @@ The **Tweakpane** panel sits in the board's top-right corner, collapsed by
 default. It holds the saves, View toggles (grid, ports, source values, seed
 tint -- the green/red wash on seeded belts, ghosts included -- labels, pan
 momentum, items, belts (placed belts and underground ends; a planned run's
-ghost still draws), sources (hidden, not removed), **gate status colours**,
-**belt status colours** and an **fps counter** -- frames and ticks per
-second actually achieved, over half-second windows, bottom-left of the board), Debug, and
+ghost still draws), gates (every machine, Sources included -- for a brief
+look at the belts underneath; still there and still tappable, and items
+held inside a machine still draw: View > items hides those), sources
+(hidden, not removed), **gate status colours** and **belt status
+colours**, a **status colours** folder of pickers for both, and an **fps
+counter** -- frames and ticks per second actually reached, over
+half-second windows, bottom-left of the board), Debug, and
 the Status folder. Tweakpane is **vendored** (`vendor/`, MIT) rather than
 pulled from a CDN, which keeps the no-build, works-offline property. Status
 writes the same row fields the desktop's Status window does, plus the
@@ -126,11 +130,19 @@ seed's `.z` bits, so a save edited here reads correctly there.
 ### Undo
 
 [history.js](history.js) keeps **states, not edits**: each entry is a whole
-`Board.snapshot()` (grid, entity table, row allocator -- about 5 MB on a
-512×512 board), so restoring cannot half-apply anything and no edit needs an
-inverse. It keeps `UNDO_DEPTH` (3) steps behind the current state, one
-constant.
+`Board.snapshot()` (grid, entity table, row allocator), so restoring
+cannot half-apply anything and no edit needs an inverse. It keeps
+`UNDO_DEPTH` (15) steps behind the current state, one constant.
 
+- **A snapshot is sparse.** A dense copy was about 5 MB on a 512×512 board
+  (the 4 MB grid is nearly all zeros, and the entity table is kept at its
+  doubled capacity), which was why the depth was 3: 16 of them is 80 MB on
+  a phone. The grid is stored as the occupied cells' indices and their four
+  words, and the entity table up to its last non-zero value (compared as
+  bits, so a trailing `-0` survives). About 1.2 MB on `cpu.npz`, `Ram2.npz`
+  and `noram.npz`, and 2-4 ms to take or restore. `Board.toNpz(snap)`
+  expands one to write it. `tests/npz.test.mjs` restores one word for word
+  and saves it byte for byte as the board it was taken from.
 - **The checkpoint** is one more state, just before the oldest: undo from
   the oldest step restores it, and redo walks forward through the history
   again from there. It is set when a board loads and whenever Checkpoint is
@@ -163,6 +175,13 @@ ports and values stay, ghosts keep their own colours):
   and the lane that control selects is not starved, nor is a Sink with any
   lane fed, and a Source (no inputs) never starves.
 - **green, running**: neither.
+
+All six status colours (these three and the belts' three below) are the
+player's: View > **status colours** has a picker for each -- Tweakpane's
+saturation/value square and hue strip -- and **Reset colours**. They persist
+with the panel's preferences, as hex (`STATUS_COLOUR_DEFAULTS` in
+panel.js); a stored key this build does not know, or a value that is not a
+`#rrggbb`, is ignored.
 
 **Belt status colours** do the same for belts, per run (segment), in
 `beltStatus()`: **red** empty; **yellow** stalled -- the head item is at the
@@ -221,7 +240,9 @@ and written back untouched, not drawn.
   restarting the simulation, and a drag or an open editor is held back as
   a change in progress until it ends (otherwise every frame of a drag was
   a step).
-- Not yet: labels do not travel with a selection, copy or paste.
+- **Labels join a selection** (see "Selecting"): a box picks up every
+  label it touches, and they move, turn, delete, cut, copy and paste with
+  the rest, and bake into stamp slots.
 
 ### The Dev folder
 
@@ -534,14 +555,15 @@ outlined in cyan. Deselecting places it back wherever the selection now is.
 | tap empty board | deselect everything that fits |
 | one-finger drag from a selected entity | move the whole selection |
 | one-finger drag elsewhere | pan |
-| Box, then a drag (from anywhere) | a rectangle: everything it touches is **added**, then Box disarms |
 | Index, then Values… | number the selected Sources and belts and write them values (see "Indexing") |
-| Reverse | every selected belt and underground faces the other way, in place; machines untouched (see below) |
+| Reverse | every selected belt and underground faces the other way, in place; Swap and Reciprocal turn half round, Merge and Route swap for each other (see below) |
 | Vector, drag the offset, Confirm | add every repeat of the selection along the vector, until it breaks (see "Vectors") |
 | Turn buttons | turn / mirror the selection as one stamp |
 | Delete | discard the selection |
 | long press a belt or underground | select its whole run; if the whole run is already selected, deselect it |
-| long press anywhere else, then drag | a box from the press point, as Box does: everything it touches is **added**. The box corner shows the moment the hold registers; lifting without dragging selects nothing |
+| long press anywhere else, then drag | a box from the press point: everything it touches is **added**, labels included. The box corner shows the moment the hold registers; lifting without dragging selects nothing |
+| tap a selected label | put that label back |
+| one-finger drag from a selected label | move the whole selection |
 | Cut | the selection becomes a stamp, and pasting starts with the ghost **exactly where the selection was** |
 | Copy | the selection becomes a stamp and goes back down; if all of it fit, pasting starts with the ghost over the originals |
 | a stamp swatch | paste it (tap it again to stop) |
@@ -551,10 +573,10 @@ outlined in cyan. Deselecting places it back wherever the selection now is.
   (moved onto something, say) stays selected, tinted red where it clashes.
   So a deselect-all can leave a few behind, and Copy then does not start
   pasting, leaving the player to deal with them.
-- **The Box only adds.** It appears only once something is selected, so a
-  box select is: tap one thing that belongs in it, then Box and drag. It
-  first toggled (dropping what was selected in the rectangle), which made
-  growing a selection by overlapping boxes undo itself.
+- **A box only adds.** It first toggled (dropping what was selected in the
+  rectangle), which made growing a selection by overlapping boxes undo
+  itself. There used to be a Box button on the selection bar as well; it
+  was removed because the long press below was the only way it got used.
 - **The pose is a continuous centre point**, like a placement ghost, so four
   turns come back exactly where they started. It is re-centred on the
   selection's box whenever the membership changes.
@@ -578,9 +600,9 @@ outlined in cyan. Deselecting places it back wherever the selection now is.
   with nothing planned, and while selecting; elsewhere it is an ordinary
   press.
 - **A long press anywhere but a belt arms a box** at the press, so a box
-  select needs no Box button and no first entity. `onLongPress` answers
+  select needs no first entity. `onLongPress` answers
   `"drag"` and `camera.js` hands the finger's moves and lift to the drag
-  hooks, the same path the Box button's drag takes. The cost is that a
+  hooks. The cost is that a
   still hold off a belt no longer ends as a tap (it used to start a run or
   a placement there); it does nothing. A hold on a **selected** entity is
   the exception and stays a press, so a slow drag from it still moves the
@@ -597,9 +619,55 @@ outlined in cyan. Deselecting places it back wherever the selection now is.
   (the desktop's empty-hand R on a pair: the exit is downstream of the
   entrance by position, so swapping the role alone would leave it upstream
   of its own entrance). A pair inside the selection reverses together and
-  stays paired. Machines are left alone, so a whole subtree can be
-  reversed in one go and its machines turned by hand. It changes the
-  lifted entries; the selection going down is the edit, one undo step.
+  stays paired. It changes the lifted entries; the selection going down is
+  the edit, one undo step.
+- **Reverse inverts the machines that have an inverse**
+  (`reversedGate()` in stamp.js). Swap and Reciprocal turn half round, and
+  Merge and Route each become the other, turned half round. A half turn
+  keeps the box, and so the origin, where it was, and puts every input
+  port exactly where an output was. The point is a tree of these: send
+  signals out through it, then copy it and Reverse the copy to undo every
+  swap and route. That only works if the control polarity lines up too, and
+  it does: Merge takes lane `a` when `c > 0`, and the turned Route sends a
+  positive control's value back out of that same cell. A half turn
+  commutes with the mirror, so a flipped machine keeps its flip. Every
+  other machine is left alone.
+
+  `tests/stamp.test.mjs` runs values through each gate, joins each output
+  port to the reversed gate's input on the same cell and face, and asserts
+  every value comes back out of the port it went in by. It covers every
+  orientation and both control signs. It is mutation-tested: no turn, a
+  turn plus a mirror, and Merge/Route kept as themselves all fail. The
+  turn-plus-mirror case **passed** at first, because the test looked up
+  the reversed gate's orientation with the original flip and not its own.
+- **Labels travel with the selection.** A box lifts every label whose box
+  it touches off `board.notes` into the stamp's `notes`
+  (`core/stamp.py`'s `Stamp.annotations`, rects in the stamp's frame), drawn
+  dimmed with the lifted outline; hidden labels (View > labels off) are not
+  picked up, as they take no taps. A label always fits, so it goes back
+  whenever the whole selection does (`dropAll()`), or alone on a tap. Turns
+  and mirrors move a label's **centre** with the cells and never its box or
+  text, so it stays upright, readable and over what it labels. Copy, Cut and
+  the paste ghost carry them; a paste places them wherever it lands
+  (nothing blocks a label), and a label-only paste is a label edit, so it
+  does not restart the simulation. The stamp's box is the **entities'**,
+  so a label hanging outside them does not move the paste ghost; a stamp of
+  labels alone takes their box on the cell lattice. Reverse, Index and the
+  selection vector ignore labels.
+
+  `tests/stamp.test.mjs` puts each label on a marker belt and asserts it is
+  still centred on that belt, at its own size, after random sequences of
+  turns and mirrors (mutation-tested: turning the wrong way, a no-op mirror
+  and swapping w/h all fail). The desktop is **not** the oracle here:
+  `core/stamp.py`'s `rotated()` and `mirrored()` turn a label inside the
+  box (`rotate_in_box()`) *and then* shift it again in `normalise()`, so on
+  a 3×1 run a label on the last belt comes back on the wrong end after a
+  clockwise turn or a mirror (the counter-clockwise turn is only right
+  there because the run is one cell tall). The two apps do not share
+  stamps, so nothing crosses over, but the desktop's is a bug.
+- Rounding: a label's rect is rounded to a millionth by the transforms, not
+  to the thousandth a dragged label uses -- at a thousandth a box of odd
+  thousandths moved half a thousandth a turn.
 - **Underground pairs.** Lifting one end of a pair releases the other
   (`Engine.unpair_under()`). Both ends lifted stay paired to each other.
   Placing back pairs the stamp's own ends first, then each unpaired end
@@ -881,9 +949,11 @@ replaces the board in front of you. Saving over an existing name asks first.
   than silently left out of the file.
 - The simulation's items are **not** saved, as on the desktop: a loaded
   board starts paused at tick 0 with its seeds on.
-- **Two saves keep themselves**, listed with the rest: **auto save**, every
-  30 s (`AUTOSAVE_MS`) when the board changed since the last one, and
-  **exitsave**, whenever the app is hidden -- closed, switched away from,
+- **Four saves keep themselves**, listed with the rest. Three timed tiers
+  (`AUTOSAVES`): **auto save** every 30 s, **autosave5** every 5 min and
+  **autosave15** every 15 min. Each writes when the board has changed since
+  that tier last wrote, so the slow two are older copies to fall back on.
+  The fourth is **exitsave**, whenever the app is hidden -- closed, switched away from,
   the screen locked. A phone gives no other warning of a close, and nothing
   asynchronous can be relied on to finish in that moment, so the save's
   bytes are **prepared ahead of time** (compressed after every committed
@@ -893,10 +963,18 @@ replaces the board in front of you. Saving over an existing name asks first.
 - **Both write the history's current state** -- the last stable board,
   `Board.toNpz(snapshot)` -- so a selection half-lifted off the board is
   saved where it was picked up, not missing.
+- **Nothing is written until the board has been edited this session**: no
+  tier and no exitsave (`edited`, set by `recordStep()`; loading a board
+  does not count). Opening the app used to clobber the saves it was opened
+  to choose between: the resumed board overwrote an older autosave before
+  the player got round to loading it. A session that only looks, or only
+  loads, leaves every save as it found it. The cost is that loading a
+  board and closing without an edit resumes the previous one next time.
 - **Opening the app loads the exitsave, unless the auto save is newer**,
   and either opens under the name of the board it holds (kept in its index
   entry), so saving it again does not write over the autosave. With
-  neither, the bundled default loads as before.
+  neither, the bundled default loads as before. The 5- and 15-minute tiers
+  are never resumed; they are loaded by hand.
 
 `tests/npz.test.mjs` writes `cpu.npz` and `ram.npz` back out after an edit,
 reads them here, and loads them through the desktop's `persistence.load()`,
