@@ -924,6 +924,99 @@ results are discarded), or a belt's run (its id, length, whether it is fed
 and drains, and the items on it, head first). Rewritten every frame; the
 panel touches the DOM only when the text changes.
 
+## Audio
+
+The panel's **Audio** folder makes sound from the ticks: a drone per moving
+belt run and a click per gate fire. **Off by default and off at every
+launch** (a browser only starts audio from a tap); the dials persist with
+the panel's preferences, the switch does not.
+
+**Off costs nothing.** `audio.js` and the worklet are imported only when
+the switch is ticked, and the tick's only trace is `Sim.audio`, null: one
+check in `step()`, passed on to `structurePhase()`. Measured on `cpu.npz`
+(best of 8 runs in node): 67 µs a tick before, 63 µs after with audio off,
+73 µs with it on -- the recorder is the whole on-cost.
+
+Three files, split by thread:
+
+- [audio-params.js](audio-params.js) -- the dials (`AUDIO_DEFAULTS`,
+  `AUDIO_SPEC`) and the gate groups. Tiny and loaded always, so the panel
+  can show the dials without any audio code.
+- [audio.js](audio.js) -- main thread. `Recorder` is `Sim.audio`: per tick
+  it writes one bit per **candidate run** (a run no longer than the cutoff)
+  and a fire count per **group** into flat typed arrays, and `paint()`
+  posts the frame's ticks to the worklet (`flush()`, buffers transferred),
+  or `stop()` while paused. `startAudio()` builds the graph.
+- [audio-dsp.js](audio-dsp.js) -- `GatesSynth`, the synthesiser, as a plain
+  class; [audio-worklet.js](audio-worklet.js) is its AudioWorklet wrapper.
+  Plain so `tests/audio.test.mjs` renders it under node.
+
+What sounds:
+
+- **A belt run is active on a tick** if it pushed or popped, or its newest
+  item moved (the belt status colours' "moving", with "stalled but moving:
+  green"). Two `positionOf()` calls per candidate per tick. Its drone has
+  pitch **1-tile Hz / length** (the sim's length, buried underground tiles
+  included), so 10 tiles is an octave above 20 and every run is a
+  subharmonic of the 1-tile pitch. Runs over **max length** get no voice.
+  Attack and release dials gate it per tick: short, a run moving every
+  other tick buzzes at half the tick rate; long, it smooths to a drone.
+  **Follow tick rate** scales the pitch by (rate / reference)^track; 0
+  (the default) keeps it fixed.
+- **A gate fire is a click**: an impulse into a two-pole resonator (tone,
+  decay), per group -- **0: Swap, Route, Merge; 1: everything else**;
+  Sources are silent (`audioGroupOf()`). Only the per-tick **count** per
+  group crosses threads, so fires cost the same on any board. Clicks
+  closer together than a click lasts overlap into a buzz at the tick rate,
+  by design: raise the rate and the ticking becomes a pitch.
+- **Normalisation is against the board, not the moment**: a drone is scaled
+  by 1 / N^p with N the candidate runs, a group's clicks by 1 / N^p with N
+  that group's gates. N changes only on an edit, so more activity is always
+  louder; p = 0.5 puts "everything active" near full scale for
+  uncorrelated voices. A tanh soft clip is the safety net (switchable). The
+  meter shows the peak before it, in dB, and counts clipped samples.
+
+**Time.** The sim ticks in bursts, a frame's worth at once; the synth plays
+them back evenly at the rate they were run at, **latency** behind (60 ms).
+Playback starts once that much is queued, and its speed follows the queue's
+depth (smoothed, 0.25× to 1.25×): if the sim cannot reach its rate (the
+frame budget drops ticks), playback slows and pitches sag rather than
+gapping. A queue over 3 latencies deep is **skipped** to the target, not
+raced through. Run dry -- paused, or stalled -- every voice releases and
+playback waits to refill. A tick takes effect at its start (an early
+version applied each tick after its own duration, at a placeholder rate of
+1 tps, and so played nothing at all).
+
+**Voices.** A voice belongs to an active run, never to a candidate as such:
+13 candidates of which 4 are active take 4 voices. Past the **voice limit**,
+a run turning on is **refused** (no stealing, which would click) and counted;
+when a voice frees -- its run off and its release finished -- the first
+refused run still on takes it. A releasing voice still holds its slot, so
+at high tick rates with a long release the count runs near the limit while
+few runs are active at any one instant: the meter shows both
+(`voices n / limit`, `runs active k of N`). The pool is
+`VOICE_LIMIT_MAX` (1024). A reconfig (any edit: the run ids are rebuilt)
+orphans the old voices, which release out at their old pitch.
+
+**The forecast is not heard.** `forecast()` runs a real `step()` and rolls
+it back; `step()` skips the recorder while `rec` is set, or every drawn tick
+would be heard twice. Pinned by the recorder test, which also asserts the
+recorded run is tick-for-tick identical to an unrecorded one.
+
+Two practical notes: the `AudioContext` is created and resumed **inside the
+tap** (main.js `setAudio()`), before the dynamic import, since iOS will not
+start one made after an await; `navigator.audioSession.type = "playback"`
+is set where the browser has it, or the iPhone's silent switch mutes it.
+And ticking the box **blurs it**: otherwise the next Space (play) toggled
+audio off again.
+
+`tests/audio.test.mjs`: the octave rule and rate tracking by zero
+crossings; silence when idle; the buzz's period is the tick's; the start
+threshold and run-dry release; the skip; the voice limit (refusal and
+reuse); stop; the groups; and the recorder on `cpu.npz`. Mutation-tested:
+recording the forecast, never reusing a freed voice, and a wrong pitch law
+each fail it.
+
 ## Saving
 
 The panel's **Board** folder saves the board **to this browser** under a
@@ -1018,7 +1111,10 @@ asserting every array matches and exactly the edited value differs.
 | `ui.js` | the shell's state and DOM: modes, sim and turn buttons, thumb pads, swatches, long press, picker |
 | `tools.js` | the tool catalog (from `types.json`) and the swatch drawings |
 | `icons.js` | line icons as path data (mostly Lucide, ISC) |
-| `panel.js` | the Tweakpane panel: bundled and browser saves, export, View, Debug, Status (with the live channel readout) |
+| `panel.js` | the Tweakpane panel: bundled and browser saves, export, View, Audio, Debug, Status (with the live channel readout) |
+| `audio-params.js` | the Audio dials and the gate groups; loaded always |
+| `audio.js` | audio, main thread: the per-tick recorder and starting the graph; loaded on demand |
+| `audio-dsp.js`, `audio-worklet.js` | the synthesiser, and its AudioWorklet wrapper |
 | `vendor/` | Tweakpane 4.0.5, vendored |
 | `npz.js` | `.npz` reader and writer: zip directory + native `DecompressionStream` / `CompressionStream` + `.npy` headers |
 | `saves.js` | browser saves: whole `.npz` files in localStorage, and their index |

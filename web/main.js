@@ -130,6 +130,50 @@ const debug = window.gates = {
   plan: () => currentPlan(),
 };
 
+// --- audio -------------------------------------------------------------------
+//
+// Off by default and loaded on demand: with it off, audio.js and the worklet
+// are never fetched and the tick's only cost is Sim.audio's null check.
+let audio = null;          // the running engine (audio.js startAudio), or null
+let audioStarting = false;
+function setAudio(on) {
+  if (!on) {
+    if (audio) { audio.close(); audio = null; }
+    panel.setAudioMeter("off");
+    return;
+  }
+  if (audio || audioStarting) return;
+  const Ctx = window.AudioContext || window.webkitAudioContext;
+  if (!Ctx || !window.AudioWorkletNode) { panel.setAudioOn(false); panel.setAudioMeter("no Web Audio here"); return; }
+  // Made and resumed here, inside the tap: iOS will not start a context
+  // created after an await.
+  const ctx = new Ctx({ latencyHint: "interactive" });
+  ctx.resume();
+  audioStarting = true;
+  panel.setAudioMeter("starting…");
+  import("./audio.js")
+    .then(m => m.startAudio(ctx, { ...panel.audio }, sim, (mm) => { if (audio) panel.setAudioMeter(meterText(mm)); }))
+    .then(a => {
+      audioStarting = false;
+      if (!panel.audioOn.on) { a.close(); return; }   // switched off while starting
+      audio = a;
+      redraw();
+    })
+    .catch(e => {
+      audioStarting = false;
+      ctx.close().catch(() => {});
+      panel.setAudioOn(false);
+      panel.setAudioMeter(`failed: ${e.message}`);
+    });
+}
+function meterText(m) {
+  const db = m.peak > 0 ? (20 * Math.log10(m.peak)).toFixed(1) : "-inf";
+  return `voices ${m.voices} / ${m.limit}` + (m.refused ? `  (${m.refused} refused)` : "") + "\n" +
+    `runs active ${m.active} of ${m.candidates}\n` +
+    `peak ${m.peak.toFixed(2)} (${db} dB)` + (m.clipped ? `  clipped ${m.clipped}` : "") + "\n" +
+    `lag ${Math.round(m.lagMs)} ms · speed ${m.speed.toFixed(2)}`;
+}
+
 let queued = false;
 let lastNow = null;    // the previous playing frame's time, or null
 // Stepping stops after this many ms of a frame and drops the rest of the
@@ -179,6 +223,11 @@ function paint(now) {
     }
     shell.setTick(sim.tick);
     if (inspectRow >= 0) panel.setLive(liveText(inspectRow));
+  }
+  // Ship this frame's ticks to the audio thread; paused, let it fall silent.
+  if (audio) {
+    if (sim && !clock.paused) audio.rec.flush(clock.rate);
+    else audio.rec.stop();
   }
   lastNow = sim && !clock.paused ? now : null;
   countFrame(now, ran);
@@ -1511,6 +1560,7 @@ async function show(name, bytes) {
     board = await Board.fromNpz(T, bytes);
     panel.setBoardName(name.replace(/\.npz$/i, ""));
     sim = new Sim(T, board);
+    if (audio) audio.rec.attach(sim);
     clock.reset();
     shell.setPaused(true);   // a freshly loaded board waits to be started
     run = null;
@@ -1758,6 +1808,8 @@ async function init() {
     onFit: () => { if (board) cam.frame(board.bounds); redraw(); },
     onView: (v) => { view = v; redraw(); },
     onColours: (c) => { statusColours = c; redraw(); },
+    onAudioEnable: (on) => setAudio(on),
+    onAudio: (p) => { if (audio) audio.setParams(p); },
     onTune: (t) => { setTune(t); redraw(); },
     onClearStamps: () => shell.clearStamps(),
     onCloseStatus: () => inspect(-1),

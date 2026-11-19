@@ -7,6 +7,7 @@
 
 import { Pane } from "./vendor/tweakpane-4.0.5.min.js";
 import { TUNE_DEFAULTS, TUNE_SPEC } from "./tune.js";
+import { AUDIO_DEFAULTS, AUDIO_SPEC } from "./audio-params.js";
 
 const PANE_KEY = "gates.web.pane.v1";
 const DIR_NAMES = ["+X east", "+Y north", "-X west", "-Y south"];
@@ -94,6 +95,41 @@ export class Panel {
       pushColours();
     });
 
+    // Audio: sound from the ticks (audio.js). The switch is off at every
+    // launch -- a browser only starts audio from a tap -- and is not
+    // persisted; the dials are. Turning it on is the only thing that loads
+    // any audio code.
+    this.audio = { ...AUDIO_DEFAULTS };
+    for (const [k, v] of Object.entries(this.prefs.audio || {})) {
+      if (k in AUDIO_DEFAULTS && typeof v === typeof AUDIO_DEFAULTS[k]) this.audio[k] = v;
+    }
+    this.audioOn = { on: false };
+    this.audioMeter = { text: "off" };
+    const audio = this.pane.addFolder({ title: "Audio", expanded: false });
+    this.audioOnBinding = audio.addBinding(this.audioOn, "on", { label: "sound" })
+      .on("change", (ev) => {
+        // Hand the keyboard back, or the next Space (play) toggles this box.
+        if (document.activeElement instanceof HTMLElement) document.activeElement.blur();
+        cb.onAudioEnable(ev.value);
+      });
+    audio.addBinding(this.audioMeter, "text", { label: "meter", readonly: true, multiline: true, rows: 4, interval: 250 });
+    const pushAudio = () => {
+      this.prefs.audio = { ...this.audio };
+      savePrefs(this.prefs);
+      cb.onAudio({ ...this.audio });
+    };
+    const audioBindings = [];
+    let agroup = audio;
+    for (const [key, label, opts] of AUDIO_SPEC) {
+      if (key === "---") { agroup = audio.addFolder({ title: label, expanded: false }); continue; }
+      audioBindings.push(agroup.addBinding(this.audio, key, { label, ...(opts || {}) }).on("change", pushAudio));
+    }
+    audio.addButton({ title: "Reset audio dials" }).on("click", () => {
+      Object.assign(this.audio, AUDIO_DEFAULTS);
+      for (const b of audioBindings) b.refresh();
+      pushAudio();
+    });
+
     // Dev: the tuned-by-eye numbers and the force-build switch. Persisted
     // with the rest of the panel's preferences.
     this.dev = { ...TUNE_DEFAULTS, ...(this.prefs.dev || {}) };
@@ -123,6 +159,11 @@ export class Panel {
     const dbg = this.pane.addFolder({ title: "Debug", expanded: false });
     dbg.addButton({ title: "Clear stamps" }).on("click", () => cb.onClearStamps());
   }
+
+  // The audio switch, when main.js could not honour it.
+  setAudioOn(on) { this.audioOn.on = on; this.audioOnBinding.refresh(); }
+  // Read by the meter's monitor binding on its own interval.
+  setAudioMeter(text) { this.audioMeter.text = text; }
 
   // The bundled saves, as a dropdown at the top of the Board folder.
   setSaves(names, current) {

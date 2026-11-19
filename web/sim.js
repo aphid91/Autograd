@@ -62,6 +62,9 @@ export class Sim {
     // so a forecast knows when it is stale.
     this.version = 0;
     this.rec = null;                // the forecast's event log, while one runs
+    // audio.js's Recorder while audio is on, else null: then the tick's whole
+    // audio cost is this null check (step() and structurePhase()).
+    this.audio = null;
     this.fc = null;                 // the last forecast
     this.sync();
   }
@@ -602,17 +605,21 @@ export class Sim {
   step() {
     this.sync();
     this.version++;
-    this.structurePhase();
+    // Not while forecasting: that step is rolled back, and is not heard.
+    const A = this.rec ? null : this.audio;
+    if (A) A.pre(this);
+    this.structurePhase(A);
     for (const seg of this.order) this.tickSegment(seg, this.tick);
     this.deliverDirect();
     this.tick++;
+    if (A) A.post(this);
   }
 
   // The prefilter (GateSim._candidate_rows) and the per-gate firing rule.
   // The prefilter tests only necessary conditions that are pure row state --
   // the rule satisfiable by occupancy, a free output zone -- so it can admit
   // a gate that then does nothing but never rejects one that would fire.
-  structurePhase() {
+  structurePhase(A = null) {
     for (const g of this.gates) {
       const row = g.row, s = g.sim;
       let fed = 0;
@@ -624,7 +631,10 @@ export class Sim {
         for (let c = 0; c < s.n_out && !free; c++) if (!this.outHeld(row, c)) free = true;
         if (!free) continue;
       }
-      if (this.fire(g)) this.stats.fired++;
+      if (this.fire(g)) {
+        this.stats.fired++;
+        if (A) A.fires[g.agroup]++;
+      }
     }
   }
 
