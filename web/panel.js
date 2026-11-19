@@ -11,6 +11,19 @@ import { TUNE_DEFAULTS, TUNE_SPEC } from "./tune.js";
 const PANE_KEY = "gates.web.pane.v1";
 const DIR_NAMES = ["+X east", "+Y north", "-X west", "-Y south"];
 
+// The status colours' shipped values (View > status colours), as hex so
+// Tweakpane's picker -- a saturation/value square and a hue strip -- edits
+// them directly. main.js reads the live ones; a stored key this build does
+// not know is ignored.
+export const STATUS_COLOUR_DEFAULTS = {
+  gateRunning: "#45a854", gateStarved: "#c7423d", gateBlocked: "#dbb82e",
+  beltMoving: "#50a05c", beltEmpty: "#b04842", beltStalled: "#d6b43a",
+};
+const STATUS_COLOUR_LABELS = [
+  ["gateRunning", "gate running"], ["gateStarved", "gate starved"], ["gateBlocked", "gate blocked"],
+  ["beltMoving", "belt moving"], ["beltEmpty", "belt empty"], ["beltStalled", "belt stalled"],
+];
+
 function loadPrefs() {
   try { return JSON.parse(localStorage.getItem(PANE_KEY) || "null") || {}; } catch { return {}; }
 }
@@ -53,15 +66,33 @@ export class Panel {
       board.addButton({ title: "Delete saved" }).on("click", () => this.local.saved && cb.onDeleteLocal(this.local.saved)),
     ];
 
-    this.view = { grid: true, ports: true, labels: true, seedTint: true, notes: true, momentum: true, items: true, belts: true, gateStatus: false, sources: true, beltStatus: false, beltActive: true, ...this.prefs.view };
+    this.view = { grid: true, ports: true, labels: true, seedTint: true, notes: true, momentum: true, items: true, belts: true, gates: true, gateStatus: false, sources: true, beltStatus: false, beltActive: true, ...this.prefs.view };
     const view = this.pane.addFolder({ title: "View", expanded: false });
-    for (const [key, label] of [["grid", "grid lines"], ["ports", "ports"], ["labels", "source values"], ["seedTint", "seed tint"], ["notes", "labels (notes)"], ["momentum", "pan momentum"], ["items", "items"], ["belts", "belts"], ["gateStatus", "gate status colours"], ["beltStatus", "belt status colours"], ["beltActive", "stalled but moving: green"], ["sources", "sources"]]) {
+    for (const [key, label] of [["grid", "grid lines"], ["ports", "ports"], ["labels", "source values"], ["seedTint", "seed tint"], ["notes", "labels (notes)"], ["momentum", "pan momentum"], ["items", "items"], ["belts", "belts"], ["gates", "gates"], ["gateStatus", "gate status colours"], ["beltStatus", "belt status colours"], ["beltActive", "stalled but moving: green"], ["sources", "sources"]]) {
       view.addBinding(this.view, key, { label }).on("change", () => {
         this.prefs.view = { ...this.view };
         savePrefs(this.prefs);
         cb.onView({ ...this.view });
       });
     }
+
+    // The status colours, each with a picker. Persisted with the panel.
+    const known = Object.keys(STATUS_COLOUR_DEFAULTS);
+    const stored = Object.fromEntries(Object.entries(this.prefs.colours || {}).filter(([k, v]) => known.includes(k) && /^#[0-9a-f]{6}$/i.test(v)));
+    this.colours = { ...STATUS_COLOUR_DEFAULTS, ...stored };
+    const colours = view.addFolder({ title: "status colours", expanded: false });
+    const pushColours = () => {
+      this.prefs.colours = { ...this.colours };
+      savePrefs(this.prefs);
+      cb.onColours({ ...this.colours });
+    };
+    const colourBindings = STATUS_COLOUR_LABELS.map(([key, label]) =>
+      colours.addBinding(this.colours, key, { label, view: "color" }).on("change", pushColours));
+    colours.addButton({ title: "Reset colours" }).on("click", () => {
+      Object.assign(this.colours, STATUS_COLOUR_DEFAULTS);
+      for (const b of colourBindings) b.refresh();
+      pushColours();
+    });
 
     // Dev: the tuned-by-eye numbers and the force-build switch. Persisted
     // with the rest of the panel's preferences.

@@ -4,8 +4,11 @@
 //
 // A stamp is plain data, so it persists in a toolbar slot as JSON:
 //
-//   { entries: [entry], w, h }      normalised: the covered box starts at 0,0
+//   { entries: [entry], w, h, notes }   normalised: the covered box starts at 0,0
 //   entry = { type, dx, dy, dir, flip, exit, partner, emit, seed }
+//   notes = [label]: the desktop's label records (notes.js), rect in the
+//           stamp's frame -- core/stamp.py's Stamp.annotations. Optional:
+//           a stamp stored before labels travelled has none.
 //
 // `type` is the type NAME (types.json `name`), not the integer id, for the
 // same reason the desktop's toolbar file uses class names: it is readable,
@@ -45,18 +48,74 @@ export function bounds(T, entries) {
   return { x: x0, y: y0, w: x1 - x0, h: y1 - y0 };
 }
 
-// A stamp from entries in any frame: shifted so the box starts at (0, 0).
-// Also returns where that box was, so a caller holding absolute entries
-// knows the stamp's origin.
-export function makeStamp(T, entries) {
-  const b = bounds(T, entries);
+// A stamp from entries and labels in any frame: shifted so the box starts
+// at (0, 0). Also returns where that box was, so a caller holding absolute
+// entries knows the stamp's origin.
+//
+// The box is the ENTRIES' box: a label hanging outside the machines must
+// not move it, or where the paste ghost sits would change (core/stamp.py
+// bounds()). With no entries, a stamp of labels alone takes their box,
+// floored and ceiled onto the cell lattice -- a zero box would centre the
+// paste on nothing.
+export function makeStamp(T, entries, notes = []) {
+  const b = entries.length ? bounds(T, entries) : notesBounds(notes);
   return {
-    stamp: { entries: entries.map(e => ({ ...e, dx: e.dx - b.x, dy: e.dy - b.y })), w: b.w, h: b.h },
+    stamp: {
+      entries: entries.map(e => ({ ...e, dx: e.dx - b.x, dy: e.dy - b.y })),
+      w: b.w, h: b.h,
+      notes: notes.map(n => shiftNote(n, -b.x, -b.y)),
+    },
     origin: [b.x, b.y],
   };
 }
 
-export const copyStamp = (s) => ({ entries: s.entries.map(e => ({ ...e })), w: s.w, h: s.h });
+const copyNote = (n) => ({ ...n, rect: n.rect.slice() });
+export const copyStamp = (s) => ({ entries: s.entries.map(e => ({ ...e })), w: s.w, h: s.h, notes: (s.notes || []).map(copyNote) });
+
+// --- labels in a stamp -------------------------------------------------------
+// A label's rect is [x, y, w, h] with (x, y) its TOP-left (world +Y is up,
+// so it hangs down to y - h). Positions transform with the stamp; the box
+// and its text never do -- a turned stamp keeps its labels upright and
+// readable, and mirrored text is simply broken (core/stamp.py), so a label
+// moves its centre and keeps its w and h.
+
+// Rounded to a millionth: tidy in a save, and fine enough that a label
+// does not drift over many turns (rounding to the thousandth a dragged
+// label uses moved a box of odd-thousandth height by half a thousandth a
+// turn).
+const r3 = (v) => Math.round(v * 1e6) / 1e6;
+
+export function shiftNote(n, dx, dy) {
+  const [x, y, w, h] = n.rect;
+  return { ...n, rect: [r3(x + dx), r3(y + dy), w, h] };
+}
+
+// The label with its centre sent through `f(cx, cy) -> [cx', cy']`.
+function moveNote(n, f) {
+  const [x, y, w, h] = n.rect;
+  const [cx, cy] = f(x + w / 2, y - h / 2);
+  return { ...n, rect: [r3(cx - w / 2), r3(cy + h / 2), w, h] };
+}
+
+// The cells the labels' boxes cover, on the lattice.
+export function notesBounds(notes) {
+  let x0 = Infinity, y0 = Infinity, x1 = -Infinity, y1 = -Infinity;
+  for (const n of notes) {
+    const [x, y, w, h] = n.rect;
+    x0 = Math.min(x0, x); x1 = Math.max(x1, x + w);
+    y0 = Math.min(y0, y - h); y1 = Math.max(y1, y);
+  }
+  if (!isFinite(x0)) return { x: 0, y: 0, w: 0, h: 0 };
+  x0 = Math.floor(x0); y0 = Math.floor(y0);
+  return { x: x0, y: y0, w: Math.max(1, Math.ceil(x1) - x0), h: Math.max(1, Math.ceil(y1) - y0) };
+}
+
+// Does a label's box touch the cell rectangle { x, y, w, h }? (Cells x ..
+// x+w-1: the box covers world [x, x+w] x [y, y+h].)
+export function noteTouches(n, r) {
+  const [x, y, w, h] = n.rect;
+  return x <= r.x + r.w && x + w >= r.x && y - h <= r.y + r.h && y >= r.y;
+}
 
 // A quarter turn, clockwise if `cw`. Each entry's whole cell span turns and
 // the new span's lower-left becomes its origin: a footprint extends +X/+Y
@@ -74,7 +133,13 @@ export function rotated(T, s, cw) {
       e.dir = (e.dir + 1) % 4;
     }
   }
-  return makeStamp(T, out).stamp;
+  // A label's centre turns with the cells: cell (cx, cy) -> (-cy, cx) is
+  // the continuous (x, y) -> (1 - y, x), applied the same number of times.
+  const notes = (s.notes || []).map(n => moveNote(n, (x, y) => {
+    for (let i = 0; i < turns; i++) [x, y] = [1 - y, x];
+    return [x, y];
+  }));
+  return makeStamp(T, out, notes).stamp;
 }
 
 // Mirrored about the stamp's vertical centre line. A chiral machine toggles
@@ -86,7 +151,9 @@ export function mirrored(T, s) {
     const chiral = typeByName(T, e.type).td.chiral;
     return { ...e, dx: -(e.dx + w - 1), dir: (6 - e.dir) % 4, flip: chiral ? !e.flip : e.flip };
   });
-  return makeStamp(T, out).stamp;
+  // Cell cx -> -cx is the continuous x -> 1 - x; the text is not mirrored.
+  const notes = (s.notes || []).map(n => moveNote(n, (x, y) => [1 - x, y]));
+  return makeStamp(T, out, notes).stamp;
 }
 
 // Every cell of every entry with the box at (ox, oy), as [x, y, index].
@@ -113,8 +180,12 @@ export function subset(entries, keep) {
 
 // Does every entry name a type this build has? A slot holding a stamp with
 // an unknown machine costs that slot, not the bar.
+// A stamp of labels alone is a real stamp (core/stamp.py Stamp.__bool__).
 export function isValidStamp(T, s) {
-  return !!s && Array.isArray(s.entries) && s.entries.length > 0 &&
+  if (!s || !Array.isArray(s.entries)) return false;
+  const notes = s.notes === undefined ? [] : s.notes;
+  if (!Array.isArray(notes) || !notes.every(n => n && Array.isArray(n.rect) && n.rect.length === 4)) return false;
+  return (s.entries.length > 0 || notes.length > 0) &&
     s.entries.every(e => e && typeByName(T, e.type));
 }
 

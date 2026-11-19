@@ -11,11 +11,11 @@ import { Board } from "./board.js";
 import { Camera, attachGestures } from "./camera.js";
 import { render } from "./render.js";
 import { Shell } from "./ui.js";
-import { Panel } from "./panel.js";
+import { Panel, STATUS_COLOUR_DEFAULTS } from "./panel.js";
 import { ROUTE_NAMES, ROUTE_H_FIRST, ROUTE_V_FIRST, chooseRoute, planRun, routeWorks, turnTip } from "./planner.js";
 import { originFor } from "./placer.js";
 import { VALUE_CHOICES, hasValue, toolValue } from "./tools.js";
-import { makeStamp, mirrored, reversedGate, rotated, stampCells, subset } from "./stamp.js";
+import { makeStamp, mirrored, noteTouches, reversedGate, rotated, shiftNote, stampCells, subset } from "./stamp.js";
 import { emitMask, emitsWith, stampGhost } from "./ghost.js";
 import { traceRun } from "./segtrace.js";
 import { TUNE, setTune } from "./tune.js";
@@ -23,7 +23,7 @@ import { Sim, Clock } from "./sim.js";
 import { History } from "./history.js";
 import { DEFAULT, naturalOrder, tableValues, finalValues } from "./indexer.js";
 import { entrySize } from "./stamp.js";
-import { noteAt, gripAt, newRect, MIN_W, MIN_H } from "./notes.js";
+import { noteAt, gripAt, isText, newRect, MIN_W, MIN_H } from "./notes.js";
 import { Claims, followChain, offsets, layCopies, isZero, rotateVec, flipVec, moreCount, lessCount } from "./vector.js";
 import { deleteSave, getSave, listSaves, putSave } from "./saves.js";
 
@@ -40,6 +40,7 @@ let dpr = 1;
 let shell = null;
 let panel = null;
 let view = {};
+let statusColours = { ...STATUS_COLOUR_DEFAULTS };   // View > status colours
 let inspectRow = -1;   // a row, not a description: re-read it every time
 // The simulation of the loaded board, and the clock that paces it. A new
 // Sim per board, as a fresh desktop session per load: segment ids come from
@@ -168,6 +169,7 @@ function paint(now) {
   const hide = run ? runCopies().copies.filter(c => c.over).map(c => c.start) : null;
   render(ctx, board, cam, dpr, { ...view, selected: info, ghosts, sim, alpha: clock.alpha, hide, vector: vectorMarks(),
                                 indexLabels: indexLabels(), noteSel: noteEdit, noteGrips: labelHeld(),
+                                ghostNotes: ghostNotes(),
                                 gateTint: view.gateStatus ? gateStatus() : null,
                                 beltTint: view.beltStatus ? beltStatus() : null });
   debug.renderMs = performance.now() - t0;
@@ -252,11 +254,13 @@ function checkpoint() {
 // does not have what its own firing rule needs (a Merge needs its control
 // and the lane that selects, a Sink any one lane; a Source never starves);
 // RUNNING (green) otherwise. Dangling outputs discard and never block.
-const STATUS_COL = { blocked: [0.86, 0.72, 0.18], starved: [0.78, 0.26, 0.24], running: [0.27, 0.66, 0.33] };
+// The colours are the player's (View > status colours, panel.js).
+const hexRgb = (h) => [1, 3, 5].map(i => parseInt(h.slice(i, i + 2), 16) / 255);
 function gateStatus() {
   const out = new Map();
   if (!sim) return out;
   sim.sync();
+  const STATUS_COL = { blocked: hexRgb(statusColours.gateBlocked), starved: hexRgb(statusColours.gateStarved), running: hexRgb(statusColours.gateRunning) };
   for (const g of sim.gates) {
     const blocked = g.drains.some(c => sim.outHeld(g.row, c));
     const starved = g.sim.n_in > 0 && !sim.inputsReady(g);
@@ -270,9 +274,9 @@ function gateStatus() {
 // leave on the coming tick (the forecast has no pop), so items are stuck on
 // it (and, by default, nothing on it is moving either -- see below); GREEN
 // otherwise (carrying, and moving). Returns (x, y) -> colour.
-const BELT_STATUS_COL = { empty: "rgb(176,72,66)", stalled: "rgb(214,180,58)", moving: "rgb(80,160,92)" };
 function beltStatus() {
   if (!sim) return null;
+  const BELT_STATUS_COL = { empty: statusColours.beltEmpty, stalled: statusColours.beltStalled, moving: statusColours.beltMoving };
   sim.sync();
   const F = sim.forecast();
   const bySid = new Map();
@@ -598,10 +602,11 @@ function indexApply(o) {
 
 function openSelectPicker() {
   if (!sel) return;
+  // A selection of labels alone has no entity to anchor on: its box's corner.
   const first = selAbs()[0];
   vec.picking = "select";
   vec.sv = [0, 0];
-  vec.anchor = [first.dx, first.dy];
+  vec.anchor = first ? [first.dx, first.dy] : selOrigin();
   grab = null;
   syncVector();
 }
@@ -611,6 +616,7 @@ function confirmSelectVector() {
   closePicker(true);
   if (!sel || isZero(v)) return;
   const pattern = selAbs();
+  if (!pattern.length) return;   // labels are not followed: no pattern to match
   const rows = [];
   for (const off of followChain(v, (o) => {
     const found = pattern.map(e => matchRow(e, e.dx + o[0], e.dy + o[1]));
@@ -696,7 +702,7 @@ function onTap(sx, sy) {
     } else commitRun();
     return;
   }
-  if (sel) { selectTap(x, y); return; }
+  if (sel) { selectTap(x, y, wx, wy); return; }
   // Idle: a tap on an entity selects it, whatever the hand holds; a tap on
   // empty board is the held tool's.
   const row = board.entityAt(x, y);
@@ -971,7 +977,8 @@ function placementAt(tool, origin) {
     const st = tool.stamp;
     const at = st.entries.map(e => [origin[0] + e.dx, origin[1] + e.dy]);
     const ghost = stampGhost(board, st.entries, at);
-    return { tool, kind: "stamp", origin, w: st.w, h: st.h, entries: st.entries, at, ghost, blocked: ghost.blocked };
+    const notes = (st.notes || []).map(n => shiftNote(n, origin[0], origin[1]));
+    return { tool, kind: "stamp", origin, w: st.w, h: st.h, entries: st.entries, at, ghost, blocked: ghost.blocked, notes };
   }
   const dir = tool.dir | 0, flip = !!tool.flip;
   if (tool.kind === "rawbelt") {
@@ -1030,7 +1037,12 @@ function placeOnce() {
 // machine or raw belt only -- never for a copy, and never for a stamp,
 // which already places whatever fits.
 function placeOne(pl, original) {
-  if (pl.kind === "stamp") return board.placeEntries(pl.entries, pl.at, { derive: false }).size > 0;
+  if (pl.kind === "stamp") {
+    // Labels always fit. A label edit is not a board edit (it must not
+    // restart the simulation), so only placed entities count for the derive.
+    if (pl.notes.length) { board.notes.push(...pl.notes.map(n => ({ ...n, rect: n.rect.slice() }))); board.notesRev++; }
+    return board.placeEntries(pl.entries, pl.at, { derive: false }).size > 0;
+  }
   const blocked = placementCells(pl).filter(([x, y]) => !board.isFree(x, y));
   if (blocked.length) {
     if (!original || !TUNE.forceBuild) return false;
@@ -1068,6 +1080,12 @@ function onGhost(sx, sy) {
 //   drag from a selected one  move the whole selection
 //   drag with Box armed       a rectangle that adds what it touches
 //   Turn buttons              turn / mirror the selection as one stamp
+//
+// Labels join it too: a box picks up every (visible) label it touches, and
+// they are lifted off board.notes into the stamp's `notes`, so they move,
+// turn, delete, cut, copy and paste with the rest (stamp.js keeps them
+// upright). A label always fits, so it goes back down whenever the whole
+// selection does; a tap on a selected label puts that one back.
 
 const selOrigin = () => originFor(sel.stamp.w, sel.stamp.h, sel.px, sel.py);
 
@@ -1077,16 +1095,26 @@ function selAbs() {
   return sel.stamp.entries.map(e => ({ ...e, dx: ox + e.dx, dy: oy + e.dy }));
 }
 
-// Replace the selection with these absolute entries. The pose is re-centred
-// on their box, so a turn after a membership change pivots on what is
-// actually selected.
-function setSel(abs) {
-  if (!abs.length) sel = null;
+// The selection's labels with absolute rects.
+function selNotes() {
+  if (!sel) return [];
+  const [ox, oy] = selOrigin();
+  return (sel.stamp.notes || []).map(n => shiftNote(n, ox, oy));
+}
+
+// The selected label at world point (wx, wy), or -1.
+const selNoteAt = (wx, wy) => (sel && notesOn() ? noteAt(selNotes(), wx, wy) : -1);
+
+// Replace the selection with these absolute entries and labels (by default
+// the labels it already holds). The pose is re-centred on their box, so a
+// turn after a membership change pivots on what is actually selected.
+function setSel(abs, notes = selNotes()) {
+  if (!abs.length && !notes.length) sel = null;
   else {
-    const { stamp, origin } = makeStamp(T, abs);
+    const { stamp, origin } = makeStamp(T, abs, notes);
     sel = { stamp, px: origin[0] + stamp.w / 2, py: origin[1] + stamp.h / 2 };
   }
-  shell.setSelection(sel ? sel.stamp.entries.length : 0);
+  shell.setSelection(sel ? sel.stamp.entries.length + sel.stamp.notes.length : 0);
   // Nothing left selected: the selection's picker has nothing to repeat,
   // and there is nothing left to index.
   if (!sel && vec.picking === "select") closePicker(false);
@@ -1103,14 +1131,37 @@ function selIndexAt(x, y) {
   return hit ? hit[2] : -1;
 }
 
-function lift(rows) {
+// Lift entity rows, and labels (the board.notes records themselves), into
+// the selection.
+function lift(rows, notes = []) {
   rows = [...new Set(rows)].filter(r => r > 0);
-  if (!rows.length) return;
+  notes = [...new Set(notes)].filter(n => board.notes.includes(n));
+  if (!rows.length && !notes.length) return;
   const abs = sel ? selAbs() : [];
-  const caught = board.capture(rows).map(e => ({ ...e, partner: e.partner === null ? null : e.partner + abs.length }));
-  board.eraseRows(rows);
-  if (rows.includes(inspectRow)) inspect(-1);
-  setSel([...abs, ...caught]);
+  const held = selNotes();
+  let caught = [];
+  if (rows.length) {
+    caught = board.capture(rows).map(e => ({ ...e, partner: e.partner === null ? null : e.partner + abs.length }));
+    board.eraseRows(rows);
+    if (rows.includes(inspectRow)) inspect(-1);
+  }
+  if (notes.length) {
+    for (const n of notes) board.notes.splice(board.notes.indexOf(n), 1);
+    noteEdit = -1;   // indices moved; no editor is open during a selection anyway
+    board.notesRev++;
+  }
+  setSel([...abs, ...caught], [...held, ...notes]);
+}
+
+// Put the selection's labels `which` (indices into selNotes()) back on the
+// board where the selection now has them. A label always fits.
+function dropNotes(which) {
+  if (!sel || !which.length) return;
+  const all = selNotes();
+  const want = new Set(which);
+  for (const k of which) board.notes.push(all[k]);
+  board.notesRev++;
+  setSel(selAbs(), all.filter((_, k) => !want.has(k)));
 }
 
 // Place the selected entries `which` (indices) back on the board where the
@@ -1126,9 +1177,17 @@ function drop(which) {
   setSel(subset(abs, i => !placedOrig.has(i)));
 }
 
-function dropAll() { if (sel) drop(sel.stamp.entries.map((_, i) => i)); }
+// Everything that fits goes down, and every label.
+function dropAll() {
+  if (!sel) return;
+  dropNotes(sel.stamp.notes.map((_, k) => k));
+  if (sel) drop(sel.stamp.entries.map((_, i) => i));
+}
 
-function selectTap(x, y) {
+function selectTap(x, y, wx, wy) {
+  // A selected label draws over the rest, so it wins the tap: it goes back.
+  const k = selNoteAt(wx, wy);
+  if (k >= 0) { dropNotes([k]); return; }
   const i = selIndexAt(x, y);
   if (i >= 0) { drop([i]); return; }
   const row = board.entityAt(x, y);
@@ -1136,8 +1195,10 @@ function selectTap(x, y) {
   else dropAll();
 }
 
-// Add every board entity the box touches to the selection. It only adds:
-// what is already selected stays selected.
+// Add every board entity the box touches to the selection, and every label
+// whose box it touches (if labels are showing: hidden ones take no taps,
+// so they take no boxes either). It only adds: what is already selected
+// stays selected.
 function boxAdd(r) {
   const rows = new Set();
   for (let y = r.y; y < r.y + r.h; y++) {
@@ -1146,7 +1207,19 @@ function boxAdd(r) {
       if (row >= 0) rows.add(row);
     }
   }
-  lift([...rows]);
+  const notes = notesOn() ? board.notes.filter(n => isText(n) && noteTouches(n, r)) : [];
+  lift([...rows], notes);
+}
+
+// Labels off the board that still draw: the selection's (outlined, as a
+// lifted entity is) and those a paste would place, ghosted.
+function ghostNotes() {
+  if (!board || !notesOn()) return null;
+  const out = [];
+  const held = selNotes();
+  if (held.length) out.push({ notes: held, lifted: true });
+  for (const pl of placements()) if (pl.kind === "stamp" && pl.notes.length) out.push({ notes: pl.notes, lifted: false });
+  return out.length ? out : null;
 }
 
 function selGhost() {
@@ -1211,10 +1284,10 @@ function selectFlip() {
 // cancel; a copy's ghost sits over the originals.
 function selectCommand(c) {
   if (!sel) return;
-  if (c === "delete") { setSel([]); return; }
+  if (c === "delete") { setSel([], []); return; }
   const pose = [sel.px, sel.py];
   const id = shell.addStamp(sel.stamp);
-  if (c === "cut") { setSel([]); enterPaste(id, pose); return; }
+  if (c === "cut") { setSel([], []); enterPaste(id, pose); return; }
   // Copy: the selection goes back down. If all of it fit, there is nothing
   // left selected and the copy is ready to paste; anything that could not go
   // back stays selected for the player to deal with.
@@ -1227,7 +1300,7 @@ function selectCommand(c) {
 // given, puts the ghost up straight away at that centre point.
 function enterPaste(id, pose = null) {
   dropAll();
-  if (sel) setSel([]);
+  if (sel) setSel([], []);
   place = pose ? { px: pose[0], py: pose[1] } : null;
   shell.setPasting(id);
   syncBar();
@@ -1263,7 +1336,7 @@ function onLongPress(sx, sy) {
   if (!cells.length) {
     // A hold on a selected entity stays a press: a slow drag from it still
     // moves the selection, as it always did.
-    if (sel && selIndexAt(x, y) >= 0) return false;
+    if (sel && (selIndexAt(x, y) >= 0 || selNoteAt(...cam.screenToWorld(sx, sy)) >= 0)) return false;
     // Anywhere else but a belt, the hold arms a box selection at the press,
     // drawn at once so the hold reads as having taken. The finger now drags
     // the box out; lifting it without moving does nothing.
@@ -1307,7 +1380,7 @@ const dragHooks = {
     if (run || place) return true;
     if (!shell.selecting) return false;
     if (sx === undefined) return false;
-    return selIndexAt(...cellUnder(sx, sy)) >= 0;
+    return selIndexAt(...cellUnder(sx, sy)) >= 0 || selNoteAt(...cam.screenToWorld(sx, sy)) >= 0;
   },
   begin(sx, sy) {
     const world0 = cam.screenToWorld(sx, sy);
@@ -1657,6 +1730,7 @@ async function init() {
     onOpenFile: () => fileInput.click(),
     onFit: () => { if (board) cam.frame(board.bounds); redraw(); },
     onView: (v) => { view = v; redraw(); },
+    onColours: (c) => { statusColours = c; redraw(); },
     onTune: (t) => { setTune(t); redraw(); },
     onClearStamps: () => shell.clearStamps(),
     onCloseStatus: () => inspect(-1),
@@ -1669,6 +1743,7 @@ async function init() {
   });
   panel.setLocalSaves(listSaves());
   view = { ...panel.view };
+  statusColours = { ...panel.colours };
   setTune(panel.dev);
 
   resize();

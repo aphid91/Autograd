@@ -144,3 +144,64 @@ test("a reversed gate undoes the gate, port for port", async () => {
   }
   assert.equal(checked, 64);
 });
+
+// Labels travel with a stamp: a label's box moves with the turn and the
+// mirror, upright and unmirrored. The oracle is the machines themselves:
+// each label is centred on a marker belt, and after any sequence of turns
+// and mirrors it must still be centred on that same belt, whatever its own
+// size. (core/stamp.py is NOT the oracle here: its rotated() and mirrored()
+// turn a label inside the box and then shift it again when renormalising,
+// so a label on a 3x1 run's last belt lands on the wrong end -- a desktop
+// bug, recorded in web/CLAUDE.md.)
+test("a stamp's labels stay on the machines they label through turns and mirrors", () => {
+  const r = rng(19);
+  const q = (v) => Math.round(v * 1000) / 1000;
+  let checked = 0;
+  for (let i = 0; i < 80; i++) {
+    const base = randomStamp(r).entries.map(e => ({ ...e, dx: e.dx + 1, dy: e.dy + 1 }));
+    // Marker belts on cells no machine covers, each with a label on it.
+    const used = new Set(stampCells(T, { entries: base }, 0, 0).map(([x, y]) => `${x},${y}`));
+    const markers = [], notes = [];
+    for (let k = 0; k < 3; k++) {
+      const x = Math.floor(r() * 9), y = Math.floor(r() * 9);
+      if (used.has(`${x},${y}`)) continue;
+      used.add(`${x},${y}`);
+      markers.push({ type: "belt", dx: x, dy: y, dir: 0, flip: false, exit: false, partner: null, emit: null, seed: null });
+      const w = 0.25 + Math.floor(r() * 20) * 0.25, h = 0.25 + Math.floor(r() * 12) * 0.25;   // exact in binary
+      notes.push({ kind: "text", colour: 0, size: 1, text: "x", rect: [x + 0.5 - w / 2, y + 0.5 + h / 2, w, h] });
+    }
+    if (!markers.length) continue;
+    let s = makeStamp(T, [...base, ...markers], notes).stamp;
+    const n0 = base.length;
+    for (let step = 0; step < 6; step++) {
+      const op = Math.floor(r() * 3);
+      s = op === 0 ? rotated(T, s, true) : op === 1 ? rotated(T, s, false) : mirrored(T, s);
+      s.notes.forEach((n, k) => {
+        const m = s.entries[n0 + k];
+        const [x, y, w, h] = n.rect;
+        assert.ok(Math.abs(x + w / 2 - (m.dx + 0.5)) < 1e-4 && Math.abs(y - h / 2 - (m.dy + 0.5)) < 1e-4,
+          `stamp ${i} step ${step}: label at ${n.rect} is not on its belt at ${m.dx},${m.dy}`);
+        assert.deepEqual([w, h], [notes[k].rect[2], notes[k].rect[3]], "a label keeps its own size");
+        checked++;
+      });
+    }
+  }
+  assert.ok(checked > 500);
+});
+
+test("labels survive four turns and two mirrors, and a stamp of labels alone is valid", async () => {
+  const { isValidStamp, copyStamp } = await import("../stamp.js");
+  const s = makeStamp(T, [], [{ kind: "text", colour: 1, size: 2, text: "hi", rect: [3.25, 7.5, 2.5, 1.25] }]).stamp;
+  assert.deepEqual([s.w, s.h], [3, 2]);
+  assert.ok(isValidStamp(T, s));
+  let t = s;
+  for (let k = 0; k < 4; k++) t = rotated(T, t, true);
+  assert.deepEqual(t.notes, s.notes);
+  assert.deepEqual(mirrored(T, mirrored(T, s)).notes, s.notes);
+  const c = copyStamp(s);
+  c.notes[0].rect[0] = 99;
+  assert.equal(s.notes[0].rect[0], s.notes[0].rect[0] === 99 ? -1 : s.notes[0].rect[0]);
+  assert.notEqual(s.notes[0].rect[0], 99);
+  assert.ok(!isValidStamp(T, { entries: [], w: 0, h: 0 }));
+  assert.ok(isValidStamp(T, { entries: [{ type: "belt", dx: 0, dy: 0, dir: 0 }], w: 1, h: 1 }));   // stored before labels
+});

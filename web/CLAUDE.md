@@ -115,8 +115,11 @@ The **Tweakpane** panel sits in the board's top-right corner, collapsed by
 default. It holds the saves, View toggles (grid, ports, source values, seed
 tint -- the green/red wash on seeded belts, ghosts included -- labels, pan
 momentum, items, belts (placed belts and underground ends; a planned run's
-ghost still draws), sources (hidden, not removed), **gate status colours**
-and **belt status colours**), Debug, and
+ghost still draws), gates (every machine, Sources included -- for a brief
+look at the belts underneath; still there and still tappable, and items
+held inside a machine still draw: View > items hides those), sources
+(hidden, not removed), **gate status colours** and **belt status
+colours**, and a **status colours** folder of pickers for both), Debug, and
 the Status folder. Tweakpane is **vendored** (`vendor/`, MIT) rather than
 pulled from a CDN, which keeps the no-build, works-offline property. Status
 writes the same row fields the desktop's Status window does, plus the
@@ -125,11 +128,19 @@ seed's `.z` bits, so a save edited here reads correctly there.
 ### Undo
 
 [history.js](history.js) keeps **states, not edits**: each entry is a whole
-`Board.snapshot()` (grid, entity table, row allocator -- about 5 MB on a
-512×512 board), so restoring cannot half-apply anything and no edit needs an
-inverse. It keeps `UNDO_DEPTH` (3) steps behind the current state, one
-constant.
+`Board.snapshot()` (grid, entity table, row allocator), so restoring
+cannot half-apply anything and no edit needs an inverse. It keeps
+`UNDO_DEPTH` (15) steps behind the current state, one constant.
 
+- **A snapshot is sparse.** A dense copy was about 5 MB on a 512×512 board
+  (the 4 MB grid is nearly all zeros, and the entity table is kept at its
+  doubled capacity), which was why the depth was 3: 16 of them is 80 MB on
+  a phone. The grid is stored as the occupied cells' indices and their four
+  words, and the entity table up to its last non-zero value (compared as
+  bits, so a trailing `-0` survives). About 1.2 MB on `cpu.npz`, `Ram2.npz`
+  and `noram.npz`, and 2-4 ms to take or restore. `Board.toNpz(snap)`
+  expands one to write it. `tests/npz.test.mjs` restores one word for word
+  and saves it byte for byte as the board it was taken from.
 - **The checkpoint** is one more state, just before the oldest: undo from
   the oldest step restores it, and redo walks forward through the history
   again from there. It is set when a board loads and whenever Checkpoint is
@@ -162,6 +173,13 @@ ports and values stay, ghosts keep their own colours):
   and the lane that control selects is not starved, nor is a Sink with any
   lane fed, and a Source (no inputs) never starves.
 - **green, running**: neither.
+
+All six status colours (these three and the belts' three below) are the
+player's: View > **status colours** has a picker for each -- Tweakpane's
+saturation/value square and hue strip -- and **Reset colours**. They persist
+with the panel's preferences, as hex (`STATUS_COLOUR_DEFAULTS` in
+panel.js); a stored key this build does not know, or a value that is not a
+`#rrggbb`, is ignored.
 
 **Belt status colours** do the same for belts, per run (segment), in
 `beltStatus()`: **red** empty; **yellow** stalled -- the head item is at the
@@ -220,7 +238,9 @@ and written back untouched, not drawn.
   restarting the simulation, and a drag or an open editor is held back as
   a change in progress until it ends (otherwise every frame of a drag was
   a step).
-- Not yet: labels do not travel with a selection, copy or paste.
+- **Labels join a selection** (see "Selecting"): a box picks up every
+  label it touches, and they move, turn, delete, cut, copy and paste with
+  the rest, and bake into stamp slots.
 
 ### The Dev folder
 
@@ -539,7 +559,9 @@ outlined in cyan. Deselecting places it back wherever the selection now is.
 | Turn buttons | turn / mirror the selection as one stamp |
 | Delete | discard the selection |
 | long press a belt or underground | select its whole run; if the whole run is already selected, deselect it |
-| long press anywhere else, then drag | a box from the press point: everything it touches is **added**. The box corner shows the moment the hold registers; lifting without dragging selects nothing |
+| long press anywhere else, then drag | a box from the press point: everything it touches is **added**, labels included. The box corner shows the moment the hold registers; lifting without dragging selects nothing |
+| tap a selected label | put that label back |
+| one-finger drag from a selected label | move the whole selection |
 | Cut | the selection becomes a stamp, and pasting starts with the ghost **exactly where the selection was** |
 | Copy | the selection becomes a stamp and goes back down; if all of it fit, pasting starts with the ghost over the originals |
 | a stamp swatch | paste it (tap it again to stop) |
@@ -616,6 +638,34 @@ outlined in cyan. Deselecting places it back wherever the selection now is.
   turn plus a mirror, and Merge/Route kept as themselves all fail. The
   turn-plus-mirror case **passed** at first, because the test looked up
   the reversed gate's orientation with the original flip and not its own.
+- **Labels travel with the selection.** A box lifts every label whose box
+  it touches off `board.notes` into the stamp's `notes`
+  (`core/stamp.py`'s `Stamp.annotations`, rects in the stamp's frame), drawn
+  dimmed with the lifted outline; hidden labels (View > labels off) are not
+  picked up, as they take no taps. A label always fits, so it goes back
+  whenever the whole selection does (`dropAll()`), or alone on a tap. Turns
+  and mirrors move a label's **centre** with the cells and never its box or
+  text, so it stays upright, readable and over what it labels. Copy, Cut and
+  the paste ghost carry them; a paste places them wherever it lands
+  (nothing blocks a label), and a label-only paste is a label edit, so it
+  does not restart the simulation. The stamp's box is the **entities'**,
+  so a label hanging outside them does not move the paste ghost; a stamp of
+  labels alone takes their box on the cell lattice. Reverse, Index and the
+  selection vector ignore labels.
+
+  `tests/stamp.test.mjs` puts each label on a marker belt and asserts it is
+  still centred on that belt, at its own size, after random sequences of
+  turns and mirrors (mutation-tested: turning the wrong way, a no-op mirror
+  and swapping w/h all fail). The desktop is **not** the oracle here:
+  `core/stamp.py`'s `rotated()` and `mirrored()` turn a label inside the
+  box (`rotate_in_box()`) *and then* shift it again in `normalise()`, so on
+  a 3×1 run a label on the last belt comes back on the wrong end after a
+  clockwise turn or a mirror (the counter-clockwise turn is only right
+  there because the run is one cell tall). The two apps do not share
+  stamps, so nothing crosses over, but the desktop's is a bug.
+- Rounding: a label's rect is rounded to a millionth by the transforms, not
+  to the thousandth a dragged label uses -- at a thousandth a box of odd
+  thousandths moved half a thousandth a turn.
 - **Underground pairs.** Lifting one end of a pair releases the other
   (`Engine.unpair_under()`). Both ends lifted stay paired to each other.
   Placing back pairs the stamp's own ends first, then each unpaired end
