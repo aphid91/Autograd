@@ -1218,6 +1218,23 @@ the camera arithmetic, loaded always and tested in node;
   picker records nothing. **Cancel recording** keeps what was encoded: a
   partial video is still a video.
 
+**The dry run**: with an end camera set, pressing play flies the view along
+the path a recording started now would take, to tune the start view and
+the fades without rendering. The view at the press is the start, and the
+**tick on screen** picks the frame (frame f is tick `t0 + f * tps / 60`, as
+in video.js), so the camera matches the content at any play rate -- at the
+video's own ticks/s it runs in real time. The view is set so the crop box
+*is* that frame, and holds the end view once the path is done. The video
+and camera dials apply live. **Any disturbance restores the view** from the
+press: pause, a pan or zoom of any kind, an edit (undo included), Reset, a
+load (which then frames the new board), unsetting the end camera, starting
+a recording. A manual move is detected by the camera no longer being where
+the dry run last put it (`driveDryRun()`), which catches drag, pinch,
+wheel, the pan glide and Fit board without touching camera.js. Checked in
+the browser: a second into a 2 s path at the video's rate the zoom is the
+geometric midpoint, a pause or a pan puts back the exact start view, and a
+full run holds the end view.
+
 Checked in headless Chromium: 2 s at 480×270 with sound and an end camera
 gave 120 frames of H.264 at exactly 2.00 s and an Opus track (mean
 -15 dB), the first frame the whole board and the last the zoomed end

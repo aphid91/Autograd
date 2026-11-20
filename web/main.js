@@ -24,7 +24,7 @@ import { History } from "./history.js";
 import { DEFAULT, naturalOrder, tableValues, finalValues } from "./indexer.js";
 import { entrySize, typeByName } from "./stamp.js";
 import { installPixel, Screen } from "./pixel.js";
-import { cropBox, evenDim, frameCount } from "./video-params.js";
+import { cropBox, evenDim, frameBox, frameCount } from "./video-params.js";
 import { noteAt, gripAt, isText, newRect, MIN_W, MIN_H } from "./notes.js";
 import { Claims, followChain, offsets, layCopies, isZero, rotateVec, flipVec, moreCount, lessCount } from "./vector.js";
 import { deleteSave, getSave, listSaves, putSave } from "./saves.js";
@@ -280,6 +280,7 @@ async function recordVideoNow() {
   if (!sim || !board) return;
   const settings = { ...panel.video };
   const base = (panel.local.name || "gates").replace(/[^\w.-]+/g, "_");
+  endDryRun();       // a recording starts from the view play took over from
   const choice = await chooseVideoFile(`${base}.mp4`);       // first await: keeps the gesture
   if (choice.kind === "cancelled") return;
   const own = { cancel: false };
@@ -319,6 +320,49 @@ async function recordVideoNow() {
     recording = null;
     panel.setVideoRecording(false);
   }
+}
+
+// --- the camera's dry run -----------------------------------------------------------
+//
+// With an end camera set, pressing play flies the view along the path a
+// recording started now would take: the view at the press is the start, and
+// the tick on screen decides the frame (frame f is tick t0 + f * tps / 60,
+// as in video.js), so the camera always matches the content, at any play
+// rate. The view is set so the crop box IS that frame. It holds the end
+// view once the path is done. The video and camera dials apply live, so the
+// fades can be tuned while watching.
+//
+// Any disturbance -- pause, a pan or zoom of any kind, an edit (undo
+// included), Reset, a load, unsetting the end camera, starting a real
+// recording -- puts the view back where it was when play was pressed. A
+// manual camera move is detected by the camera no longer being where the
+// dry run last put it, which catches drag, pinch, wheel, the pan glide and
+// Fit board alike without touching camera.js.
+let dry = null;   // { start, t0, sim, rev, set }: set = the view last applied
+function startDryRun() {
+  if (!endCam || !sim || recording) { dry = null; return; }
+  dry = { start: camState(), t0: sim.tick, sim, rev: board.revision, set: null };
+}
+function endDryRun() {
+  if (!dry) return;
+  const st = dry.start;
+  dry = null;
+  cam.cx = st.cx; cam.cy = st.cy; cam.zoom = st.zoom;
+  redraw();
+}
+function driveDryRun() {
+  if (!dry) return;
+  const moved = dry.set && (cam.cx !== dry.set.cx || cam.cy !== dry.set.cy || cam.zoom !== dry.set.zoom);
+  if (moved || !endCam || clock.paused || sim !== dry.sim || board.revision !== dry.rev) { endDryRun(); return; }
+  const v = panel.video, frames = frameCount(v);
+  const f = Math.min(frames - 1, Math.max(0, (sim.tick + clock.alpha - dry.t0) * 60 / v.tps));
+  const box = frameBox(dry.start, endCam, v, f, frames);
+  // The view whose crop box is `box`: the crop is the largest box of the
+  // video's aspect in the view, so its half-width is min(w/2, h/2 * aspect) / zoom.
+  const aspect = v.width / v.height;
+  cam.cx = box.cx; cam.cy = box.cy;
+  cam.zoom = Math.min(cam.w / 2, (cam.h / 2) * aspect) / box.hw;
+  dry.set = { cx: cam.cx, cy: cam.cy, zoom: cam.zoom };
 }
 
 // --- baked audio ------------------------------------------------------------------
@@ -516,6 +560,7 @@ function paint(now) {
     shell.setTick(sim.tick);
     if (inspectRow >= 0) panel.setLive(liveText(inspectRow));
   }
+  driveDryRun();
   // Ship this frame's ticks to the audio thread; paused, let it fall silent.
   if (audio) {
     if (clock.paused) stopBakedPlay();
@@ -1859,6 +1904,7 @@ function rectOf(a, b) {
 
 async function show(name, bytes) {
   try {
+    endDryRun();      // before the new board's framing, which then stands
     board = await Board.fromNpz(T, bytes);
     panel.setBoardName(name.replace(/\.npz$/i, ""));
     loadAudioSettings();
@@ -2086,6 +2132,7 @@ async function init() {
     // With a live bake, back to the bake's own tick-0 state, so playing
     // replays exactly what was baked.
     onReset: () => {
+      endDryRun();
       if (sim) {
         stopBakedPlay();
         if (bakeLive()) sim.restoreFrom(bake.snap); else sim.reset();
@@ -2094,7 +2141,11 @@ async function init() {
       }
       redraw();
     },
-    onPause: (paused) => { clock.paused = paused; redraw(); },
+    onPause: (paused) => {
+      clock.paused = paused;
+      if (paused) endDryRun(); else startDryRun();
+      redraw();
+    },
     onRate: (rate) => { clock.setRate(rate); redraw(); },
     onBuildTap: () => {
       if (vec.picking === "build") closePicker(true);
@@ -2126,7 +2177,7 @@ async function init() {
     onAudioEnable: (on) => setAudio(on),
     onBake: () => openBakeDialog(),
     onVideoRecord: () => recordVideoNow(),
-    onVideoEndCamera: (set) => { endCam = set ? camState() : null; panel.setVideoEndCamera(!!endCam); redraw(); },
+    onVideoEndCamera: (set) => { endDryRun(); endCam = set ? camState() : null; panel.setVideoEndCamera(!!endCam); redraw(); },
     onVideoOpen: (open) => { videoOpen = open; redraw(); },
     onVideo: () => redraw(),
     onAudio: (p) => { if (audio) audio.setParams(p); touchAudio(); },
