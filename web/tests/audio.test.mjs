@@ -293,3 +293,49 @@ test("baking a real save: the live sim is untouched, a bake is repeatable, resto
   for (let i = 0; i < 50; i++) live.step();
   assert.equal(stateLine(live), mid, "and replays the same ticks");
 });
+
+// --- length window, per-length gain, low cut -------------------------------------
+
+test("only runs between the min and max length are candidates", { skip: !existsSync(save) }, async () => {
+  const bytes = readFileSync(save);
+  const board = await Board.fromNpz(T, bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength));
+  const sim = new Sim(T, board);
+  const msgs = [];
+  const rec = new Recorder({ postMessage: (m) => msgs.push(m) }, { ...AUDIO_DEFAULTS, beltMinLen: 4, beltCutoff: 12 });
+  rec.attach(sim);
+  sim.step();
+  const want = sim.order.filter(s => s.length >= 4 && s.length <= 12).map(s => s.length);
+  assert.ok(want.length > 0 && want.length < sim.order.length);
+  assert.deepEqual([...msgs.find(m => m.type === "config").lengths], want);
+  rec.setLengths(1, 64);                     // a change reconfigures on the next tick
+  sim.step();
+  assert.deepEqual([...msgs.filter(m => m.type === "config").pop().lengths],
+                   sim.order.filter(s => s.length <= 64).map(s => s.length));
+});
+
+test("per-length gain scales lengths 1-6 only, live", () => {
+  const level = (L, p, change) => {
+    const s = synth({ beltShape: 0, ...p });
+    s.message({ type: "config", lengths: new Float64Array([L]), groups: [0, 0] });
+    const out = stream(s, 0.5, 1000, [0]);
+    if (!change) return peakOf(out.subarray(SR / 4));
+    s.message({ type: "params", p: { ...AUDIO_DEFAULTS, softClip: false, beltShape: 0, ...change } });
+    return peakOf(stream(s, 0.5, 1000, [0]).subarray(SR / 4));
+  };
+  const full = level(3, {});
+  assert.ok(Math.abs(level(3, { lenGain3: 0.5 }) / full - 0.5) < 0.01, "length 3 at half");
+  assert.ok(Math.abs(level(4, { lenGain3: 0.5 }) / level(4, {}) - 1) < 0.01, "length 4 untouched");
+  assert.ok(Math.abs(level(7, { lenGain1: 0, lenGain6: 0 }) / level(7, {}) - 1) < 0.01, "7 and up at 1");
+  assert.ok(Math.abs(level(3, {}, { lenGain3: 0.25 }) / full - 0.25) < 0.01, "a sounding voice follows the dial");
+});
+
+test("the low cut takes out the rumble and leaves the middle", () => {
+  const level = (L, cut) => {
+    const s = synth({ beltShape: 0, lowCutHz: cut });
+    s.message({ type: "config", lengths: new Float64Array([L]), groups: [0, 0] });
+    return peakOf(stream(s, 0.6, 1000, [0]).subarray(SR / 3));
+  };
+  // 1760 / 40 = 44 Hz against a 200 Hz cut; 1760 / 2 = 880 Hz.
+  assert.ok(level(40, 200) < level(40, 0) * 0.1, `44 Hz: ${level(40, 200)} vs ${level(40, 0)}`);
+  assert.ok(level(2, 200) > level(2, 0) * 0.95, "880 Hz passes");
+});

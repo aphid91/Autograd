@@ -13,7 +13,11 @@ export const AUDIO_DEFAULTS = {
   // Belts: a drone per active run, pitch = maxHz / length (positions).
   beltGain: 1,
   beltMaxHz: 1760,      // a 1-tile run; 10 tiles is an octave above 20
+  beltMinLen: 1,        // runs shorter than this get no voice
   beltCutoff: 64,       // runs longer than this get no voice
+  // Per-length gain for the shortest (highest) runs; 7 and up are at 1.
+  lenGain1: 1, lenGain2: 1, lenGain3: 1, lenGain4: 1, lenGain5: 1, lenGain6: 1,
+  lowCutHz: 0,          // high-pass on the mix, against rumble; 0 = off
   beltShape: 0.3,       // 0 sine, 0.5 triangle, 1 saw
   attackMs: 5,
   releaseMs: 40,
@@ -45,6 +49,7 @@ export const AUDIO_SPEC = [
   ["---", "belts"],
   ["beltGain", "gain", { min: 0, max: 4, step: 0.01 }],
   ["beltMaxHz", "1-tile Hz", { min: 50, max: 8000, step: 10 }],
+  ["beltMinLen", "min length", { min: 1, max: 512, step: 1 }],
   ["beltCutoff", "max length", { min: 1, max: 512, step: 1 }],
   ["beltShape", "sine→tri→saw", { min: 0, max: 1, step: 0.01 }],
   ["attackMs", "attack ms", { min: 0.5, max: 200, step: 0.5 }],
@@ -52,6 +57,14 @@ export const AUDIO_SPEC = [
   ["beltTrack", "follow tick rate", { min: 0, max: 1, step: 0.05 }],
   ["trackRef", "at tick rate", { min: 1, max: 10000, step: 1 }],
   ["voiceLimit", "voice limit", { min: 8, max: VOICE_LIMIT_MAX, step: 8 }],
+  ["---", "tone"],
+  ["lenGain1", "length 1", { min: 0, max: 2, step: 0.01 }],
+  ["lenGain2", "length 2", { min: 0, max: 2, step: 0.01 }],
+  ["lenGain3", "length 3", { min: 0, max: 2, step: 0.01 }],
+  ["lenGain4", "length 4", { min: 0, max: 2, step: 0.01 }],
+  ["lenGain5", "length 5", { min: 0, max: 2, step: 0.01 }],
+  ["lenGain6", "length 6", { min: 0, max: 2, step: 0.01 }],
+  ["lowCutHz", "low cut Hz", { min: 0, max: 1000, step: 5 }],
   ["---", "swap / route / merge"],
   ["g0Gain", "gain", { min: 0, max: 4, step: 0.01 }],
   ["g0Tone", "tone Hz", { min: 50, max: 12000, step: 10 }],

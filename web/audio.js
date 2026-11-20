@@ -17,6 +17,7 @@ import { audioGroupOf } from "./audio-params.js";
 export class Recorder {
   constructor(port, params) {
     this.port = port;
+    this.minLen = params.beltMinLen;
     this.cutoff = params.beltCutoff;
     this.sim = null;
     this.rebuilds = -1;
@@ -38,14 +39,17 @@ export class Recorder {
   }
   detach() { if (this.sim) this.sim.audio = null; this.sim = null; }
 
-  setCutoff(c) { if (c !== this.cutoff) { this.cutoff = c; this.rebuilds = -1; } }
+  // Which run lengths may sound; a change reconfigures on the next tick.
+  setLengths(min, max) {
+    if (min !== this.minLen || max !== this.cutoff) { this.minLen = min; this.cutoff = max; this.rebuilds = -1; }
+  }
 
   // Which runs may sound, and each gate's click group. Flushes first: the
   // ticks so far belong to the old candidates.
   configure(sim) {
     this.flush(this.lastRate || 1);
     this.rebuilds = sim.stats.rebuilds;
-    this.cands = sim.order.filter(seg => seg.length <= this.cutoff);
+    this.cands = sim.order.filter(seg => seg.length >= this.minLen && seg.length <= this.cutoff);
     const n = this.cands.length;
     this.h = new Int32Array(n); this.t = new Int32Array(n); this.pos = new Float64Array(n);
     this.words = (n + 31) >>> 5;
@@ -129,7 +133,7 @@ export async function startAudio(ctx, params, sim, onMeter) {
   rec.attach(sim);
   return {
     ctx, node, rec,
-    setParams(p) { node.port.postMessage({ type: "params", p }); rec.setCutoff(p.beltCutoff); },
+    setParams(p) { node.port.postMessage({ type: "params", p }); rec.setLengths(p.beltMinLen, p.beltCutoff); },
     // A bake's samples, as an AudioBuffer for this context.
     buffer(samples, sampleRate) {
       const b = ctx.createBuffer(1, samples.length, sampleRate);

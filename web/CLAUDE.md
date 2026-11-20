@@ -958,7 +958,8 @@ What sounds:
   green"). Two `positionOf()` calls per candidate per tick. Its drone has
   pitch **1-tile Hz / length** (the sim's length, buried underground tiles
   included), so 10 tiles is an octave above 20 and every run is a
-  subharmonic of the 1-tile pitch. Runs over **max length** get no voice.
+  subharmonic of the 1-tile pitch. Runs outside **min length** to **max
+  length** get no voice (the recorder leaves them out of the candidates).
   Attack and release dials gate it per tick: short, a run moving every
   other tick buzzes at half the tick rate; long, it smooths to a drone.
   **Follow tick rate** scales the pitch by (rate / reference)^track; 0
@@ -1002,6 +1003,14 @@ orphans the old voices, which release out at their old pitch.
 it back; `step()` skips the recorder while `rec` is set, or every drawn tick
 would be heard twice. Pinned by the recorder test, which also asserts the
 recorded run is tick-for-tick identical to an unrecorded one.
+
+**Tone** (a sub-folder): a gain per run length for **lengths 1 to 6** --
+the shortest runs are the highest pitches, and the usual thing to tame --
+with 7 and longer at 1. Per voice, not a filter, so it takes exactly those
+runs and nothing else (a filter would also take the upper harmonics of
+longer runs under a triangle or saw); it follows the dial on voices already
+sounding. **Low cut** is a 2nd-order Butterworth high-pass on the whole mix
+against rumble (0 Hz is off), per sample, so a bake stays bit-identical.
 
 **Start tick and fade** (`startTick`, `fadeMs`): the synth is silent while
 the tick it plays is before the start tick, then fades in. It keeps
@@ -1071,7 +1080,8 @@ threshold and run-dry release; the skip; the voice limit (refusal and
 reuse); stop; the groups; the recorder on `cpu.npz`; the start tick and
 fade; hold on underrun; sample-exact ticks offline; the WAV header; and a
 real bake -- the live sim untouched, two bakes identical, and
-`restoreFrom()` replaying the same ticks. Mutation-tested:
+`restoreFrom()` replaying the same ticks; the length window (and that
+changing it reconfigures); the per-length gains, live; and the low cut. Mutation-tested:
 recording the forecast, never reusing a freed voice, and a wrong pitch law
 each fail it.
 
