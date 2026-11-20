@@ -19,8 +19,9 @@ export const AUDIO_DEFAULTS = {
   lenGain1: 1, lenGain2: 1, lenGain3: 1, lenGain4: 1, lenGain5: 1, lenGain6: 1,
   lowCutHz: 0,          // high-pass on the mix, against rumble; 0 = off
   beltShape: 0.3,       // 0 sine, 0.5 triangle, 1 saw
-  attackMs: 5,
+  attackMs: 5,          // for a 10-tile run; see sluggishness
   releaseMs: 40,
+  sluggish: 0,          // attack and release scale with (length / 10)^this
   beltTrack: 0,         // 0 fixed pitch; 1 pitch proportional to tick rate
   trackRef: 30,         // the tick rate at which tracking changes nothing
   voiceLimit: 256,      // belt voices at once
@@ -54,6 +55,7 @@ export const AUDIO_SPEC = [
   ["beltShape", "sine→tri→saw", { min: 0, max: 1, step: 0.01 }],
   ["attackMs", "attack ms", { min: 0.5, max: 200, step: 0.5 }],
   ["releaseMs", "release ms", { min: 1, max: 1000, step: 1 }],
+  ["sluggish", "sluggishness", { min: -2, max: 2, step: 0.05 }],
   ["beltTrack", "follow tick rate", { min: 0, max: 1, step: 0.05 }],
   ["trackRef", "at tick rate", { min: 1, max: 10000, step: 1 }],
   ["voiceLimit", "voice limit", { min: 8, max: VOICE_LIMIT_MAX, step: 8 }],

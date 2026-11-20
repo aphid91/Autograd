@@ -471,6 +471,50 @@ function bakedTick() {
   return bake.t0 + (ac.currentTime - out - bakedPlay.t0Time) * bake.rate;
 }
 
+// The Bake dialog's Play / Pause: the baked buffer on its own, from where it
+// was paused (from the start once it has played through), with the
+// simulation left alone. On the sound's context if sound is on, else on one
+// made in this tap. Stopped by closing the dialog, a new bake, or Play on
+// the board.
+let preview = null;       // { src, ctx, t0, from } while playing
+let previewAt = 0;        // seconds into the bake to resume from
+let previewCtx = null;    // our own context, when sound is off
+function stopPreview(keepPlace = true) {
+  if (!preview) { if (!keepPlace) previewAt = 0; return; }
+  const p = preview;
+  preview = null;
+  previewAt = keepPlace ? p.from + (p.ctx.currentTime - p.t0) : 0;
+  p.src.onended = null;
+  try { p.src.stop(); } catch { /* ended */ }
+  p.src.disconnect();
+  syncPreviewBtn();
+}
+function syncPreviewBtn() {
+  const b = document.getElementById("bake-play");
+  if (b) { b.textContent = preview ? "Pause" : "Play"; b.disabled = !bake || !!baking; }
+}
+function togglePreview() {
+  if (preview) { stopPreview(); return; }
+  if (!bake) return;
+  let ctx = audio?.ctx;
+  if (!ctx) {
+    const Ctx = window.AudioContext || window.webkitAudioContext;
+    if (!Ctx) return;
+    ctx = previewCtx ||= new Ctx();
+  }
+  ctx.resume();
+  const buf = ctx.createBuffer(1, bake.samples.length, bake.sampleRate);
+  buf.copyToChannel(bake.samples, 0);
+  if (previewAt >= buf.duration - 0.01) previewAt = 0;
+  const src = ctx.createBufferSource();
+  src.buffer = buf;
+  src.connect(ctx.destination);
+  src.start(0, previewAt);
+  src.onended = () => { if (preview?.src === src) { preview = null; previewAt = 0; syncPreviewBtn(); } };
+  preview = { src, ctx, t0: ctx.currentTime, from: previewAt };
+  syncPreviewBtn();
+}
+
 function openBakeDialog() {
   const m = document.getElementById("bakemenu");
   const secs = m.querySelector("#bake-seconds"), rate = m.querySelector("#bake-rate");
@@ -482,8 +526,10 @@ function openBakeDialog() {
     status.textContent = text ?? (`Starts with a Reset. Audio from tick ${panel.audio.startTick}` +
       (panel.audio.fadeMs ? `, fading in over ${panel.audio.fadeMs} ms` : "") + ".\n" + bakeStatus());
     go.disabled = !!baking; cancel.disabled = !baking; wav.disabled = !bake || !!baking;
+    syncPreviewBtn();
   };
-  const close = () => { m.dataset.open = "false"; };
+  const close = () => { stopPreview(); m.dataset.open = "false"; };
+  m.querySelector("#bake-play").onclick = () => togglePreview();
   m.querySelector("#bake-close").onclick = close;
   let down = false;
   m.onpointerdown = (e) => { down = e.target === m; };
@@ -508,6 +554,7 @@ async function runBake(seconds, rate, show) {
   shell.setPaused(true);
   clock.paused = true;
   stopBakedPlay();
+  stopPreview(false);
   bake = null;
   sim.reset();
   clock.reset();
@@ -2192,7 +2239,7 @@ async function init() {
     },
     onPause: (paused) => {
       clock.paused = paused;
-      if (paused) endDryRun(); else startDryRun();
+      if (paused) endDryRun(); else { startDryRun(); stopPreview(); }
       redraw();
     },
     onRate: (rate) => { clock.setRate(rate); redraw(); },

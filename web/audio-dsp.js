@@ -62,6 +62,8 @@ export class GatesSynth {
     this.vPhase = new Float64Array(V);
     this.vInc = new Float64Array(V);
     this.vGain = new Float64Array(V);    // the per-length gain
+    this.vAtk = new Float64Array(V);     // per-voice envelope coefficients:
+    this.vRel = new Float64Array(V);     // sluggishness makes them depend on length
     this.nv = 0;
     // The tick queue.
     this.queue = [];
@@ -97,8 +99,6 @@ export class GatesSynth {
   applyParams() {
     const p = this.p, sr = this.sr;
     if (p.beltShape !== this.shape) this.buildTable(p.beltShape);
-    this.atk = 1 - Math.exp(-1 / Math.max(1, sr * p.attackMs / 1000));
-    this.rel = 1 - Math.exp(-1 / Math.max(1, sr * p.releaseMs / 1000));
     for (let g = 0; g < 2; g++) {
       const tone = Math.min(p[`g${g}Tone`], sr * 0.45), decay = p[`g${g}DecayMs`];
       const r = Math.exp(-1 / Math.max(1, sr * decay / 1000)), w = 2 * Math.PI * tone / sr;
@@ -106,7 +106,7 @@ export class GatesSynth {
       this.rx[g] = Math.sin(w);          // impulse scale: the response peaks near 1
     }
     this.trackRate = -1;                 // re-pitch every voice on the next tick
-    for (let v = 0; v < this.nv; v++) if (this.vSeg[v] >= 0) this.vGain[v] = this.lenGain(this.vSeg[v]);
+    for (let v = 0; v < this.nv; v++) if (this.vSeg[v] >= 0) { this.vGain[v] = this.lenGain(this.vSeg[v]); this.envFor(v, this.vSeg[v]); }
     // Low cut: an RBJ high-pass, Q = 1/sqrt(2) (Butterworth), on the mix.
     const fc = Math.min(p.lowCutHz, sr * 0.45);
     this.hpOn = fc > 0;
@@ -115,6 +115,16 @@ export class GatesSynth {
       this.hb0 = (1 + cw) / 2 / a0; this.hb1 = -(1 + cw) / a0; this.hb2 = this.hb0;
       this.ha1 = -2 * cw / a0; this.ha2 = (1 - alpha) / a0;
     } else { this.hx1 = this.hx2 = this.hy1 = this.hy2 = 0; }
+  }
+
+  // A voice's attack and release: the dials' times are a 10-tile run's, and
+  // sluggishness s scales them by (length / 10)^s -- 0 the same for all, 1 a
+  // 20-tile run twice as slow, -1 twice as quick.
+  envFor(v, i) {
+    const p = this.p, k = p.sluggish ? Math.pow(this.lens[i] / 10, p.sluggish) : 1;
+    const coef = (ms) => 1 - Math.exp(-1 / Math.max(1, this.sr * ms * k / 1000));
+    this.vAtk[v] = coef(p.attackMs);
+    this.vRel[v] = coef(p.releaseMs);
   }
 
   // A run's own gain: the tone dials for lengths 1-6, 1 for anything longer.
@@ -212,6 +222,7 @@ export class GatesSynth {
     this.vSeg[v] = i; this.vOn[v] = 1; this.vEnv[v] = 0; this.vPhase[v] = 0;
     this.vInc[v] = this.pitch(i) / this.sr;
     this.vGain[v] = this.lenGain(i);
+    this.envFor(v, i);
     this.voiceOf[i] = v;
   }
 
@@ -226,6 +237,7 @@ export class GatesSynth {
     if (v !== last) {
       this.vSeg[v] = this.vSeg[last]; this.vOn[v] = this.vOn[last]; this.vEnv[v] = this.vEnv[last];
       this.vPhase[v] = this.vPhase[last]; this.vInc[v] = this.vInc[last]; this.vGain[v] = this.vGain[last];
+      this.vAtk[v] = this.vAtk[last]; this.vRel[v] = this.vRel[last];
       if (this.vSeg[v] >= 0) this.voiceOf[this.vSeg[v]] = v;
     }
     // A run refused a voice earlier takes the one just freed.
@@ -384,10 +396,9 @@ export class GatesSynth {
       this.ry1[g] = y1; this.ry2[g] = y2;
     }
     const T = this.table, amp = this.p.beltGain / Math.pow(Math.max(1, this.n), this.p.norm);
-    const atk = this.atk, rel = this.rel;
     for (let v = 0; v < this.nv; v++) {
       let env = this.vEnv[v], ph = this.vPhase[v];
-      const inc = this.vInc[v], tgt = this.vOn[v], coef = tgt ? atk : rel, g = amp * this.vGain[v];
+      const inc = this.vInc[v], tgt = this.vOn[v], coef = tgt ? this.vAtk[v] : this.vRel[v], g = amp * this.vGain[v];
       for (let s = at; s < end; s++) {
         env += (tgt - env) * coef;
         const fi = ph * TABLE, j = fi | 0;

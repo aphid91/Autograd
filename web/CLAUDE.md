@@ -1013,6 +1013,10 @@ What sounds:
   length** get no voice (the recorder leaves them out of the candidates).
   Attack and release dials gate it per tick: short, a run moving every
   other tick buzzes at half the tick rate; long, it smooths to a drone.
+  The dials are a **10-tile run's** times: **sluggishness** s (-2..2, 0 by
+  default) scales them by (length / 10)^s, so at 1 a 20-tile run is twice
+  as slow and a 5-tile one twice as quick. Per voice (`envFor()`), set on
+  allocation and on any dial change, so a sounding voice follows it.
   **Follow tick rate** scales the pitch by (rate / reference)^track; 0
   (the default) keeps it fixed.
 - **A gate fire is a click**: an impulse into a two-pole resonator (tone,
@@ -1104,7 +1108,11 @@ busy moments; baking is the thorough one.
 
 **Bake audio…** (Audio folder) opens a sheet: seconds (default 30, at most
 300) and ticks per second (default the current rate), **Bake**, **Cancel
-bake** and **Download WAV** (16-bit mono). [audio-bake.js](audio-bake.js)
+bake**, **Play / Pause** and **Download WAV** (16-bit mono). Play / Pause
+plays the baked buffer on its own -- the simulation untouched -- from where
+it was paused, from the start once it has played through; on the sound's
+context, or one made in the tap when sound is off. Closing the dialog, a
+new bake or Play on the board stops it. [audio-bake.js](audio-bake.js)
 renders the stretch ahead of time with no frame budget and no deadline:
 the same recorder and the same synth, the synth **offline** (no latency, no
 speed control, no skipping), fed every tick before it renders their

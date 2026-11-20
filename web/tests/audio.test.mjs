@@ -434,3 +434,24 @@ test("a sound selection: only runs and gates touching its cells are heard, and t
   assert.ok(msgs.filter(m => m.type === "config").pop().lengths.length > want.length);
   assert.equal(rec.selInfo, null);
 });
+
+test("sluggishness: attack and release scale with (length / 10)^s, exact for a 10-tile run", () => {
+  const coef = (ms) => 1 - Math.exp(-1 / (SR * ms / 1000));
+  for (const s of [0, 1, -1, 2]) {
+    const syn = synth({ attackMs: 20, releaseMs: 80, sluggish: s });
+    syn.message({ type: "config", lengths: new Float64Array([10, 20, 5]), groups: [0, 0] });
+    stream(syn, 0.2, 1000, [0, 1, 2]);
+    const v = (i) => syn.voiceOf[i];
+    for (const [i, L] of [[0, 10], [1, 20], [2, 5]]) {
+      const k = Math.pow(L / 10, s);
+      assert.ok(Math.abs(syn.vAtk[v(i)] - coef(20 * k)) < 1e-12, `s ${s} L ${L} attack`);
+      assert.ok(Math.abs(syn.vRel[v(i)] - coef(80 * k)) < 1e-12, `s ${s} L ${L} release`);
+    }
+  }
+  // And a sounding voice follows the dial.
+  const syn = synth({ attackMs: 20, sluggish: 0 });
+  syn.message({ type: "config", lengths: new Float64Array([20]), groups: [0, 0] });
+  stream(syn, 0.2, 1000, [0]);
+  syn.message({ type: "params", p: { ...AUDIO_DEFAULTS, softClip: false, attackMs: 20, sluggish: 1 } });
+  assert.ok(Math.abs(syn.vAtk[syn.voiceOf[0]] - coef(40)) < 1e-12);
+});
