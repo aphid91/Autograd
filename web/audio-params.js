@@ -93,3 +93,48 @@ export function bakeKey(p) {
 // The Bake dialog's limits and defaults.
 export const BAKE_DEFAULT_SECONDS = 30;
 export const BAKE_MAX_SECONDS = 300;
+
+// --- audio settings in a save -----------------------------------------------
+//
+// A save carries the dials and the bake dialog's seconds and rate as JSON
+// under its own `audio` key, beside the annotations (the desktop ignores a
+// key it does not know). The "sound" switch is never saved.
+
+// Only known dials, of the right type, clamped to the panel's range: the
+// file may be hand-edited, older or newer. An unknown or bad entry costs
+// that dial, never the rest.
+export function cleanDials(d) {
+  const out = {};
+  if (!d || typeof d !== "object") return out;
+  const spec = Object.fromEntries(AUDIO_SPEC.filter(e => e[0] !== "---").map(e => [e[0], e[2]]));
+  for (const [k, v] of Object.entries(d)) {
+    if (!(k in AUDIO_DEFAULTS) || typeof v !== typeof AUDIO_DEFAULTS[k]) continue;
+    if (typeof v === "number") {
+      if (!Number.isFinite(v)) continue;
+      const o = spec[k];
+      out[k] = o ? Math.min(o.max, Math.max(o.min, v)) : v;
+    } else out[k] = v;
+  }
+  return out;
+}
+
+// The record a save holds: { dials, bake: { seconds, rate } }.
+export function audioRecord(dials, bake) {
+  return { dials: { ...dials }, bake: bake ? { seconds: bake.seconds, rate: bake.rate } : null };
+}
+
+// A save's `audio` blob back into a record, or null when it has none (or
+// it is unreadable: a corrupt blob costs the sound settings, never the board).
+export function parseAudio(blob) {
+  if (typeof blob !== "string" || !blob.trim()) return null;
+  try {
+    const v = JSON.parse(blob);
+    if (!v || typeof v !== "object") return null;
+    const b = v.bake;
+    const bake = b && Number.isFinite(b.seconds) && Number.isFinite(b.rate) && b.seconds > 0 && b.rate > 0
+      ? { seconds: Math.min(b.seconds, BAKE_MAX_SECONDS), rate: b.rate } : null;
+    return { dials: cleanDials(v.dials), bake };
+  } catch {
+    return null;
+  }
+}

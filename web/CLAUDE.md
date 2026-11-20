@@ -928,8 +928,9 @@ panel touches the DOM only when the text changes.
 
 The panel's **Audio** folder makes sound from the ticks: a drone per moving
 belt run and a click per gate fire. **Off by default and off at every
-launch** (a browser only starts audio from a tap); the dials persist with
-the panel's preferences, the switch does not.
+launch** (a browser only starts audio from a tap). The dials travel **with
+the save** (below) and are also kept in the panel's preferences as the
+last ones in front of the player; the switch is never kept.
 
 **Off costs nothing.** `audio.js` and the worklet are imported only when
 the switch is ticked, and the tick's only trace is `Sim.audio`, null: one
@@ -1066,6 +1067,33 @@ ticks, so 10000 tps is far slower to bake than 240.
   (a refused run given the freed slot mid-loop was rendered over the whole
   span, starting before its time); and a dead click is flushed to zero per
   sample rather than at span ends. Found by baking twice and comparing.
+
+### Audio settings in the save
+
+Every save carries the dials and the Bake dialog's seconds and rate under
+its own `audio` key: a JSON string in a 0-d array, the same shape as
+`annotations` (`audioRecord()` / `parseAudio()` in audio-params.js). The
+desktop ignores a key it does not know, so it still loads these files; it
+does not write the key back, and is deliberately left that way.
+
+- **Loading a save with settings applies them** over the dials and shows
+  "audio settings loaded from this save" in the meter for a few seconds.
+  **A save without them** (the bundled ones, anything older) leaves the dials
+  as they are. Either way `board.audio` then becomes the dials in front of
+  the player, so the next save writes them.
+- **A dial change is a change for the autosaves**, like a label edit
+  (`board.audioRev` is part of the save key, and it sets `edited`), but it
+  does not restart the simulation and is not an undo step: a slider drag
+  is dozens of changes. Reset audio dials is one more such change.
+- **Applying a save's dials is not a change.** Tweakpane's `refresh()` fires
+  `change` (it re-snaps the value to the step), so `Panel.applyAudio()`
+  holds `applyingAudio` while it refreshes and the panel does not report
+  it; without that, merely loading a save counted as an edit and woke the
+  autosaves.
+- **Cleaned on read** (`cleanDials()`): only known dials of the right type,
+  clamped to the panel's ranges; a bad entry costs that dial, a corrupt
+  blob costs the settings, never the board.
+- The baked audio itself is not saved: memory only, and tens of MB.
 
 Two practical notes: the `AudioContext` is created and resumed **inside the
 tap** (main.js `setAudio()`), before the dynamic import, since iOS will not
@@ -1223,7 +1251,7 @@ node --test web/tests/*.test.mjs
 
 Pure-JS tests (the planner, the placer, the stamp transforms, the run
 tracer, the closed form against the naive oracle, the opcodes, the clock,
-the `.npz` writer) run in Node, with no npm and no browser. The whole tick against the
+the `.npz` writer, audio settings in a save) run in Node, with no npm and no browser. The whole tick against the
 desktop's is a separate, slower check (about 25 s for every save):
 
 ```bash

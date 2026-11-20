@@ -10,7 +10,7 @@ import { dirname, join } from "node:path";
 import { GatesSynth } from "../audio-dsp.js";
 import { Recorder } from "../audio.js";
 import { bakeAudio, wavBytes } from "../audio-bake.js";
-import { AUDIO_DEFAULTS, audioGroupOf } from "../audio-params.js";
+import { AUDIO_DEFAULTS, audioGroupOf, audioRecord, parseAudio, BAKE_MAX_SECONDS } from "../audio-params.js";
 import { Board } from "../board.js";
 import { Sim } from "../sim.js";
 import { stateLine } from "./sim_state.mjs";
@@ -338,4 +338,32 @@ test("the low cut takes out the rumble and leaves the middle", () => {
   // 1760 / 40 = 44 Hz against a 200 Hz cut; 1760 / 2 = 880 Hz.
   assert.ok(level(40, 200) < level(40, 0) * 0.1, `44 Hz: ${level(40, 200)} vs ${level(40, 0)}`);
   assert.ok(level(2, 200) > level(2, 0) * 0.95, "880 Hz passes");
+});
+
+// --- audio settings in a save ------------------------------------------------------
+
+test("a save carries its audio settings through write and read; older saves have none", { skip: !existsSync(save) }, async () => {
+  const bytes = readFileSync(save);
+  const board = await Board.fromNpz(T, bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength));
+  assert.equal(board.audio, null, "a save from before has no audio settings");
+  const dials = { ...AUDIO_DEFAULTS, beltMaxHz: 990, lenGain2: 0.25, softClip: false, startTick: 120 };
+  board.audio = audioRecord(dials, { seconds: 12, rate: 480 });
+  const out = new Uint8Array(await board.toNpz());
+  const back = await Board.fromNpz(T, out.buffer);
+  assert.deepEqual(back.audio, { dials, bake: { seconds: 12, rate: 480 } });
+  // Through the autosave's path too (a snapshot).
+  const snapOut = new Uint8Array(await board.toNpz(board.snapshot()));
+  assert.deepEqual((await Board.fromNpz(T, snapOut.buffer)).audio.dials, dials);
+});
+
+test("a save's audio record is cleaned: unknown, mistyped and out-of-range dials go, the rest stay", () => {
+  const rec = parseAudio(JSON.stringify({
+    dials: { master: 0.8, beltCutoff: 99999, fadeMs: -5, softClip: "yes", nonsense: 3, beltShape: NaN, lenGain1: 0.3 },
+    bake: { seconds: 9999, rate: 30 },
+  }));
+  assert.deepEqual(rec.dials, { master: 0.8, beltCutoff: 512, fadeMs: 0, lenGain1: 0.3 });
+  assert.deepEqual(rec.bake, { seconds: BAKE_MAX_SECONDS, rate: 30 });
+  assert.equal(parseAudio("{not json"), null, "a corrupt blob costs the settings, not the board");
+  assert.equal(parseAudio(""), null);
+  assert.equal(parseAudio(JSON.stringify({ dials: {}, bake: { seconds: -1, rate: 5 } })).bake, null);
 });

@@ -116,9 +116,11 @@ export class Panel {
     const pushAudio = () => {
       this.prefs.audio = { ...this.audio };
       savePrefs(this.prefs);
-      cb.onAudio({ ...this.audio });
+      // A refresh from applyAudio() fires change too (Tweakpane re-snaps
+      // to the step): a load, not the player, so not reported.
+      if (!this.applyingAudio) cb.onAudio({ ...this.audio });
     };
-    const audioBindings = [];
+    const audioBindings = this.audioBindings = [];
     let agroup = audio;
     for (const [key, label, opts] of AUDIO_SPEC) {
       if (key === "---") { agroup = audio.addFolder({ title: label, expanded: false }); continue; }
@@ -159,6 +161,17 @@ export class Panel {
 
     const dbg = this.pane.addFolder({ title: "Debug", expanded: false });
     dbg.addButton({ title: "Clear stamps" }).on("click", () => cb.onClearStamps());
+  }
+
+  // A save's dials (already cleaned: audio-params.js cleanDials) over the
+  // ones in front of the player. Loading is not a change the player made, so
+  // this does not call onAudio; main.js passes them on to the synth itself.
+  applyAudio(dials) {
+    Object.assign(this.audio, dials);
+    this.applyingAudio = true;
+    try { for (const b of this.audioBindings) b.refresh(); } finally { this.applyingAudio = false; }
+    this.prefs.audio = { ...this.audio };
+    savePrefs(this.prefs);
   }
 
   // The audio switch, when main.js could not honour it.

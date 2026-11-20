@@ -7,6 +7,7 @@
 
 import { readNpz, writeNpz } from "./npz.js";
 import { parseNotes } from "./notes.js";
+import { parseAudio } from "./audio-params.js";
 
 export const FORMAT_VERSION = 1;
 
@@ -32,6 +33,11 @@ export class Board {
     // restart the simulation, but it is an undo step.
     this.notes = parseNotes(arrays.annotations?.data);
     this.notesRev = 0;
+    // The save's audio settings (audio-params.js), or null if it has none.
+    // main.js keeps this the dials in front of the player, so every save
+    // writes them; not part of a snapshot, so undo never touches them.
+    this.audio = parseAudio(arrays.audio?.data);
+    this.audioRev = 0;
     this.derive();
   }
 
@@ -79,6 +85,7 @@ export class Board {
       next_row: { descr: "<i4", shape: [1], data: new Int32Array([src.nextRow]) },
       free_rows: { descr: "<i4", shape: [src.freeRows.length], data: new Int32Array(src.freeRows) },
       live_count: { descr: "<i4", shape: [1], data: new Int32Array([src.liveCount]) },
+      ...(this.audio ? { audio: { descr: "<U", shape: [], data: JSON.stringify(this.audio) } } : {}),
     });
   }
 

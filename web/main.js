@@ -26,7 +26,7 @@ import { entrySize } from "./stamp.js";
 import { noteAt, gripAt, isText, newRect, MIN_W, MIN_H } from "./notes.js";
 import { Claims, followChain, offsets, layCopies, isZero, rotateVec, flipVec, moreCount, lessCount } from "./vector.js";
 import { deleteSave, getSave, listSaves, putSave } from "./saves.js";
-import { bakeKey, BAKE_DEFAULT_SECONDS, BAKE_MAX_SECONDS } from "./audio-params.js";
+import { bakeKey, audioRecord, BAKE_DEFAULT_SECONDS, BAKE_MAX_SECONDS } from "./audio-params.js";
 
 const DEFAULT_SAVE = "default.npz";
 
@@ -176,7 +176,39 @@ function meterText(m) {
     `runs active ${m.active} of ${m.candidates}\n` +
     `peak ${m.peak.toFixed(2)} (${db} dB)` + (m.clipped ? `  clipped ${m.clipped}` : "") + "\n" +
     `lag ${Math.round(m.lagMs)} ms · speed ${m.speed.toFixed(2)}` +
-    (bakedPlay ? "  (baked)" : "") + "\n" + bakeStatus();
+    (bakedPlay ? "  (baked)" : "") + "\n" + bakeStatus() +
+    (audioNote && performance.now() < audioNote.until ? `\n${audioNote.text}` : "");
+}
+
+// --- audio settings in the save ------------------------------------------------
+//
+// Every save carries the dials and the bake dialog's seconds and rate
+// (board.audio; audio-params.js has the format). Loading a save that has
+// them applies them; one without leaves the dials as they are. Either way
+// board.audio is then the dials in front of the player, so the next save
+// writes them. A dial change is a change for the autosaves, like a label
+// edit, but it does not restart the simulation and is not an undo step.
+let bakeOpts = null;        // { seconds, rate } last used in the Bake dialog
+let audioNote = null;       // { text, until }: a line for the meter
+function loadAudioSettings() {
+  const saved = board.audio;
+  if (saved) {
+    panel.applyAudio(saved.dials);
+    if (saved.bake) bakeOpts = saved.bake;
+    if (audio) audio.setParams({ ...panel.audio });
+    audioNote = { text: "audio settings loaded from this save", until: performance.now() + 6000 };
+    if (!audio) panel.setAudioMeter(`off\n${audioNote.text}`);
+  } else if (!audio) panel.setAudioMeter("off");
+  board.audio = audioRecord(panel.audio, bakeOpts);
+}
+// The dials (or the bake options) moved: the board's record follows, and
+// the autosaves will write it.
+function touchAudio() {
+  if (!board) return;
+  board.audio = audioRecord(panel.audio, bakeOpts);
+  board.audioRev++;
+  edited = true;
+  prepareSave();
 }
 
 // --- baked audio ------------------------------------------------------------------
@@ -243,8 +275,8 @@ function openBakeDialog() {
   const secs = m.querySelector("#bake-seconds"), rate = m.querySelector("#bake-rate");
   const status = m.querySelector("#bake-status"), go = m.querySelector("#bake-go");
   const cancel = m.querySelector("#bake-cancel"), wav = m.querySelector("#bake-wav");
-  if (!secs.value) secs.value = String(BAKE_DEFAULT_SECONDS);
-  rate.value = String(clock.rate);
+  secs.value = String(bakeOpts?.seconds ?? (Number(secs.value) || BAKE_DEFAULT_SECONDS));
+  rate.value = String(bakeOpts?.rate ?? clock.rate);
   const show = (text) => {
     status.textContent = text ?? (`Starts with a Reset. Audio from tick ${panel.audio.startTick}` +
       (panel.audio.fadeMs ? `, fading in over ${panel.audio.fadeMs} ms` : "") + ".\n" + bakeStatus());
@@ -261,6 +293,7 @@ function openBakeDialog() {
     const sv = Number(secs.value), rv = Number(rate.value);
     if (!(sv > 0 && sv <= BAKE_MAX_SECONDS)) { show(`Duration must be between 0 and ${BAKE_MAX_SECONDS} s.`); return; }
     if (!(rv >= RATE_MIN && rv <= RATE_MAX)) { show(`Tick rate must be ${RATE_MIN} to ${RATE_MAX}.`); return; }
+    if (bakeOpts?.seconds !== sv || bakeOpts?.rate !== rv) { bakeOpts = { seconds: sv, rate: rv }; touchAudio(); }
     // Playing it back needs sound on; this tap is the gesture that may start it.
     if (!audio && !audioStarting) { panel.setAudioOn(true); setAudio(true); }
     runBake(sv, rv, show);
@@ -1710,6 +1743,7 @@ async function show(name, bytes) {
   try {
     board = await Board.fromNpz(T, bytes);
     panel.setBoardName(name.replace(/\.npz$/i, ""));
+    loadAudioSettings();
     sim = new Sim(T, board);
     stopBakedPlay();
     if (audio) audio.rec.attach(sim);
@@ -1772,7 +1806,7 @@ let boardName = "";
 let loadGen = 0;          // which load the prepared bytes belong to
 let ready = null;         // { key, bytes }: the current state, compressed
 let preparing = false;
-const saveKey = () => `${loadGen}:${committed}`;
+const saveKey = () => `${loadGen}:${committed}:${board?.audioRev ?? 0}`;
 
 async function prepareSave() {
   if (!board || preparing) return;
@@ -1972,7 +2006,7 @@ async function init() {
     onColours: (c) => { statusColours = c; redraw(); },
     onAudioEnable: (on) => setAudio(on),
     onBake: () => openBakeDialog(),
-    onAudio: (p) => { if (audio) audio.setParams(p); },
+    onAudio: (p) => { if (audio) audio.setParams(p); touchAudio(); },
     onTune: (t) => { setTune(t); redraw(); },
     onClearStamps: () => shell.clearStamps(),
     onCloseStatus: () => inspect(-1),
