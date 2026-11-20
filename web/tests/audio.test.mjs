@@ -497,3 +497,15 @@ test("a slow tick rate keeps sounding: no crash, no dropouts, and back to fast a
   const back = stream(s, 1, 1000, [0, 1], 0, 1);
   assert.ok(quietest(back.subarray(SR / 4)) > 0.05, "fast again");
 });
+
+test("at 1 tps every tick is played, one a second", () => {
+  // A flat 1 s cap on the queue held less than the 1.5 ticks playback waits
+  // for, so it dropped ticks: the drone moved every other tick, or not at all.
+  for (const rate of [0.5, 1, 2]) {
+    const s = synth();
+    s.message({ type: "config", lengths: new Float64Array([4]), groups: [0] });
+    stream(s, 14 / rate, rate, [0], 0, 0);
+    const behind = 14 - s.ticksPlayed;
+    assert.ok(behind >= 1 && behind <= 3, `${rate} tps: ${s.ticksPlayed} of 14 ticks played`);
+  }
+});

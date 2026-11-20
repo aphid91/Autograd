@@ -172,8 +172,13 @@ export class GatesSynth {
     this.queue.push(b);
     this.queued += b.n;
     if (this.offline) return;
-    // Never build more than MAX_QUEUE_S of lag: drop the oldest ticks.
-    while (this.queue.length > 1 && this.queued / Math.max(b.rate, 1e-3) > MAX_QUEUE_S) {
+    // Never build more than MAX_QUEUE_S of lag: drop the oldest ticks --
+    // but always keep room for a few ticks. At 1 tps one tick is a second,
+    // and a flat 1 s cap held less than the 1.5 ticks playback waits for,
+    // so every other tick was dropped and the drone moved at half speed.
+    const rate = Math.max(b.rate, 1e-3);
+    const cap = Math.max(MAX_QUEUE_S, (SKIP_AT + 1) * 1.5 / rate);
+    while (this.queue.length > 1 && this.queued / rate > cap) {
       const old = this.queue.shift();
       this.queued -= old.n - this.qi;
       this.qi = 0;

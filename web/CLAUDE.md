@@ -1136,6 +1136,14 @@ throw, stops the synth (it restarts on the next ticks) and posts
 `{type: "error"}`, which main.js logs. Pinned by a test streaming 1000 →
 5 → 10 → 2 → 1000 tps that asserts no 100 ms window goes silent.
 
+**The queue's lag cap scales with the tick.** It drops the oldest ticks
+past 1 s queued, which at 1 tps is one tick -- less than the 1.5 ticks
+playback waits for, so ticks were dropped and the drone moved every other
+tick (or, fed perfectly evenly, never started). The cap is now at least
+`(SKIP_AT + 1) * 1.5` ticks; at 1 tps the audio runs about 1.5 s behind
+the picture, the price of never running dry between ticks. Pinned by a
+test that every tick plays at 0.5, 1 and 2 tps.
+
 **Hold on underrun** (off by default): when the queue runs dry, the voices
 hold where they are instead of releasing, and playback picks up the moment
 ticks arrive, with no refill wait. A hold gives up after `HOLD_MAX_S`
