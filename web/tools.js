@@ -52,7 +52,7 @@ export function isKnown(T, slot) {
 }
 
 function typeOf(T, name) {
-  return Object.values(T.types).find(t => t.name === name);
+  return typeByName(T, name)?.td;
 }
 
 // The number a placement carries. A Source always emits something and

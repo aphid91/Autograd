@@ -67,10 +67,21 @@ export class Panel {
       board.addButton({ title: "Delete saved" }).on("click", () => this.local.saved && cb.onDeleteLocal(this.local.saved)),
     ];
 
-    this.view = { grid: true, ports: true, labels: true, seedTint: true, notes: true, momentum: true, items: true, belts: true, gates: true, gateStatus: false, sources: true, beltStatus: false, beltActive: true, fps: false, ...this.prefs.view };
+    this.view = { grid: true, ports: true, labels: true, seedTint: true, notes: true, momentum: true, items: true, belts: true, gates: true, gateStatus: false, sources: true, beltStatus: false, beltActive: true, fps: false, pixelAlpha: 0, pixelMax: 8, ...this.prefs.view };
     const view = this.pane.addFolder({ title: "View", expanded: false });
     for (const [key, label] of [["grid", "grid lines"], ["ports", "ports"], ["labels", "source values"], ["seedTint", "seed tint"], ["notes", "labels (notes)"], ["momentum", "pan momentum"], ["items", "items"], ["belts", "belts"], ["gates", "gates"], ["gateStatus", "gate status colours"], ["beltStatus", "belt status colours"], ["beltActive", "stalled but moving: green"], ["sources", "sources"], ["fps", "fps counter"]]) {
       view.addBinding(this.view, key, { label }).on("change", () => {
+        this.prefs.view = { ...this.view };
+        savePrefs(this.prefs);
+        cb.onView({ ...this.view });
+      });
+    }
+    // The pixel overlay (pixel.js): how opaque the Pixels' screen is (0 is
+    // off, and a Pixel's fire then records nothing), and the largest square
+    // a Pixel's Z may ask for, in cells each side of its centre.
+    for (const [key, label, opts] of [["pixelAlpha", "pixel overlay", { min: 0, max: 1, step: 0.01 }],
+                                      ["pixelMax", "pixel max size", { min: 1, max: 64, step: 1 }]]) {
+      view.addBinding(this.view, key, { label, ...opts }).on("change", () => {
         this.prefs.view = { ...this.view };
         savePrefs(this.prefs);
         cb.onView({ ...this.view });

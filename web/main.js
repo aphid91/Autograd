@@ -22,7 +22,8 @@ import { TUNE, setTune } from "./tune.js";
 import { Sim, Clock, RATE_MIN, RATE_MAX } from "./sim.js";
 import { History } from "./history.js";
 import { DEFAULT, naturalOrder, tableValues, finalValues } from "./indexer.js";
-import { entrySize } from "./stamp.js";
+import { entrySize, typeByName } from "./stamp.js";
+import { installPixel, Screen } from "./pixel.js";
 import { noteAt, gripAt, isText, newRect, MIN_W, MIN_H } from "./notes.js";
 import { Claims, followChain, offsets, layCopies, isZero, rotateVec, flipVec, moreCount, lessCount } from "./vector.js";
 import { deleteSave, getSave, listSaves, putSave } from "./saves.js";
@@ -130,6 +131,20 @@ const debug = window.gates = {
   placement: () => currentPlacement(),
   plan: () => currentPlan(),
 };
+
+// --- the pixel overlay --------------------------------------------------------
+//
+// View > pixel overlay above 0 hands the sim the Screen, and each Pixel's
+// fire records its colour on it (pixel.js); at 0 the sim has none and a
+// fire records nothing. Switching on starts blank, as does every edit and
+// Reset (the sim clears it on a rebuild).
+const screen = new Screen();
+function syncScreen() {
+  if (!sim) return;
+  const on = view.pixelAlpha > 0;
+  if (on && sim.screen !== screen) { screen.clear(); sim.screen = screen; }
+  else if (!on && sim.screen) { sim.screen = null; screen.clear(); }
+}
 
 // --- audio -------------------------------------------------------------------
 //
@@ -430,6 +445,7 @@ function paint(now) {
   render(ctx, board, cam, dpr, { ...view, selected: info, ghosts, sim, alpha: clock.alpha, hide, vector: vectorMarks(),
                                 indexLabels: indexLabels(), noteSel: noteEdit, noteGrips: labelHeld(),
                                 ghostNotes: ghostNotes(),
+                                pixels: sim?.screen ? { screen, alpha: view.pixelAlpha, max: view.pixelMax } : null,
                                 gateTint: view.gateStatus ? gateStatus() : null,
                                 beltTint: view.beltStatus ? beltStatus() : null });
   debug.renderMs = performance.now() - t0;
@@ -1185,7 +1201,7 @@ function placer() {
 }
 
 function typeIdOf(name) {
-  return Number(Object.keys(T.types).find(k => T.types[k].name === name));
+  return typeByName(T, name)?.id ?? NaN;
 }
 
 // The tool at the ghost's position: what would be built, and where it is
@@ -1745,6 +1761,7 @@ async function show(name, bytes) {
     panel.setBoardName(name.replace(/\.npz$/i, ""));
     loadAudioSettings();
     sim = new Sim(T, board);
+    syncScreen();
     stopBakedPlay();
     if (audio) audio.rec.attach(sim);
     clock.reset();
@@ -1919,7 +1936,7 @@ async function loadBundled(name) {
 }
 
 async function init() {
-  T = await (await fetch("types.json")).json();
+  T = installPixel(await (await fetch("types.json")).json());
 
   let lastMode = null;
   shell = new Shell(T, {
@@ -2002,7 +2019,7 @@ async function init() {
     onLoadSave: (name) => loadBundled(name).catch(e => alert(e.message)),
     onOpenFile: () => fileInput.click(),
     onFit: () => { if (board) cam.frame(board.bounds); redraw(); },
-    onView: (v) => { view = v; redraw(); },
+    onView: (v) => { view = v; syncScreen(); redraw(); },
     onColours: (c) => { statusColours = c; redraw(); },
     onAudioEnable: (on) => setAudio(on),
     onBake: () => openBakeDialog(),
@@ -2019,6 +2036,7 @@ async function init() {
   });
   panel.setLocalSaves(listSaves());
   view = { ...panel.view };
+  syncScreen();
   statusColours = { ...panel.colours };
   setTune(panel.dev);
 

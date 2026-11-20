@@ -26,7 +26,8 @@ export function typeByName(T, name) {
     for (const [id, td] of Object.entries(T.types)) m.set(td.name, { id: Number(id), td });
     byNameCache.set(T, m);
   }
-  return m.get(name) || null;
+  // An alias (pixel.js: "sink" is now "pixel") for names saved before.
+  return m.get(name) || m.get(T.aliases?.[name]) || null;
 }
 
 // The footprint an entry covers at its orientation: { w, h }.

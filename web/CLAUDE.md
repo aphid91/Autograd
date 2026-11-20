@@ -494,6 +494,48 @@ the footprint about its middle.
 Underground ends draw **narrowing toward the buried side** (the front of an
 entrance, the back of an exit), on the board and on the swatch.
 
+### Pixels
+
+**Pixel** ([pixel.js](pixel.js)) is a **web-only machine** that replaces
+Sink: `installPixel(T)` swaps it into the loaded `types.json` under **Sink's
+type id**, so every Sink in a save *is* a Pixel here, with no conversion
+pass (same 2x2 footprint, same look, same row layout). It is the one
+machine defined outside `core/entity.py`, by choice: the desktop is
+reference material and still reads the id as a Sink. Old toolbar slots and
+stamps naming "sink" resolve through `T.aliases` (`typeByName()`).
+
+- **Four inputs, all needed to fire, no outputs.** Facing +X with cell 0
+  bottom-left: **H** on cell 0's west face, **S** on the west face of the
+  cell above it, **V** on cell 0's south face -- three contiguous perimeter
+  spaces, V alone on its face -- and **Z** on the north face of the far
+  corner. Chiral, so F mirrors it. The placed ports for all eight
+  orientations come from `placePorts()`, a port of the desktop's
+  flip-then-rotate, which `tests/pixel.test.mjs` checks by rebuilding every
+  exported machine's ports from its authored ones.
+- **A fire sets its pixel**: hue H in turns (wrapping), saturation S and
+  value V clamped to 0..1, NaN as 0. **Z is the size**: 0 or less draws
+  nothing; above 0, `round(Z)` clamped to 1..View > pixel max size, as half
+  the side in cells -- Z = 1 covers exactly the machine (2x2), Z = 2 a 4x4,
+  centred on the machine's centre, which is always a grid corner, so every
+  square sits on the grid.
+- **View > pixel overlay** (0..1) is the screen's opacity, and 0 is off:
+  the sim then has no `Screen` and a fire records nothing (the Pixel still
+  consumes its inputs). Switching it on starts blank; so do every edit,
+  Reset (including a bake's), load and undo -- the sim clears it on any
+  rebuild. Not saved.
+- **The most recent fire draws on top** where squares overlap: the Screen
+  is a Map that re-inserts a row on each fire, so iteration order is fire
+  order.
+- Drawn over the board and its items; while it is on, the planning ghosts
+  move above it so what is being placed stays visible.
+- **Not heard in a forecast**, like audio: `forecast()` runs a real step,
+  so the hook is skipped while `rec` is set. A bake's clone has no screen.
+- Its fires click in audio group 1. Items going in vanish at its edge, as
+  they did into a Sink (it has no `LINKS`).
+- `tools/check_web_sim.py` and the tests that compare with the desktop load
+  `types.json` without `installPixel()`, so they still compare Sink with
+  Sink.
+
 ### How machines draw
 
 As the desktop draws them, because a design reads by it: the body, the
@@ -1212,6 +1254,7 @@ asserting every array matches and exactly the edited value differs.
 | `audio.js` | audio, main thread: the per-tick recorder and starting the graph; loaded on demand |
 | `audio-dsp.js`, `audio-worklet.js` | the synthesiser, and its AudioWorklet wrapper |
 | `audio-bake.js` | baking: a stretch of ticks rendered offline, and the WAV writer; loaded on demand |
+| `pixel.js` | the Pixel machine (web-only, in Sink's id), its screen, and the overlay's drawing |
 | `vendor/` | Tweakpane 4.0.5, vendored |
 | `npz.js` | `.npz` reader and writer: zip directory + native `DecompressionStream` / `CompressionStream` + `.npy` headers |
 | `saves.js` | browser saves: whole `.npz` files in localStorage, and their index |

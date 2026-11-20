@@ -75,6 +75,7 @@ const emitShown = (s, z, labels) => s.emit !== null && labels && z >= LOD.marks;
 import { structGlyph } from "./glyphs.js";
 import { TUNE } from "./tune.js";
 import { itemPoints } from "./flow.js";
+import { drawPixels } from "./pixel.js";
 import { css as noteCss, isText, sizeOf, wrap, PAD, LINE } from "./notes.js";
 
 const css = (c) => `rgb(${(c[0] * 255) | 0},${(c[1] * 255) | 0},${(c[2] * 255) | 0})`;
@@ -151,13 +152,22 @@ export function render(ctx, board, cam, dpr, opts = {}) {
   ctx.lineWidth = 2 * px;
   ctx.strokeRect(0, 0, board.width, board.height);
 
+  // The planning ghosts go under the items -- or, while the pixel overlay
+  // is on, over it, so what is being placed stays visible on the screen.
   const ghosts = (view.ghosts || [view.ghost]).filter(Boolean);
-  for (const g of ghosts) drawGhost(ctx, board.T, g, z, px, on, S, view.ports, view.labels, view.seedTint);
+  const drawGhosts = () => { for (const g of ghosts) drawGhost(ctx, board.T, g, z, px, on, S, view.ports, view.labels, view.seedTint); };
+  if (!view.pixels) drawGhosts();
 
   // Items last among the board's contents: cargo on a cell, over any tint,
   // so a red wash never changes the colour that says an item's sign.
   let cargo = null;
   if (view.sim && view.items !== false) cargo = drawItems(ctx, view.sim, view.alpha || 0, z, on, S);
+
+  // The pixel overlay (pixel.js): over the board and its items.
+  if (view.pixels) {
+    drawPixels(ctx, board, view.pixels.screen, view.pixels.alpha, view.pixels.max, on);
+    drawGhosts();
+  }
 
   // The vector picker's highlights, over the ghosts they move.
   if (view.vector) drawVectorMarks(ctx, view.vector, px);

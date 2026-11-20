@@ -65,6 +65,9 @@ export class Sim {
     // audio.js's Recorder while audio is on, else null: then the tick's whole
     // audio cost is this null check (step() and structurePhase()).
     this.audio = null;
+    // pixel.js's Screen while View > pixel overlay is on, else null: a
+    // Pixel's fire records its colour there. Web-only; no desktop analogue.
+    this.screen = null;
     this.fc = null;                 // the last forecast
     this.sync();
   }
@@ -270,6 +273,7 @@ export class Sim {
     this.rebuild();
     this.flush();
     this.seed();
+    this.screen?.clear();      // an edit, a Reset: the screen starts blank
     return true;
   }
 
@@ -371,6 +375,7 @@ export class Sim {
       const o = this.orientOf(row), [ox, oy] = this.originOf(row);
       const gate = {
         row, td, sim: td.sim,
+        pixel: td.class === "Pixel",
         strict: td.sim.fire_rule === this.T.sim.FIRE_ALL,
         outFaces: o.outputs.map(([lx, ly, face], i) => ({ x: ox + lx, y: oy + ly, face, ch: td.sim.out_ch[i] })),
         inFaces: o.inputs.map(([lx, ly, face], i) => ({ x: ox + lx, y: oy + ly, face, ch: td.sim.in_ch[i] })),
@@ -608,7 +613,7 @@ export class Sim {
     // Not while forecasting: that step is rolled back, and is not heard.
     const A = this.rec ? null : this.audio;
     if (A) A.pre(this);
-    this.structurePhase(A);
+    this.structurePhase(A, this.rec ? null : this.screen);
     for (const seg of this.order) this.tickSegment(seg, this.tick);
     this.deliverDirect();
     this.tick++;
@@ -619,7 +624,7 @@ export class Sim {
   // The prefilter tests only necessary conditions that are pure row state --
   // the rule satisfiable by occupancy, a free output zone -- so it can admit
   // a gate that then does nothing but never rejects one that would fire.
-  structurePhase(A = null) {
+  structurePhase(A = null, P = null) {
     for (const g of this.gates) {
       const row = g.row, s = g.sim;
       let fed = 0;
@@ -631,7 +636,7 @@ export class Sim {
         for (let c = 0; c < s.n_out && !free; c++) if (!this.outHeld(row, c)) free = true;
         if (!free) continue;
       }
-      if (this.fire(g)) {
+      if (this.fire(g, P)) {
         this.stats.fired++;
         if (A) A.fires[g.agroup]++;
       }
@@ -639,7 +644,7 @@ export class Sim {
   }
 
   // _fire_admitted, for one gate the prefilter let through.
-  fire(g) {
+  fire(g, P = null) {
     const row = g.row, s = g.sim;
     if (!this.inputsReady(g)) return false;
     const drains = g.drains;
@@ -661,6 +666,7 @@ export class Sim {
     const values = [];
     for (let c = 0; c < s.n_in; c++) values.push(this.inHeld(row, c) ? this.inValue(row, c) : null);
     const results = evalOps(this.T, s.ops, values, 0);
+    if (P && g.pixel) P.fire(row, values);
     const consumed = this.consumed(g, values).filter(c => this.inHeld(row, c));
     for (const c of consumed) this.clearIn(row, c);
     const produced = [];
@@ -793,7 +799,7 @@ export class Sim {
     }
     c.order = this.order.map(seg => c.segments.get(seg.sid));
     c.stats = { ...this.stats };
-    c.audio = null; c.rec = null; c.fc = null;
+    c.audio = null; c.rec = null; c.fc = null; c.screen = null;
     return c;
   }
 
@@ -812,6 +818,7 @@ export class Sim {
     Object.assign(this.stats, snap.stats);
     this.version++;
     this.fc = null;
+    this.screen?.clear();
   }
 
   // --- reading it back ------------------------------------------------------------
