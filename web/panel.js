@@ -138,6 +138,11 @@ export class Panel {
       if (key === "---") { agroup = audio.addFolder({ title: label, expanded: false }); continue; }
       audioBindings.push(agroup.addBinding(this.audio, key, { label, ...(opts || {}) }).on("change", pushAudio));
     }
+    // The sound selection: the selected entities are the only ones heard
+    // (nothing selected: everything). Kept after deselecting; reset by any
+    // change to the board (main.js).
+    this.audioSelBtn = audio.addButton({ title: "Set audio selection" });
+    this.audioSelBtn.on("click", () => cb.onAudioSelection());
     audio.addButton({ title: "Bake audio…" }).on("click", () => cb.onBake());
     audio.addButton({ title: "Reset audio dials" }).on("click", () => {
       Object.assign(this.audio, AUDIO_DEFAULTS);
@@ -216,6 +221,8 @@ export class Panel {
     this.prefs.audio = { ...this.audio };
     savePrefs(this.prefs);
   }
+
+  setAudioSelection(on) { this.audioSelBtn.title = on ? "Set audio selection ✓" : "Set audio selection"; }
 
   // --- video ---------------------------------------------------------------
 

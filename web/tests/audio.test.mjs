@@ -367,3 +367,70 @@ test("a save's audio record is cleaned: unknown, mistyped and out-of-range dials
   assert.equal(parseAudio(""), null);
   assert.equal(parseAudio(JSON.stringify({ dials: {}, bake: { seconds: -1, rate: 5 } })).bake, null);
 });
+
+// --- the sound selection ----------------------------------------------------------
+
+async function loadCpu() {
+  const bytes = readFileSync(save);
+  return Board.fromNpz(T, bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength));
+}
+
+test("the board's content hash: same after lifting and putting back in place, ticking, or a label edit; not after a move or a value change", { skip: !existsSync(save) }, async () => {
+  const board = await loadCpu();
+  const h0 = board.contentHash();
+  // Ticking rewrites gate channels in the entity table: not content.
+  const sim = new Sim(T, board);
+  for (let i = 0; i < 30; i++) sim.step();
+  assert.equal(board.contentHash(), h0, "ticking is not a change");
+  // Lift some machines and put them back where they were: new rows, same board.
+  const rows = board.structs.slice(0, 6).map(s => s.row);
+  const entries = board.capture(rows);
+  board.eraseRows(rows);
+  assert.notEqual(board.contentHash(), h0, "lifted is different");
+  board.placeEntries(entries, entries.map(e => [e.dx, e.dy]));
+  assert.equal(board.contentHash(), h0, "put back in place is the same board");
+  board.notes.push({ kind: "text", colour: "white", size: 0.9, text: "x", rect: [0, 0, 2, 1] });
+  assert.equal(board.contentHash(), h0, "a label is not sound content");
+  // Moved: a change.
+  const one = board.structs[0].row, [e] = board.capture([one]);
+  board.eraseRows([one]);
+  let moved = false;
+  for (const [mx, my] of [[0, 40], [40, 0], [0, -40], [-40, 0]]) {
+    if (!board.entryBlocked(e, e.dx + mx, e.dy + my).length) { board.placeEntries([e], [[e.dx + mx, e.dy + my]]); moved = true; break; }
+  }
+  assert.ok(moved);
+  const h1 = board.contentHash();
+  assert.notEqual(h1, h0, "moved is a change");
+  // A Source's value is content.
+  const src = board.structs.find(s => T.types[s.type].name === "source");
+  board.setEmit(src.row, 12.5);
+  assert.notEqual(board.contentHash(), h1, "a Source's value is content");
+});
+
+test("a sound selection: only runs and gates touching its cells are heard, and the normalisation counts them", { skip: !existsSync(save) }, async () => {
+  const board = await loadCpu();
+  const sim = new Sim(T, board), W = board.width;
+  const seg = sim.order.find(s => s.length >= 3 && s.length <= 10);
+  const gate = sim.gates.find(g => g.td.class === "Shear");
+  const [gx, gy] = sim.originOf(gate.row);
+  // One cell of the run (its middle: a part selects the whole run) and one of the gate.
+  const [mx, my] = seg.cells[1];
+  const cells = new Set([my * W + mx, gy * W + gx]);
+  const msgs = [];
+  const rec = new Recorder({ postMessage: (m) => msgs.push(m) }, AUDIO_DEFAULTS, cells);
+  rec.attach(sim);
+  sim.step();
+  const cfg = msgs.find(m => m.type === "config");
+  const want = sim.order.filter(s => s.length <= AUDIO_DEFAULTS.beltCutoff && s.cells.some(([x, y]) => cells.has(y * W + x)));
+  assert.deepEqual([...cfg.lengths], want.map(s => s.length));
+  assert.ok(want.includes(seg));
+  assert.deepEqual(cfg.groups, [0, 1], "one gate, group 1");
+  assert.deepEqual(rec.selInfo, { runs: want.length, gates: 1 });
+  // Every other gate fires into the silent group.
+  assert.ok(sim.gates.filter(g => g !== gate).every(g => g.agroup === 2));
+  // Cleared: the whole board again.
+  rec.setSelection(null);
+  sim.step();
+  assert.ok(msgs.filter(m => m.type === "config").pop().lengths.length > want.length);
+  assert.equal(rec.selInfo, null);
+});

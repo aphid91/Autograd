@@ -15,8 +15,12 @@
 import { audioGroupOf } from "./audio-params.js";
 
 export class Recorder {
-  constructor(port, params) {
+  // `selection`: a Set of cell indices (y * width + x) -- only runs touching
+  // one and gates covering one sound -- or null for the whole board.
+  constructor(port, params, selection = null) {
     this.port = port;
+    this.selection = selection;
+    this.selInfo = null;
     this.minLen = params.beltMinLen;
     this.cutoff = params.beltCutoff;
     this.sim = null;
@@ -39,6 +43,17 @@ export class Recorder {
   }
   detach() { if (this.sim) this.sim.audio = null; this.sim = null; }
 
+  // A new sound selection takes effect now (not at the next tick), so the
+  // meter's counts are right even while paused.
+  setSelection(cells) {
+    if (cells === this.selection) return;
+    this.selection = cells;
+    this.rebuilds = -1;
+    // Synced first: the board may have been edited since the last tick (a
+    // lift, say), and the gate table must describe the board as it is.
+    if (this.sim) { this.sim.sync(); this.configure(this.sim); }
+  }
+
   // Which run lengths may sound; a change reconfigures on the next tick.
   setLengths(min, max) {
     if (min !== this.minLen || max !== this.cutoff) { this.minLen = min; this.cutoff = max; this.rebuilds = -1; }
@@ -49,7 +64,10 @@ export class Recorder {
   configure(sim) {
     this.flush(this.lastRate || 1);
     this.rebuilds = sim.stats.rebuilds;
-    this.cands = sim.order.filter(seg => seg.length >= this.minLen && seg.length <= this.cutoff);
+    const sel = this.selection, W = sim.board.width;
+    const picked = (cells) => !sel || cells.some(([x, y]) => sel.has(y * W + x));
+    // A run sounds if any of its cells is selected, underground ends included.
+    this.cands = sim.order.filter(seg => seg.length >= this.minLen && seg.length <= this.cutoff && picked(seg.cells));
     const n = this.cands.length;
     this.h = new Int32Array(n); this.t = new Int32Array(n); this.pos = new Float64Array(n);
     this.words = (n + 31) >>> 5;
@@ -57,8 +75,18 @@ export class Recorder {
     const groups = [0, 0];
     for (const g of sim.gates) {
       g.agroup = audioGroupOf(g.td.class);
+      // Outside the sound selection a gate clicks in the silent group, as a
+      // Source does: no cost per tick.
+      if (sel && g.agroup < 2) {
+        const [ox, oy] = sim.originOf(g.row), o = sim.orientOf(g.row), cells = [];
+        for (let x = 0; x < o.w; x++) for (let y = 0; y < o.h; y++) cells.push([ox + x, oy + y]);
+        if (!picked(cells)) g.agroup = 2;
+      }
       if (g.agroup < 2) groups[g.agroup]++;
     }
+    // Normalisation counts the selection only, so isolating part of a machine
+    // fills the mix rather than playing it as quietly as it sits in the whole.
+    this.selInfo = sel ? { runs: this.cands.length, gates: groups[0] + groups[1] } : null;
     this.port.postMessage({ type: "config", lengths: Float64Array.from(this.cands, s => s.length), groups });
   }
 

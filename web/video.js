@@ -37,7 +37,7 @@ export async function recordVideo({ sim, settings, startCam, endCam, draw, audio
   let sound = null;
   if (audio) {
     sound = await audio.bake({
-      start: sim, params: audio.params, rate: tps, seconds: settings.duration, sampleRate: 48000, t0,
+      start: sim, params: audio.params, rate: tps, seconds: settings.duration, sampleRate: 48000, t0, selection: audio.selection,
       onProgress: (f) => onProgress?.({ phase: "audio", fraction: f }), shouldStop,
     });
     if (!sound) { await writable?.abort?.().catch(() => {}); return { kind: "empty" }; }

@@ -129,6 +129,9 @@ const debug = window.gates = {
   get place() { return place; },
   get sel() { return sel; },
   selEntries: () => (sel ? selAbs() : []),
+  lift: (rows) => { lift(rows); redraw(); },
+  dropAll: () => { dropAll(); redraw(); },
+  get soundSel() { return soundSel; },
   placement: () => currentPlacement(),
   plan: () => currentPlan(),
 };
@@ -177,6 +180,7 @@ function setAudio(on) {
       audioStarting = false;
       if (!panel.audioOn.on) { a.close(); return; }   // switched off while starting
       audio = a;
+      a.rec.setSelection(soundSel?.cells ?? null);
       redraw();
     })
     .catch(e => {
@@ -193,7 +197,8 @@ function meterText(m) {
     `peak ${m.peak.toFixed(2)} (${db} dB)` + (m.clipped ? `  clipped ${m.clipped}` : "") + "\n" +
     `lag ${Math.round(m.lagMs)} ms · speed ${m.speed.toFixed(2)}` +
     (bakedPlay ? "  (baked)" : "") + "\n" + bakeStatus() +
-    (audioNote && performance.now() < audioNote.until ? `\n${audioNote.text}` : "");
+    (audioNote && performance.now() < audioNote.until ? `\n${audioNote.text}` : "") +
+    (audio?.rec.selInfo ? `\nsound selection: ${audio.rec.selInfo.runs} runs, ${audio.rec.selInfo.gates} gates` : "");
 }
 
 // --- audio settings in the save ------------------------------------------------
@@ -297,7 +302,7 @@ async function recordVideoNow() {
     const [{ recordVideo }, bakeMod] = await Promise.all([import("./video.js"), withSound ? import("./audio-bake.js") : null]);
     const res = await recordVideo({
       sim: copy, settings, startCam, endCam, draw: drawVideoFrame,
-      audio: withSound ? { params: { ...panel.audio }, bake: bakeMod.bakeAudio } : null,
+      audio: withSound ? { params: { ...panel.audio }, bake: bakeMod.bakeAudio, selection: soundSel?.cells ?? null } : null,
       writable: choice.kind === "file" ? choice.writable : null,
       onProgress: (p) => panel.setVideoProgress(p.phase === "audio"
         ? `baking audio ${Math.round(p.fraction * 100)}%`
@@ -320,6 +325,47 @@ async function recordVideoNow() {
     recording = null;
     panel.setVideoRecording(false);
   }
+}
+
+// --- the sound selection ------------------------------------------------------------
+//
+// Audio > Set audio selection: with entities selected, only they sound (a
+// run if any of its cells is selected, a gate if any of its cells is); with
+// nothing selected, everything does again. The cells are taken where the
+// selection sits at the press, and kept after deselecting.
+//
+// It is reset by any change to the board -- and selecting is itself an edit
+// here (the selection is lifted off the board), so "a change" is a change of
+// CONTENT: Board.contentHash(), which ignores row ids and per-tick channel
+// values. The reference is the first stable board after the press (nothing
+// lifted), so deselecting in place keeps it and moving the selection, any
+// other edit, an undo or a load resets it. Normalisation then counts only
+// what is selected (audio.js), so an isolated part fills the mix.
+let soundSel = null;      // { cells: Set<y*W+x>, ref: hash | null, rev, id }
+let soundSelN = 0;
+const soundSelId = () => soundSel?.id ?? 0;
+function setSoundSelection() {
+  if (!sel || !sel.stamp.entries.length) { clearSoundSel(); return; }
+  const [ox, oy] = selOrigin(), W = board.width;
+  const cells = new Set(stampCells(T, sel.stamp, ox, oy).map(([x, y]) => y * W + x));
+  soundSel = { cells, ref: null, rev: -1, id: ++soundSelN };
+  audio?.rec.setSelection(cells);
+  panel.setAudioSelection(true);
+}
+function clearSoundSel() {
+  if (!soundSel) return;
+  soundSel = null;
+  audio?.rec.setSelection(null);
+  panel.setAudioSelection(false);
+}
+// Each frame: once nothing is lifted, any change of content since the
+// reference resets it.
+function checkSoundSel() {
+  if (!soundSel || sel || !board || board.revision === soundSel.rev) return;
+  soundSel.rev = board.revision;
+  const h = board.contentHash();
+  if (soundSel.ref === null) soundSel.ref = h;
+  else if (h !== soundSel.ref) clearSoundSel();
 }
 
 // --- the camera's dry run -----------------------------------------------------------
@@ -389,6 +435,7 @@ function bakeStale() {
   if (!bake) return null;
   if (!bakeLive()) return "the board changed";
   if (bake.key !== bakeKey(panel.audio)) return "the dials changed";
+  if (bake.sel !== soundSelId()) return "the sound selection changed";
   if (clock.rate !== bake.rate) return `the rate is not ${bake.rate}`;
   return null;
 }
@@ -469,13 +516,13 @@ async function runBake(seconds, rate, show) {
   const own = { cancel: false };
   baking = own;
   const startSim = sim, revision = board.revision, rebuilds = sim.stats.rebuilds;
-  const params = { ...panel.audio }, key = bakeKey(params);
+  const params = { ...panel.audio }, key = bakeKey(params), sel = soundSelId();
   const t = performance.now();
   const { bakeAudio } = await import("./audio-bake.js");
   let res = null;
   try {
     res = await bakeAudio({
-      start: snap, params, rate, seconds, sampleRate: audioCtx?.sampleRate || 48000,
+      start: snap, params, rate, seconds, sampleRate: audioCtx?.sampleRate || 48000, selection: soundSel?.cells ?? null,
       onProgress: (f, tick, end) => show(`Baking… ${Math.round(f * 100)}%  (tick ${tick} of ${end})`),
       shouldStop: () => own.cancel || sim !== startSim || board.revision !== revision,
     });
@@ -484,7 +531,7 @@ async function runBake(seconds, rate, show) {
   }
   baking = null;
   if (!res) { show(res === null ? "Bake cancelled (or the board changed)." : undefined); return; }
-  bake = { snap, sim: startSim, revision, rebuilds, rate, key, ...res, buf: null };
+  bake = { snap, sim: startSim, revision, rebuilds, rate, key, sel, ...res, buf: null };
   shell.setRate(rate);     // play it at the rate it was baked at
   show(`Baked ${seconds} s at ${rate} tps in ${((performance.now() - t) / 1000).toFixed(1)} s. Press play.\n` + bakeStatus());
   redraw();
@@ -561,6 +608,7 @@ function paint(now) {
     if (inspectRow >= 0) panel.setLive(liveText(inspectRow));
   }
   driveDryRun();
+  checkSoundSel();
   // Ship this frame's ticks to the audio thread; paused, let it fall silent.
   if (audio) {
     if (clock.paused) stopBakedPlay();
@@ -1905,6 +1953,7 @@ function rectOf(a, b) {
 async function show(name, bytes) {
   try {
     endDryRun();      // before the new board's framing, which then stands
+    clearSoundSel();  // a new board: everything sounds again
     board = await Board.fromNpz(T, bytes);
     panel.setBoardName(name.replace(/\.npz$/i, ""));
     loadAudioSettings();
@@ -2176,6 +2225,7 @@ async function init() {
     onColours: (c) => { statusColours = c; redraw(); },
     onAudioEnable: (on) => setAudio(on),
     onBake: () => openBakeDialog(),
+    onAudioSelection: () => { setSoundSelection(); redraw(); },
     onVideoRecord: () => recordVideoNow(),
     onVideoEndCamera: (set) => { endDryRun(); endCam = set ? camState() : null; panel.setVideoEndCamera(!!endCam); redraw(); },
     onVideoOpen: (open) => { videoOpen = open; redraw(); },

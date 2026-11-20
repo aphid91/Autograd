@@ -89,6 +89,28 @@ export class Board {
     });
   }
 
+  // What the board IS, as a hash: every occupied cell's position, type,
+  // facing, footprint offset and flags, and a Source's value and a belt's
+  // seed value. Not the row ids -- putting a selection back where it was can
+  // take different rows, and that is no change -- and not gate channels,
+  // which the simulation rewrites every tick. The audio selection resets
+  // when this moves (main.js).
+  contentHash() {
+    const g = this.grid, E = this.T.entity, C = this.T.cell;
+    const f32 = new Float32Array(1), u32 = new Uint32Array(f32.buffer);
+    let h = 2166136261 >>> 0;
+    const mix = (v) => { h = Math.imul(h ^ (v | 0), 16777619) >>> 0; };
+    for (let i = 0; i < g.length; i += 4) {
+      const x = g[i];
+      if (!x) continue;
+      mix(i); mix(x & ((1 << C.ID_SHIFT) - 1)); mix(g[i + 1]); mix(g[i + 2] & ~C.GHOST_MASK);
+      const row = this.cellId(x);
+      if (this.T.types[(x >> C.TYPE_SHIFT) & C.TYPE_MASK]?.name === "source") { f32[0] = this.field(row, E.F_EMIT); mix(u32[0]); }
+      if (g[i + 2] & C.SEED_BIT) { f32[0] = this.field(row, E.F_SEED_VALUE); mix(u32[0]); }
+    }
+    return h;
+  }
+
   // --- raw access -------------------------------------------------------
 
   cellX(x, y) {

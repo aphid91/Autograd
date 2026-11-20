@@ -1069,6 +1069,31 @@ following the runs while silent, so a drone already going at the start
 tick fades in rather than starting cold. Each batch carries its first
 tick's number (`tick0`) for this. Default 0 and 0: no change.
 
+**Set audio selection** (a button): with entities selected, only they
+sound -- a run if any of its cells is selected (underground ends count),
+a gate if any of its cells is -- and with nothing selected everything does
+again. The cells are taken where the selection sits at the press, and kept
+after deselecting; the meter adds "sound selection: n runs, m gates".
+Unselected gates click in the silent group, as a Source does, so it costs
+nothing per tick, and **normalisation counts only the selection**, so an
+isolated part fills the mix. A change of sound selection makes a bake stale,
+and a video's soundtrack uses it.
+
+**Any change to the board resets it**, and since selecting is itself an
+edit here (the selection is lifted off), "a change" means a change of
+**content**: `Board.contentHash()` -- every occupied cell's type, facing,
+footprint offset and flags, a Source's value and a belt's seed value, but
+**not row ids** (putting a selection back where it was can take different
+rows) and not gate channels (rewritten every tick). The reference is the
+first stable board after the press, so deselecting in place keeps it and
+moving the selection, any other edit, an undo or a load resets it (labels
+are not content). `Recorder.setSelection()` syncs the sim and reconfigures
+at once rather than at the next tick -- configuring against a sim that had
+not yet seen the lift read rows the lift had freed. Tested: the hash
+survives a lift and put-back, ticking and a label, and moves with a moved
+machine or a Source's value; the recorder takes exactly the touched runs
+and gates.
+
 **Hold on underrun** (off by default): when the queue runs dry, the voices
 hold where they are instead of releasing, and playback picks up the moment
 ticks arrive, with no refill wait. A hold gives up after `HOLD_MAX_S`
