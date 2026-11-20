@@ -24,6 +24,7 @@ import { History } from "./history.js";
 import { DEFAULT, naturalOrder, tableValues, finalValues } from "./indexer.js";
 import { entrySize, typeByName } from "./stamp.js";
 import { installPixel, Screen } from "./pixel.js";
+import { cropBox, evenDim, frameCount } from "./video-params.js";
 import { noteAt, gripAt, isText, newRect, MIN_W, MIN_H } from "./notes.js";
 import { Claims, followChain, offsets, layCopies, isZero, rotateVec, flipVec, moreCount, lessCount } from "./vector.js";
 import { deleteSave, getSave, listSaves, putSave } from "./saves.js";
@@ -224,6 +225,100 @@ function touchAudio() {
   board.audioRev++;
   edited = true;
   prepareSave();
+}
+
+// --- video export ---------------------------------------------------------------
+//
+// Video (panel) renders a stretch of the simulation offline into an MP4
+// (video.js, after Fluoddity's recorder). It starts from the current tick,
+// on a copy of the sim, so the live board is not touched -- it is paused
+// while the render runs, and any edit stops it, keeping what was encoded.
+// With sound on, the same ticks are baked into its audio track.
+//
+// The camera moves from where it is when Record is pressed to the end state
+// captured by "Select end camera state" (if any), over the lerp window.
+let endCam = null;          // { cx, cy, zoom, w, h }, or null: a still camera
+let videoOpen = false;      // the Video folder is open: show the frame on the board
+let recording = null;       // { cancel } while a video renders
+const camState = () => ({ cx: cam.cx, cy: cam.cy, zoom: cam.zoom, w: cam.w, h: cam.h });
+
+// What the video frame covers, for the preview: the crop box now, and the
+// end camera's (dashed), in the video's aspect.
+function videoBoxes() {
+  if (!videoOpen) return null;
+  const v = panel.video, aspect = v.width / v.height;
+  const boxes = [{ ...cropBox(camState(), aspect), dashed: false }];
+  if (endCam) boxes.push({ ...cropBox(endCam, aspect), dashed: true });
+  return boxes;
+}
+
+// One video frame: the board as View draws it, never the editing marks.
+function drawVideoFrame(ctx, s, vcam, alpha) {
+  render(ctx, s.board, vcam, 1, {
+    ...view, sim: s, alpha, ghosts: [],
+    gateTint: view.gateStatus ? gateStatus(s) : null,
+    beltTint: view.beltStatus ? beltStatus(s) : null,
+    pixels: s.screen ? { screen: s.screen, alpha: view.pixelAlpha, max: view.pixelMax } : null,
+  });
+}
+
+// Fluoddity's saveFile.ts: the picker must be raised before any other await
+// in the click, or it loses the gesture. Three outcomes: a file to stream
+// into, no picker here (buffer and download), or the player said no.
+async function chooseVideoFile(name) {
+  if (typeof window.showSaveFilePicker !== "function") return { kind: "unavailable" };
+  try {
+    const handle = await window.showSaveFilePicker({ suggestedName: name, types: [{ description: "MP4 video", accept: { "video/mp4": [".mp4"] } }] });
+    return { kind: "file", writable: await handle.createWritable() };
+  } catch (e) {
+    return e?.name === "AbortError" ? { kind: "cancelled" } : { kind: "unavailable" };
+  }
+}
+
+async function recordVideoNow() {
+  if (recording) { recording.cancel = true; return; }
+  if (!sim || !board) return;
+  const settings = { ...panel.video };
+  const base = (panel.local.name || "gates").replace(/[^\w.-]+/g, "_");
+  const choice = await chooseVideoFile(`${base}.mp4`);       // first await: keeps the gesture
+  if (choice.kind === "cancelled") return;
+  const own = { cancel: false };
+  recording = own;
+  panel.setVideoRecording(true);
+  shell.setPaused(true);
+  clock.paused = true;
+  const copy = sim.clone();
+  if (view.pixelAlpha > 0) copy.screen = new Screen();
+  const startCam = camState(), rev = board.revision, live = sim;
+  const withSound = !!audio;
+  panel.setVideoProgress("starting…");
+  try {
+    const [{ recordVideo }, bakeMod] = await Promise.all([import("./video.js"), withSound ? import("./audio-bake.js") : null]);
+    const res = await recordVideo({
+      sim: copy, settings, startCam, endCam, draw: drawVideoFrame,
+      audio: withSound ? { params: { ...panel.audio }, bake: bakeMod.bakeAudio } : null,
+      writable: choice.kind === "file" ? choice.writable : null,
+      onProgress: (p) => panel.setVideoProgress(p.phase === "audio"
+        ? `baking audio ${Math.round(p.fraction * 100)}%`
+        : `frame ${p.frame} of ${p.frames} (${Math.round(p.fraction * 100)}%)`),
+      shouldStop: () => own.cancel || sim !== live || board.revision !== rev,
+    });
+    if (res.kind === "buffered") {
+      const a = document.createElement("a");
+      a.href = URL.createObjectURL(res.blob);
+      a.download = `${base}.mp4`;
+      a.click();
+      setTimeout(() => URL.revokeObjectURL(a.href), 10000);
+    }
+    panel.setVideoProgress(res.kind === "empty" ? "nothing recorded"
+      : `saved ${res.frames} frames${res.frames < frameCount(settings) ? " (stopped early)" : ""}`);
+  } catch (e) {
+    console.error(e);
+    panel.setVideoProgress(`failed: ${e.message}`);
+  } finally {
+    recording = null;
+    panel.setVideoRecording(false);
+  }
 }
 
 // --- baked audio ------------------------------------------------------------------
@@ -446,6 +541,7 @@ function paint(now) {
                                 indexLabels: indexLabels(), noteSel: noteEdit, noteGrips: labelHeld(),
                                 ghostNotes: ghostNotes(),
                                 pixels: sim?.screen ? { screen, alpha: view.pixelAlpha, max: view.pixelMax } : null,
+                                frameBoxes: videoBoxes(),
                                 gateTint: view.gateStatus ? gateStatus() : null,
                                 beltTint: view.beltStatus ? beltStatus() : null });
   debug.renderMs = performance.now() - t0;
@@ -532,14 +628,15 @@ function checkpoint() {
 // RUNNING (green) otherwise. Dangling outputs discard and never block.
 // The colours are the player's (View > status colours, panel.js).
 const hexRgb = (h) => [1, 3, 5].map(i => parseInt(h.slice(i, i + 2), 16) / 255);
-function gateStatus() {
+// `s` is the sim to read (the live one, or a video's copy).
+function gateStatus(s = sim) {
   const out = new Map();
-  if (!sim) return out;
-  sim.sync();
+  if (!s) return out;
+  s.sync();
   const STATUS_COL = { blocked: hexRgb(statusColours.gateBlocked), starved: hexRgb(statusColours.gateStarved), running: hexRgb(statusColours.gateRunning) };
-  for (const g of sim.gates) {
-    const blocked = g.drains.some(c => sim.outHeld(g.row, c));
-    const starved = g.sim.n_in > 0 && !sim.inputsReady(g);
+  for (const g of s.gates) {
+    const blocked = g.drains.some(c => s.outHeld(g.row, c));
+    const starved = g.sim.n_in > 0 && !s.inputsReady(g);
     out.set(g.row, blocked ? STATUS_COL.blocked : starved ? STATUS_COL.starved : STATUS_COL.running);
   }
   return out;
@@ -550,16 +647,16 @@ function gateStatus() {
 // leave on the coming tick (the forecast has no pop), so items are stuck on
 // it (and, by default, nothing on it is moving either -- see below); GREEN
 // otherwise (carrying, and moving). Returns (x, y) -> colour.
-function beltStatus() {
-  if (!sim) return null;
+function beltStatus(s = sim) {
+  if (!s) return null;
   const BELT_STATUS_COL = { empty: statusColours.beltEmpty, stalled: statusColours.beltStalled, moving: statusColours.beltMoving };
-  sim.sync();
-  const F = sim.forecast();
+  s.sync();
+  const F = s.forecast();
   const bySid = new Map();
-  for (const seg of sim.segments.values()) {
+  for (const seg of s.segments.values()) {
     let st = "moving";
     if (seg.head === seg.tail) st = "empty";
-    else if (sim.positionOf(seg, seg.head, sim.tick) >= seg.length * sim.UNIT && !F.pops.has(seg)) {
+    else if (s.positionOf(seg, seg.head, s.tick) >= seg.length * s.UNIT && !F.pops.has(seg)) {
       st = "stalled";
       // View > "stalled but moving: green": a stalled run whose items are
       // still moving -- one is pushed on this tick, or the newest is still
@@ -567,14 +664,14 @@ function beltStatus() {
       // they all have) -- is not static, and reads green. O(1) per run.
       if (view.beltActive !== false) {
         const k = seg.tail - 1;
-        const moving = sim.positionOf(seg, k, sim.tick, 1) > sim.positionOf(seg, k, sim.tick, 0);
+        const moving = s.positionOf(seg, k, s.tick, 1) > s.positionOf(seg, k, s.tick, 0);
         if (moving || F.pushes.has(seg)) st = "moving";
       }
     }
     bySid.set(seg.sid, BELT_STATUS_COL[st]);
   }
-  const W = board.width;
-  return (x, y) => bySid.get(sim.segAt[y * W + x]) || null;
+  const W = s.board.width;
+  return (x, y) => bySid.get(s.segAt[y * W + x]) || null;
 }
 
 // What the Status pane's live readout says about a row: a gate's channels,
@@ -622,6 +719,11 @@ function resize() {
   canvas.width = Math.round(r.width * dpr);
   canvas.height = Math.round(r.height * dpr);
   cam.resize(r.width, r.height);
+  // A first video size: the board's own size on screen, in device pixels --
+  // here, once the canvas has a real size (before, it is the default 300x150).
+  if (panel && (!panel.video.width || !panel.video.height) && r.width > 0 && r.height > 0) {
+    panel.setVideoSize(evenDim(canvas.width), evenDim(canvas.height));
+  }
   redraw();
 }
 
@@ -2023,6 +2125,10 @@ async function init() {
     onColours: (c) => { statusColours = c; redraw(); },
     onAudioEnable: (on) => setAudio(on),
     onBake: () => openBakeDialog(),
+    onVideoRecord: () => recordVideoNow(),
+    onVideoEndCamera: (set) => { endCam = set ? camState() : null; panel.setVideoEndCamera(!!endCam); redraw(); },
+    onVideoOpen: (open) => { videoOpen = open; redraw(); },
+    onVideo: () => redraw(),
     onAudio: (p) => { if (audio) audio.setParams(p); touchAudio(); },
     onTune: (t) => { setTune(t); redraw(); },
     onClearStamps: () => shell.clearStamps(),
@@ -2037,6 +2143,7 @@ async function init() {
   panel.setLocalSaves(listSaves());
   view = { ...panel.view };
   syncScreen();
+
   statusColours = { ...panel.colours };
   setTune(panel.dev);
 

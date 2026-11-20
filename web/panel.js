@@ -8,6 +8,7 @@
 import { Pane } from "./vendor/tweakpane-4.0.5.min.js";
 import { TUNE_DEFAULTS, TUNE_SPEC } from "./tune.js";
 import { AUDIO_DEFAULTS, AUDIO_SPEC } from "./audio-params.js";
+import { VIDEO_SPEC, CAMERA_SPEC, VIDEO_FPS, cleanVideo, frameCount } from "./video-params.js";
 
 const PANE_KEY = "gates.web.pane.v1";
 const DIR_NAMES = ["+X east", "+Y north", "-X west", "-Y south"];
@@ -144,6 +145,37 @@ export class Panel {
       pushAudio();
     });
 
+    // Video: render a stretch of the simulation offline into an MP4
+    // (video.js; main.js runs it). After Fluoddity's Recording tab. The
+    // settings persist with the panel; the end camera is per session.
+    this.video = cleanVideo(this.prefs.video);
+    const vid = this.pane.addFolder({ title: "Video", expanded: false });
+    // Open, the board shows the frame the video will cover.
+    vid.on("fold", (ev) => cb.onVideoOpen(ev.expanded));
+    const pushVideo = () => {
+      this.prefs.video = { ...this.video };
+      savePrefs(this.prefs);
+      this.updateVideoText();
+      cb.onVideo({ ...this.video });
+    };
+    this.videoBindings = [];
+    for (const [key, label, opts] of VIDEO_SPEC) {
+      this.videoBindings.push(vid.addBinding(this.video, key, { label, ...opts }).on("change", pushVideo));
+    }
+    const camF = vid.addFolder({ title: "camera", expanded: false });
+    this.endCamBtn = camF.addButton({ title: "Select end camera state" });
+    this.endCamBtn.on("click", () => cb.onVideoEndCamera(true));
+    camF.addButton({ title: "Unset end camera" }).on("click", () => cb.onVideoEndCamera(false));
+    for (const [key, label, opts] of CAMERA_SPEC) {
+      this.videoBindings.push(camF.addBinding(this.video, key, { label, ...opts }).on("change", pushVideo));
+    }
+    this.videoText = { text: "" };
+    this.videoStatus = "";
+    vid.addBinding(this.videoText, "text", { label: "", readonly: true, multiline: true, rows: 2, interval: 250 });
+    this.recordBtn = vid.addButton({ title: "Begin recording" });
+    this.recordBtn.on("click", () => cb.onVideoRecord());
+    this.updateVideoText();
+
     // Dev: the tuned-by-eye numbers and the force-build switch. Persisted
     // with the rest of the panel's preferences.
     this.dev = { ...TUNE_DEFAULTS, ...(this.prefs.dev || {}) };
@@ -183,6 +215,24 @@ export class Panel {
     try { for (const b of this.audioBindings) b.refresh(); } finally { this.applyingAudio = false; }
     this.prefs.audio = { ...this.audio };
     savePrefs(this.prefs);
+  }
+
+  // --- video ---------------------------------------------------------------
+
+  updateVideoText() {
+    const v = this.video, tpf = v.tps / VIDEO_FPS;
+    this.videoText.text = `${frameCount(v)} frames · ${v.width}×${v.height} · ` +
+      `${tpf >= 10 ? Math.round(tpf) : +tpf.toFixed(2)} ticks/frame` + (this.videoStatus ? `\n${this.videoStatus}` : "");
+  }
+  setVideoProgress(text) { this.videoStatus = text; this.updateVideoText(); }
+  setVideoRecording(on) { this.recordBtn.title = on ? "Cancel recording" : "Begin recording"; }
+  setVideoEndCamera(set) { this.endCamBtn.title = set ? "Select end camera state ✓" : "Select end camera state"; }
+  setVideoSize(w, h) {
+    this.video.width = w; this.video.height = h;
+    for (const b of this.videoBindings) b.refresh();
+    this.prefs.video = { ...this.video };
+    savePrefs(this.prefs);
+    this.updateVideoText();
   }
 
   // The audio switch, when main.js could not honour it.

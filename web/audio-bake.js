@@ -13,13 +13,15 @@ import { Recorder } from "./audio.js";
 
 const CHUNK_MS = 25;   // work between yields
 
-// Render the ticks [params.startTick, startTick + seconds * rate) of `start`
-// (a Sim, not modified) at `rate`. Resolves to { samples, sampleRate, t0,
-// end, rate } -- samples[0] is the start of tick t0 -- or null if
-// `shouldStop()` turned true.
-export async function bakeAudio({ start, params, rate, seconds, sampleRate, onProgress, shouldStop }) {
+// Render the ticks [t0, t0 + seconds * rate) of `start` (a Sim, not
+// modified) at `rate`. Resolves to { samples, sampleRate, t0, end, rate } --
+// samples[0] is the start of tick t0 -- or null if `shouldStop()` turned
+// true. t0 defaults to the start tick (the Bake dialog: audio from there);
+// a video passes its own first tick, so the soundtrack starts and ends with
+// the picture, silent before the start tick if that comes later.
+export async function bakeAudio({ start, params, rate, seconds, sampleRate, onProgress, shouldStop, t0: from0 }) {
   const sim = start.clone();
-  const t0 = Math.max(params.startTick, sim.tick);
+  const t0 = from0 ?? Math.max(params.startTick, sim.tick);
   const end = t0 + Math.max(1, Math.round(seconds * rate));
   // The synth runs from a little before t0, silent, so a drone already
   // sounding at t0 fades in rather than starting cold.

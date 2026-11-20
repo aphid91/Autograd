@@ -169,6 +169,18 @@ export function render(ctx, board, cam, dpr, opts = {}) {
     drawGhosts();
   }
 
+  // The video frame (Video folder open): the crop box now, solid, and the
+  // end camera's, dashed. Screen-pixel lines, over everything on the board.
+  if (view.frameBoxes) {
+    ctx.lineWidth = 2 * px;
+    for (const b of view.frameBoxes) {
+      ctx.setLineDash(b.dashed ? [8 * px, 6 * px] : []);
+      ctx.strokeStyle = b.dashed ? "rgba(255,200,80,0.9)" : "rgba(255,255,255,0.85)";
+      ctx.strokeRect(b.cx - b.hw, b.cy - b.hh, 2 * b.hw, 2 * b.hh);
+    }
+    ctx.setLineDash([]);
+  }
+
   // The vector picker's highlights, over the ghosts they move.
   if (view.vector) drawVectorMarks(ctx, view.vector, px);
 

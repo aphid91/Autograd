@@ -1155,6 +1155,70 @@ changing it reconfigures); the per-length gains, live; and the low cut. Mutation
 recording the forecast, never reusing a freed voice, and a wrong pitch law
 each fail it.
 
+## Video
+
+The panel's **Video** folder renders a stretch of the simulation **offline**
+into an MP4: after Fluoddity's Recording tab (`aphid91/fluoddity-web`,
+`src/recorder/`), with **mediabunny** (MPL-2.0, vendored unmodified as
+`vendor/mediabunny-1.55.1.min.mjs` with its licence, and imported only when
+a recording starts). [video-params.js](video-params.js) is the settings and
+the camera arithmetic, loaded always and tested in node;
+[video.js](video.js) is the recorder, loaded on demand.
+
+- **Settings**: width and height (128-3840, even -- H.264 4:2:0 needs it;
+  the first default is the board's size on screen in device pixels),
+  duration (1-120 s), **ticks / s** of video, and mediabunny's five named
+  quality levels. 60 fps, fixed. The summary line reads "frames · size ·
+  ticks/frame", then progress. Persisted with the panel; the end camera is
+  per session.
+- **Offline, on a copy.** It starts **from the current tick**, on a clone
+  of the sim (as a bake does), and draws each frame into its own canvas
+  with `render()`, so the frame budget and the live board's playback never
+  touch it. The live sim is paused meanwhile, and an edit or a new board
+  stops the render. Frame `f` is the state at tick `t0 + f * tps / 60` --
+  fractional ticks drawn at that alpha, so a slow tick rate still moves
+  smoothly -- stamped `f / 60`, a **computed** time, so a frame that takes a
+  second to draw still lasts 1/60 s. `await video.add()` is the
+  backpressure (Fluoddity's note): dropping it queues frames until the tab
+  dies.
+- **What is drawn**: the board as View draws it -- grid, status colours,
+  the pixel overlay (the copy gets its own Screen, starting blank), labels
+  -- and never the selection, ghosts or other editing marks
+  (`drawVideoFrame()` in main.js; `gateStatus()`/`beltStatus()` take the sim
+  to read for this).
+- **Sound**: with Audio's switch on, the same ticks are baked
+  (`bakeAudio(..., t0)`: a bake may now start mid-run, at the video's own
+  first tick, so the soundtrack starts and ends with the picture; the start
+  tick still silences what comes before it) and fed to an audio track a
+  second at a time beside the frames. AAC, or Opus where AAC cannot be
+  encoded (Linux Chromium); H.264, then VP9, then AV1 for the picture, each
+  asked of the browser rather than assumed.
+- **The camera**: the frame is the largest box of the video's aspect that
+  fits the view (`cropBox()`), shown on the board while the folder is open;
+  **Select end camera state** captures the view as it is, drawn dashed, and
+  **Unset end camera** drops it. The move runs from the view at Record to
+  the end state over **start lerp .. end lerp** (fractions of the video,
+  still outside), its speed a trapezoid: **fade in** and **fade out** are
+  the ramps as fractions of that window (0/0 constant speed, 0.5/0.5 a
+  smooth S; scaled down if they exceed 1). Centre linear, size geometric,
+  so a zoom feels even.
+- **Saving**, as Fluoddity: the file picker is raised **before any other
+  await** in the click (it needs the gesture), and a chosen file is
+  **streamed** into (`fastStart: false`, flat memory; `finalize()` closes
+  it -- closing again throws); no picker (Firefox, Safari, iPhone) or a
+  failed one **buffers** in memory and downloads at the end; Cancel in the
+  picker records nothing. **Cancel recording** keeps what was encoded: a
+  partial video is still a video.
+
+Checked in headless Chromium: 2 s at 480×270 with sound and an end camera
+gave 120 frames of H.264 at exactly 2.00 s and an Opus track (mean
+-15 dB), the first frame the whole board and the last the zoomed end
+camera, the live sim still at its tick; cancelling a 1080p recording at
+frame 182 gave a valid 3.03 s file. `tests/video.test.mjs` covers the move
+(still outside the window, monotone, continuous, linear without fades,
+symmetric), the crop box, the lerp, the settings, and a bake starting
+mid-run.
+
 ## Saving
 
 The panel's **Board** folder saves the board **to this browser** under a
@@ -1255,7 +1319,9 @@ asserting every array matches and exactly the edited value differs.
 | `audio-dsp.js`, `audio-worklet.js` | the synthesiser, and its AudioWorklet wrapper |
 | `audio-bake.js` | baking: a stretch of ticks rendered offline, and the WAV writer; loaded on demand |
 | `pixel.js` | the Pixel machine (web-only, in Sink's id), its screen, and the overlay's drawing |
-| `vendor/` | Tweakpane 4.0.5, vendored |
+| `video-params.js` | video export: the settings and the camera move; loaded always |
+| `video.js` | video export: the offline recorder (mediabunny); loaded on demand |
+| `vendor/` | Tweakpane 4.0.5 (MIT) and mediabunny 1.55.1 (MPL-2.0, with its licence), vendored |
 | `npz.js` | `.npz` reader and writer: zip directory + native `DecompressionStream` / `CompressionStream` + `.npy` headers |
 | `saves.js` | browser saves: whole `.npz` files in localStorage, and their index |
 | `board.js` | the save's arrays, validation, derived render lists, `entityAt`/`describe`, placing, erasing, capturing, and the two setting writers |
