@@ -21,6 +21,7 @@ import { traceRun } from "./segtrace.js";
 import { TUNE, setTune } from "./tune.js";
 import { Sim, Clock, RATE_MIN, RATE_MAX } from "./sim.js";
 import { History } from "./history.js";
+import { icon } from "./icons.js";
 import { DEFAULT, naturalOrder, tableValues, finalValues } from "./indexer.js";
 import { entrySize, typeByName } from "./stamp.js";
 import { installPixel, Screen } from "./pixel.js";
@@ -30,7 +31,7 @@ import { Claims, followChain, offsets, layCopies, isZero, rotateVec, flipVec, mo
 import { deleteSave, getSave, listSaves, putSave } from "./saves.js";
 import { bakeKey, audioRecord, BAKE_DEFAULT_SECONDS, BAKE_MAX_SECONDS } from "./audio-params.js";
 
-const DEFAULT_SAVE = "default.npz";
+const DEFAULT_SAVE = "Default.npz";
 
 const canvas = document.getElementById("board");
 const ctx = canvas.getContext("2d", { alpha: false });
@@ -157,7 +158,18 @@ function syncScreen() {
 let audio = null;          // the running engine (audio.js startAudio), or null
 let audioStarting = false;
 let audioCtx = null;       // its context, from the tap that switched it on
+let soundWanted = false;   // the sound button's state (top-left of the board)
+// The sound button: a speaker, crossed out while sound is off.
+function setSoundBtn(on) {
+  const b = document.getElementById("sound-btn");
+  if (!b) return;
+  b.innerHTML = icon(on ? "soundOn" : "soundOff");
+  b.setAttribute("aria-pressed", String(on));
+  b.title = on ? "Sound on (tap for off)" : "Sound off (tap for on)";
+}
 function setAudio(on) {
+  soundWanted = on;
+  setSoundBtn(on);
   if (!on) {
     bakedPlay = null;
     if (audio) { audio.close(); audio = null; }
@@ -167,7 +179,7 @@ function setAudio(on) {
   }
   if (audio || audioStarting) return;
   const Ctx = window.AudioContext || window.webkitAudioContext;
-  if (!Ctx || !window.AudioWorkletNode) { panel.setAudioOn(false); panel.setAudioMeter("no Web Audio here"); return; }
+  if (!Ctx || !window.AudioWorkletNode) { soundWanted = false; setSoundBtn(false); panel.setAudioMeter("no Web Audio here"); return; }
   // Made and resumed here, inside the tap: iOS will not start a context
   // created after an await.
   const ctx = audioCtx = new Ctx({ latencyHint: "interactive" });
@@ -178,7 +190,7 @@ function setAudio(on) {
     .then(m => m.startAudio(ctx, { ...panel.audio }, sim, (mm) => { if (audio) panel.setAudioMeter(meterText(mm)); }))
     .then(a => {
       audioStarting = false;
-      if (!panel.audioOn.on) { a.close(); return; }   // switched off while starting
+      if (!soundWanted) { a.close(); return; }   // switched off while starting
       audio = a;
       a.rec.setSelection(soundSel?.cells ?? null);
       redraw();
@@ -186,7 +198,8 @@ function setAudio(on) {
     .catch(e => {
       audioStarting = false;
       ctx.close().catch(() => {});
-      panel.setAudioOn(false);
+      soundWanted = false;
+      setSoundBtn(false);
       panel.setAudioMeter(`failed: ${e.message}`);
     });
 }
@@ -284,9 +297,13 @@ async function recordVideoNow() {
   if (recording) { recording.cancel = true; return; }
   if (!sim || !board) return;
   const settings = { ...panel.video };
-  const base = (panel.local.name || "gates").replace(/[^\w.-]+/g, "_");
+  // A short timestamp in the name, so takes of one scene do not collide:
+  // "CPU experiments 11-20 12_07_33.mp4" (underscores: no dots in a name).
+  const base = (panel.local.name || "gates").replace(/[^\w .-]+/g, "_").trim() || "gates";
+  const d = new Date(), two = (n) => String(n).padStart(2, "0");
+  const fileName = `${base} ${two(d.getMonth() + 1)}-${two(d.getDate())} ${two(d.getHours())}_${two(d.getMinutes())}_${two(d.getSeconds())}.mp4`;
   endDryRun();       // a recording starts from the view play took over from
-  const choice = await chooseVideoFile(`${base}.mp4`);       // first await: keeps the gesture
+  const choice = await chooseVideoFile(fileName);       // first await: keeps the gesture
   if (choice.kind === "cancelled") return;
   const own = { cancel: false };
   recording = own;
@@ -312,7 +329,7 @@ async function recordVideoNow() {
     if (res.kind === "buffered") {
       const a = document.createElement("a");
       a.href = URL.createObjectURL(res.blob);
-      a.download = `${base}.mp4`;
+      a.download = fileName;
       a.click();
       setTimeout(() => URL.revokeObjectURL(a.href), 10000);
     }
@@ -542,7 +559,7 @@ function openBakeDialog() {
     if (!(rv >= RATE_MIN && rv <= RATE_MAX)) { show(`Tick rate must be ${RATE_MIN} to ${RATE_MAX}.`); return; }
     if (bakeOpts?.seconds !== sv || bakeOpts?.rate !== rv) { bakeOpts = { seconds: sv, rate: rv }; touchAudio(); }
     // Playing it back needs sound on; this tap is the gesture that may start it.
-    if (!audio && !audioStarting) { panel.setAudioOn(true); setAudio(true); }
+    if (!audio && !audioStarting) setAudio(true);
     runBake(sv, rv, show);
   };
   show();
@@ -2297,6 +2314,9 @@ async function init() {
 
   resize();
   new ResizeObserver(resize).observe(canvas);
+  const soundBtn = document.getElementById("sound-btn");
+  setSoundBtn(false);
+  soundBtn.addEventListener("click", () => { setAudio(!soundWanted); soundBtn.blur(); });
   attachGestures(canvas, cam, redraw, { onTap, onLongPress, drag: dragHooks, momentum: () => view.momentum !== false });
 
   fileInput.addEventListener("change", async () => {

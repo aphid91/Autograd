@@ -36,7 +36,8 @@ const MAX_QUEUE_S = 1;      // a stalled audio thread never builds more lag than
 const SPEED_TAU_S = 0.3;    // how quickly playback speed follows the queue
 const MAX_SPEED = 1.25;     // catching up on a small backlog: barely audible
 const SKIP_AT = 3;          // a backlog this many latencies deep is skipped, not raced through
-const HOLD_MAX_S = 0.5;     // holding through an underrun gives up after this long
+const HOLD_MAX_S = 0.5;
+const TILT_CAP = Math.pow(10, 24 / 20);   // +24 dB     // holding through an underrun gives up after this long
 
 export class GatesSynth {
   constructor(sampleRate, { offline = false } = {}) {
@@ -128,9 +129,15 @@ export class GatesSynth {
   }
 
   // A run's own gain: the tone dials for lengths 1-6, 1 for anything longer.
+  // Times the pitch tilt: (length / min length)^tilt, so a min-length run is
+  // unchanged and each doubling of length is 6 dB louder per unit of tilt --
+  // a small speaker (and an ear) loses about that much per octave down.
+  // Capped at +24 dB so a long run at a steep tilt cannot swamp the mix.
   lenGain(i) {
-    const L = Math.round(this.lens[i]);
-    return L >= 1 && L <= 6 ? this.p[`lenGain${L}`] : 1;
+    const p = this.p, L = Math.round(this.lens[i]);
+    const g = L >= 1 && L <= 6 ? p[`lenGain${L}`] : 1;
+    if (!p.pitchTilt) return g;
+    return g * Math.min(TILT_CAP, Math.pow(this.lens[i] / Math.max(1, p.beltMinLen), p.pitchTilt));
   }
 
   // One cycle, blended sine -> triangle -> saw, with a guard sample.
@@ -207,7 +214,9 @@ export class GatesSynth {
   pitch(i) {
     const p = this.p;
     const track = p.beltTrack > 0 ? Math.pow(this.rate / Math.max(p.trackRef, 1e-3), p.beltTrack) : 1;
-    return Math.min(p.beltMaxHz / this.lens[i] * track, this.sr * 0.45);
+    // The dial is a min-length run's pitch: raising min length transposes
+    // everything up, the shortest audible run always at the dial's pitch.
+    return Math.min(p.beltMaxHz * Math.max(1, p.beltMinLen) / this.lens[i] * track, this.sr * 0.45);
   }
 
   on(i) {

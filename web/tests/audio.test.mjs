@@ -455,3 +455,24 @@ test("sluggishness: attack and release scale with (length / 10)^s, exact for a 1
   syn.message({ type: "params", p: { ...AUDIO_DEFAULTS, softClip: false, attackMs: 20, sluggish: 1 } });
   assert.ok(Math.abs(syn.vAtk[syn.voiceOf[0]] - coef(40)) < 1e-12);
 });
+
+test("min-length Hz: the dial is a min-length run's pitch, so a run twice as long is an octave down", () => {
+  const s = synth({ beltShape: 0, beltMinLen: 2 });
+  s.message({ type: "config", lengths: new Float64Array([4]), groups: [0, 0] });
+  const f = freq(stream(s, 1, 1000, [0]));
+  assert.ok(Math.abs(f - AUDIO_DEFAULTS.beltMaxHz / 2) < 2, `${f} Hz`);
+});
+
+test("pitch tilt: gain times (length / min length)^tilt, capped at +24 dB", () => {
+  const level = (L, p) => {
+    const s = synth({ beltShape: 0, ...p });
+    s.message({ type: "config", lengths: new Float64Array([L]), groups: [0, 0] });
+    return peakOf(stream(s, 0.5, 1000, [0]).subarray(SR / 4));
+  };
+  const base = { beltMinLen: 4 };
+  assert.ok(Math.abs(level(16, { ...base, pitchTilt: 1 }) / level(16, base) - 4) < 0.05, "tilt 1: 4x the length, 4x the amplitude");
+  assert.ok(Math.abs(level(8, { ...base, pitchTilt: 2 }) / level(8, base) - 4) < 0.05, "tilt 2: 2x the length, 4x");
+  assert.ok(Math.abs(level(4, { ...base, pitchTilt: 2 }) / level(4, base) - 1) < 0.01, "a min-length run is unchanged");
+  const cap = Math.pow(10, 24 / 20);
+  assert.ok(Math.abs(level(64, { ...base, beltCutoff: 64, pitchTilt: 2, master: 0.01 }) / level(64, { ...base, beltCutoff: 64, master: 0.01 }) - cap) < 0.1, "capped at +24 dB");
+});

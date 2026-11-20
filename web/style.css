@@ -92,11 +92,26 @@ html, body {
   touch-action: none;
 }
 
-/* View > fps counter, in the board's bottom-left corner (the top is the
-   Tweakpane's, full width on a phone). Never takes a touch. */
+/* The sound button, in the board's top-left corner (the top-right is the
+   Tweakpane's, full width on a phone), and View > fps counter under it. */
+#sound-btn {
+  position: absolute;
+  top: calc(6 * var(--u));
+  left: calc(6 * var(--u));
+  width: calc(36 * var(--u));
+  height: calc(36 * var(--u));
+  padding: calc(7 * var(--u));
+  border-radius: 50%;
+  border: var(--border) solid var(--edge);
+  background: rgba(0, 0, 0, 0.55);
+  color: var(--ink-dim);
+  touch-action: manipulation;
+}
+#sound-btn[aria-pressed="true"] { color: var(--accent); border-color: var(--accent); }
+#sound-btn svg { width: 100%; height: 100%; fill: none; stroke: currentColor; stroke-width: 2; stroke-linecap: round; stroke-linejoin: round; }
 #fps {
   position: absolute;
-  bottom: calc(6 * var(--u));
+  top: calc(48 * var(--u));
   left: calc(6 * var(--u));
   padding: 2px 6px;
   border-radius: 4px;

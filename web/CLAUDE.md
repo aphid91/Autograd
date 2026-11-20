@@ -26,10 +26,15 @@ covers it).
 bash web/build.sh && python3 -m http.server -d _site 8000
 ```
 
-`build.sh` copies the app and every root `.npz` into `_site/`, writing
-`saves/index.json` for the save picker. On push to `Web`,
+`build.sh` copies the app and every `.npz` in **`web/saves/`** into
+`_site/`, writing `saves/index.json` for the save picker. On push to `Web`,
 `.github/workflows/pages.yml` does the same and deploys to GitHub Pages.
-`default.npz` is loaded at startup if it exists.
+`Default.npz` is loaded at startup if it exists. The bundled boards are
+**CPU experiments** (the root's `cpu.npz`), **RAM experiments** (the root's
+`quicksave.npz`), **GameOfLife_SLOW** and **Default**; the `.npz` files at
+the repo root are not shipped -- they are the desktop's and the tests'
+fixtures (`check_web_sim.py`, the web tests and the desktop's profiling
+tools load them by name), so they stay where they are.
 
 ## Installing it, and offline
 
@@ -120,9 +125,10 @@ ghost still draws), gates (every machine, Sources included -- for a brief
 look at the belts underneath; still there and still tappable, and items
 held inside a machine still draw: View > items hides those), sources
 (hidden, not removed), **gate status colours** and **belt status
-colours**, a **status colours** folder of pickers for both, and an **fps
-counter** -- frames and ticks per second actually reached, over
-half-second windows, bottom-left of the board), Debug, and
+colours** (on by default, with "stalled but moving: green"), a **status
+colours** folder of pickers for both, and an **fps counter** -- frames and
+ticks per second actually reached, over half-second windows, top-left of
+the board under the sound button), Debug, and
 the Status folder. Tweakpane is **vendored** (`vendor/`, MIT) rather than
 pulled from a CDN, which keeps the no-build, works-offline property. Status
 writes the same row fields the desktop's Status window does, plus the
@@ -256,7 +262,7 @@ a ghost or a run's tip. Scales multiply the shipped value, so 1 is always
 panel's preferences; a stored key this build does not know is ignored.
 
 Below a divider, two sub-folders of **zoom thresholds**: the zoom (CSS px
-per cell) below which belts turn to solid squares, and from which the grid,
+per cell) below which belts turn to solid squares (0 by default: never), and from which the grid,
 glyphs and Source values, ports, port edges and belt chevrons draw; and the
 **text fades**, in px of text height (what legibility depends on) -- item
 numbers fading in between two values, and a label's text appearing from
@@ -978,7 +984,10 @@ panel touches the DOM only when the text changes.
 
 The panel's **Audio** folder makes sound from the ticks: a drone per moving
 belt run and a click per gate fire. **Off by default and off at every
-launch** (a browser only starts audio from a tap). The dials travel **with
+launch** (a browser only starts audio from a tap). It is switched by the
+**sound button** in the board's top-left corner -- a speaker, crossed out
+while off -- not from the panel; the Audio folder holds the meter and the
+dials. The dials travel **with
 the save** (below) and are also kept in the panel's preferences as the
 last ones in front of the player; the switch is never kept.
 
@@ -1007,9 +1016,12 @@ What sounds:
 - **A belt run is active on a tick** if it pushed or popped, or its newest
   item moved (the belt status colours' "moving", with "stalled but moving:
   green"). Two `positionOf()` calls per candidate per tick. Its drone has
-  pitch **1-tile Hz / length** (the sim's length, buried underground tiles
-  included), so 10 tiles is an octave above 20 and every run is a
-  subharmonic of the 1-tile pitch. Runs outside **min length** to **max
+  pitch **min-length Hz × min length / length** (the sim's length, buried
+  underground tiles included): the dial is the pitch of the shortest run
+  that sounds, so raising min length transposes everything up and the
+  shortest audible run stays at the dial's pitch, 10 tiles is still an
+  octave above 20, and every run is a subharmonic of that pitch. (The key
+  is still `beltMaxHz`, so saves keep it; at min length 1 nothing moved.) Runs outside **min length** to **max
   length** get no voice (the recorder leaves them out of the candidates).
   Attack and release dials gate it per tick: short, a run moving every
   other tick buzzes at half the tick rate; long, it smooths to a drone.
@@ -1064,7 +1076,13 @@ the shortest runs are the highest pitches, and the usual thing to tame --
 with 7 and longer at 1. Per voice, not a filter, so it takes exactly those
 runs and nothing else (a filter would also take the upper harmonics of
 longer runs under a triangle or saw); it follows the dial on voices already
-sounding. **Low cut** is a 2nd-order Butterworth high-pass on the whole mix
+sounding. **Pitch tilt** (0..2) multiplies that by (length / min length)^tilt:
+a min-length run is unchanged and each doubling of length is +6 dB per unit
+of tilt -- about what a small speaker (and an ear) loses per octave down,
+so near 1 a single run sounds about equally loud at every length and above
+1 the low runs dominate. Capped at +24 dB. Phone speakers barely play
+below 150-200 Hz at all, which the waveform dial helps with too: a saw
+gives a low run harmonics the speaker can reproduce. **Low cut** is a 2nd-order Butterworth high-pass on the whole mix
 against rumble (0 Hz is off), per sample, so a bake stays bit-identical.
 
 **Start tick and fade** (`startTick`, `fadeMs`): the synth is silent while
@@ -1182,8 +1200,8 @@ Two practical notes: the `AudioContext` is created and resumed **inside the
 tap** (main.js `setAudio()`), before the dynamic import, since iOS will not
 start one made after an await; `navigator.audioSession.type = "playback"`
 is set where the browser has it, or the iPhone's silent switch mutes it.
-And ticking the box **blurs it**: otherwise the next Space (play) toggled
-audio off again.
+The sound button **blurs itself** after a tap: otherwise the next Space
+(play) toggled audio off again.
 
 `tests/audio.test.mjs`: the octave rule and rate tracking by zero
 crossings; silence when idle; the buzz's period is the tick's; the start
@@ -1243,6 +1261,9 @@ the camera arithmetic, loaded always and tested in node;
   the ramps as fractions of that window (0/0 constant speed, 0.5/0.5 a
   smooth S; scaled down if they exceed 1). Centre linear, size geometric,
   so a zoom feels even.
+- **The file name** is the board's name and a short timestamp, e.g.
+  `CPU experiments 11-20 12_07_33.mp4` (underscores, not dots), so several
+  takes of one scene do not collide.
 - **Saving**, as Fluoddity: the file picker is raised **before any other
   await** in the click (it needs the gesture), and a chosen file is
   **streamed** into (`fastStart: false`, flat memory; `finalize()` closes

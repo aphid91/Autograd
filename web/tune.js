@@ -22,7 +22,7 @@ export const TUNE_DEFAULTS = {
   // Zoom thresholds, in CSS px per cell: below each, that detail is not
   // drawn (render.js's LOD reads these live).
   lodZoom: 0,            // 0: the zoom thresholds test the real zoom; above 0, this value instead
-  lodBeltSolid: 4,       // belts become solid squares
+  lodBeltSolid: 0,       // belts become solid squares (0: never)
   lodGrid: 6,            // grid lines
   lodMarks: 5,           // machine glyphs and Source values
   lodPorts: 8,           // port arrows

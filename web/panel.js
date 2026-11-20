@@ -68,7 +68,7 @@ export class Panel {
       board.addButton({ title: "Delete saved" }).on("click", () => this.local.saved && cb.onDeleteLocal(this.local.saved)),
     ];
 
-    this.view = { grid: true, ports: true, labels: true, seedTint: true, notes: true, momentum: true, items: true, belts: true, gates: true, gateStatus: false, sources: true, beltStatus: false, beltActive: true, fps: false, pixelAlpha: 0, pixelMax: 8, ...this.prefs.view };
+    this.view = { grid: true, ports: true, labels: true, seedTint: true, notes: true, momentum: true, items: true, belts: true, gates: true, gateStatus: false, sources: true, beltStatus: true, beltActive: true, fps: false, pixelAlpha: 0, pixelMax: 8, ...this.prefs.view };
     const view = this.pane.addFolder({ title: "View", expanded: false });
     for (const [key, label] of [["grid", "grid lines"], ["ports", "ports"], ["labels", "source values"], ["seedTint", "seed tint"], ["notes", "labels (notes)"], ["momentum", "pan momentum"], ["items", "items"], ["belts", "belts"], ["gates", "gates"], ["gateStatus", "gate status colours"], ["beltStatus", "belt status colours"], ["beltActive", "stalled but moving: green"], ["sources", "sources"], ["fps", "fps counter"]]) {
       view.addBinding(this.view, key, { label }).on("change", () => {
@@ -115,15 +115,8 @@ export class Panel {
     for (const [k, v] of Object.entries(this.prefs.audio || {})) {
       if (k in AUDIO_DEFAULTS && typeof v === typeof AUDIO_DEFAULTS[k]) this.audio[k] = v;
     }
-    this.audioOn = { on: false };
     this.audioMeter = { text: "off" };
     const audio = this.pane.addFolder({ title: "Audio", expanded: false });
-    this.audioOnBinding = audio.addBinding(this.audioOn, "on", { label: "sound" })
-      .on("change", (ev) => {
-        // Hand the keyboard back, or the next Space (play) toggles this box.
-        if (document.activeElement instanceof HTMLElement) document.activeElement.blur();
-        cb.onAudioEnable(ev.value);
-      });
     audio.addBinding(this.audioMeter, "text", { label: "meter", readonly: true, multiline: true, rows: 5, interval: 250 });
     const pushAudio = () => {
       this.prefs.audio = { ...this.audio };
@@ -243,7 +236,7 @@ export class Panel {
   }
 
   // The audio switch, when main.js could not honour it.
-  setAudioOn(on) { this.audioOn.on = on; this.audioOnBinding.refresh(); }
+
   // Read by the meter's monitor binding on its own interval.
   setAudioMeter(text) { this.audioMeter.text = text; }
 
