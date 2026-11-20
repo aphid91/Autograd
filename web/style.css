@@ -479,6 +479,7 @@ html, body {
 }
 .idx-preview[data-error="true"] { color: var(--danger); }
 .idx-apply { color: var(--accent); border-color: var(--accent); }
+.sheet-btn:disabled { opacity: 0.4; }
 /* The label editor. */
 #note-text {
   width: 100%; box-sizing: border-box; resize: vertical; min-height: calc(64 * var(--u));

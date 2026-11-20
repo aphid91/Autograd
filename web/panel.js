@@ -112,7 +112,7 @@ export class Panel {
         if (document.activeElement instanceof HTMLElement) document.activeElement.blur();
         cb.onAudioEnable(ev.value);
       });
-    audio.addBinding(this.audioMeter, "text", { label: "meter", readonly: true, multiline: true, rows: 4, interval: 250 });
+    audio.addBinding(this.audioMeter, "text", { label: "meter", readonly: true, multiline: true, rows: 5, interval: 250 });
     const pushAudio = () => {
       this.prefs.audio = { ...this.audio };
       savePrefs(this.prefs);
@@ -124,6 +124,7 @@ export class Panel {
       if (key === "---") { agroup = audio.addFolder({ title: label, expanded: false }); continue; }
       audioBindings.push(agroup.addBinding(this.audio, key, { label, ...(opts || {}) }).on("change", pushAudio));
     }
+    audio.addButton({ title: "Bake audio…" }).on("click", () => cb.onBake());
     audio.addButton({ title: "Reset audio dials" }).on("click", () => {
       Object.assign(this.audio, AUDIO_DEFAULTS);
       for (const b of audioBindings) b.refresh();

@@ -61,6 +61,7 @@ export class Recorder {
   // Called by Sim.step() after its sync, before the structure phase.
   pre(sim) {
     if (sim.stats.rebuilds !== this.rebuilds) this.configure(sim);
+    if (!this.n) this.tick0 = sim.tick;
     const c = this.cands, h = this.h, t = this.t, pos = this.pos;
     for (let i = 0; i < c.length; i++) {
       const seg = c[i];
@@ -100,7 +101,7 @@ export class Recorder {
     if (!this.n) return;
     this.stopped = false;
     const n = this.n, W = this.words;
-    const m = { type: "ticks", n, words: W, rate,
+    const m = { type: "ticks", n, tick0: this.tick0, words: W, rate,
                 bits: this.bits.slice(0, n * W), f0: this.f0.slice(0, n), f1: this.f1.slice(0, n) };
     this.port.postMessage(m, [m.bits.buffer, m.f0.buffer, m.f1.buffer]);
     this.n = 0;
@@ -129,6 +130,29 @@ export async function startAudio(ctx, params, sim, onMeter) {
   return {
     ctx, node, rec,
     setParams(p) { node.port.postMessage({ type: "params", p }); rec.setCutoff(p.beltCutoff); },
-    async close() { rec.detach(); node.port.onmessage = null; node.disconnect(); await ctx.close(); },
+    // A bake's samples, as an AudioBuffer for this context.
+    buffer(samples, sampleRate) {
+      const b = ctx.createBuffer(1, samples.length, sampleRate);
+      b.copyToChannel(samples, 0);
+      return b;
+    },
+    // Play `buf` from `offset` seconds into it, starting at context time
+    // `when`; any earlier one stops. Straight to the destination: no queue,
+    // so the only latency is the output's own.
+    playBaked(buf, when, offset) {
+      this.stopBaked();
+      const src = ctx.createBufferSource();
+      src.buffer = buf;
+      src.connect(ctx.destination);
+      src.start(Math.max(when, ctx.currentTime), Math.max(0, offset));
+      this.src = src;
+    },
+    stopBaked() {
+      if (!this.src) return;
+      try { this.src.stop(); } catch { /* already ended */ }
+      this.src.disconnect();
+      this.src = null;
+    },
+    async close() { this.stopBaked(); rec.detach(); node.port.onmessage = null; node.disconnect(); await ctx.close(); },
   };
 }

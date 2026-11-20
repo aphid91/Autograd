@@ -7,15 +7,25 @@
 // behind, so a burst of ticks run in one frame comes out evenly spaced. If
 // the sim falls behind (the frame budget drops ticks), the queue shrinks and
 // playback slows to match: the clicks drop in pitch rather than gapping. If
-// it runs dry, every voice releases and playback waits to refill.
+// it runs dry, every voice releases and playback waits to refill -- or,
+// with `holdUnderrun`, the voices hold where they are for up to HOLD_MAX_S
+// and playback picks up the moment ticks arrive, with no refill wait.
+//
+// Before `startTick` the synth runs silent (voices still follow the runs,
+// so a drone already sounding fades in rather than starting cold), and
+// fades in over `fadeMs` from it.
+//
+// Offline (a bake): no latency, no speed control, no skipping, never a
+// release for want of ticks -- the caller feeds every tick before rendering
+// its samples, so tick k starts at sample k * sampleRate / rate exactly.
 //
 // Messages (from audio.js):
 //   { type: "config", lengths: Float64Array, groups: [n0, n1] }
 //       the belt runs that may sound (their lengths), and the gate counts
 //       per group; sent whenever the sim's segments are rebuilt
-//   { type: "ticks", n, words, rate, bits: Uint32Array, f0, f1: Uint16Array }
-//       n ticks: per tick, `words` words of run-active bits, and how many
-//       gates of each group fired
+//   { type: "ticks", n, tick0, words, rate, bits: Uint32Array, f0, f1: Uint16Array }
+//       n ticks from tick0: per tick, `words` words of run-active bits, and
+//       how many gates of each group fired
 //   { type: "params", p }   the panel's dials
 //   { type: "stop" }        paused: drop the queue, release everything
 
@@ -26,10 +36,12 @@ const MAX_QUEUE_S = 1;      // a stalled audio thread never builds more lag than
 const SPEED_TAU_S = 0.3;    // how quickly playback speed follows the queue
 const MAX_SPEED = 1.25;     // catching up on a small backlog: barely audible
 const SKIP_AT = 3;          // a backlog this many latencies deep is skipped, not raced through
+const HOLD_MAX_S = 0.5;     // holding through an underrun gives up after this long
 
 export class GatesSynth {
-  constructor(sampleRate) {
+  constructor(sampleRate, { offline = false } = {}) {
     this.sr = sampleRate;
+    this.offline = offline;
     this.p = { ...AUDIO_DEFAULTS };
     this.table = new Float32Array(TABLE + 1);
     this.shape = -1;
@@ -59,6 +71,12 @@ export class GatesSynth {
     this.playing = false;
     this.tickPos = 0;                    // fraction of the current tick elapsed
     this.speed = 1;
+    this.played = 0;                     // offline: ticks applied since playback began
+    this.sampleNo = 0;                   // offline: samples rendered since then
+    this.held = false;                   // holding through an underrun
+    this.heldS = 0;
+    this.curTick = -1;                   // the tick being played, absolute
+    this.fade = 0;                       // 0..1, the fade in from startTick
     // Click resonators, one per group: y = c1*y1 + c2*y2 + x.
     this.ry1 = [0, 0]; this.ry2 = [0, 0]; this.rc1 = [0, 0]; this.rc2 = [0, 0]; this.rx = [0, 0];
     this.imp = [0, 0];                   // impulse due on the next sample
@@ -119,6 +137,7 @@ export class GatesSynth {
     if (b.words !== this.words || !b.n) return;   // from before the last config
     this.queue.push(b);
     this.queued += b.n;
+    if (this.offline) return;
     // Never build more than MAX_QUEUE_S of lag: drop the oldest ticks.
     while (this.queue.length > 1 && this.queued / Math.max(b.rate, 1e-3) > MAX_QUEUE_S) {
       const old = this.queue.shift();
@@ -149,6 +168,7 @@ export class GatesSynth {
   // whatever it says afresh.
   gatesOff() {
     this.playing = false;
+    this.held = false; this.heldS = 0;
     this.tickPos = 0;
     for (let v = 0; v < this.nv; v++) this.vOn[v] = 0;
     this.prev.fill(0);
@@ -209,6 +229,7 @@ export class GatesSynth {
     if (!this.queued) return false;
     const b = this.queue[0], k = this.qi;
     this.rate = b.rate;
+    this.curTick = (b.tick0 ?? 0) + k;
     if (this.rate !== this.trackRate) {
       this.trackRate = this.rate;
       for (let v = 0; v < this.nv; v++) if (this.vSeg[v] >= 0) this.vInc[v] = this.pitch(this.vSeg[v]) / this.sr;
@@ -246,27 +267,54 @@ export class GatesSynth {
     const queuedS = this.queued / Math.max(this.queue.length ? this.queue[0].rate : this.rate, 1e-3);
     // A tick takes effect at its start: tickPos is how far through the one
     // already applied playback is.
-    if (!this.playing && this.queued && queuedS >= target) {
-      this.playing = true; this.speed = 1; this.tickPos = 0;
-      this.nextTick();
+    if (this.held) {
+      // Ticks again: carry straight on. Too long without: let go.
+      if (this.queued) { this.held = false; this.heldS = 0; this.tickPos = 0; if (this.nextTick()) this.played++; }
+      else if ((this.heldS += n / sr) > HOLD_MAX_S && !this.offline) this.gatesOff();
     }
-    if (this.playing && queuedS > SKIP_AT * target) this.skip(queuedS - target);
-    if (this.playing) {
-      const want = Math.min(MAX_SPEED, Math.max(0.25, queuedS / target));
-      this.speed += (want - this.speed) * Math.min(1, n / sr / SPEED_TAU_S);
+    if (!this.playing && this.queued && (this.offline || queuedS >= target)) {
+      this.playing = true; this.speed = 1; this.tickPos = 0;
+      this.played = this.nextTick() ? 1 : 0; this.sampleNo = 0;
+    }
+    if (this.offline) this.speed = 1;
+    else {
+      if (this.playing && queuedS > SKIP_AT * target) this.skip(queuedS - target);
+      if (this.playing) {
+        const want = Math.min(MAX_SPEED, Math.max(0.25, queuedS / target));
+        this.speed += (want - this.speed) * Math.min(1, n / sr / SPEED_TAU_S);
+      }
     }
     let i = 0;
     while (i < n) {
       let span = n - i;
+      if (this.offline && this.playing && !this.held) {
+        // Exact: tick k begins at sample round(k * sr / rate), however the
+        // caller splits the rendering -- so a bake is the same to the bit
+        // whatever its chunks.
+        const next = Math.round(this.played * sr / this.rate);
+        if (next <= this.sampleNo) {
+          if (this.nextTick()) this.played++; else this.held = true;
+          continue;
+        }
+        span = Math.min(span, next - this.sampleNo);
+        this.span(out, i, span, this.sampleNo + span === next);
+        i += span; this.sampleNo += span;
+        continue;
+      }
       const tps = this.rate * this.speed / sr;   // ticks per sample
-      if (this.playing) span = Math.min(span, Math.max(1, Math.ceil((1 - this.tickPos) / tps)));
-      this.span(out, i, span);
+      const moving = this.playing && !this.held;
+      if (moving) span = Math.min(span, Math.max(1, Math.ceil((1 - this.tickPos) / tps)));
+      this.span(out, i, span, moving && this.tickPos + span * tps >= 1 || !moving);
       i += span;
-      if (this.playing) {
+      if (moving) {
         this.tickPos += span * tps;
         while (this.tickPos >= 1) {
           this.tickPos -= 1;
-          if (!this.nextTick()) { this.gatesOff(); break; }
+          if (!this.nextTick()) {
+            if (this.offline || this.p.holdUnderrun) { this.held = true; this.heldS = 0; this.tickPos = 0; }
+            else this.gatesOff();
+            break;
+          }
         }
       }
     }
@@ -283,17 +331,25 @@ export class GatesSynth {
   }
 
   // `len` samples at out[at..]: the clicks, then every voice over the span.
-  span(out, at, len) {
+  // `edge`: the span ends on a tick boundary (or nothing is playing), the
+  // only place a finished voice is freed, so where the caller splits the
+  // rendering never changes what is heard.
+  span(out, at, len, edge = true) {
     const end = at + len;
     for (let g = 0; g < 2; g++) {
       let y1 = this.ry1[g], y2 = this.ry2[g];
       const c1 = this.rc1[g], c2 = this.rc2[g];
       let x = this.imp[g] * this.rx[g];
       this.imp[g] = 0;
-      if (g === 0) for (let s = at; s < end; s++) { const y = c1 * y1 + c2 * y2 + x; x = 0; y2 = y1; y1 = y; out[s] = y; }
-      else for (let s = at; s < end; s++) { const y = c1 * y1 + c2 * y2 + x; x = 0; y2 = y1; y1 = y; out[s] += y; }
-      // Flush denormals once a click has died away.
-      if (Math.abs(y1) < 1e-12 && Math.abs(y2) < 1e-12) { y1 = 0; y2 = 0; }
+      // A click that has died away is flushed to zero per sample (no
+      // denormals, and the same wherever a span ends).
+      for (let s = at; s < end; s++) {
+        let y = c1 * y1 + c2 * y2 + x;
+        x = 0;
+        if (y < 1e-20 && y > -1e-20) y = 0;
+        y2 = y1; y1 = y;
+        if (g === 0) out[s] = y; else out[s] += y;
+      }
       this.ry1[g] = y1; this.ry2[g] = y2;
     }
     const T = this.table, amp = this.p.beltGain / Math.pow(Math.max(1, this.n), this.p.norm);
@@ -309,7 +365,23 @@ export class GatesSynth {
         if (ph >= 1) ph -= 1;
       }
       this.vEnv[v] = env; this.vPhase[v] = ph;
-      if (!tgt && env < 1e-4) { this.free(v); v--; }
+    }
+    // Free finished voices after the span, from the top: a freed slot takes
+    // the last voice (already checked), and a refused run given the slot
+    // starts sounding on the next span -- not retroactively over this one.
+    if (edge) {
+      for (let v = this.nv - 1; v >= 0; v--) if (!this.vOn[v] && this.vEnv[v] < 1e-4) this.free(v);
+    }
+    // Silent before startTick, then the fade in.
+    const p = this.p;
+    if (this.curTick < p.startTick) {
+      this.fade = 0;
+      out.fill(0, at, end);
+    } else if (this.fade < 1) {
+      const inc = p.fadeMs > 0 ? 1000 / (p.fadeMs * this.sr) : 1;
+      let f = this.fade;
+      for (let s = at; s < end; s++) { f = Math.min(1, f + inc); out[s] *= f; }
+      this.fade = f;
     }
   }
 

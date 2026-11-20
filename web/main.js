@@ -19,13 +19,14 @@ import { makeStamp, mirrored, noteTouches, reversedGate, rotated, shiftNote, sta
 import { emitMask, emitsWith, stampGhost } from "./ghost.js";
 import { traceRun } from "./segtrace.js";
 import { TUNE, setTune } from "./tune.js";
-import { Sim, Clock } from "./sim.js";
+import { Sim, Clock, RATE_MIN, RATE_MAX } from "./sim.js";
 import { History } from "./history.js";
 import { DEFAULT, naturalOrder, tableValues, finalValues } from "./indexer.js";
 import { entrySize } from "./stamp.js";
 import { noteAt, gripAt, isText, newRect, MIN_W, MIN_H } from "./notes.js";
 import { Claims, followChain, offsets, layCopies, isZero, rotateVec, flipVec, moreCount, lessCount } from "./vector.js";
 import { deleteSave, getSave, listSaves, putSave } from "./saves.js";
+import { bakeKey, BAKE_DEFAULT_SECONDS, BAKE_MAX_SECONDS } from "./audio-params.js";
 
 const DEFAULT_SAVE = "default.npz";
 
@@ -136,9 +137,12 @@ const debug = window.gates = {
 // are never fetched and the tick's only cost is Sim.audio's null check.
 let audio = null;          // the running engine (audio.js startAudio), or null
 let audioStarting = false;
+let audioCtx = null;       // its context, from the tap that switched it on
 function setAudio(on) {
   if (!on) {
+    bakedPlay = null;
     if (audio) { audio.close(); audio = null; }
+    audioCtx = null;
     panel.setAudioMeter("off");
     return;
   }
@@ -147,7 +151,7 @@ function setAudio(on) {
   if (!Ctx || !window.AudioWorkletNode) { panel.setAudioOn(false); panel.setAudioMeter("no Web Audio here"); return; }
   // Made and resumed here, inside the tap: iOS will not start a context
   // created after an await.
-  const ctx = new Ctx({ latencyHint: "interactive" });
+  const ctx = audioCtx = new Ctx({ latencyHint: "interactive" });
   ctx.resume();
   audioStarting = true;
   panel.setAudioMeter("starting…");
@@ -171,7 +175,143 @@ function meterText(m) {
   return `voices ${m.voices} / ${m.limit}` + (m.refused ? `  (${m.refused} refused)` : "") + "\n" +
     `runs active ${m.active} of ${m.candidates}\n` +
     `peak ${m.peak.toFixed(2)} (${db} dB)` + (m.clipped ? `  clipped ${m.clipped}` : "") + "\n" +
-    `lag ${Math.round(m.lagMs)} ms · speed ${m.speed.toFixed(2)}`;
+    `lag ${Math.round(m.lagMs)} ms · speed ${m.speed.toFixed(2)}` +
+    (bakedPlay ? "  (baked)" : "") + "\n" + bakeStatus();
+}
+
+// --- baked audio ------------------------------------------------------------------
+//
+// A stretch of ticks rendered ahead of time (audio-bake.js), played back
+// from a buffer while the live sim is on exactly that stretch. It starts
+// with a Reset and keeps that tick-0 state (`snap`): while the bake is
+// valid, Reset restores it rather than rebuilding, since a rebuild renumbers
+// the runs and the numbering decides the belt phase's order -- only the
+// same state is sure to replay the same ticks.
+//
+// While it plays, the audio is the clock: each frame steps the sim to the
+// tick being heard, with a bigger step budget, so frames drop rather than
+// the board drifting from the sound.
+let bake = null;           // { snap, sim, revision, rebuilds, rate, key, t0, end, samples, sampleRate, buf }
+let bakedPlay = null;      // { t0Time }: context time at which tick bake.t0 is heard
+let baking = null;         // { cancel } while a bake runs
+const BAKED_BUDGET_MS = 100;
+
+// Same board, same run numbering, same sim: Reset can return to the bake's start.
+const bakeLive = () => !!(bake && sim === bake.sim && board.revision === bake.revision &&
+                          sim.stats.rebuilds === bake.rebuilds);
+function bakeStale() {
+  if (!bake) return null;
+  if (!bakeLive()) return "the board changed";
+  if (bake.key !== bakeKey(panel.audio)) return "the dials changed";
+  if (clock.rate !== bake.rate) return `the rate is not ${bake.rate}`;
+  return null;
+}
+// The live sim is inside the baked stretch and the bake still says what it would play.
+const bakePlayable = () => !!(audio && bake && !bakeStale() && sim.tick < bake.end);
+function bakeStatus() {
+  if (baking) return "bake: baking…";
+  if (!bake) return "bake: none";
+  const why = bakeStale(), secs = ((bake.end - bake.t0) / bake.rate).toFixed(1);
+  return `bake: ${secs} s @ ${bake.rate} tps, ticks ${bake.t0}–${bake.end}` + (why ? ` -- stale: ${why}` : "");
+}
+
+function startBakedPlay() {
+  audio.rec.stop();
+  audio.rec.detach();                // nothing to record: the buffer is the sound
+  if (!bake.buf) bake.buf = audio.buffer(bake.samples, bake.sampleRate);
+  const ac = audio.ctx, lead = 0.03;
+  const at = sim.tick + clock.alpha;
+  // Tick `at` starts sounding `lead` from now (out of the speakers a
+  // further outputLatency on, which the clock below takes off again).
+  const t0Time = ac.currentTime + lead - (at - bake.t0) / bake.rate;
+  audio.playBaked(bake.buf, Math.max(ac.currentTime + lead, t0Time), Math.max(0, (at - bake.t0) / bake.rate));
+  bakedPlay = { t0Time };
+}
+function stopBakedPlay() {
+  if (!bakedPlay) return;
+  bakedPlay = null;
+  if (audio) { audio.stopBaked(); audio.rec.attach(sim); }
+}
+// The fractional tick being heard now.
+function bakedTick() {
+  const ac = audio.ctx, out = ac.outputLatency || ac.baseLatency || 0;
+  return bake.t0 + (ac.currentTime - out - bakedPlay.t0Time) * bake.rate;
+}
+
+function openBakeDialog() {
+  const m = document.getElementById("bakemenu");
+  const secs = m.querySelector("#bake-seconds"), rate = m.querySelector("#bake-rate");
+  const status = m.querySelector("#bake-status"), go = m.querySelector("#bake-go");
+  const cancel = m.querySelector("#bake-cancel"), wav = m.querySelector("#bake-wav");
+  if (!secs.value) secs.value = String(BAKE_DEFAULT_SECONDS);
+  rate.value = String(clock.rate);
+  const show = (text) => {
+    status.textContent = text ?? (`Starts with a Reset. Audio from tick ${panel.audio.startTick}` +
+      (panel.audio.fadeMs ? `, fading in over ${panel.audio.fadeMs} ms` : "") + ".\n" + bakeStatus());
+    go.disabled = !!baking; cancel.disabled = !baking; wav.disabled = !bake || !!baking;
+  };
+  const close = () => { m.dataset.open = "false"; };
+  m.querySelector("#bake-close").onclick = close;
+  let down = false;
+  m.onpointerdown = (e) => { down = e.target === m; };
+  m.onclick = (e) => { if (e.target === m && down) close(); down = false; };
+  cancel.onclick = () => { if (baking) baking.cancel = true; };
+  wav.onclick = () => bake && downloadWav();
+  go.onclick = () => {
+    const sv = Number(secs.value), rv = Number(rate.value);
+    if (!(sv > 0 && sv <= BAKE_MAX_SECONDS)) { show(`Duration must be between 0 and ${BAKE_MAX_SECONDS} s.`); return; }
+    if (!(rv >= RATE_MIN && rv <= RATE_MAX)) { show(`Tick rate must be ${RATE_MIN} to ${RATE_MAX}.`); return; }
+    // Playing it back needs sound on; this tap is the gesture that may start it.
+    if (!audio && !audioStarting) { panel.setAudioOn(true); setAudio(true); }
+    runBake(sv, rv, show);
+  };
+  show();
+  m.dataset.open = "true";
+}
+
+async function runBake(seconds, rate, show) {
+  if (!sim || baking) return;
+  shell.setPaused(true);
+  clock.paused = true;
+  stopBakedPlay();
+  bake = null;
+  sim.reset();
+  clock.reset();
+  redraw();
+  const snap = sim.clone();
+  const own = { cancel: false };
+  baking = own;
+  const startSim = sim, revision = board.revision, rebuilds = sim.stats.rebuilds;
+  const params = { ...panel.audio }, key = bakeKey(params);
+  const t = performance.now();
+  const { bakeAudio } = await import("./audio-bake.js");
+  let res = null;
+  try {
+    res = await bakeAudio({
+      start: snap, params, rate, seconds, sampleRate: audioCtx?.sampleRate || 48000,
+      onProgress: (f, tick, end) => show(`Baking… ${Math.round(f * 100)}%  (tick ${tick} of ${end})`),
+      shouldStop: () => own.cancel || sim !== startSim || board.revision !== revision,
+    });
+  } catch (e) {
+    show(`Bake failed: ${e.message}`);
+  }
+  baking = null;
+  if (!res) { show(res === null ? "Bake cancelled (or the board changed)." : undefined); return; }
+  bake = { snap, sim: startSim, revision, rebuilds, rate, key, ...res, buf: null };
+  shell.setRate(rate);     // play it at the rate it was baked at
+  show(`Baked ${seconds} s at ${rate} tps in ${((performance.now() - t) / 1000).toFixed(1)} s. Press play.\n` + bakeStatus());
+  redraw();
+}
+
+function downloadWav() {
+  import("./audio-bake.js").then(({ wavBytes }) => {
+    const blob = new Blob([wavBytes(bake.samples, bake.sampleRate)], { type: "audio/wav" });
+    const a = document.createElement("a");
+    a.href = URL.createObjectURL(blob);
+    a.download = `${(panel.local.name || "gates").replace(/[^\w.-]+/g, "_")}-${bake.rate}tps-t${bake.t0}.wav`;
+    a.click();
+    setTimeout(() => URL.revokeObjectURL(a.href), 10000);
+  });
 }
 
 let queued = false;
@@ -210,7 +350,16 @@ function paint(now) {
     // An edit since the last frame re-derives the runs and starts fresh --
     // here rather than at each edit site, so no edit path can forget it.
     sim.sync();
-    if (!clock.paused) {
+    if (!clock.paused && bakePlayable()) {
+      // Baked: step to the tick being heard. The buffer runs on its own
+      // clock, so falling behind costs frames, never sync.
+      if (!bakedPlay) startBakedPlay();
+      const target = Math.min(bakedTick(), bake.end);
+      const t0 = performance.now();
+      while (sim.tick < Math.floor(target) && performance.now() - t0 < BAKED_BUDGET_MS) { sim.step(); ran++; }
+      clock.frac = Math.min(1, Math.max(0, target - sim.tick));
+    } else if (!clock.paused) {
+      if (bakedPlay) stopBakedPlay();   // out of the baked stretch: realtime from here
       // A stalled frame (a backgrounded tab) is clamped, and the clock caps
       // the backlog too, so coming back never freezes to catch up.
       const dt = lastNow === null ? 0 : Math.min(0.25, (now - lastNow) / 1000);
@@ -226,7 +375,9 @@ function paint(now) {
   }
   // Ship this frame's ticks to the audio thread; paused, let it fall silent.
   if (audio) {
-    if (sim && !clock.paused) audio.rec.flush(clock.rate);
+    if (clock.paused) stopBakedPlay();
+    if (bakedPlay) { /* the buffer is playing */ }
+    else if (sim && !clock.paused) audio.rec.flush(clock.rate);
     else audio.rec.stop();
   }
   lastNow = sim && !clock.paused ? now : null;
@@ -1560,6 +1711,7 @@ async function show(name, bytes) {
     board = await Board.fromNpz(T, bytes);
     panel.setBoardName(name.replace(/\.npz$/i, ""));
     sim = new Sim(T, board);
+    stopBakedPlay();
     if (audio) audio.rec.attach(sim);
     clock.reset();
     shell.setPaused(true);   // a freshly loaded board waits to be started
@@ -1778,7 +1930,17 @@ async function init() {
     // Tapping the stamp being pasted puts it away; any other starts pasting it.
     onPasteStamp: (id) => { if (shell.state.pasteStamp === id) exitPaste(); else enterPaste(id); },
     // ctrl+R: tick 0, every item gone, seeds back on; the factory stays.
-    onReset: () => { if (sim) { sim.reset(); clock.reset(); } redraw(); },
+    // With a live bake, back to the bake's own tick-0 state, so playing
+    // replays exactly what was baked.
+    onReset: () => {
+      if (sim) {
+        stopBakedPlay();
+        if (bakeLive()) sim.restoreFrom(bake.snap); else sim.reset();
+        clock.reset();
+        if (audio) audio.rec.stop();
+      }
+      redraw();
+    },
     onPause: (paused) => { clock.paused = paused; redraw(); },
     onRate: (rate) => { clock.setRate(rate); redraw(); },
     onBuildTap: () => {
@@ -1809,6 +1971,7 @@ async function init() {
     onView: (v) => { view = v; redraw(); },
     onColours: (c) => { statusColours = c; redraw(); },
     onAudioEnable: (on) => setAudio(on),
+    onBake: () => openBakeDialog(),
     onAudio: (p) => { if (audio) audio.setParams(p); },
     onTune: (t) => { setTune(t); redraw(); },
     onClearStamps: () => shell.clearStamps(),

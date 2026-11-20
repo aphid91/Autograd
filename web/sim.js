@@ -772,6 +772,48 @@ export class Sim {
     return this.fc;
   }
 
+  // --- copies, for baking audio --------------------------------------------------
+  //
+  // A copy that ticks on without touching this one: its own entity table
+  // (gate channels) and its own runs (rings, counters); everything derived
+  // from the board -- the gate table, the edges, the cell maps -- is shared,
+  // since a copy never rebuilds (its board's revision is frozen with it).
+  // The grid is shared too: an edit to the live board invalidates a bake,
+  // and the bake checks for one between chunks.
+  clone() {
+    const c = Object.create(Sim.prototype);
+    Object.assign(c, this);
+    const b = Object.create(Object.getPrototypeOf(this.board));
+    Object.assign(b, this.board);
+    b.entities = this.board.entities.slice();
+    c.board = b;
+    c.segments = new Map();
+    for (const [sid, seg] of this.segments) {
+      c.segments.set(sid, { ...seg, enter: seg.enter.slice(), payload: seg.payload.slice() });
+    }
+    c.order = this.order.map(seg => c.segments.get(seg.sid));
+    c.stats = { ...this.stats };
+    c.audio = null; c.rec = null; c.fc = null;
+    return c;
+  }
+
+  // Put this sim back into a state copied from it by clone(), with no edit
+  // since. What a bake's Reset uses: a rebuild renumbers the runs, and the
+  // numbering decides the belt phase's order, so only the same state is
+  // guaranteed to replay the same ticks.
+  restoreFrom(snap) {
+    this.board.entities.set(snap.board.entities);
+    for (const seg of this.order) {
+      const s = snap.segments.get(seg.sid);
+      seg.head = s.head; seg.tail = s.tail; seg.anchor = s.anchor;
+      seg.enter.set(s.enter); seg.payload.set(s.payload);
+    }
+    this.tick = snap.tick;
+    Object.assign(this.stats, snap.stats);
+    this.version++;
+    this.fc = null;
+  }
+
   // --- reading it back ------------------------------------------------------------
 
   liveItems() {

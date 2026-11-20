@@ -1003,6 +1003,61 @@ it back; `step()` skips the recorder while `rec` is set, or every drawn tick
 would be heard twice. Pinned by the recorder test, which also asserts the
 recorded run is tick-for-tick identical to an unrecorded one.
 
+**Start tick and fade** (`startTick`, `fadeMs`): the synth is silent while
+the tick it plays is before the start tick, then fades in. It keeps
+following the runs while silent, so a drone already going at the start
+tick fades in rather than starting cold. Each batch carries its first
+tick's number (`tick0`) for this. Default 0 and 0: no change.
+
+**Hold on underrun** (off by default): when the queue runs dry, the voices
+hold where they are instead of releasing, and playback picks up the moment
+ticks arrive, with no refill wait. A hold gives up after `HOLD_MAX_S`
+(0.5 s); a pause is still a stop. It is the realtime remedy for stutter at
+busy moments; baking is the thorough one.
+
+### Baking
+
+**Bake audio…** (Audio folder) opens a sheet: seconds (default 30, at most
+300) and ticks per second (default the current rate), **Bake**, **Cancel
+bake** and **Download WAV** (16-bit mono). [audio-bake.js](audio-bake.js)
+renders the stretch ahead of time with no frame budget and no deadline:
+the same recorder and the same synth, the synth **offline** (no latency, no
+speed control, no skipping), fed every tick before it renders their
+samples. About 0.6 s for 4 s at 240 tps on desktop; most of the cost is
+ticks, so 10000 tps is far slower to bake than 240.
+
+- **It starts with a Reset and keeps that state** (`Sim.clone()`), and
+  while the bake is live **Reset restores it** (`Sim.restoreFrom()`)
+  instead of re-deriving. A rebuild renumbers the runs, alternating scan
+  order, and the numbering decides the belt phase's order, so only the
+  same state is sure to replay the same ticks. With no bake, or after an
+  edit, Reset is the desktop's as before (`check_web_sim.py` is unaffected).
+- **It runs on a clone**, in 25 ms chunks with a yield between, so the live
+  board is untouched and the page stays live. A clone copies the entity
+  table and each run's ring and counters; everything derived (gate table,
+  edges, cell maps, the grid) is shared, since a clone never rebuilds. An
+  edit or a new board cancels the bake.
+- **Warm-up**: the synth runs from about half a second (attack + release)
+  before the start tick, so the bake starts with the voices a realtime run
+  would have.
+- **Playback**: while the live sim is in the baked stretch, at the bake's
+  rate, with the same dials (`bakeKey()`: everything but latency and hold),
+  the buffer plays straight to the destination -- no queue, so only the
+  output's own latency -- and **the audio is the clock**: each frame steps
+  the sim to the tick being heard (context time less `outputLatency`), with
+  a 100 ms step budget, so a busy frame drops frames rather than drifting.
+  Leaving the stretch, pausing, or the bake going stale hands back to
+  realtime (a small skip, accepted). The meter's last line says which bake
+  exists and why it is stale.
+- **A bake is the same to the bit however it is chunked**, which took three
+  fixes in the synth, all inaudible but each a real dependence on where a
+  render call ended: offline, tick k starts at sample `round(k * sr /
+  rate)` from a sample count rather than an accumulated float; finished
+  voices are freed only on a tick boundary, **after** the span is rendered
+  (a refused run given the freed slot mid-loop was rendered over the whole
+  span, starting before its time); and a dead click is flushed to zero per
+  sample rather than at span ends. Found by baking twice and comparing.
+
 Two practical notes: the `AudioContext` is created and resumed **inside the
 tap** (main.js `setAudio()`), before the dynamic import, since iOS will not
 start one made after an await; `navigator.audioSession.type = "playback"`
@@ -1013,7 +1068,10 @@ audio off again.
 `tests/audio.test.mjs`: the octave rule and rate tracking by zero
 crossings; silence when idle; the buzz's period is the tick's; the start
 threshold and run-dry release; the skip; the voice limit (refusal and
-reuse); stop; the groups; and the recorder on `cpu.npz`. Mutation-tested:
+reuse); stop; the groups; the recorder on `cpu.npz`; the start tick and
+fade; hold on underrun; sample-exact ticks offline; the WAV header; and a
+real bake -- the live sim untouched, two bakes identical, and
+`restoreFrom()` replaying the same ticks. Mutation-tested:
 recording the forecast, never reusing a freed voice, and a wrong pitch law
 each fail it.
 
@@ -1115,6 +1173,7 @@ asserting every array matches and exactly the edited value differs.
 | `audio-params.js` | the Audio dials and the gate groups; loaded always |
 | `audio.js` | audio, main thread: the per-tick recorder and starting the graph; loaded on demand |
 | `audio-dsp.js`, `audio-worklet.js` | the synthesiser, and its AudioWorklet wrapper |
+| `audio-bake.js` | baking: a stretch of ticks rendered offline, and the WAV writer; loaded on demand |
 | `vendor/` | Tweakpane 4.0.5, vendored |
 | `npz.js` | `.npz` reader and writer: zip directory + native `DecompressionStream` / `CompressionStream` + `.npy` headers |
 | `saves.js` | browser saves: whole `.npz` files in localStorage, and their index |

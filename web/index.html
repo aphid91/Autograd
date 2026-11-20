@@ -47,6 +47,25 @@
   </div>
 </div>
 
+<div id="bakemenu" class="sheetwrap" data-open="false" role="dialog" aria-modal="true" aria-labelledby="bake-title">
+  <div class="sheet">
+    <div class="sheet-head">
+      <span id="bake-title">Bake audio</span>
+      <button type="button" class="b sheet-btn" id="bake-close">Close</button>
+    </div>
+    <div class="idx-row">
+      <label class="idx-ab">seconds <input id="bake-seconds" type="text" inputmode="decimal" autocomplete="off"></label>
+      <label class="idx-ab">ticks/s <input id="bake-rate" type="text" inputmode="decimal" autocomplete="off"></label>
+    </div>
+    <div id="bake-status" class="idx-preview"></div>
+    <div class="idx-row">
+      <button type="button" class="b sheet-btn idx-apply" id="bake-go">Bake</button>
+      <button type="button" class="b sheet-btn" id="bake-cancel">Cancel bake</button>
+      <button type="button" class="b sheet-btn" id="bake-wav">Download WAV</button>
+    </div>
+  </div>
+</div>
+
 <div id="stampmenu" class="sheetwrap" data-open="false" role="dialog" aria-modal="true" aria-labelledby="stampmenu-title">
   <div class="sheet">
     <div class="sheet-head">

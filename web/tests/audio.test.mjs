@@ -9,6 +9,7 @@ import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 import { GatesSynth } from "../audio-dsp.js";
 import { Recorder } from "../audio.js";
+import { bakeAudio, wavBytes } from "../audio-bake.js";
 import { AUDIO_DEFAULTS, audioGroupOf } from "../audio-params.js";
 import { Board } from "../board.js";
 import { Sim } from "../sim.js";
@@ -203,4 +204,92 @@ test("the recorder on a real save: hears every tick but no forecast, and changes
   // Detached, the sim no longer calls it.
   rec.detach();
   assert.equal(heard.audio, null);
+});
+
+// --- start tick, fade, hold, baking ---------------------------------------------
+
+function ticksAt(s, tick0, n, rate, active = [], f0 = 0, f1 = 0) {
+  const W = s.words, bits = new Uint32Array(n * W);
+  for (let k = 0; k < n; k++) for (const i of active) bits[k * W + (i >>> 5)] |= 1 << (i & 31);
+  s.message({ type: "ticks", n, tick0, words: W, rate, bits, f0: new Uint16Array(n).fill(f0), f1: new Uint16Array(n).fill(f1) });
+}
+const peakOf = (a) => a.reduce((m, x) => Math.max(m, Math.abs(x)), 0);
+
+test("silent before the start tick, then a fade in over fadeMs", () => {
+  const s = new GatesSynth(SR, { offline: true });
+  s.message({ type: "params", p: { ...AUDIO_DEFAULTS, softClip: false, beltShape: 0, startTick: 100, fadeMs: 200 } });
+  s.message({ type: "config", lengths: new Float64Array([10]), groups: [0, 0] });
+  ticksAt(s, 0, 1000, 1000, [0]);            // 1 tick per ms
+  const out = render(s, SR);
+  assert.equal(peakOf(out.subarray(0, 99 * 48)), 0, "silent before tick 100");
+  const early = peakOf(out.subarray(100 * 48, 110 * 48)), late = peakOf(out.subarray(400 * 48, 500 * 48));
+  assert.ok(early > 0 && early < late * 0.15, `fading in: ${early} then ${late}`);
+  assert.ok(peakOf(out.subarray(250 * 48, 260 * 48)) < late * 0.9, "still fading at 150 ms");
+});
+
+test("hold on underrun: the voices sound through a gap in the ticks, and carry on", () => {
+  for (const hold of [false, true]) {
+    const s = synth({ holdUnderrun: hold, latencyMs: 20, releaseMs: 5 });
+    s.message({ type: "config", lengths: new Float64Array([10]), groups: [0, 0] });
+    stream(s, 0.2, 1000, [0]);
+    const gap = render(s, SR / 10);          // 100 ms with no ticks
+    // The queue's last 20 ms play out first; by the gap's end a release
+    // is long finished and a hold is still sounding.
+    const tail = peakOf(gap.subarray(gap.length * 0.9));
+    if (hold) assert.ok(tail > 0.01, `held: ${tail}`);
+    else assert.ok(tail < 1e-4, `released: ${tail}`);
+    // And the next ticks carry on at once, with no refill wait.
+    if (hold) {
+      ticks(s, 5, 1000, [0]);
+      render(s, 128);
+      assert.ok(s.meter().ticks > 0, "playing again");
+    }
+  }
+});
+
+test("offline, tick k starts at sample k * sampleRate / rate exactly", () => {
+  const s = new GatesSynth(SR, { offline: true });
+  s.message({ type: "params", p: { ...AUDIO_DEFAULTS, softClip: false } });
+  s.message({ type: "config", lengths: new Float64Array(0), groups: [0, 1] });
+  const n = 40, W = 0, f1 = new Uint16Array(n);
+  f1[37] = 1;                                  // one fire, on tick 37
+  s.message({ type: "ticks", n, tick0: 0, words: W, rate: 300, bits: new Uint32Array(0), f0: new Uint16Array(n), f1 });
+  const out = render(s, Math.ceil(40 * SR / 300));
+  const first = out.findIndex(x => x !== 0);
+  assert.equal(first, Math.round(37 * SR / 300));
+});
+
+test("WAV: a 16-bit PCM mono header and the samples", () => {
+  const buf = wavBytes(new Float32Array([0, 1, -1, 0.5]), 44100), v = new DataView(buf);
+  const str = (o, n) => String.fromCharCode(...new Uint8Array(buf, o, n));
+  assert.equal(str(0, 4), "RIFF"); assert.equal(str(8, 4), "WAVE"); assert.equal(str(36, 4), "data");
+  assert.equal(v.getUint32(24, true), 44100);
+  assert.equal(v.getUint16(34, true), 16);
+  assert.deepEqual([0, 1, 2, 3].map(i => v.getInt16(44 + 2 * i, true)), [0, 32767, -32768, 16383]);
+});
+
+test("baking a real save: the live sim is untouched, a bake is repeatable, restoreFrom replays it", { skip: !existsSync(save) }, async () => {
+  const bytes = readFileSync(save);
+  const board = await Board.fromNpz(T, bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength));
+  const live = new Sim(T, board);
+  live.reset();
+  const snap = live.clone();
+  const before = stateLine(live);
+  const params = { ...AUDIO_DEFAULTS, startTick: 20, fadeMs: 50 };
+  const opts = { start: snap, params, rate: 240, seconds: 0.5, sampleRate: SR };
+  const a = await bakeAudio(opts), b = await bakeAudio(opts);
+  assert.equal(stateLine(live), before, "the live sim never moved");
+  assert.equal(stateLine(snap), before, "nor did the snapshot");
+  assert.equal(a.t0, 20); assert.equal(a.end, 20 + 120);
+  assert.equal(a.samples.length, Math.round(120 * SR / 240));
+  assert.ok(peakOf(a.samples) > 0, "it made a sound");
+  assert.deepEqual(a.samples, b.samples, "the same bake twice is the same audio");
+
+  // Played on, then Reset to the bake's start: the same ticks again.
+  for (let i = 0; i < 50; i++) live.step();
+  const mid = stateLine(live);
+  live.restoreFrom(snap);
+  assert.equal(stateLine(live), before, "restoreFrom is the bake's start");
+  for (let i = 0; i < 50; i++) live.step();
+  assert.equal(stateLine(live), mid, "and replays the same ticks");
 });

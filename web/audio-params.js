@@ -7,6 +7,9 @@ export const AUDIO_DEFAULTS = {
   norm: 0.5,            // normalisation exponent p: each voice is scaled by 1 / N^p
   softClip: true,       // tanh on the way out; a safety net, not a compressor
   latencyMs: 60,        // how far the audio runs behind the sim
+  holdUnderrun: false,  // realtime: hold the voices through a short underrun instead of releasing
+  startTick: 0,         // silent before this tick (skips the start-up spike)
+  fadeMs: 0,            // fade in from the start tick
   // Belts: a drone per active run, pitch = maxHz / length (positions).
   beltGain: 1,
   beltMaxHz: 1760,      // a 1-tile run; 10 tiles is an octave above 20
@@ -36,6 +39,9 @@ export const AUDIO_SPEC = [
   ["norm", "normalise (p)", { min: 0, max: 1, step: 0.05 }],
   ["softClip", "soft clip"],
   ["latencyMs", "latency ms", { min: 20, max: 250, step: 5 }],
+  ["holdUnderrun", "hold on underrun"],
+  ["startTick", "audio from tick", { min: 0, max: 5000, step: 1 }],
+  ["fadeMs", "fade in ms", { min: 0, max: 10000, step: 10 }],
   ["---", "belts"],
   ["beltGain", "gain", { min: 0, max: 4, step: 0.01 }],
   ["beltMaxHz", "1-tile Hz", { min: 50, max: 8000, step: 10 }],
@@ -61,3 +67,16 @@ export function audioGroupOf(cls) {
   if (cls === "Source") return 2;
   return cls === "Swap" || cls === "Route" || cls === "Merge" ? 0 : 1;
 }
+
+// Dials that only steer realtime playback, so changing them leaves a bake
+// valid. Everything else changes what a bake would have rendered.
+export const REALTIME_ONLY = ["latencyMs", "holdUnderrun"];
+export function bakeKey(p) {
+  const o = {};
+  for (const k of Object.keys(AUDIO_DEFAULTS)) if (!REALTIME_ONLY.includes(k)) o[k] = p[k];
+  return JSON.stringify(o);
+}
+
+// The Bake dialog's limits and defaults.
+export const BAKE_DEFAULT_SECONDS = 30;
+export const BAKE_MAX_SECONDS = 300;
