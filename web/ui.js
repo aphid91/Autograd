@@ -772,7 +772,9 @@ export class Shell {
     label.className = "rowlabel";
     label.textContent = iv.kind === "emit" ? "Emits" : "Seed";
     row.append(label, this.numberGrid(iv.values, iv.current, (v) => this.cb.onInspectValue?.(v)));
-    if (iv.kind === "emit") row.append(this.customValue(iv.values, iv.current, (v) => this.cb.onInspectValue?.(v)));
+    // A box for any other number: a Source's emit value or a belt's seed.
+    // (Typing the seed it already has is no change, so it never unseeds.)
+    row.append(this.customValue(iv.values, iv.current, (v) => this.cb.onInspectValue?.(v)));
   }
 
   setInspectValue(iv) {

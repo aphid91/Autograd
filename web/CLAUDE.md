@@ -76,8 +76,9 @@ scale 1.15.
     number swatches), and a tap on bare board clears it. While Status shows a Source or
     a belt, the bar offers the number swatches (0, 1, −1, 2, 4, 8) for its
     emit value or seed; on a belt, tapping the lit number unseeds it. A
-    Source also gets a **text box** after the swatches for any other value
-    (see "Placing machines and raw belts").
+    **text box** after the swatches takes any other value, for a Source or
+    a belt's seed (see "Placing machines and raw belts"); typing the seed a
+    belt already has changes nothing, so it never unseeds.
 - **Sim** (right): Reset (the desktop's ctrl+R: tick 0, every item gone,
   seeds back on, the factory untouched) and Play/Pause. Space toggles
   play. It **starts paused**, and loading a save pauses it again. **Long
@@ -260,6 +261,13 @@ glyphs and Source values, ports, port edges and belt chevrons draw; and the
 **text fades**, in px of text height (what legibility depends on) -- item
 numbers fading in between two values, and a label's text appearing from
 one. `render.js`'s `LOD` reads them live through getters.
+
+**Override zoom** (first in the zoom thresholds; 0 is off): above 0, the
+thresholds decide as if the zoom were that value, whatever the real zoom
+-- for a far-out view with full detail, or a close one without. The real
+zoom also sets sizes, so it is not swapped out; each threshold is rescaled
+instead (`t * z / override`, against the zoom of the render in progress),
+which gives exactly the same yes or no. It applies to video frames too.
 
 **Force build** makes the builder tools win: a blocked machine or raw belt
 deletes whatever is in its way and is placed, and a belt run deletes what

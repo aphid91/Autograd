@@ -51,13 +51,21 @@ const ITEM_TEXT = { size: 0.3, glyph: 0.336 };   // its fade band: TUNE.itemText
 
 // Below this zoom (CSS px per cell) detail is not drawn at all.
 // Live from the Dev folder's zoom thresholds (tune.js).
+//
+// Dev > override zoom, above 0, decides the detail as if the zoom were that
+// value, at any real zoom. Every threshold is compared against the real zoom
+// `z` (which also sets sizes, so it cannot simply be swapped), so the
+// override rescales each threshold instead: z >= t * z / o exactly when
+// o >= t. `lodZ` is the zoom of the render in progress, set by render().
+let lodZ = 1;
+const lod = (t) => (TUNE.lodZoom > 0 ? t * lodZ / TUNE.lodZoom : t);
 const LOD = {
-  get beltSolid() { return TUNE.lodBeltSolid; },
-  get gridLines() { return TUNE.lodGrid; },
-  get chevrons() { return TUNE.lodChevrons; },
-  get ports() { return TUNE.lodPorts; },
-  get marks() { return TUNE.lodMarks; },
-  get portEdge() { return TUNE.lodPortEdge; },
+  get beltSolid() { return lod(TUNE.lodBeltSolid); },
+  get gridLines() { return lod(TUNE.lodGrid); },
+  get chevrons() { return lod(TUNE.lodChevrons); },
+  get ports() { return lod(TUNE.lodPorts); },
+  get marks() { return lod(TUNE.lodMarks); },
+  get portEdge() { return lod(TUNE.lodPortEdge); },
 };
 
 // A Source's number, in CSS px: 1.75x the first cut, bounded by the body's
@@ -94,6 +102,7 @@ export const DEFAULT_VIEW = { grid: true, ports: true, labels: true, seedTint: t
 export function render(ctx, board, cam, dpr, opts = {}) {
   const view = { ...DEFAULT_VIEW, ...opts };
   const z = cam.zoom;
+  lodZ = z;
   ctx.setTransform(1, 0, 0, 1, 0, 0);
   ctx.fillStyle = COL.void;
   ctx.fillRect(0, 0, ctx.canvas.width, ctx.canvas.height);
