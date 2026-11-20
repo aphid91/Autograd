@@ -95,10 +95,12 @@ export class Shell {
       // The simulation starts paused, so loading a save never sets it going.
       paused: true,
       // Ticks per second. Persisted; a stored value out of range is dropped.
-      rate: Number.isFinite(saved.rate) && saved.rate >= RATE_MIN && saved.rate <= RATE_MAX ? saved.rate : 1,
+      rate: Number.isFinite(saved.rate) && saved.rate >= RATE_MIN && saved.rate <= RATE_MAX ? saved.rate : 30,
       // The rate panel above the Sim buttons, toggled by a long press on
-      // Play/Pause. Not persisted: it is opened to change something.
-      simPanel: false,
+      // Play/Pause. Persisted, and open on a first visit, so it is found.
+      simPanel: typeof saved.simPanel === "boolean" ? saved.simPanel : true,
+      // Whether the "long press" hint has been shown (on the first close).
+      simHinted: saved.simHinted === true,
       customOpen: false,   // the Custom entry row is showing
       // While main.js is planning something, what the bar should show:
       //   { kind: "belt", routeName, routeIcon }   a belt run
@@ -131,7 +133,7 @@ export class Shell {
 
   changed() {
     const s = this.state;
-    store({ mode: s.mode, slots: s.slots, selected: s.selected, rate: s.rate });
+    store({ mode: s.mode, slots: s.slots, selected: s.selected, rate: s.rate, simPanel: s.simPanel, simHinted: s.simHinted });
     this.render();
     this.cb.onChange?.(s);
   }
@@ -342,9 +344,26 @@ export class Shell {
   }
 
   toggleSimPanel(open = !this.state.simPanel) {
-    this.state.simPanel = open;
-    if (!open) this.state.customOpen = false;
-    this.render();
+    const s = this.state;
+    s.simPanel = open;
+    if (!open) s.customOpen = false;
+    // The first close ever says how to get it back.
+    if (!open && !s.simHinted) {
+      s.simHinted = true;
+      this.hint("long press play/pause for tick controls");
+    }
+    this.changed();
+  }
+
+  // A message over the Sim section for a few seconds.
+  hint(text, ms = 2500) {
+    const sec = this.els.controls.querySelector("#simsec");
+    let h = sec.querySelector(".sim-hint");
+    if (!h) { h = document.createElement("div"); h.className = "sim-hint"; h.setAttribute("role", "status"); sec.append(h); }
+    h.textContent = text;
+    h.dataset.open = "true";
+    clearTimeout(this.hintTimer);
+    this.hintTimer = setTimeout(() => { h.dataset.open = "false"; }, ms);
   }
 
   // The panel's buttons: a preset per rate, then Custom, which opens a text

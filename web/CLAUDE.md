@@ -90,8 +90,11 @@ scale 1.15.
   press Play/Pause** (right-click on a mouse) for the rate panel, just above
   the Sim section: presets of 1, 5, 30 and 240 ticks a second, and Custom,
   which opens a text box (0.1 to 10000). It stays open until the next long
-  press or its × button, and shows the tick count. The rate persists with
-  the shell's localStorage; the panel's open state does not.
+  press or its × button, and shows the tick count. The rate (30 by default)
+  and the panel's open state persist with the shell's localStorage. The
+  panel is **open on a first visit**, so it is found; the first time it is
+  ever closed, a hint over the Sim section says "long press play/pause for
+  tick controls" for a couple of seconds (`simHinted`, kept, so once).
 - **Edit**: Undo, Redo and Checkpoint (ctrl+Z, ctrl+shift+Z / ctrl+Y on a
   keyboard). See "Undo" below. Turning lives on the **thumb pads** in the
   board's corners, which show whenever there is something to turn: a held
@@ -118,14 +121,14 @@ Three things worth knowing:
   the desktop's panel/orchestrator split.
 
 The **Tweakpane** panel sits in the board's top-right corner, collapsed by
-default. It holds the saves, View toggles (grid, ports, source values, seed
+default. It holds the saves, View toggles (grid -- off by default, ports, source values, seed
 tint -- the green/red wash on seeded belts, ghosts included -- labels, pan
 momentum, items, belts (placed belts and underground ends; a planned run's
 ghost still draws), gates (every machine, Sources included -- for a brief
 look at the belts underneath; still there and still tappable, and items
 held inside a machine still draw: View > items hides those), sources
 (hidden, not removed), **gate status colours** and **belt status
-colours** (on by default, with "stalled but moving: green"), a **status
+colours** (both on by default, belts with "stalled but moving: green"), a **status
 colours** folder of pickers for both, and an **fps counter** -- frames and
 ticks per second actually reached, over half-second windows, top-left of
 the board under the sound button), Debug, and
@@ -983,13 +986,18 @@ panel touches the DOM only when the text changes.
 ## Audio
 
 The panel's **Audio** folder makes sound from the ticks: a drone per moving
-belt run and a click per gate fire. **Off by default and off at every
-launch** (a browser only starts audio from a tap). It is switched by the
+belt run and a click per gate fire. **On by default, and remembered across
+sessions** (`gates.web.sound.v1` in localStorage, written only by the
+player's own tap). A browser starts audio only from a gesture, so a launch
+with sound on shows the button on and starts it on the **first tap or key
+anywhere** (`armSound()`: pointerup, touchend, keydown -- the events that
+count as activation on a touch screen; a tap on the sound button itself is
+left to its own click, which turns sound off). It is switched by the
 **sound button** in the board's top-left corner -- a speaker, crossed out
 while off -- not from the panel; the Audio folder holds the meter and the
 dials. The dials travel **with
 the save** (below) and are also kept in the panel's preferences as the
-last ones in front of the player; the switch is never kept.
+last ones in front of the player; the switch is never in a save.
 
 **Off costs nothing.** `audio.js` and the worklet are imported only when
 the switch is ticked, and the tick's only trace is `Sim.audio`, null: one
@@ -1115,6 +1123,18 @@ not yet seen the lift read rows the lift had freed. Tested: the hash
 survives a lift and put-back, ticking and a label, and moves with a moved
 machine or a Source's value; the recorder takes exactly the touched runs
 and gates.
+
+**A slow tick rate must not kill the worklet.** At 5 tps one tick lasts
+200 ms, longer than the skip threshold (3 × 60 ms latency): starting
+playback took the only queued tick, and the skip test, on the depth
+measured *before* that, `skip()`'d an empty queue -- a throw, and an
+AudioWorkletProcessor that throws is silent for good, so sound came back
+only by switching it off and on. Now the start threshold is at least 1.5
+ticks (`max(latency, 1.5 / rate)`), the depth is re-measured after the
+start, `skip()` returns on an empty queue, and the worklet catches any
+throw, stops the synth (it restarts on the next ticks) and posts
+`{type: "error"}`, which main.js logs. Pinned by a test streaming 1000 →
+5 → 10 → 2 → 1000 tps that asserts no 100 ms window goes silent.
 
 **Hold on underrun** (off by default): when the queue runs dry, the voices
 hold where they are instead of releasing, and playback picks up the moment

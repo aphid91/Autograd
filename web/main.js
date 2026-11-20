@@ -159,6 +159,31 @@ let audio = null;          // the running engine (audio.js startAudio), or null
 let audioStarting = false;
 let audioCtx = null;       // its context, from the tap that switched it on
 let soundWanted = false;   // the sound button's state (top-left of the board)
+// The player's choice, kept across sessions; on until they turn it off.
+const SOUND_KEY = "gates.web.sound.v1";
+function soundStored() {
+  try { return localStorage.getItem(SOUND_KEY) !== "off"; } catch { return true; }
+}
+function storeSound(on) {
+  try { localStorage.setItem(SOUND_KEY, on ? "on" : "off"); } catch { /* not kept */ }
+}
+// A browser starts audio only from a gesture, so a launch with sound on
+// shows the button on and starts it on the first tap or key anywhere --
+// pointerup / touchend / keydown, the events that count as activation on
+// a touch screen. A context made before then would only be suspended.
+// Until it runs, each gesture tries again (a resume can be refused).
+function armSound() {
+  const evs = ["pointerup", "touchend", "keydown"];
+  const go = (e) => {
+    if (!soundWanted) return done();
+    if (e.target?.closest?.("#sound-btn")) return;   // the button's own click decides
+    if (!audio && !audioStarting) setAudio(true);
+    else audioCtx?.resume?.();
+    if (audioCtx?.state === "running") done();
+  };
+  const done = () => { for (const ev of evs) document.removeEventListener(ev, go, true); };
+  for (const ev of evs) document.addEventListener(ev, go, true);
+}
 // The sound button: a speaker, crossed out while sound is off.
 function setSoundBtn(on) {
   const b = document.getElementById("sound-btn");
@@ -187,7 +212,11 @@ function setAudio(on) {
   audioStarting = true;
   panel.setAudioMeter("starting…");
   import("./audio.js")
-    .then(m => m.startAudio(ctx, { ...panel.audio }, sim, (mm) => { if (audio) panel.setAudioMeter(meterText(mm)); }))
+    .then(m => m.startAudio(ctx, { ...panel.audio }, sim, (mm) => {
+      if (!audio) return;
+      if (mm.type === "error") { console.warn("audio:", mm.message); return; }   // the worklet recovered; say so in the console
+      panel.setAudioMeter(meterText(mm));
+    }))
     .then(a => {
       audioStarting = false;
       if (!soundWanted) { a.close(); return; }   // switched off while starting
@@ -559,7 +588,7 @@ function openBakeDialog() {
     if (!(rv >= RATE_MIN && rv <= RATE_MAX)) { show(`Tick rate must be ${RATE_MIN} to ${RATE_MAX}.`); return; }
     if (bakeOpts?.seconds !== sv || bakeOpts?.rate !== rv) { bakeOpts = { seconds: sv, rate: rv }; touchAudio(); }
     // Playing it back needs sound on; this tap is the gesture that may start it.
-    if (!audio && !audioStarting) setAudio(true);
+    if (!audio && !audioStarting) { setAudio(true); storeSound(true); }
     runBake(sv, rv, show);
   };
   show();
@@ -2315,8 +2344,10 @@ async function init() {
   resize();
   new ResizeObserver(resize).observe(canvas);
   const soundBtn = document.getElementById("sound-btn");
-  setSoundBtn(false);
-  soundBtn.addEventListener("click", () => { setAudio(!soundWanted); soundBtn.blur(); });
+  soundWanted = soundStored();
+  setSoundBtn(soundWanted);
+  if (soundWanted) { panel.setAudioMeter("starts on your first tap"); armSound(); }
+  soundBtn.addEventListener("click", () => { setAudio(!soundWanted); storeSound(soundWanted); soundBtn.blur(); });
   attachGestures(canvas, cam, redraw, { onTap, onLongPress, drag: dragHooks, momentum: () => view.momentum !== false });
 
   fileInput.addEventListener("change", async () => {

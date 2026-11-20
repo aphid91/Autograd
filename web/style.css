@@ -641,6 +641,28 @@ html, body {
   z-index: 8;
 }
 .simpanel[data-open="true"] { display: flex; }
+
+/* The one-time hint shown when the rate panel is first closed. */
+.sim-hint {
+  position: absolute;
+  bottom: calc(100% + var(--pad) * var(--u));
+  left: 50%;
+  transform: translateX(-50%);
+  width: max-content;
+  max-width: calc(100vw - 2 * var(--pad) * var(--u));
+  padding: calc(5 * var(--u)) calc(8 * var(--u));
+  background: var(--chrome);
+  border: var(--border) solid var(--accent);
+  border-radius: var(--r);
+  color: var(--ink);
+  font-size: calc(var(--label-fs) * 1.15 * var(--u));
+  text-align: center;
+  pointer-events: none;
+  opacity: 0;
+  transition: opacity 0.3s;
+  z-index: 8;
+}
+.sim-hint[data-open="true"] { opacity: 1; }
 .simpanel-head {
   display: flex;
   align-items: center;

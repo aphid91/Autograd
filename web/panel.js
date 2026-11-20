@@ -68,7 +68,7 @@ export class Panel {
       board.addButton({ title: "Delete saved" }).on("click", () => this.local.saved && cb.onDeleteLocal(this.local.saved)),
     ];
 
-    this.view = { grid: true, ports: true, labels: true, seedTint: true, notes: true, momentum: true, items: true, belts: true, gates: true, gateStatus: false, sources: true, beltStatus: true, beltActive: true, fps: false, pixelAlpha: 0, pixelMax: 8, ...this.prefs.view };
+    this.view = { grid: false, ports: true, labels: true, seedTint: true, notes: true, momentum: true, items: true, belts: true, gates: true, gateStatus: true, sources: true, beltStatus: true, beltActive: true, fps: false, pixelAlpha: 0, pixelMax: 8, ...this.prefs.view };
     const view = this.pane.addFolder({ title: "View", expanded: false });
     for (const [key, label] of [["grid", "grid lines"], ["ports", "ports"], ["labels", "source values"], ["seedTint", "seed tint"], ["notes", "labels (notes)"], ["momentum", "pan momentum"], ["items", "items"], ["belts", "belts"], ["gates", "gates"], ["gateStatus", "gate status colours"], ["beltStatus", "belt status colours"], ["beltActive", "stalled but moving: green"], ["sources", "sources"], ["fps", "fps counter"]]) {
       view.addBinding(this.view, key, { label }).on("change", () => {

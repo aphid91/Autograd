@@ -184,6 +184,7 @@ export class GatesSynth {
   // are not lost: the next tick applied is compared against the last one
   // applied. Their clicks are.
   skip(seconds) {
+    if (!this.queue.length) return;
     let drop = Math.floor(seconds * Math.max(this.queue[0].rate, 1e-3));
     while (drop > 0 && this.queue.length) {
       const b = this.queue[0], left = b.n - this.qi, d = Math.min(drop, left);
@@ -302,8 +303,13 @@ export class GatesSynth {
     const sr = this.sr, p = this.p;
     // Start once the queue holds the latency's worth; follow the queue's
     // depth with the playback speed.
-    const target = p.latencyMs / 1000;
-    const queuedS = this.queued / Math.max(this.queue.length ? this.queue[0].rate : this.rate, 1e-3);
+    // At a slow tick rate a single tick outlasts the latency (200 ms at 5
+    // tps against 60 ms), so the target is at least a tick and a half --
+    // otherwise one queued tick reads as a backlog to skip and the queue
+    // runs dry between every pair of ticks.
+    const qRate = () => Math.max(this.queue.length ? this.queue[0].rate : this.rate, 1e-3);
+    const target = Math.max(p.latencyMs / 1000, 1.5 / qRate());
+    let queuedS = this.queued / qRate();
     // A tick takes effect at its start: tickPos is how far through the one
     // already applied playback is.
     if (this.held) {
@@ -314,6 +320,10 @@ export class GatesSynth {
     if (!this.playing && this.queued && (this.offline || queuedS >= target)) {
       this.playing = true; this.speed = 1; this.tickPos = 0;
       this.played = this.nextTick() ? 1 : 0; this.sampleNo = 0;
+      // Measured again: starting took a tick off the queue. Skipping on the
+      // stale figure once skip()'d an empty queue -- a throw on the audio
+      // thread, and an AudioWorkletProcessor that throws is silent for good.
+      queuedS = this.queued / qRate();
     }
     if (this.offline) this.speed = 1;
     else {

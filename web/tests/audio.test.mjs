@@ -476,3 +476,24 @@ test("pitch tilt: gain times (length / min length)^tilt, capped at +24 dB", () =
   const cap = Math.pow(10, 24 / 20);
   assert.ok(Math.abs(level(64, { ...base, beltCutoff: 64, pitchTilt: 2, master: 0.01 }) / level(64, { ...base, beltCutoff: 64, master: 0.01 }) - cap) < 0.1, "capped at +24 dB");
 });
+
+test("a slow tick rate keeps sounding: no crash, no dropouts, and back to fast after", () => {
+  // 1000 tps, then 5 and 10 (one tick outlasts the 60 ms latency), then 1000.
+  // Once, the start-up took the only queued tick and the skip check, on its
+  // stale figure, skip()'d an empty queue: a throw, which silences a real
+  // AudioWorkletProcessor for good.
+  const s = synth({ releaseMs: 40 });
+  s.message({ type: "config", lengths: new Float64Array([4, 8]), groups: [0, 1] });
+  const quietest = (out) => {
+    let lo = Infinity;
+    for (let i = 0; i + 4800 <= out.length; i += 4800) lo = Math.min(lo, peakOf(out.subarray(i, i + 4800)));
+    return lo;
+  };
+  stream(s, 1, 1000, [0, 1], 0, 1);
+  for (const rate of [5, 10, 2]) {
+    const out = stream(s, 3, rate, [0, 1], 0, 1);
+    assert.ok(quietest(out.subarray(SR)) > 0.05, `${rate} tps: never silent for 100 ms once started`);
+  }
+  const back = stream(s, 1, 1000, [0, 1], 0, 1);
+  assert.ok(quietest(back.subarray(SR / 4)) > 0.05, "fast again");
+});
