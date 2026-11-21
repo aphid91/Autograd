@@ -638,7 +638,7 @@ export class Sim {
       }
       if (this.fire(g, P)) {
         this.stats.fired++;
-        if (A) A.fires[g.agroup]++;
+        if (A) A.fires[g.agroup] += g.again ?? 1;   // a far gate (space.js) counts for less
       }
     }
   }

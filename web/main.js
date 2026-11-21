@@ -30,6 +30,7 @@ import { DEFAULT, naturalOrder, tableValues, finalValues } from "./indexer.js";
 import { entrySize, typeByName } from "./stamp.js";
 import { installPixel, Screen } from "./pixel.js";
 import { cropBox, evenDim, frameBox, frameCount } from "./video-params.js";
+import { spaceWeights, spaceKey, fringeOf } from "./space.js";
 import { noteAt, gripAt, isText, newRect, MIN_W, MIN_H } from "./notes.js";
 import { Claims, followChain, offsets, layCopies, isZero, rotateVec, flipVec, moreCount, lessCount } from "./vector.js";
 import { deleteSave, getSave, listSaves, putSave } from "./saves.js";
@@ -138,6 +139,7 @@ const debug = window.gates = {
   lift: (rows) => { lift(rows); redraw(); },
   dropAll: () => { dropAll(); redraw(); },
   get soundSel() { return soundSel; },
+  get audio() { return audio; },
   placement: () => currentPlacement(),
   plan: () => currentPlan(),
 };
@@ -227,6 +229,7 @@ function setAudio(on) {
       if (!soundWanted) { a.close(); return; }   // switched off while starting
       audio = a;
       a.rec.setSelection(soundSel?.cells ?? null);
+      a.rec.setSpace(currentSpace());
       redraw();
     })
     .catch(e => {
@@ -245,7 +248,8 @@ function meterText(m) {
     `lag ${Math.round(m.lagMs)} ms · speed ${m.speed.toFixed(2)}` +
     (bakedPlay ? "  (baked)" : "") + "\n" + bakeStatus() +
     (audioNote && performance.now() < audioNote.until ? `\n${audioNote.text}` : "") +
-    (audio?.rec.selInfo ? `\nsound selection: ${audio.rec.selInfo.runs} runs, ${audio.rec.selInfo.gates} gates` : "");
+    (audio?.rec.selInfo ? `\n${panel.audio.camAudio ? "in earshot of the screen" : soundSel?.region ? "in earshot of the region" : "sound selection"}: ` +
+      `${audio.rec.selInfo.runs} runs, ${audio.rec.selInfo.gates} gates` : "");
 }
 
 // --- audio settings in the save ------------------------------------------------
@@ -297,7 +301,7 @@ const camState = () => ({ cx: cam.cx, cy: cam.cy, zoom: cam.zoom, w: cam.w, h: c
 // What the video frame covers, for the preview: the crop box now, and the
 // end camera's (dashed), in the video's aspect.
 function videoBoxes() {
-  if (!videoOpen) return null;
+  if (!videoOpen || !panel.paneOpen) return null;
   const v = panel.video, aspect = v.width / v.height;
   const boxes = [{ ...cropBox(camState(), aspect), dashed: false }];
   if (endCam) boxes.push({ ...cropBox(endCam, aspect), dashed: true });
@@ -315,6 +319,21 @@ function drawVideoFrame(ctx, s, vcam, alpha) {
     ...layerOpts(recLayers, view.gateStatus ? gateStatus(s) : null, view.beltStatus ? beltStatus(s) : null, true),
     pixels: s.screen ? { screen: s.screen, alpha: view.pixelAlpha, max: view.pixelMax } : null,
   });
+}
+
+// Camera-aware audio in a video hears the VIDEO's frame, which moves with
+// the end camera: tick t is frame (t - t0) * 60 / tps (as video.js draws
+// it), and the frame's crop box, scaled by the screen scale dial, is the
+// box. Null when camera-aware audio is off (the static space is used).
+function videoSpaceAt(settings, startCam, endCam, t0) {
+  const p = panel.audio;
+  if (!p.camAudio) return null;
+  const frames = frameCount(settings), fringe = p.spaceFringe, lp = p.spaceLp, k = p.camScale;
+  return (tick) => {
+    const f = Math.min(frames - 1, Math.max(0, (tick - t0) * 60 / settings.tps));
+    const b = frameBox(startCam, endCam, settings, f, frames);
+    return { rect: { x: b.cx - b.hw * k, y: b.cy - b.hh * k, w: 2 * b.hw * k, h: 2 * b.hh * k }, fringe, lp };
+  };
 }
 
 // Fluoddity's saveFile.ts: the picker must be raised before any other await
@@ -357,7 +376,8 @@ async function recordVideoNow() {
     const [{ recordVideo }, bakeMod] = await Promise.all([import("./video.js"), withSound ? import("./audio-bake.js") : null]);
     const res = await recordVideo({
       sim: copy, settings, startCam, endCam, draw: drawVideoFrame,
-      audio: withSound ? { params: { ...panel.audio }, bake: bakeMod.bakeAudio, selection: soundSel?.cells ?? null } : null,
+      audio: withSound ? { params: { ...panel.audio }, bake: bakeMod.bakeAudio, selection: soundSel?.cells ?? null,
+                           space: currentSpace(), spaceAt: videoSpaceAt(settings, startCam, endCam, copy.tick) } : null,
       writable: choice.kind === "file" ? choice.writable : null,
       onProgress: (p) => panel.setVideoProgress(p.phase === "audio"
         ? `baking audio ${Math.round(p.fraction * 100)}%`
@@ -421,6 +441,35 @@ function setSoundSelection() {
   panel.setAudioRegion(null);
 }
 
+// The space the audio hears (space.js), or null: with camera-aware audio
+// on, the screen -- the whole board view, scaled about its centre by the
+// screen scale dial -- else the audio region, else none. The soft edge and
+// the distance low-pass apply to either.
+function currentSpace(camera = camState()) {
+  const p = panel.audio;
+  let rect = null;
+  if (p.camAudio) {
+    const hw = camera.w / 2 / camera.zoom * p.camScale, hh = camera.h / 2 / camera.zoom * p.camScale;
+    rect = { x: camera.cx - hw, y: camera.cy - hh, w: 2 * hw, h: 2 * hh };
+  } else if (soundSel?.region) rect = soundSel.region;
+  return rect ? { rect, fringe: p.spaceFringe, lp: p.spaceLp } : null;
+}
+// Each frame: the recorder hears where the camera is now. It sends weights
+// only when the box (to a hundredth of a cell) or a dial actually moved.
+function syncSpace() { if (audio) audio.rec.setSpace(currentSpace()); }
+
+// The audio's box on the board: the core dashed, the fringe's outer edge
+// fainter and rounded (distance is Euclidean, so the fade's limit has round
+// corners). The region always shows; the camera's box only while the Audio
+// folder is open in an expanded pane, as the video frame does -- it is the
+// screen, and would otherwise frame every view.
+function spaceMarks() {
+  const sp = currentSpace();
+  if (!sp) return null;
+  if (panel.audio.camAudio && !panel.audioVisible) return null;
+  return { rect: sp.rect, fringe: fringeOf(sp), camera: !!panel.audio.camAudio };
+}
+
 // Arm (or disarm) the region box: the next one-finger drag on the board
 // draws it; a tap instead cancels, and clears any audio selection.
 function armSoundRegion() {
@@ -438,10 +487,11 @@ function setSoundRegion(r) {
     for (let x = r.x; x < r.x + r.w; x++) if (board.entityAt(x, y) >= 0) { touched = true; break; }
   }
   if (!touched) { clearSoundSel(); return; }
-  const W = board.width, { x: x0, y: y0, w, h } = r;
-  const cells = { has: (k) => { const x = k % W, y = (k - x) / W; return x >= x0 && x < x0 + w && y >= y0 && y < y0 + h; } };
-  soundSel = { cells, ref: null, rev: -1, id: ++soundSelN, region: { ...r } };
-  audio?.rec.setSelection(cells);
+  // Not a cell filter but a SPACE (space.js): with a soft edge, entities
+  // past the box are heard too, quieter. With a hard edge (the default)
+  // that is exactly "touching the box", as before.
+  soundSel = { cells: null, ref: null, rev: -1, id: ++soundSelN, region: { ...r } };
+  audio?.rec.setSelection(null);
   panel.setAudioSelection(false);
   panel.setAudioRegion("set");
   redraw();
@@ -701,7 +751,11 @@ function openScaleDialog() {
   const drawHist = (f) => {
     const p = panel.audio;
     if (sim) sim.sync();
-    const runs = sim ? eligibleRuns(sim, p.beltMinLen, p.beltCutoff, soundSel?.cells ?? null) : [];
+    let runs = sim ? eligibleRuns(sim, p.beltMinLen, p.beltCutoff, soundSel?.cells ?? null) : [];
+    // With a space, the runs it leaves audible at all (a hard edge: those
+    // touching the box).
+    const sp = currentSpace();
+    if (sim && sp) { const w = spaceWeights(sim, runs, [], sp); runs = runs.filter((_, i) => w.gain[i] > 0); }
     const lo = Math.max(1, p.beltMinLen);
     const hi = Math.max(lo, Math.min(p.beltCutoff, runs.reduce((a, s) => Math.max(a, s.length), lo)));
     const counts = new Int32Array(hi - lo + 1);
@@ -734,7 +788,7 @@ function openScaleDialog() {
     c.textAlign = "right"; c.fillText("length", pad.l + w, 11);
     if (!histInfo.dataset.pinned) {
       histInfo.textContent = `${runs.length} run${runs.length === 1 ? "" : "s"} may sound` +
-        (soundSel?.region ? " (the audio region)" : soundSel ? " (the audio selection)" : "") + " -- tap a bar for its pitch";
+        (panel.audio.camAudio ? " (on screen)" : soundSel?.region ? " (the audio region)" : soundSel ? " (the audio selection)" : "") + " -- tap a bar for its pitch";
     }
   };
   const histAt = (e) => {
@@ -864,6 +918,7 @@ async function runBake(seconds, rate, show) {
   try {
     res = await bakeAudio({
       start: snap, params, rate, seconds, sampleRate: audioCtx?.sampleRate || 48000, selection: soundSel?.cells ?? null,
+      space: currentSpace(),
       onProgress: (f, tick, end) => show(`Baking… ${Math.round(f * 100)}%  (tick ${tick} of ${end})`),
       shouldStop: () => own.cancel || sim !== startSim || board.revision !== revision,
     });
@@ -960,6 +1015,7 @@ function paint(now) {
   lastNow = sim && !clock.paused ? now : null;
   countFrame(now, ran);
   recordStep();
+  syncSpace();
   const t0 = performance.now();
   const info = board ? board.describe(inspectRow) : null;
   const ghosts = [
@@ -979,7 +1035,7 @@ function paint(now) {
                                 ghostNotes: ghostNotes(),
                                 pixels: sim?.screen ? { screen, alpha: view.pixelAlpha, max: view.pixelMax } : null,
                                 frameBoxes: videoBoxes(),
-                                soundRegion: soundSel?.region || null,
+                                soundSpace: spaceMarks(),
                                 ...layerOpts(lv, gTint, bTint),
                                 layerLabelHits: labelHits = [], layerLabelSel: labelSel });
   syncLayerPanel(lv);
@@ -2910,8 +2966,10 @@ async function init() {
     onVideoRecord: () => recordVideoNow(),
     onVideoEndCamera: (set) => { endDryRun(); endCam = set ? camState() : null; panel.setVideoEndCamera(!!endCam); redraw(); },
     onVideoOpen: (open) => { videoOpen = open; redraw(); },
+    onPaneFold: () => redraw(),
     onVideo: () => redraw(),
-    onAudio: (p) => { if (audio) audio.setParams(p); touchAudio(); },
+    onAudio: (p) => { if (audio) audio.setParams(p); touchAudio(); redraw(); },
+    onAudioOpen: () => redraw(),
     onTune: (t) => { setTune(t); redraw(); },
     onClearStamps: () => shell.clearStamps(),
     onCloseStatus: () => inspect(-1),

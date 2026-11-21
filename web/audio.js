@@ -13,13 +13,21 @@
 // their buffers transferred, and stop() while paused.
 
 import { audioGroupOf, eligibleRuns } from "./audio-params.js";
+import { spaceWeights, spaceKey } from "./space.js";
 
 export class Recorder {
   // `selection`: a Set of cell indices (y * width + x) -- only runs touching
   // one and gates covering one sound -- or null for the whole board.
-  constructor(port, params, selection = null) {
+  // `space`: { rect, fringe, lp } (space.js) -- each candidate weighted by
+  // its distance from the box -- or null. `spaceAt(tick)`, if given, is
+  // asked each tick instead (a video's soundtrack, whose camera moves).
+  constructor(port, params, selection = null, space = null, spaceAt = null) {
     this.port = port;
     this.selection = selection;
+    this.space = space;
+    this.spaceAt = spaceAt;
+    this.spaceKey = spaceKey(space);
+    this.gateList = [];
     this.selInfo = null;
     this.minLen = params.beltMinLen;
     this.cutoff = params.beltCutoff;
@@ -28,10 +36,12 @@ export class Recorder {
     this.cands = [];
     this.h = new Int32Array(0); this.t = new Int32Array(0); this.pos = new Float64Array(0);
     this.words = 0;
-    this.fires = new Int32Array(3);
+    this.fires = new Float64Array(3);
     this.n = 0;
     this.cap = 0;
-    this.bits = new Uint32Array(0); this.f0 = new Uint16Array(0); this.f1 = new Uint16Array(0);
+    // Fire "counts" are sums of the firing gates' spatial gains (1 each
+    // without a space), so a far gate clicks quieter.
+    this.bits = new Uint32Array(0); this.f0 = new Float32Array(0); this.f1 = new Float32Array(0);
     this.stopped = true;
   }
 
@@ -54,6 +64,33 @@ export class Recorder {
     if (this.sim) { this.sim.sync(); this.configure(this.sim); }
   }
 
+  // A new space (the camera moved, the region or a dial changed): the
+  // candidates stay as they are -- a reconfigure would orphan every voice
+  // -- and only their weights are sent. Ticks already recorded go first,
+  // under the old weights.
+  setSpace(space) {
+    const key = spaceKey(space);
+    if (key === this.spaceKey) return;
+    this.space = space;
+    this.spaceKey = key;
+    if (this.sim && this.rebuilds === this.sim.stats.rebuilds) { this.flush(this.lastRate || 1); this.sendSpace(this.sim); }
+  }
+
+  // The weights for the current candidates and gates, to the synth.
+  sendSpace(sim) {
+    const w = spaceWeights(sim, this.cands, this.gateList, this.space);
+    const groups = [0, 0];
+    this.gateList.forEach((g, i) => { g.again = w.gateGain[i]; groups[g.agroup] += g.again; });
+    if (this.space) {
+      let runs = 0;
+      for (const g of w.gain) if (g > 0) runs++;
+      let gates = 0;
+      for (const g of w.gateGain) if (g > 0) gates++;
+      this.selInfo = { runs, gates };
+    }
+    this.port.postMessage({ type: "space", on: !!this.space, gain: w.gain, lp: w.lp, norm: w.runSum, groups });
+  }
+
   // Which run lengths may sound; a change reconfigures on the next tick.
   setLengths(min, max) {
     if (min !== this.minLen || max !== this.cutoff) { this.minLen = min; this.cutoff = max; this.rebuilds = -1; }
@@ -73,8 +110,10 @@ export class Recorder {
     this.words = (n + 31) >>> 5;
     this.cap = 0;
     const groups = [0, 0];
+    this.gateList = [];
     for (const g of sim.gates) {
       g.agroup = audioGroupOf(g.td.class);
+      g.again = 1;
       // Outside the sound selection a gate clicks in the silent group, as a
       // Source does: no cost per tick.
       if (sel && g.agroup < 2) {
@@ -82,17 +121,21 @@ export class Recorder {
         for (let x = 0; x < o.w; x++) for (let y = 0; y < o.h; y++) cells.push([ox + x, oy + y]);
         if (!picked(cells)) g.agroup = 2;
       }
-      if (g.agroup < 2) groups[g.agroup]++;
+      if (g.agroup < 2) { groups[g.agroup]++; this.gateList.push(g); }
     }
     // Normalisation counts the selection only, so isolating part of a machine
     // fills the mix rather than playing it as quietly as it sits in the whole.
     this.selInfo = sel ? { runs: this.cands.length, gates: groups[0] + groups[1] } : null;
     this.port.postMessage({ type: "config", lengths: Float64Array.from(this.cands, s => s.length), groups });
+    // With a space the synth weighs every candidate (and normalises by the
+    // weights, not the count); without one a config alone is the old state.
+    if (this.space) this.sendSpace(sim);
   }
 
   // Called by Sim.step() after its sync, before the structure phase.
   pre(sim) {
     if (sim.stats.rebuilds !== this.rebuilds) this.configure(sim);
+    if (this.spaceAt) this.setSpace(this.spaceAt(sim.tick));
     if (!this.n) this.tick0 = sim.tick;
     const c = this.cands, h = this.h, t = this.t, pos = this.pos;
     for (let i = 0; i < c.length; i++) {
@@ -116,13 +159,13 @@ export class Recorder {
       if (!on && t[i] > h[i]) on = sim.positionOf(seg, t[i] - 1, sim.tick) > pos[i];
       if (on) bits[off + (i >>> 5)] |= 1 << (i & 31);
     }
-    this.f0[k] = Math.min(65535, this.fires[0]);
-    this.f1[k] = Math.min(65535, this.fires[1]);
+    this.f0[k] = this.fires[0];
+    this.f1[k] = this.fires[1];
   }
 
   grow() {
     const cap = Math.max(256, this.cap * 2), W = this.words;
-    const bits = new Uint32Array(cap * W), f0 = new Uint16Array(cap), f1 = new Uint16Array(cap);
+    const bits = new Uint32Array(cap * W), f0 = new Float32Array(cap), f1 = new Float32Array(cap);
     bits.set(this.bits.subarray(0, this.n * W)); f0.set(this.f0.subarray(0, this.n)); f1.set(this.f1.subarray(0, this.n));
     this.bits = bits; this.f0 = f0; this.f1 = f1; this.cap = cap;
   }

@@ -37,8 +37,9 @@ const MAX_QUEUE_S = 1;      // a stalled audio thread never builds more lag than
 const SPEED_TAU_S = 0.3;    // how quickly playback speed follows the queue
 const MAX_SPEED = 1.25;     // catching up on a small backlog: barely audible
 const SKIP_AT = 3;          // a backlog this many latencies deep is skipped, not raced through
-const HOLD_MAX_S = 0.5;
-const TILT_CAP = Math.pow(10, 24 / 20);   // +24 dB     // holding through an underrun gives up after this long
+const HOLD_MAX_S = 0.5;     // holding through an underrun gives up after this long
+const TILT_CAP = Math.pow(10, 24 / 20);   // +24 dB
+const SPACE_GLIDE_S = 0.04; // how fast a voice's spatial gain follows the camera
 
 export class GatesSynth {
   constructor(sampleRate, { offline = false } = {}) {
@@ -66,6 +67,19 @@ export class GatesSynth {
     this.vGain = new Float64Array(V);    // the per-length gain
     this.vAtk = new Float64Array(V);     // per-voice envelope coefficients:
     this.vRel = new Float64Array(V);     // sluggishness makes them depend on length
+    // Spatial audio (space.js): per voice, the smoothed gain and the
+    // distance low-pass (its one-pole coefficient, 1 = open, and state).
+    this.vS = new Float64Array(V);
+    this.vLpA = new Float64Array(V).fill(1);
+    this.vLpY = new Float64Array(V);
+    // Per candidate: its spatial gain and cutoff (Hz, 0 = none), whether it
+    // is waiting for a voice (refused), and whether a space is in force.
+    this.sGain = new Float32Array(0);
+    this.sLp = new Float32Array(0);
+    this.isRef = new Uint8Array(0);
+    this.spaced = false;
+    this.bNorm = 0;                      // the weights' sum: what the drones normalise by
+    this.ampS = -1;                      // the drones' smoothed normalised gain (spaced only)
     this.nv = 0;
     // The tick queue.
     this.queue = [];
@@ -94,6 +108,7 @@ export class GatesSynth {
   message(m) {
     if (m.type === "ticks") this.push(m);
     else if (m.type === "config") this.configure(m.lengths, m.groups);
+    else if (m.type === "space") this.setSpace(m);
     else if (m.type === "params") { Object.assign(this.p, m.p); this.applyParams(); }
     else if (m.type === "stop") this.stop();
   }
@@ -166,8 +181,12 @@ export class GatesSynth {
     this.words = (this.n + 31) >>> 5;
     this.voiceOf = new Int32Array(this.n).fill(-1);
     this.prev = new Uint32Array(this.words);
-    this.groups = [groups[0] | 0, groups[1] | 0];
+    this.groups = [Number(groups[0]) || 0, Number(groups[1]) || 0];
     this.active = 0; this.refused = 0;
+    this.sGain = new Float32Array(this.n).fill(1);
+    this.sLp = new Float32Array(this.n);
+    this.isRef = new Uint8Array(this.n);
+    this.spaced = false;
     // Ticks already queued were recorded against the old candidates.
     this.queue = []; this.qi = 0; this.queued = 0;
   }
@@ -232,25 +251,63 @@ export class GatesSynth {
     return Math.min(scaleHz(this.scale, this.lens[i], p.beltMaxHz, p.beltMinLen) * track, this.sr * 0.45);
   }
 
+  // A run out of earshot (spatial gain 0) takes no voice: on a big board
+  // seen through a small screen, the runs far away would otherwise fill the
+  // voice limit with silence.
   on(i) {
+    if (this.sGain[i] <= 0) return;
     const v = this.voiceOf[i];
     if (v >= 0) { this.vOn[v] = 1; return; }
-    if (this.nv >= Math.min(this.p.voiceLimit, VOICE_LIMIT_MAX)) { this.refused++; return; }
+    if (this.nv >= Math.min(this.p.voiceLimit, VOICE_LIMIT_MAX)) {
+      if (!this.isRef[i]) { this.isRef[i] = 1; this.refused++; }
+      return;
+    }
     this.alloc(i);
   }
+
+  // New spatial weights for the same candidates (the camera moved): runs
+  // already on take or give up their voices to match, and every voice's
+  // filter follows; its gain glides there (span()).
+  setSpace(m) {
+    if (m.gain.length !== this.n) return;   // for an older config
+    this.spaced = !!m.on;
+    this.sGain = Float32Array.from(m.gain);
+    this.sLp = Float32Array.from(m.lp);
+    this.bNorm = m.norm;
+    this.groups = [Number(m.groups[0]) || 0, Number(m.groups[1]) || 0];
+    for (let v = 0; v < this.nv; v++) if (this.vSeg[v] >= 0) this.vLpA[v] = this.lpCoef(this.sLp[this.vSeg[v]]);
+    for (let w = 0; w < this.words; w++) {
+      let bits = this.prev[w];
+      while (bits) {
+        const b = 31 - Math.clz32(bits);
+        bits &= ~(1 << b);
+        const i = (w << 5) | b, v = this.voiceOf[i];
+        if (this.sGain[i] <= 0) {
+          if (v >= 0) this.vOn[v] = 0;
+          if (this.isRef[i]) { this.isRef[i] = 0; this.refused--; }
+        } else this.on(i);
+      }
+    }
+  }
+
+  lpCoef(hz) { return hz > 0 ? 1 - Math.exp(-2 * Math.PI * Math.min(hz, this.sr * 0.45) / this.sr) : 1; }
 
   alloc(i) {
     const v = this.nv++;
     this.vSeg[v] = i; this.vOn[v] = 1; this.vEnv[v] = 0; this.vPhase[v] = 0;
     this.vInc[v] = this.pitch(i) / this.sr;
     this.vGain[v] = this.lenGain(i);
+    this.vS[v] = this.sGain[i];
+    this.vLpA[v] = this.lpCoef(this.sLp[i]); this.vLpY[v] = 0;
     this.envFor(v, i);
     this.voiceOf[i] = v;
+    if (this.isRef[i]) { this.isRef[i] = 0; this.refused--; }
   }
 
   off(i) {
     const v = this.voiceOf[i];
-    if (v >= 0) this.vOn[v] = 0; else this.refused--;
+    if (v >= 0) this.vOn[v] = 0;
+    if (this.isRef[i]) { this.isRef[i] = 0; this.refused--; }
   }
 
   free(v) {
@@ -260,6 +317,7 @@ export class GatesSynth {
       this.vSeg[v] = this.vSeg[last]; this.vOn[v] = this.vOn[last]; this.vEnv[v] = this.vEnv[last];
       this.vPhase[v] = this.vPhase[last]; this.vInc[v] = this.vInc[last]; this.vGain[v] = this.vGain[last];
       this.vAtk[v] = this.vAtk[last]; this.vRel[v] = this.vRel[last];
+      this.vS[v] = this.vS[last]; this.vLpA[v] = this.vLpA[last]; this.vLpY[v] = this.vLpY[last];
       if (this.vSeg[v] >= 0) this.voiceOf[this.vSeg[v]] = v;
     }
     // A run refused a voice earlier takes the one just freed.
@@ -270,7 +328,7 @@ export class GatesSynth {
           const b = 31 - Math.clz32(bits);
           bits &= ~(1 << b);
           const i = (w << 5) | b;
-          if (this.voiceOf[i] < 0) { this.refused--; this.alloc(i); return; }
+          if (this.voiceOf[i] < 0 && this.isRef[i]) { this.alloc(i); return; }
         }
       }
     }
@@ -426,16 +484,43 @@ export class GatesSynth {
       }
       this.ry1[g] = y1; this.ry2[g] = y2;
     }
-    const T = this.table, amp = this.p.beltGain / Math.pow(Math.max(1, this.n), this.p.norm);
+    const T = this.table;
+    let amp = this.p.beltGain / Math.pow(Math.max(1, this.n), this.p.norm);
+    // Spatial: normalised by the weights' sum rather than the count, so a
+    // screen's worth fills the mix -- and, since that sum moves as the
+    // camera does, glided rather than stepped, as each voice's own gain is.
+    const glide = this.spaced ? 1 - Math.exp(-len / (this.sr * SPACE_GLIDE_S)) : 1;
+    if (this.spaced) {
+      const want = this.p.beltGain / Math.pow(Math.max(1, this.bNorm), this.p.norm);
+      this.ampS = this.ampS < 0 ? want : this.ampS + (want - this.ampS) * glide;
+      amp = this.ampS;
+    } else this.ampS = -1;
     for (let v = 0; v < this.nv; v++) {
       let env = this.vEnv[v], ph = this.vPhase[v];
-      const inc = this.vInc[v], tgt = this.vOn[v], coef = tgt ? this.vAtk[v] : this.vRel[v], g = amp * this.vGain[v];
-      for (let s = at; s < end; s++) {
-        env += (tgt - env) * coef;
-        const fi = ph * TABLE, j = fi | 0;
-        out[s] += g * env * (T[j] + (T[j + 1] - T[j]) * (fi - j));
-        ph += inc;
-        if (ph >= 1) ph -= 1;
+      if (this.spaced && this.vSeg[v] >= 0) this.vS[v] += (this.sGain[this.vSeg[v]] - this.vS[v]) * glide;
+      const inc = this.vInc[v], tgt = this.vOn[v], coef = tgt ? this.vAtk[v] : this.vRel[v];
+      const g = amp * this.vGain[v] * (this.spaced ? this.vS[v] : 1), a = this.vLpA[v];
+      if (a >= 1) {
+        for (let s = at; s < end; s++) {
+          env += (tgt - env) * coef;
+          const fi = ph * TABLE, j = fi | 0;
+          out[s] += g * env * (T[j] + (T[j + 1] - T[j]) * (fi - j));
+          ph += inc;
+          if (ph >= 1) ph -= 1;
+        }
+      } else {
+        // The distance low-pass: one pole on the oscillator, so a far run
+        // has lost its upper harmonics.
+        let y = this.vLpY[v];
+        for (let s = at; s < end; s++) {
+          env += (tgt - env) * coef;
+          const fi = ph * TABLE, j = fi | 0;
+          y += a * ((T[j] + (T[j + 1] - T[j]) * (fi - j)) - y);
+          out[s] += g * env * y;
+          ph += inc;
+          if (ph >= 1) ph -= 1;
+        }
+        this.vLpY[v] = y;
       }
       this.vEnv[v] = env; this.vPhase[v] = ph;
     }

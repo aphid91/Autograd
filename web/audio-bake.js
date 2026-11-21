@@ -19,7 +19,8 @@ const CHUNK_MS = 25;   // work between yields
 // true. t0 defaults to the start tick (the Bake dialog: audio from there);
 // a video passes its own first tick, so the soundtrack starts and ends with
 // the picture, silent before the start tick if that comes later.
-export async function bakeAudio({ start, params, rate, seconds, sampleRate, onProgress, shouldStop, t0: from0, selection = null }) {
+export async function bakeAudio({ start, params, rate, seconds, sampleRate, onProgress, shouldStop, t0: from0, selection = null,
+                                  space = null, spaceAt = null }) {
   const sim = start.clone();
   const t0 = from0 ?? Math.max(params.startTick, sim.tick);
   const end = t0 + Math.max(1, Math.round(seconds * rate));
@@ -30,7 +31,7 @@ export async function bakeAudio({ start, params, rate, seconds, sampleRate, onPr
 
   const synth = new GatesSynth(sampleRate, { offline: true });
   synth.message({ type: "params", p: { ...params } });
-  const rec = new Recorder({ postMessage: (m) => synth.message(m) }, params, selection);
+  const rec = new Recorder({ postMessage: (m) => synth.message(m) }, params, selection, space, spaceAt);
   const spt = sampleRate / rate;                     // samples per tick
   const total = Math.round((end - from) * spt);
   const out = new Float32Array(total);

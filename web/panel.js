@@ -38,7 +38,14 @@ export class Panel {
     this.cb = cb;
     this.prefs = { expanded: false, view: {}, ...loadPrefs() };
     this.pane = new Pane({ container: host, title: "Gates", expanded: !!this.prefs.expanded });
-    this.pane.on("fold", (ev) => { this.prefs.expanded = ev.expanded; savePrefs(this.prefs); });
+    // A folder's fold bubbles up to the pane: only the pane's own counts.
+    this.paneOpen = !!this.prefs.expanded;
+    this.pane.on("fold", (ev) => {
+      if (ev.target && ev.target !== this.pane) return;
+      this.paneOpen = ev.expanded;
+      this.prefs.expanded = ev.expanded; savePrefs(this.prefs);
+      cb.onPaneFold?.();
+    });
 
     // Status first, so an inspected entity is the top of the panel.
     this.status = this.pane.addFolder({ title: "Status", expanded: true });
@@ -117,6 +124,9 @@ export class Panel {
     }
     this.audioMeter = { text: "off" };
     const audio = this.pane.addFolder({ title: "Audio", expanded: false });
+    // Open (in an expanded pane), the board shows camera-aware audio's box.
+    this.audioOpen = false;
+    audio.on("fold", (ev) => { if (ev.target && ev.target !== audio) return; this.audioOpen = ev.expanded; cb.onAudioOpen?.(); });
     audio.addBinding(this.audioMeter, "text", { label: "meter", readonly: true, multiline: true, rows: 5, interval: 250 });
     const pushAudio = () => {
       this.prefs.audio = { ...this.audio };
@@ -154,7 +164,7 @@ export class Panel {
     this.video = cleanVideo(this.prefs.video);
     const vid = this.pane.addFolder({ title: "Video", expanded: false });
     // Open, the board shows the frame the video will cover.
-    vid.on("fold", (ev) => cb.onVideoOpen(ev.expanded));
+    vid.on("fold", (ev) => { if (ev.target && ev.target !== vid) return; cb.onVideoOpen(ev.expanded); });
     const pushVideo = () => {
       this.prefs.video = { ...this.video };
       savePrefs(this.prefs);
@@ -219,6 +229,8 @@ export class Panel {
     this.prefs.audio = { ...this.audio };
     savePrefs(this.prefs);
   }
+
+  get audioVisible() { return this.paneOpen && this.audioOpen; }
 
   setAudioSelection(on) { this.audioSelBtn.title = on ? "Set audio selection ✓" : "Set audio selection"; }
   // null, "armed" (the next drag draws the box) or "set".

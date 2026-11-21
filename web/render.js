@@ -204,15 +204,23 @@ export function render(ctx, board, cam, dpr, opts = {}) {
     ctx.setLineDash([]);
   }
 
-  // The audio region (Audio > Set audio region): a dashed outline round the
-  // box whose contents sound, screen-pixel lines. An editing mark: never in
-  // a video frame.
-  if (view.soundRegion) {
-    const r = view.soundRegion;
-    ctx.lineWidth = 2 * px;
+  // The audio's box (Audio > Set audio region, or camera-aware audio): the
+  // box itself dashed -- fainter for the camera's, which is the screen --
+  // and, with a soft edge, the fringe's outer limit, rounded since distance
+  // is Euclidean. Screen-pixel lines. An editing mark: never in a video.
+  if (view.soundSpace) {
+    const { rect: r, fringe: D, camera } = view.soundSpace;
+    ctx.lineWidth = (camera ? 1.5 : 2) * px;
     ctx.setLineDash([6 * px, 4 * px]);
-    ctx.strokeStyle = "rgba(95,211,230,0.9)";
+    ctx.strokeStyle = camera ? "rgba(95,211,230,0.55)" : "rgba(95,211,230,0.9)";
     ctx.strokeRect(r.x, r.y, r.w, r.h);
+    if (D > 0) {
+      ctx.setLineDash([2 * px, 5 * px]);
+      ctx.strokeStyle = "rgba(95,211,230,0.35)";
+      ctx.beginPath();
+      ctx.roundRect(r.x - D, r.y - D, r.w + 2 * D, r.h + 2 * D, D);
+      ctx.stroke();
+    }
     ctx.setLineDash([]);
   }
 

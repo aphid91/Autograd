@@ -1311,6 +1311,55 @@ they have. `tests/region.test.mjs` checks a region picks exactly the runs
 touching its box on `cpu.npz`, and that a run built inside it afterwards
 becomes a candidate.
 
+**Space: camera-aware audio, and soft edges** ([space.js](space.js);
+Audio > **space**). The region is no longer a cell filter but a **space**: a
+box, and every run and gate weighted by its distance from it. Inside
+(anything touching the box) is full volume and unfiltered; out to the
+**soft edge** -- a fraction of the box's longer side, so a camera box feels
+the same at any zoom -- the volume falls along a half cosine to 0, and the
+**distance low-pass** (a one-pole per voice) closes from 18 kHz by up to 7
+octaves at the fringe's edge. Beyond it nothing is heard. **Soft edge 0 is
+a hard edge** -- touching or nothing, exactly the region as it was -- and
+both dials default to 0.
+
+- **Camera-aware** (a switch) makes the box the screen -- the whole board
+  view, scaled about its centre by **screen scale** (0.5: a box half the
+  screen's size). It takes over from a drawn region while on. An entity
+  selection still narrows what can sound, and the box weighs it.
+- **Panning never re-voices.** The candidates (length window and entity
+  selection) are fixed; distance is a per-candidate gain and cutoff sent
+  as their own message (`Recorder.setSpace()` -> the synth's `space`),
+  only when the box moves by a hundredth of a cell or a dial changes
+  (`spaceKey()`). A reconfigure would orphan every voice. On `cpu.npz`
+  panning took the heard runs from 110 to 245 of a fixed 613.
+- **Out of earshot takes no voice**: a run at gain 0 is not voiced even
+  while active (and not counted as refused), so a big board seen through a
+  small screen does not fill the voice limit with silence; moving it into
+  earshot voices it at once.
+- **Gains glide** (40 ms) per voice, and the drones normalise by the
+  weights' **sum** rather than the count -- glided too, since it moves with
+  the camera -- so a screen's worth fills the mix as an isolated part does.
+- **Gates click by their weight**: a fire adds its gate's gain to its
+  group's count, and groups normalise by the gains' sums. They get the
+  falloff but not the low-pass, since a group's clicks share one
+  resonator.
+- **Shown** as the box dashed and, with a soft edge, the fringe's limit
+  dotted with round corners (distance is Euclidean). The region's always
+  shows; the camera's only while the Audio folder is open in an expanded
+  pane -- the same rule the video frame now follows (it ignored a minimised
+  pane before). A sub-folder folding inside Audio or Video bubbles a fold
+  event up; those are ignored by target.
+- **Bakes and videos**: a bake uses the space at the press; a video's
+  soundtrack with camera-aware on hears the **video's** frame, which moves
+  with the end camera (`videoSpaceAt()`: tick -> frame -> crop box, scaled).
+  A bake does not follow a pan made after it.
+- Without a space every path is unchanged to the bit (the existing audio
+  tests, bit-identical bakes included, pass untouched);
+  `tests/space.test.mjs` pins the curves, a hard edge being exactly
+  "touching the box" on `cpu.npz`, the soft fringe, and the synth: no
+  voice at gain 0, re-voiced on a pan without a reconfigure, and the
+  low-pass cutting a saw's high-frequency energy tenfold.
+
 **Any change to the board resets** an entity selection, and since selecting is itself an
 edit here (the selection is lifted off), "a change" means a change of
 **content**: `Board.contentHash()` -- every occupied cell's type, facing,
@@ -1632,6 +1681,7 @@ asserting every array matches and exactly the edited value differs.
 | `audio-params.js` | the Audio dials and the gate groups; loaded always |
 | `audio.js` | audio, main thread: the per-tick recorder and starting the graph; loaded on demand |
 | `audio-dsp.js`, `audio-worklet.js` | the synthesiser, and its AudioWorklet wrapper |
+| `space.js` | spatial audio: distance to the region or screen box, the falloff and low-pass curves, per-run and per-gate weights |
 | `scale.js` | belt scales: the formula language, presets, tables, the wavelength table the synth reads |
 | `audio-bake.js` | baking: a stretch of ticks rendered offline, and the WAV writer; loaded on demand |
 | `pixel.js` | the Pixel machine (web-only, in Sink's id), its screen, and the overlay's drawing |

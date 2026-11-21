@@ -40,6 +40,13 @@ export const AUDIO_DEFAULTS = {
   g1Gain: 1,            // every other machine
   g1Tone: 1800,
   g1DecayMs: 3,
+  // Space (space.js): camera-aware audio hears the screen, scaled about its
+  // centre; the fringe and low-pass soften the screen's edge and the audio
+  // region's alike. 0 and 0 is a hard edge, as the region always was.
+  camAudio: false,
+  camScale: 1,          // the screen box, about its centre, before it is heard
+  spaceFringe: 0,       // fade-out distance, as a fraction of the box's longer side
+  spaceLp: 0,           // how far the low-pass closes at the fringe's edge, 0..1
 };
 
 export const VOICE_LIMIT_MAX = 1024;
@@ -83,6 +90,11 @@ export const AUDIO_SPEC = [
   ["g1Gain", "gain", { min: 0, max: 4, step: 0.01 }],
   ["g1Tone", "tone Hz", { min: 50, max: 12000, step: 10 }],
   ["g1DecayMs", "decay ms", { min: 0.2, max: 100, step: 0.1 }],
+  ["---", "space"],
+  ["camAudio", "camera-aware"],
+  ["camScale", "screen scale", { min: 0.1, max: 3, step: 0.05 }],
+  ["spaceFringe", "soft edge", { min: 0, max: 2, step: 0.05 }],
+  ["spaceLp", "distance low-pass", { min: 0, max: 1, step: 0.05 }],
 ];
 
 // The belt runs that may sound: a run of the simulation whose length is
