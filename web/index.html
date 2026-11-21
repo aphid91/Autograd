@@ -68,6 +68,23 @@
   </div>
 </div>
 
+<div id="scalemenu" class="sheetwrap" data-open="false" role="dialog" aria-modal="true" aria-labelledby="scale-title">
+  <div class="sheet">
+    <div class="sheet-head">
+      <span id="scale-title">Belt scale</span>
+      <button type="button" class="b sheet-btn" id="scale-close">Close</button>
+    </div>
+    <div id="scale-presets" class="idx-tables"></div>
+    <div class="idx-row">
+      <label class="idx-ab">f(n) = <input id="scale-expr" type="text" autocomplete="off" autocapitalize="off" spellcheck="false"></label>
+      <button type="button" class="b sheet-btn" id="scale-file">Table…</button>
+      <input id="scale-file-input" type="file" accept=".txt,.csv,text/plain" hidden>
+    </div>
+    <div id="scale-help" class="scale-help"></div>
+    <div id="scale-preview" class="idx-preview"></div>
+  </div>
+</div>
+
 <div id="stampmenu" class="sheetwrap" data-open="false" role="dialog" aria-modal="true" aria-labelledby="stampmenu-title">
   <div class="sheet">
     <div class="sheet-head">

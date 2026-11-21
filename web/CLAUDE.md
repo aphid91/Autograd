@@ -580,7 +580,8 @@ tables, the file parser, `a*x+b`), tested in `tests/indexer.test.mjs`.
   Other selected entities are not numbered and keep their settings.
 - **Values…** opens a sheet: the table -- **Random** (a shuffle of
   0..n-1, from a seed so the preview is what Apply writes; Re-roll), 
-  **Ascending** (0, 1, 2…), **Doubling** (1, 2, 4…, clamped at 2²⁴), or
+  **Ascending** (0, 1, 2…), **Doubling** (1, 2, 4…, clamped at 2²⁴),
+  **Alternating** (0, 1, 0, 1…), or
   **File…** (numbers separated by commas or whitespace, repeated to fill
   the index; `D` is the default: 0 for a Source, no seed for a belt; any
   other token rejects the file with its line) -- then **a** and **b**
@@ -1211,6 +1212,40 @@ it back; `step()` skips the recorder while `rec` is set, or every drawn tick
 would be heard twice. Pinned by the recorder test, which also asserts the
 recorded run is tick-for-tick identical to an unrecorded one.
 
+**The scale** ([scale.js](scale.js); Audio > **Customize scale…**). A
+scale is a **wavelength** function f(n), normalised so the min-length run
+keeps the dial's pitch: `Hz(n) = (min-length Hz) × f(m) / f(n)`, m the min
+length. f(n) = n is the original law (the Standard preset), and
+`tests/scale.test.mjs` pins that it gives exactly the old pitch.
+
+- **Presets are formulas** (Standard, Semitones, Major, Minor, Harmonic
+  minor, Pentatonic, Minor pentatonic, Blues, Whole tone, Dorian): picking
+  one fills the formula box, so a preset is a starting point to edit. The
+  scale ones are `2 ** (major(n - m) / 12)` and so on: longer runs walk
+  down the scale from the min length, which is the root.
+- **The formula language** is parsed, never `eval`ed, since a formula
+  rides in save files: numbers, `n`, `m`, `pi`, `e`, `+ - * / % ** ^ ( )`
+  (`%` never negative, `**` right-associative, `-2 ** 2` is -4), and
+  `floor ceil round abs sqrt exp log log2 log10 sin cos tan sign fract min
+  max pow mod clamp`, plus one function per scale (`major minor harmonic
+  pent minpent blues whole dorian`) giving degree k's semitones, continuing
+  by octaves both ways. Errors name what went wrong.
+- **A table file** ("Table…"): numbers separated by spaces, commas or
+  lines; the i-th is f(i) from n = 1, and past the end the last holds.
+- **It applies as it changes.** Every edit that parses goes straight to
+  the dials (`setScale()`): the synth re-pitches sounding voices on its next
+  tick. A half-typed formula shows red and the last good one keeps
+  playing. The preview lists the lengths from the min length, with Hz and
+  the nearest note and cents.
+- **The synth compiles it** (`scaleTable()` in `applyParams()`, only when
+  the formula, table or min length changed), so live playback, a bake and
+  a video's soundtrack read the same dials the same way. Three dials:
+  `scaleMode` (`formula` / `lut`), `scaleExpr`, `scaleLut` (the numbers as
+  text); saved with the board and the panel's preferences like any dial,
+  and a bake under another scale goes stale. A length whose f is not a
+  positive number falls back to the standard pitch, and the preview says
+  how many did.
+
 **Tone** (a sub-folder): a gain per run length for **lengths 1 to 6** --
 the shortest runs are the highest pitches, and the usual thing to tame --
 with 7 and longer at 1. Per voice, not a filter, so it takes exactly those
@@ -1562,6 +1597,7 @@ asserting every array matches and exactly the edited value differs.
 | `audio-params.js` | the Audio dials and the gate groups; loaded always |
 | `audio.js` | audio, main thread: the per-tick recorder and starting the graph; loaded on demand |
 | `audio-dsp.js`, `audio-worklet.js` | the synthesiser, and its AudioWorklet wrapper |
+| `scale.js` | belt scales: the formula language, presets, tables, the wavelength table the synth reads |
 | `audio-bake.js` | baking: a stretch of ticks rendered offline, and the WAV writer; loaded on demand |
 | `pixel.js` | the Pixel machine (web-only, in Sink's id), its screen, and the overlay's drawing |
 | `video-params.js` | video export: the settings and the camera move; loaded always |

@@ -8,8 +8,8 @@
 // a Source, no seed for a belt. Defaults are not transformed by a and b.
 
 export const DEFAULT = null;
-export const TABLES = ["random", "ascending", "doubling", "file"];
-export const TABLE_NAMES = { random: "Random", ascending: "Ascending", doubling: "Doubling", file: "File…" };
+export const TABLES = ["random", "ascending", "doubling", "alternating", "file"];
+export const TABLE_NAMES = { random: "Random", ascending: "Ascending", doubling: "Doubling", alternating: "Alternating", file: "File…" };
 
 // NATURAL order: left to right along each row, rows from the bottom up
 // (world +Y is up). `items` are { x, y }; returns their indices in order.
@@ -52,6 +52,7 @@ export function parseTable(text) {
 // reaches it at 2^24, VALUE_LIMIT).
 export function tableValues(kind, n, { file = null, seed = 1, limit = 2 ** 24 } = {}) {
   if (kind === "ascending") return Array.from({ length: n }, (_, i) => i);
+  if (kind === "alternating") return Array.from({ length: n }, (_, i) => i % 2);
   if (kind === "doubling") return Array.from({ length: n }, (_, i) => Math.min(2 ** i, limit));
   if (kind === "random") {
     const a = Array.from({ length: n }, (_, i) => i);

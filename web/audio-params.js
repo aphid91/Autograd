@@ -15,6 +15,12 @@ export const AUDIO_DEFAULTS = {
   beltMaxHz: 1760,      // the pitch of a min-length run; pitch = this * min length / length
   beltMinLen: 1,        // runs shorter than this get no voice
   beltCutoff: 64,       // runs longer than this get no voice
+  // The scale (scale.js): pitch = maxHz * f(min length) / f(length), f a
+  // formula or a table. "n" is the original law. Set from the Customize
+  // scale dialog, not a dial in the panel.
+  scaleMode: "formula", // "formula" or "lut"
+  scaleExpr: "n",
+  scaleLut: "",         // the table's numbers, as text
   // Per-length gain for the shortest (highest) runs; 7 and up are at 1.
   lenGain1: 1, lenGain2: 1, lenGain3: 1, lenGain4: 1, lenGain5: 1, lenGain6: 1,
   lowCutHz: 0,          // high-pass on the mix, against rumble; 0 = off
@@ -113,6 +119,8 @@ export function cleanDials(d) {
   const spec = Object.fromEntries(AUDIO_SPEC.filter(e => e[0] !== "---").map(e => [e[0], e[2]]));
   for (const [k, v] of Object.entries(d)) {
     if (!(k in AUDIO_DEFAULTS) || typeof v !== typeof AUDIO_DEFAULTS[k]) continue;
+    if (k === "scaleMode" && v !== "formula" && v !== "lut") continue;
+    if ((k === "scaleExpr" || k === "scaleLut") && v.length > 100000) continue;
     if (typeof v === "number") {
       if (!Number.isFinite(v)) continue;
       const o = spec[k];

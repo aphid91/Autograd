@@ -30,6 +30,7 @@
 //   { type: "stop" }        paused: drop the queue, release everything
 
 import { AUDIO_DEFAULTS, VOICE_LIMIT_MAX } from "./audio-params.js";
+import { scaleTable, scaleHz } from "./scale.js";
 
 const TABLE = 2048;
 const MAX_QUEUE_S = 1;      // a stalled audio thread never builds more lag than this
@@ -99,6 +100,10 @@ export class GatesSynth {
 
   applyParams() {
     const p = this.p, sr = this.sr;
+    // The scale's wavelength table, rebuilt only when what it depends on
+    // changes (a slider drag elsewhere must not recompile the formula).
+    const sk = `${p.scaleMode}|${p.scaleExpr}|${p.scaleLut}|${p.beltMinLen}`;
+    if (sk !== this.scaleKey) { this.scaleKey = sk; this.scale = scaleTable(p).f; }
     if (p.beltShape !== this.shape) this.buildTable(p.beltShape);
     for (let g = 0; g < 2; g++) {
       const tone = Math.min(p[`g${g}Tone`], sr * 0.45), decay = p[`g${g}DecayMs`];
@@ -222,7 +227,9 @@ export class GatesSynth {
     const track = p.beltTrack > 0 ? Math.pow(this.rate / Math.max(p.trackRef, 1e-3), p.beltTrack) : 1;
     // The dial is a min-length run's pitch: raising min length transposes
     // everything up, the shortest audible run always at the dial's pitch.
-    return Math.min(p.beltMaxHz * Math.max(1, p.beltMinLen) / this.lens[i] * track, this.sr * 0.45);
+    // The scale (scale.js) decides the rest: maxHz * f(min) / f(length),
+    // which for the standard f(n) = n is maxHz * min / length.
+    return Math.min(scaleHz(this.scale, this.lens[i], p.beltMaxHz, p.beltMinLen) * track, this.sr * 0.45);
   }
 
   on(i) {

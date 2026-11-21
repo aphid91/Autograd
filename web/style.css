@@ -476,7 +476,7 @@ html, body {
   font-size: calc(11 * var(--u));
 }
 /* The index sheet: the table choices, a and b, a preview, Apply. */
-.idx-tables { display: grid; grid-template-columns: repeat(4, 1fr); gap: calc(6 * var(--u)); }
+.idx-tables { display: grid; grid-template-columns: repeat(3, 1fr); gap: calc(6 * var(--u)); }
 .idx-tables .pick { justify-content: center; height: calc(36 * var(--u)); }
 .idx-row { display: flex; gap: calc(8 * var(--u)); align-items: center; font-size: calc(11 * var(--u)); color: var(--ink-dim); }
 .idx-row:empty { display: none; }
@@ -494,6 +494,12 @@ html, body {
 }
 .idx-preview[data-error="true"] { color: var(--danger); }
 .idx-apply { color: var(--accent); border-color: var(--accent); }
+/* The scale sheet: presets, the formula, a table file, a preview. */
+#scale-presets .pick[data-selected="true"] { border-color: var(--accent); color: var(--accent); }
+#scale-expr { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+#scale-expr[aria-invalid="true"] { border-color: var(--danger); }
+.scale-help { font-size: calc(10 * var(--u)); color: var(--ink-dim); line-height: 1.4; }
+.scale-help code { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; color: var(--ink); }
 .sheet-btn:disabled { opacity: 0.4; }
 /* The label editor. */
 #note-text {

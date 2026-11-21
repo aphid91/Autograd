@@ -11,6 +11,7 @@ import { Board } from "./board.js";
 import { Camera, attachGestures } from "./camera.js";
 import { render, BASE_COLOURS } from "./render.js";
 import { LayerPanel } from "./layerpanel.js";
+import { SCALE_PRESETS, SCALE_NAMES, compileScale, parseLut, scaleTable, scaleHz, noteName } from "./scale.js";
 import { BACKGROUND, byId, addLayer, removeLayer, renameLayer, setCurrent, isVisible, isActive,
          setForActive, layerStats, mix, parseCss, rgbCss, isolate } from "./layers.js";
 import { Shell } from "./ui.js";
@@ -569,6 +570,97 @@ function togglePreview() {
   preview = { src, ctx, t0: ctx.currentTime, from: previewAt };
   syncPreviewBtn();
 }
+
+// --- the belt scale -----------------------------------------------------------------
+//
+// Audio > Customize scale… (scale.js): presets, a formula for the wavelength
+// f(n), or a table file. Every change that parses is applied at once -- the
+// dials change and the synth re-pitches its voices on its next tick, so the
+// scale can be tuned while the board plays. A formula that does not parse
+// (half typed) is shown in red and the last good one keeps playing. It is
+// a dial change like any other: saved with the board and in the panel's
+// preferences, and a bake made under another scale goes stale.
+
+function setScale(changes) {
+  const p = panel.audio;
+  if (Object.keys(changes).every(k => p[k] === changes[k])) return;
+  panel.applyAudio(changes);
+  if (audio) audio.setParams({ ...panel.audio });
+  touchAudio();
+}
+
+function openScaleDialog() {
+  const m = document.getElementById("scalemenu");
+  const presets = m.querySelector("#scale-presets"), expr = m.querySelector("#scale-expr");
+  const preview = m.querySelector("#scale-preview"), help = m.querySelector("#scale-help");
+  const fileBtn = m.querySelector("#scale-file"), fileInput = m.querySelector("#scale-file-input");
+  let lutName = m.dataset.lutName || "";
+
+  const show = (error = null) => {
+    const p = panel.audio;
+    for (const b of presets.children) {
+      b.dataset.selected = String(p.scaleMode === "formula" && b.dataset.expr === p.scaleExpr.trim());
+    }
+    expr.setAttribute("aria-invalid", String(!!error));
+    fileBtn.textContent = p.scaleMode === "lut" ? "Table ✓" : "Table…";
+    const lines = [];
+    if (error) lines.push(`✗ ${error} -- still playing the last good scale.`, "");
+    if (p.scaleMode === "lut") {
+      lines.push(`Playing a table${lutName ? ` (${lutName})` : ""}: ${parseLutCount(p.scaleLut)} numbers, f(1) onwards.`,
+                 "Type a formula or pick a preset to go back to formulas.", "");
+    }
+    const { f, bad, error: tableError } = scaleTable(p);
+    if (tableError && !error) lines.push(`✗ ${tableError}`, "");
+    const lo = Math.max(1, p.beltMinLen), hi = Math.min(p.beltCutoff, lo + 23);
+    for (let n = lo; n <= hi; n++) {
+      const hz = Math.min(scaleHz(f, n, p.beltMaxHz, p.beltMinLen), 24000);
+      lines.push(`${String(n).padStart(4)}  ${hz.toFixed(hz < 100 ? 2 : 1).padStart(8)} Hz  ${noteName(hz)}`);
+    }
+    if (hi < p.beltCutoff) lines.push(`  …to length ${p.beltCutoff} (the max length dial)`);
+    if (bad) lines.push("", `${bad} length${bad === 1 ? "" : "s"} gave no positive wavelength; those play the standard pitch.`);
+    preview.textContent = lines.join("\n");
+    preview.dataset.error = String(!!(error || tableError));
+  };
+
+  presets.replaceChildren(...SCALE_PRESETS.map(([name, formula]) => {
+    const b = document.createElement("button");
+    b.type = "button"; b.className = "pick"; b.textContent = name; b.dataset.expr = formula;
+    b.onclick = () => { expr.value = formula; setScale({ scaleMode: "formula", scaleExpr: formula }); show(); };
+    return b;
+  }));
+  expr.value = panel.audio.scaleExpr;
+  expr.oninput = () => {
+    const text = expr.value;
+    try { compileScale(text); } catch (e) { show(e.message); return; }
+    setScale({ scaleMode: "formula", scaleExpr: text.trim() });
+    show();
+  };
+  fileBtn.onclick = () => fileInput.click();
+  fileInput.onchange = async () => {
+    const file = fileInput.files[0];
+    fileInput.value = "";
+    if (!file) return;
+    try {
+      const nums = parseLut(await file.text());
+      lutName = m.dataset.lutName = file.name;
+      setScale({ scaleMode: "lut", scaleLut: nums.join(" ") });
+      show();
+    } catch (e) { show(`${file.name}: ${e.message}`); }
+  };
+  help.innerHTML = "Wavelength of a run of length <code>n</code>; <code>m</code> is the min length, " +
+    "which keeps the min-length Hz dial. <code>+ - * / % ** ( )</code>, " +
+    `<code>${SCALE_NAMES.funcs.join(" ")}</code>, <code>pi e</code>. ` +
+    "Scale functions give the semitones of degree k. A table file: f(1), f(2)… separated by spaces, commas or lines.";
+  const close = () => { m.dataset.open = "false"; expr.blur(); };
+  m.querySelector("#scale-close").onclick = close;
+  let down = false;
+  m.onpointerdown = (e) => { down = e.target === m; };
+  m.onclick = (e) => { if (e.target === m && down) close(); down = false; };
+  show();
+  m.dataset.open = "true";
+}
+
+const parseLutCount = (text) => { try { return parseLut(text).length; } catch { return 0; } };
 
 function openBakeDialog() {
   const m = document.getElementById("bakemenu");
@@ -2648,6 +2740,7 @@ async function init() {
     onColours: (c) => { statusColours = c; redraw(); },
     onAudioEnable: (on) => setAudio(on),
     onBake: () => openBakeDialog(),
+    onScale: () => openScaleDialog(),
     onAudioSelection: () => { setSoundSelection(); redraw(); },
     onVideoRecord: () => recordVideoNow(),
     onVideoEndCamera: (set) => { endDryRun(); endCam = set ? camState() : null; panel.setVideoEndCamera(!!endCam); redraw(); },

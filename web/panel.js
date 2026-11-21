@@ -136,6 +136,7 @@ export class Panel {
     // change to the board (main.js).
     this.audioSelBtn = audio.addButton({ title: "Set audio selection" });
     this.audioSelBtn.on("click", () => cb.onAudioSelection());
+    audio.addButton({ title: "Customize scale…" }).on("click", () => cb.onScale());
     audio.addButton({ title: "Bake audio…" }).on("click", () => cb.onBake());
     audio.addButton({ title: "Reset audio dials" }).on("click", () => {
       Object.assign(this.audio, AUDIO_DEFAULTS);
