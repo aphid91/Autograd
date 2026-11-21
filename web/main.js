@@ -397,7 +397,18 @@ async function recordVideoNow() {
 // lifted), so deselecting in place keeps it and moving the selection, any
 // other edit, an undo or a load resets it. Normalisation then counts only
 // what is selected (audio.js), so an isolated part fills the mix.
-let soundSel = null;      // { cells: Set<y*W+x>, ref: hash | null, rev, id }
+//
+// Audio > Set audio region instead takes a BOX of the board: the next
+// one-finger drag draws it, and every run and gate touching it sounds --
+// whatever is built there, as it changes, since the recorder re-asks the
+// region on every rebuild. Its `cells` is not a Set but an object with
+// has(y*W+x), the one call everything reading a selection makes (the
+// recorder, eligibleRuns(), a bake, a video), so nothing downstream knows
+// which kind it has. A region is not reset by edits, only by choosing again,
+// a tap while armed, a box touching nothing, or a new board. The two kinds
+// replace each other.
+let soundSel = null;      // { cells: Set<y*W+x> | { has }, ref: hash | null, rev, id, region?: {x,y,w,h} }
+let regionArmed = false;  // Set audio region pressed: the next drag draws the box
 let soundSelN = 0;
 const soundSelId = () => soundSel?.id ?? 0;
 function setSoundSelection() {
@@ -407,17 +418,48 @@ function setSoundSelection() {
   soundSel = { cells, ref: null, rev: -1, id: ++soundSelN };
   audio?.rec.setSelection(cells);
   panel.setAudioSelection(true);
+  panel.setAudioRegion(null);
+}
+
+// Arm (or disarm) the region box: the next one-finger drag on the board
+// draws it; a tap instead cancels, and clears any audio selection.
+function armSoundRegion() {
+  regionArmed = !regionArmed;
+  panel.setAudioRegion(regionArmed ? "armed" : soundSel?.region ? "set" : null);
+  redraw();
+}
+
+// The box `r` (cells, {x, y, w, h}) as the sound selection -- or, if it
+// touches no entity, back to everything.
+function setSoundRegion(r) {
+  regionArmed = false;
+  let touched = false;
+  for (let y = r.y; y < r.y + r.h && !touched; y++) {
+    for (let x = r.x; x < r.x + r.w; x++) if (board.entityAt(x, y) >= 0) { touched = true; break; }
+  }
+  if (!touched) { clearSoundSel(); return; }
+  const W = board.width, { x: x0, y: y0, w, h } = r;
+  const cells = { has: (k) => { const x = k % W, y = (k - x) / W; return x >= x0 && x < x0 + w && y >= y0 && y < y0 + h; } };
+  soundSel = { cells, ref: null, rev: -1, id: ++soundSelN, region: { ...r } };
+  audio?.rec.setSelection(cells);
+  panel.setAudioSelection(false);
+  panel.setAudioRegion("set");
+  redraw();
 }
 function clearSoundSel() {
+  regionArmed = false;
+  panel.setAudioRegion(null);
   if (!soundSel) return;
   soundSel = null;
   audio?.rec.setSelection(null);
   panel.setAudioSelection(false);
+  redraw();
 }
 // Each frame: once nothing is lifted, any change of content since the
 // reference resets it.
 function checkSoundSel() {
-  if (!soundSel || sel || !board || board.revision === soundSel.rev) return;
+  // A region is about a place, not its contents: edits never reset it.
+  if (!soundSel || soundSel.region || sel || !board || board.revision === soundSel.rev) return;
   soundSel.rev = board.revision;
   const h = board.contentHash();
   if (soundSel.ref === null) soundSel.ref = h;
@@ -692,7 +734,7 @@ function openScaleDialog() {
     c.textAlign = "right"; c.fillText("length", pad.l + w, 11);
     if (!histInfo.dataset.pinned) {
       histInfo.textContent = `${runs.length} run${runs.length === 1 ? "" : "s"} may sound` +
-        (soundSel ? " (the audio selection)" : "") + " -- tap a bar for its pitch";
+        (soundSel?.region ? " (the audio region)" : soundSel ? " (the audio selection)" : "") + " -- tap a bar for its pitch";
     }
   };
   const histAt = (e) => {
@@ -937,6 +979,7 @@ function paint(now) {
                                 ghostNotes: ghostNotes(),
                                 pixels: sim?.screen ? { screen, alpha: view.pixelAlpha, max: view.pixelMax } : null,
                                 frameBoxes: videoBoxes(),
+                                soundRegion: soundSel?.region || null,
                                 ...layerOpts(lv, gTint, bTint),
                                 layerLabelHits: labelHits = [], layerLabelSel: labelSel });
   syncLayerPanel(lv);
@@ -1694,6 +1737,9 @@ function matchRow(e, x, y) {
 
 function onTap(sx, sy) {
   if (!board) return;
+  // Set audio region armed: a tap instead of a drag cancels it, and the
+  // audio goes back to everything.
+  if (regionArmed) { clearSoundSel(); return; }
   const [wx, wy] = cam.screenToWorld(sx, sy);
   const x = Math.floor(wx), y = Math.floor(wy);
   const mode = shell.state.mode;
@@ -2378,6 +2424,9 @@ function enterPaste(id, pose = null) {
 // them instead. The run is traced over the board AND the selection
 // together, so a run that is partly lifted is still one run.
 function onLongPress(sx, sy) {
+  // Set audio region armed: a hold starts the box at the finger, in either
+  // mode, rather than a selection.
+  if (board && regionArmed) { dragHooks.begin(sx, sy); return "drag"; }
   if (!board || shell.state.mode !== "build" || vec.picking) return false;
   if (run || place || shell.activeStamp) return false;
   const [x, y] = cellUnder(sx, sy);
@@ -2442,6 +2491,8 @@ const dragHooks = {
   // (sx, sy): where the press was. Called with no point after a pinch drops
   // back to one finger, which never starts a selection drag of its own.
   wants(sx, sy) {
+    // Set audio region armed: any one-finger drag draws the box.
+    if (regionArmed) return sx !== undefined;
     // The Hand's picked-up layer label, dragged from anywhere on it.
     if (shell.state.mode === "hand") return sx !== undefined && labelSel !== null && layerLabelHit(sx, sy) === labelSel;
     if (vec.picking) return sx !== undefined;
@@ -2453,6 +2504,7 @@ const dragHooks = {
   },
   begin(sx, sy) {
     const world0 = cam.screenToWorld(sx, sy);
+    if (regionArmed) { grab = { region: true, box: world0 }; boxRect = rectOf(world0, world0); redraw(); return; }
     if (shell.state.mode === "hand") {
       const l = labelSel !== null && byId(board.layers, labelSel);
       if (l) grab = { layerLabel: l, off0: [l.labelDx || 0, l.labelDy || 0], world0 };
@@ -2541,6 +2593,13 @@ const dragHooks = {
     syncBar();
   },
   end() {
+    if (grab?.region) {
+      const r = boxRect;
+      boxRect = null;
+      grab = null;
+      if (r) setSoundRegion(r); else clearSoundSel();
+      return;
+    }
     // A moved layer label is one undo step, when the drag ends.
     if (grab?.layerLabel) board.layersRev++;
     // A held box the finger never dragged out selects nothing.
@@ -2846,6 +2905,7 @@ async function init() {
     onAudioEnable: (on) => setAudio(on),
     onBake: () => openBakeDialog(),
     onScale: () => openScaleDialog(),
+    onAudioRegion: () => armSoundRegion(),
     onAudioSelection: () => { setSoundSelection(); redraw(); },
     onVideoRecord: () => recordVideoNow(),
     onVideoEndCamera: (set) => { endDryRun(); endCam = set ? camState() : null; panel.setVideoEndCamera(!!endCam); redraw(); },

@@ -1295,7 +1295,23 @@ nothing per tick, and **normalisation counts only the selection**, so an
 isolated part fills the mix. A change of sound selection makes a bake stale,
 and a video's soundtrack uses it.
 
-**Any change to the board resets it**, and since selecting is itself an
+**Set audio region** (the next button) is the other way to choose: a
+**place**, not a set of entities. The button arms it ("drag a box…"); the
+next one-finger drag on the board, in Build or the Hand, draws a box (a
+still hold then a drag starts it at the finger, not a selection), and
+every run and gate touching the box sounds -- whatever is built, moved or
+deleted there afterwards, since the recorder re-asks on every rebuild. It
+shows as a dashed cyan outline (an editing mark, not in videos). A tap
+while armed, or a box touching no entity, goes back to everything. Edits
+never reset it, only choosing again (either kind -- they replace each
+other) or loading a board. Its `cells` is an object with `has(y*W+x)`
+rather than a Set: that is the only call the recorder, `eligibleRuns()`, a
+bake and a video make of a selection, so none of them knows which kind
+they have. `tests/region.test.mjs` checks a region picks exactly the runs
+touching its box on `cpu.npz`, and that a run built inside it afterwards
+becomes a candidate.
+
+**Any change to the board resets** an entity selection, and since selecting is itself an
 edit here (the selection is lifted off), "a change" means a change of
 **content**: `Board.contentHash()` -- every occupied cell's type, facing,
 footprint offset and flags, a Source's value and a belt's seed value, but

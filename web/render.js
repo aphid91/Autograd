@@ -204,6 +204,18 @@ export function render(ctx, board, cam, dpr, opts = {}) {
     ctx.setLineDash([]);
   }
 
+  // The audio region (Audio > Set audio region): a dashed outline round the
+  // box whose contents sound, screen-pixel lines. An editing mark: never in
+  // a video frame.
+  if (view.soundRegion) {
+    const r = view.soundRegion;
+    ctx.lineWidth = 2 * px;
+    ctx.setLineDash([6 * px, 4 * px]);
+    ctx.strokeStyle = "rgba(95,211,230,0.9)";
+    ctx.strokeRect(r.x, r.y, r.w, r.h);
+    ctx.setLineDash([]);
+  }
+
   // The vector picker's highlights, over the ghosts they move.
   if (view.vector) drawVectorMarks(ctx, view.vector, px);
 

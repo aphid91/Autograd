@@ -136,6 +136,10 @@ export class Panel {
     // change to the board (main.js).
     this.audioSelBtn = audio.addButton({ title: "Set audio selection" });
     this.audioSelBtn.on("click", () => cb.onAudioSelection());
+    // Or a region: the next drag on the board draws a box, and whatever
+    // touches it sounds, as it is built and rebuilt.
+    this.audioRegionBtn = audio.addButton({ title: "Set audio region" });
+    this.audioRegionBtn.on("click", () => cb.onAudioRegion());
     audio.addButton({ title: "Customize scale…" }).on("click", () => cb.onScale());
     audio.addButton({ title: "Bake audio…" }).on("click", () => cb.onBake());
     audio.addButton({ title: "Reset audio dials" }).on("click", () => {
@@ -217,6 +221,11 @@ export class Panel {
   }
 
   setAudioSelection(on) { this.audioSelBtn.title = on ? "Set audio selection ✓" : "Set audio selection"; }
+  // null, "armed" (the next drag draws the box) or "set".
+  setAudioRegion(state) {
+    this.audioRegionBtn.title = state === "armed" ? "Set audio region: drag a box…"
+      : state === "set" ? "Set audio region ✓" : "Set audio region";
+  }
 
   // --- video ---------------------------------------------------------------
 
