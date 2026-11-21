@@ -12,7 +12,7 @@
 // paint() calls flush() after stepping, which posts the frame's ticks with
 // their buffers transferred, and stop() while paused.
 
-import { audioGroupOf } from "./audio-params.js";
+import { audioGroupOf, eligibleRuns } from "./audio-params.js";
 
 export class Recorder {
   // `selection`: a Set of cell indices (y * width + x) -- only runs touching
@@ -67,7 +67,7 @@ export class Recorder {
     const sel = this.selection, W = sim.board.width;
     const picked = (cells) => !sel || cells.some(([x, y]) => sel.has(y * W + x));
     // A run sounds if any of its cells is selected, underground ends included.
-    this.cands = sim.order.filter(seg => seg.length >= this.minLen && seg.length <= this.cutoff && picked(seg.cells));
+    this.cands = eligibleRuns(sim, this.minLen, this.cutoff, sel);
     const n = this.cands.length;
     this.h = new Int32Array(n); this.t = new Int32Array(n); this.pos = new Float64Array(n);
     this.words = (n + 31) >>> 5;

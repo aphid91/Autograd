@@ -33,7 +33,7 @@ import { cropBox, evenDim, frameBox, frameCount } from "./video-params.js";
 import { noteAt, gripAt, isText, newRect, MIN_W, MIN_H } from "./notes.js";
 import { Claims, followChain, offsets, layCopies, isZero, rotateVec, flipVec, moreCount, lessCount } from "./vector.js";
 import { deleteSave, getSave, listSaves, putSave } from "./saves.js";
-import { bakeKey, audioRecord, BAKE_DEFAULT_SECONDS, BAKE_MAX_SECONDS } from "./audio-params.js";
+import { bakeKey, audioRecord, eligibleRuns, BAKE_DEFAULT_SECONDS, BAKE_MAX_SECONDS } from "./audio-params.js";
 
 const DEFAULT_SAVE = "Default.npz";
 
@@ -589,53 +589,151 @@ function setScale(changes) {
   touchAudio();
 }
 
+// The min-length Hz slider is logarithmic: 50..8000 Hz is too wide a range
+// for a linear one to tune the low end. Snapped to the panel dial's step.
+const HZ_LO = 50, HZ_HI = 8000;
+const hzOf = (pos) => Math.min(HZ_HI, Math.max(HZ_LO, Math.round(HZ_LO * (HZ_HI / HZ_LO) ** (pos / 1000) / 10) * 10));
+const posOf = (hz) => Math.round(1000 * Math.log(Math.max(HZ_LO, hz) / HZ_LO) / Math.log(HZ_HI / HZ_LO));
+
+let scaleView = "notes";   // the dialog's lower half: "notes" or "lengths"
+
 function openScaleDialog() {
   const m = document.getElementById("scalemenu");
-  const presets = m.querySelector("#scale-presets"), expr = m.querySelector("#scale-expr");
+  const list = m.querySelector("#scale-presets"), expr = m.querySelector("#scale-expr");
   const preview = m.querySelector("#scale-preview"), help = m.querySelector("#scale-help");
-  const fileBtn = m.querySelector("#scale-file"), fileInput = m.querySelector("#scale-file-input");
+  const fileInput = m.querySelector("#scale-file-input");
+  const hz = m.querySelector("#scale-hz"), hzVal = m.querySelector("#scale-hz-val");
+  const minL = m.querySelector("#scale-min"), minVal = m.querySelector("#scale-min-val");
+  const histBox = m.querySelector("#scale-hist"), canvas = m.querySelector("#scale-hist-canvas");
+  const histInfo = m.querySelector("#scale-hist-info");
+  const viewNotes = m.querySelector("#scale-view-notes"), viewLengths = m.querySelector("#scale-view-lengths");
   let lutName = m.dataset.lutName || "";
+  let formulaError = null;
+  let hist = null;   // { lo, hi, counts, f, total } for the histogram's taps
 
-  const show = (error = null) => {
+  const show = () => {
     const p = panel.audio;
-    for (const b of presets.children) {
-      b.dataset.selected = String(p.scaleMode === "formula" && b.dataset.expr === p.scaleExpr.trim());
+    for (const b of list.children) {
+      b.dataset.selected = String(b.dataset.kind === "lut" ? p.scaleMode === "lut"
+        : p.scaleMode === "formula" && b.dataset.expr === p.scaleExpr.trim());
     }
-    expr.setAttribute("aria-invalid", String(!!error));
-    fileBtn.textContent = p.scaleMode === "lut" ? "Table ✓" : "Table…";
-    const lines = [];
-    if (error) lines.push(`✗ ${error} -- still playing the last good scale.`, "");
-    if (p.scaleMode === "lut") {
-      lines.push(`Playing a table${lutName ? ` (${lutName})` : ""}: ${parseLutCount(p.scaleLut)} numbers, f(1) onwards.`,
-                 "Type a formula or pick a preset to go back to formulas.", "");
-    }
+    expr.setAttribute("aria-invalid", String(!!formulaError));
+    if (document.activeElement !== hz) hz.value = String(posOf(p.beltMaxHz));
+    if (document.activeElement !== minL) minL.value = String(p.beltMinLen);
+    hzVal.textContent = `${p.beltMaxHz}`;
+    minVal.textContent = `${p.beltMinLen}`;
+    viewNotes.dataset.selected = String(scaleView === "notes");
+    viewLengths.dataset.selected = String(scaleView === "lengths");
     const { f, bad, error: tableError } = scaleTable(p);
-    if (tableError && !error) lines.push(`✗ ${tableError}`, "");
-    const lo = Math.max(1, p.beltMinLen), hi = Math.min(p.beltCutoff, lo + 23);
-    for (let n = lo; n <= hi; n++) {
-      const hz = Math.min(scaleHz(f, n, p.beltMaxHz, p.beltMinLen), 24000);
-      lines.push(`${String(n).padStart(4)}  ${hz.toFixed(hz < 100 ? 2 : 1).padStart(8)} Hz  ${noteName(hz)}`);
+    // Messages first, in either view.
+    const lines = [];
+    if (formulaError) lines.push(`✗ ${formulaError} -- still playing the last good scale.`);
+    if (p.scaleMode === "lut") lines.push(`Playing a table${lutName ? ` (${lutName})` : ""}: ${parseLutCount(p.scaleLut)} numbers, f(1) onwards.`);
+    if (tableError && !formulaError) lines.push(`✗ ${tableError}`);
+    if (bad) lines.push(`${bad} length${bad === 1 ? "" : "s"} gave no positive wavelength; those play the standard pitch.`);
+    if (scaleView === "notes") {
+      histBox.hidden = true;
+      preview.hidden = false;
+      if (lines.length) lines.push("");
+      const lo = Math.max(1, p.beltMinLen), hiL = Math.min(p.beltCutoff, lo + 23);
+      for (let n = lo; n <= hiL; n++) {
+        const h = Math.min(scaleHz(f, n, p.beltMaxHz, p.beltMinLen), 24000);
+        lines.push(`${String(n).padStart(4)}  ${h.toFixed(h < 100 ? 2 : 1).padStart(8)} Hz  ${noteName(h)}`);
+      }
+      if (hiL < p.beltCutoff) lines.push(`  …to length ${p.beltCutoff} (the max length dial)`);
+      preview.textContent = lines.join("\n");
+      preview.dataset.error = String(!!(formulaError || tableError));
+    } else {
+      preview.hidden = !lines.length;
+      preview.textContent = lines.join("\n");
+      preview.dataset.error = String(!!(formulaError || tableError));
+      histBox.hidden = false;
+      drawHist(f);
     }
-    if (hi < p.beltCutoff) lines.push(`  …to length ${p.beltCutoff} (the max length dial)`);
-    if (bad) lines.push("", `${bad} length${bad === 1 ? "" : "s"} gave no positive wavelength; those play the standard pitch.`);
-    preview.textContent = lines.join("\n");
-    preview.dataset.error = String(!!(error || tableError));
   };
 
-  presets.replaceChildren(...SCALE_PRESETS.map(([name, formula]) => {
+  // The lengths of every run that may sound -- within the min and max length
+  // dials and, with a sound selection, touching it (eligibleRuns(), the
+  // recorder's own rule) -- one bar per length, coloured by the note it
+  // plays (hue = pitch class), so a scale's shape shows in the bars.
+  const drawHist = (f) => {
+    const p = panel.audio;
+    if (sim) sim.sync();
+    const runs = sim ? eligibleRuns(sim, p.beltMinLen, p.beltCutoff, soundSel?.cells ?? null) : [];
+    const lo = Math.max(1, p.beltMinLen);
+    const hi = Math.max(lo, Math.min(p.beltCutoff, runs.reduce((a, s) => Math.max(a, s.length), lo)));
+    const counts = new Int32Array(hi - lo + 1);
+    for (const s of runs) counts[s.length - lo]++;
+    hist = { lo, hi, counts, f, total: runs.length };
+    const dpr = window.devicePixelRatio || 1, r = canvas.getBoundingClientRect();
+    canvas.width = Math.max(1, Math.round(r.width * dpr));
+    canvas.height = Math.max(1, Math.round(r.height * dpr));
+    const c = canvas.getContext("2d");
+    c.setTransform(dpr, 0, 0, dpr, 0, 0);
+    c.clearRect(0, 0, r.width, r.height);
+    const pad = { l: 8, r: 8, t: 16, b: 18 }, w = r.width - pad.l - pad.r, h = r.height - pad.t - pad.b;
+    const max = Math.max(1, ...counts), bw = w / counts.length;
+    for (let i = 0; i < counts.length; i++) {
+      if (!counts[i]) continue;
+      const hzN = scaleHz(f, lo + i, p.beltMaxHz, p.beltMinLen);
+      const pc = ((12 * Math.log2(hzN / 440) % 12) + 12) % 12;
+      c.fillStyle = `hsl(${Math.round(pc * 30)}, 70%, 60%)`;
+      // Square-root heights: one length usually dwarfs the rest, and on a
+      // linear axis a lone run at another length is a pixel tall.
+      const bh = Math.max(2, h * Math.sqrt(counts[i] / max));
+      c.fillRect(pad.l + i * bw + (bw > 3 ? 0.5 : 0), pad.t + h - bh, Math.max(1, bw - (bw > 3 ? 1 : 0)), bh);
+    }
+    c.fillStyle = "#767c8a";
+    c.font = "10px system-ui, sans-serif";
+    c.textBaseline = "top";
+    c.textAlign = "left"; c.fillText(String(lo), pad.l, pad.t + h + 4);
+    c.textAlign = "right"; c.fillText(String(hi), pad.l + w, pad.t + h + 4);
+    c.textAlign = "left"; c.textBaseline = "alphabetic"; c.fillText(`${max} run${max === 1 ? "" : "s"} (√ scale)`, pad.l, 11);
+    c.textAlign = "right"; c.fillText("length", pad.l + w, 11);
+    if (!histInfo.dataset.pinned) {
+      histInfo.textContent = `${runs.length} run${runs.length === 1 ? "" : "s"} may sound` +
+        (soundSel ? " (the audio selection)" : "") + " -- tap a bar for its pitch";
+    }
+  };
+  const histAt = (e) => {
+    if (!hist) return;
+    const r = canvas.getBoundingClientRect(), w = r.width - 16;
+    const i = Math.max(0, Math.min(hist.counts.length - 1, Math.floor((e.clientX - r.left - 8) / (w / hist.counts.length))));
+    const n = hist.lo + i, p = panel.audio, h = scaleHz(hist.f, n, p.beltMaxHz, p.beltMinLen);
+    histInfo.dataset.pinned = "1";
+    histInfo.textContent = `length ${n}: ${hist.counts[i]} run${hist.counts[i] === 1 ? "" : "s"} · ${h.toFixed(1)} Hz ${noteName(h)}`;
+  };
+  canvas.onpointerdown = (e) => { canvas.setPointerCapture(e.pointerId); histAt(e); };
+  canvas.onpointermove = (e) => { if (e.buttons || e.pointerType === "mouse") histAt(e); };
+
+  const row = (name, detail, onTap, data) => {
     const b = document.createElement("button");
-    b.type = "button"; b.className = "pick"; b.textContent = name; b.dataset.expr = formula;
-    b.onclick = () => { expr.value = formula; setScale({ scaleMode: "formula", scaleExpr: formula }); show(); };
+    b.type = "button"; b.className = "pick";
+    b.innerHTML = `<span></span><span class="scale-f"></span>`;
+    b.firstChild.textContent = name; b.lastChild.textContent = detail;
+    Object.assign(b.dataset, data);
+    b.onclick = onTap;
     return b;
-  }));
+  };
+  list.replaceChildren(
+    ...SCALE_PRESETS.map(([name, formula]) => row(name, formula, () => {
+      expr.value = formula; formulaError = null;
+      setScale({ scaleMode: "formula", scaleExpr: formula }); show();
+    }, { expr: formula })),
+    // Table…: with a table already loaded and a formula playing, back to the
+    // table; otherwise (none yet, or it is the one playing) a file to load.
+    row("Table…", lutName || (panel.audio.scaleLut ? `${parseLutCount(panel.audio.scaleLut)} numbers` : "a file of f(1), f(2)…"), () => {
+      const p = panel.audio;
+      if (p.scaleLut && p.scaleMode !== "lut") { formulaError = null; setScale({ scaleMode: "lut" }); show(); }
+      else fileInput.click();
+    }, { kind: "lut" }));
   expr.value = panel.audio.scaleExpr;
   expr.oninput = () => {
     const text = expr.value;
-    try { compileScale(text); } catch (e) { show(e.message); return; }
+    try { compileScale(text); formulaError = null; } catch (e) { formulaError = e.message; show(); return; }
     setScale({ scaleMode: "formula", scaleExpr: text.trim() });
     show();
   };
-  fileBtn.onclick = () => fileInput.click();
   fileInput.onchange = async () => {
     const file = fileInput.files[0];
     fileInput.value = "";
@@ -643,10 +741,16 @@ function openScaleDialog() {
     try {
       const nums = parseLut(await file.text());
       lutName = m.dataset.lutName = file.name;
+      list.lastChild.lastChild.textContent = file.name;
+      formulaError = null;
       setScale({ scaleMode: "lut", scaleLut: nums.join(" ") });
-      show();
-    } catch (e) { show(`${file.name}: ${e.message}`); }
+    } catch (e) { formulaError = `${file.name}: ${e.message}`; }
+    show();
   };
+  hz.oninput = () => { setScale({ beltMaxHz: hzOf(Number(hz.value)) }); show(); };
+  minL.oninput = () => { setScale({ beltMinLen: Number(minL.value) }); show(); };
+  viewNotes.onclick = () => { scaleView = "notes"; show(); };
+  viewLengths.onclick = () => { scaleView = "lengths"; delete histInfo.dataset.pinned; show(); };
   help.innerHTML = "Wavelength of a run of length <code>n</code>; <code>m</code> is the min length, " +
     "which keeps the min-length Hz dial. <code>+ - * / % ** ( )</code>, " +
     `<code>${SCALE_NAMES.funcs.join(" ")}</code>, <code>pi e</code>. ` +
@@ -656,8 +760,9 @@ function openScaleDialog() {
   let down = false;
   m.onpointerdown = (e) => { down = e.target === m; };
   m.onclick = (e) => { if (e.target === m && down) close(); down = false; };
-  show();
+  delete histInfo.dataset.pinned;
   m.dataset.open = "true";
+  show();   // after opening: the histogram measures its canvas
 }
 
 const parseLutCount = (text) => { try { return parseLut(text).length; } catch { return 0; } };

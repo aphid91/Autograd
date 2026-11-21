@@ -1218,9 +1218,28 @@ keeps the dial's pitch: `Hz(n) = (min-length Hz) × f(m) / f(n)`, m the min
 length. f(n) = n is the original law (the Standard preset), and
 `tests/scale.test.mjs` pins that it gives exactly the old pitch.
 
+- **The sheet sits at the top of the screen** (`.sheet-top`), for room,
+  and scrolls if the screen is short. Top to bottom: a short scrolling
+  list of the presets with their formulas, ending in **Table…**; the
+  formula box; copies of the **min-length Hz** (logarithmic, 50-8000,
+  snapped to 10) and **min length** dials, so the pitch can be retuned
+  without leaving the sheet (they and the panel's are the same dials);
+  then **Notes** or **Lengths** below.
+- **Notes** lists the lengths from the min length with Hz, the nearest
+  note and cents. **Lengths** is a histogram of every run that may sound
+  -- inside the min and max length and, with an audio selection, touching
+  it -- one bar per length, coloured by the note it plays (hue = pitch
+  class, so a scale's shape shows), heights on a **square-root** scale (one
+  length usually dwarfs the rest, and a lone run would be a pixel tall).
+  A tap or drag on it reads out that length's count, Hz and note. The runs
+  come from `eligibleRuns()` in audio-params.js, which the recorder now
+  uses too, so the plot and what sounds cannot disagree.
 - **Presets are formulas** (Standard, Semitones, Major, Minor, Harmonic
   minor, Pentatonic, Minor pentatonic, Blues, Whole tone, Dorian): picking
-  one fills the formula box, so a preset is a starting point to edit. The
+  one fills the formula box, so a preset is a starting point to edit.
+  **Table…** loads a file; with one loaded and a formula playing, it
+  switches back to that table instead, and tapped while the table plays it
+  loads a new one. The
   scale ones are `2 ** (major(n - m) / 12)` and so on: longer runs walk
   down the scale from the min length, which is the root.
 - **The formula language** is parsed, never `eval`ed, since a formula

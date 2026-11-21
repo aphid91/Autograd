@@ -85,6 +85,16 @@ export const AUDIO_SPEC = [
   ["g1DecayMs", "decay ms", { min: 0.2, max: 100, step: 0.1 }],
 ];
 
+// The belt runs that may sound: a run of the simulation whose length is
+// within [minLen, maxLen] and, with a sound selection (a Set of y * width + x
+// cell indices), that touches it. One rule for the recorder (audio.js) and
+// the scale dialog's histogram, so the two cannot disagree.
+export function eligibleRuns(sim, minLen, maxLen, selection = null) {
+  const W = sim.board.width;
+  const picked = (cells) => !selection || cells.some(([x, y]) => selection.has(y * W + x));
+  return sim.order.filter(seg => seg.length >= minLen && seg.length <= maxLen && picked(seg.cells));
+}
+
 // Which click group a machine's fires go to: 0, 1, or 2 for silent.
 export function audioGroupOf(cls) {
   if (cls === "Source") return 2;

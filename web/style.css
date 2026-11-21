@@ -494,8 +494,56 @@ html, body {
 }
 .idx-preview[data-error="true"] { color: var(--danger); }
 .idx-apply { color: var(--accent); border-color: var(--accent); }
-/* The scale sheet: presets, the formula, a table file, a preview. */
-#scale-presets .pick[data-selected="true"] { border-color: var(--accent); color: var(--accent); }
+/* The scale sheet, at the top of the screen for room: a short scrolling
+   list of presets (and Table…), the formula, the two pitch dials, then the
+   notes table or the lengths histogram. */
+.sheet-top { align-items: flex-start; }
+.sheet-top .sheet {
+  max-height: calc(100dvh - 12px);
+  overflow-y: auto;
+  border: var(--border) solid var(--edge);
+  border-top: 0;
+  border-radius: 0 0 calc(10 * var(--u)) calc(10 * var(--u));
+  padding-top: calc(env(safe-area-inset-top, 0px) + 12 * var(--u));
+  padding-bottom: calc(12 * var(--u));
+}
+.scale-list {
+  display: flex; flex-direction: column; gap: 2px;
+  max-height: calc(4 * 30 * var(--u) + 6px);
+  overflow-y: auto; overscroll-behavior: contain;
+  background: var(--chrome-2);
+  border: var(--border) solid var(--edge); border-radius: var(--r);
+  padding: 2px;
+  flex: none;
+}
+.scale-list .pick { height: calc(30 * var(--u)); flex: none; border-color: transparent; }
+.scale-list .pick[data-selected="true"] { border-color: var(--accent); color: var(--accent); }
+.scale-list .pick .scale-f {
+  margin-left: auto; color: var(--ink-dim);
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: calc(9.5 * var(--u));
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0;
+}
+.scale-expr { flex: none; }
+.scale-dial {
+  display: grid; grid-template-columns: calc(84 * var(--u)) minmax(0, 1fr) calc(52 * var(--u));
+  align-items: center; gap: calc(8 * var(--u));
+  font-size: calc(11 * var(--u)); color: var(--ink-dim);
+}
+.scale-dial input { width: 100%; margin: 0; accent-color: var(--accent); }
+.scale-dial output { text-align: right; color: var(--ink); font-variant-numeric: tabular-nums; }
+.scale-view { display: flex; gap: calc(6 * var(--u)); flex: none; }
+.scale-view .pick { flex: 1; height: calc(30 * var(--u)); justify-content: center; }
+.scale-view .pick[data-selected="true"] { border-color: var(--accent); color: var(--accent); }
+.scale-hist { display: flex; flex-direction: column; gap: calc(4 * var(--u)); }
+.scale-hist[hidden] { display: none; }
+.scale-hist canvas {
+  width: 100%; height: calc(150 * var(--u));
+  background: var(--chrome-2); border-radius: var(--r);
+  touch-action: none;
+}
+.scale-hist-info { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: calc(10.5 * var(--u)); color: var(--ink); min-height: 1.4em; }
+.scale-help summary { cursor: pointer; color: var(--ink-dim); }
+.scale-help > div { margin-top: calc(4 * var(--u)); }
 #scale-expr { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
 #scale-expr[aria-invalid="true"] { border-color: var(--danger); }
 .scale-help { font-size: calc(10 * var(--u)); color: var(--ink-dim); line-height: 1.4; }

@@ -68,20 +68,27 @@
   </div>
 </div>
 
-<div id="scalemenu" class="sheetwrap" data-open="false" role="dialog" aria-modal="true" aria-labelledby="scale-title">
+<div id="scalemenu" class="sheetwrap sheet-top" data-open="false" role="dialog" aria-modal="true" aria-labelledby="scale-title">
   <div class="sheet">
     <div class="sheet-head">
       <span id="scale-title">Belt scale</span>
       <button type="button" class="b sheet-btn" id="scale-close">Close</button>
     </div>
-    <div id="scale-presets" class="idx-tables"></div>
-    <div class="idx-row">
-      <label class="idx-ab">f(n) = <input id="scale-expr" type="text" autocomplete="off" autocapitalize="off" spellcheck="false"></label>
-      <button type="button" class="b sheet-btn" id="scale-file">Table…</button>
-      <input id="scale-file-input" type="file" accept=".txt,.csv,text/plain" hidden>
+    <div id="scale-presets" class="scale-list" role="listbox" aria-label="Scale presets"></div>
+    <input id="scale-file-input" type="file" accept=".txt,.csv,text/plain" hidden>
+    <label class="idx-ab scale-expr">f(n) = <input id="scale-expr" type="text" autocomplete="off" autocapitalize="off" spellcheck="false"></label>
+    <div class="scale-dial"><span>min-length Hz</span><input id="scale-hz" type="range" min="0" max="1000" step="1"><output id="scale-hz-val"></output></div>
+    <div class="scale-dial"><span>min length</span><input id="scale-min" type="range" min="1" max="512" step="1"><output id="scale-min-val"></output></div>
+    <div class="scale-view">
+      <button type="button" class="pick" id="scale-view-notes">Notes</button>
+      <button type="button" class="pick" id="scale-view-lengths">Lengths</button>
     </div>
-    <div id="scale-help" class="scale-help"></div>
     <div id="scale-preview" class="idx-preview"></div>
+    <div id="scale-hist" class="scale-hist" hidden>
+      <canvas id="scale-hist-canvas"></canvas>
+      <div id="scale-hist-info" class="scale-hist-info"></div>
+    </div>
+    <details class="scale-help"><summary>Formula help</summary><div id="scale-help"></div></details>
   </div>
 </div>
 
