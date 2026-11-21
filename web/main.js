@@ -9,7 +9,10 @@
 
 import { Board } from "./board.js";
 import { Camera, attachGestures } from "./camera.js";
-import { render } from "./render.js";
+import { render, BASE_COLOURS } from "./render.js";
+import { LayerPanel } from "./layerpanel.js";
+import { BACKGROUND, byId, addLayer, removeLayer, renameLayer, setCurrent, isVisible, isActive,
+         setForActive, layerStats, hexRgb, mix, parseCss, rgbCss } from "./layers.js";
 import { Shell } from "./ui.js";
 import { Panel } from "./panel.js";
 import { ROUTE_NAMES, ROUTE_H_FIRST, ROUTE_V_FIRST, chooseRoute, planRun, routeWorks, turnTip } from "./planner.js";
@@ -39,6 +42,7 @@ let board = null;
 let dpr = 1;
 let shell = null;
 let panel = null;
+let layerPanel = null;
 let view = {};
 let inspectRow = -1;   // a row, not a description: re-read it every time
 // The simulation of the loaded board, and the clock that paces it. A new
@@ -166,10 +170,17 @@ function paint(now) {
   ];
   // The belt a run starts on draws only as the run's ghost, at its new facing.
   const hide = run ? runCopies().copies.filter(c => c.over).map(c => c.start) : null;
+  const lv = layerView();
+  const gTint = view.gateStatus ? gateStatus() : null;
+  const bTint = view.beltStatus ? beltStatus() : null;
   render(ctx, board, cam, dpr, { ...view, selected: info, ghosts, sim, alpha: clock.alpha, hide, vector: vectorMarks(),
                                 indexLabels: indexLabels(), noteSel: noteEdit, noteGrips: labelHeld(),
-                                gateTint: view.gateStatus ? gateStatus() : null,
-                                beltTint: view.beltStatus ? beltStatus() : null });
+                                gateTint: lv ? lv.gateTint(gTint) : gTint,
+                                beltTint: lv ? lv.beltTint(bTint, BASE_COLOURS.belt) : bTint,
+                                underTint: lv ? lv.beltTint(bTint, BASE_COLOURS.under) : null,
+                                lists: lv?.lists || null, hiddenCells: lv?.hidden || null,
+                                layerLabels: lv?.labels || null });
+  syncLayerPanel(lv);
   debug.renderMs = performance.now() - t0;
   if (sim && !clock.paused) redraw();
 }
@@ -181,7 +192,7 @@ function paint(now) {
 // (clearing the way, then building) are one step.
 // The board's edit key: entities and labels both. A label edit is an undo
 // step but not a board edit -- it must not restart the simulation.
-const editKey = () => `${board.revision}/${board.notesRev}`;
+const editKey = () => `${board.revision}/${board.notesRev}/${board.layersRev}`;
 
 function recordStep() {
   if (!board || sel || editKey() === committed) return;
@@ -243,6 +254,185 @@ function checkpoint() {
   history.setCheckpoint(history.current);
   syncHistory();
 }
+
+// --- layers -------------------------------------------------------------------
+//
+// layers.js is the model; the table lives on the board (board.layers) so it
+// rides in snapshots and saves, and each entity's tag in its row. While
+// View > layers is off, layers change nothing: everything is drawn and
+// everything can be touched (new entities still go on the current layer).
+//
+// Every interaction that finds an entity under a cell goes through
+// pickAt() -- an inactive layer's entities are not there to select, run
+// over, force-build through or match -- and the Hand's inspect through
+// seeAt(), which also skips hidden layers but lets an inactive entity be
+// inspected, read only, so its layer can be made current.
+
+const layersOn = () => !!board && view.layers === true;
+
+function pickable(row) {
+  return row >= 0 && (!layersOn() || isActive(board.layers, board.layerOf(row)));
+}
+function pickAt(x, y) { const r = board.entityAt(x, y); return pickable(r) ? r : -1; }
+function seeAt(x, y) {
+  const r = board.entityAt(x, y);
+  return r >= 0 && (!layersOn() || isVisible(board.layers, board.layerOf(r))) ? r : -1;
+}
+
+// What the layers mean for drawing, rebuilt only when the board, the table
+// or its view changed -- not per frame: the visible lists (only while
+// something is hidden), the hidden-cell mask for items, each layer's label
+// at its centre of mass, and the tints. A tint blends the layer's colour
+// over whatever the entity would otherwise wear (its own colour, or a
+// status colour), by that layer's own amount.
+let lvCache = null;
+function layerView() {
+  if (!layersOn()) return null;
+  const t = board.layers;
+  const key = `${board.revision}/${board.layersRev}/${JSON.stringify(t)}`;
+  if (lvCache?.board === board && lvCache.key === key) return lvCache.lv;
+  const stats = layerStats(board, t);
+  const vis = (row) => isVisible(t, board.layerOf(row));
+  const lists = stats.hidden ? {
+    belts: board.belts.filter(b => vis(b.row)),
+    unders: board.unders.filter(u => vis(u.row)),
+    structs: board.structs.filter(st => vis(st.row)),
+  } : null;
+  const tints = new Map();
+  for (const l of t.list) if (l.colour && l.tint > 0 && isVisible(t, l.id)) tints.set(l.id, { rgb: hexRgb(l.colour), k: l.tint });
+  const labels = [];
+  for (const l of t.list) {
+    if (l.id === BACKGROUND || !(l.label > 0) || !isVisible(t, l.id)) continue;
+    const c = stats.centres.get(l.id);
+    if (c) labels.push({ x: c[0], y: c[1], text: l.name, colour: l.colour, size: l.label });
+  }
+  const strs = new Map();   // "layer|base css" -> blended css, so a belt costs a lookup
+  const blend = (id, base) => {
+    const k = `${id}|${base}`;
+    let c = strs.get(k);
+    if (!c) {
+      const tt = tints.get(id);
+      c = rgbCss(mix(parseCss(base) || [0.46, 0.47, 0.52], tt.rgb, tt.k));
+      strs.set(k, c);
+    }
+    return c;
+  };
+  let plainGate = null;     // the machines' map with no status colours, built once
+  const lv = {
+    lists, labels, stats, hidden: stats.hidden,
+    // `status`: View > gate status colours' row -> rgb map, or null.
+    gateTint(status) {
+      if (!tints.size) return status;
+      if (!status && plainGate) return plainGate;
+      const out = new Map(status || []);
+      for (const st of board.structs) {
+        const tt = tints.get(board.layerOf(st.row));
+        if (!tt) continue;
+        const base = status?.get(st.row) || T.types[st.type].colour || [0.5, 0.5, 0.5];
+        out.set(st.row, mix(base, tt.rgb, tt.k));
+      }
+      if (!status) plainGate = out;
+      return out;
+    },
+    // `status`: View > belt status colours' (x, y) -> css, or null.
+    // `base`: the belt's (or underground end's) own colour.
+    beltTint(status, base) {
+      if (!tints.size) return status;
+      const W = board.width;
+      return (x, y) => {
+        const s0 = status?.(x, y) || null;
+        const id = board.layerOf(board.cellId(board.grid[(y * W + x) * 4]));
+        return tints.has(id) ? blend(id, s0 || base) : s0;
+      };
+    },
+  };
+  lvCache = { board, key, lv };
+  return lv;
+}
+
+// The panel's model, pushed every frame (the panel redraws only on change).
+// Counts include what is lifted in the selection, so Adopt shows at once.
+function syncLayerPanel(lv = layerView()) {
+  if (!layerPanel) return;
+  layerPanel.show(layersOn());
+  shell.setInspectLayer(inspectLayerOf(inspectRow));
+  if (!lv) return;
+  const t = board.layers;
+  const counts = new Map(lv.stats.counts);
+  if (sel) {
+    for (const e of sel.stamp.entries) {
+      const id = byId(t, e.layer) ? e.layer : BACKGROUND;
+      counts.set(id, (counts.get(id) || 0) + 1);
+    }
+  }
+  // The sliders show the current layer's values -- or, with Background
+  // current, the first active layer's, since that is what they would move.
+  const cur = byId(t, t.current);
+  const ref = cur && cur.id !== BACKGROUND ? cur : t.list.find(l => l.id !== BACKGROUND && isActive(t, l.id));
+  layerPanel.update({
+    rows: t.list.map(l => ({ id: l.id, name: l.name, colour: l.colour, visible: isVisible(t, l.id),
+                             active: isActive(t, l.id), current: l.id === t.current, count: counts.get(l.id) || 0 })),
+    tint: ref?.tint ?? 0, label: ref?.label ?? 0,
+    selCount: sel ? sel.stamp.entries.length : 0,
+    canEdit: t.current !== BACKGROUND,
+  });
+}
+
+// The Hand bar's layer chip for a row, or null.
+function inspectLayerOf(row) {
+  if (!layersOn() || !board.describe(row)) return null;
+  const t = board.layers;
+  const l = byId(t, board.layerOf(row)) || t.list[0];
+  return { name: l.name, colour: l.colour, current: l.id === t.current };
+}
+
+// After any layer change. `edit`: an undo step (membership, names,
+// colours) rather than view (visibility, current, sliders).
+function layersChanged(edit) {
+  if (!board) return;
+  if (edit) board.layersRev++;
+  if (inspectRow >= 0 && seeAtRow(inspectRow) < 0) inspect(-1);
+  shell.setInspectValue(handValueOf(inspectRow));
+  syncHistory();
+  redraw();
+}
+const seeAtRow = (row) => (!layersOn() || isVisible(board.layers, board.layerOf(row)) ? row : -1);
+
+const layerActions = {
+  onSelect: (id) => { setCurrent(board.layers, id); layersChanged(false); },
+  onAdd: () => { addLayer(board.layers); layersChanged(true); },
+  onRename: () => {
+    const t = board.layers, l = byId(t, t.current);
+    if (!l || l.id === BACKGROUND) return;
+    const name = prompt("Rename layer", l.name);
+    if (name !== null && renameLayer(t, l.id, name)) layersChanged(true);
+  },
+  // Deleting a layer moves its entities -- on the board and lifted -- to
+  // Background, after asking.
+  onDelete: () => {
+    const t = board.layers, l = byId(t, t.current);
+    if (!l || l.id === BACKGROUND) return;
+    const n = (layerView()?.stats.counts.get(l.id) || 0) + (sel ? sel.stamp.entries.filter(e => e.layer === l.id).length : 0);
+    const what = n ? ` Its ${n} ${n === 1 ? "entity moves" : "entities move"} to Background.` : "";
+    if (!confirm(`Delete layer "${l.name}"?${what}`)) return;
+    board.retag(l.id, BACKGROUND);
+    if (sel) for (const e of sel.stamp.entries) if (e.layer === l.id) e.layer = BACKGROUND;
+    removeLayer(t, l.id);
+    layersChanged(true);
+  },
+  // The selection's entities join the current layer. They are lifted, so
+  // the change lands -- one undo step -- when the selection goes down.
+  onAdopt: () => {
+    if (!sel) return;
+    for (const e of sel.stamp.entries) e.layer = board.layers.current;
+    layersChanged(false);
+  },
+  onVisible: (id, v) => { const l = byId(board.layers, id); if (l) l.visible = v; layersChanged(false); },
+  onActive: (id, v) => { const l = byId(board.layers, id); if (l) l.active = v; layersChanged(false); },
+  onColour: (id, hex) => { const l = byId(board.layers, id); if (l && l.colour !== hex) { l.colour = hex; layersChanged(true); } },
+  onTint: (v) => { setForActive(board.layers, "tint", v); redraw(); },
+  onLabel: (v) => { setForActive(board.layers, "label", v); redraw(); },
+};
 
 // View > gate status colours: each machine's body coloured by what it is
 // doing in the state on screen. BLOCKED (yellow) when an output with
@@ -375,6 +565,7 @@ function inspect(row) {
 function syncInspect() {
   panel.showStatus(board ? board.describe(inspectRow) : null);
   shell.setInspectValue(handValueOf(inspectRow));
+  shell.setInspectLayer(inspectLayerOf(inspectRow));
   redraw();
 }
 
@@ -382,7 +573,8 @@ function syncInspect() {
 // a belt's seed (null when unseeded), or nothing for anything else.
 function handValueOf(row) {
   const info = board?.describe(row);
-  if (!info) return null;
+  // An inactive layer's entities can be inspected but not edited.
+  if (!info || !pickable(row)) return null;
   if (info.emit !== null) return { kind: "emit", values: VALUE_CHOICES, current: info.emit };
   if (info.seedOn !== null) return { kind: "seed", values: VALUE_CHOICES, current: info.seedOn ? info.seedValue : null };
   return null;
@@ -390,7 +582,7 @@ function handValueOf(row) {
 
 function setInspectValue(v) {
   const info = board?.describe(inspectRow);
-  if (!info) return;
+  if (!info || !pickable(inspectRow)) return;
   // Setting the value already held is not a change: an edit restarts the
   // simulation, and re-tapping the lit swatch should not.
   if (info.emit !== null) { if (Math.fround(v) !== info.emit) board.setEmit(inspectRow, v); }
@@ -623,7 +815,7 @@ function confirmSelectVector() {
 // The board row matching entry `e` with its origin at (x, y): same type,
 // facing, flip and underground role -- or -1. Settings are not compared.
 function matchRow(e, x, y) {
-  const row = board.entityAt(x, y);
+  const row = pickAt(x, y);
   if (row < 0) return -1;
   const E = T.entity;
   if ((board.field(row, E.F_ORIGIN_X) | 0) !== x || (board.field(row, E.F_ORIGIN_Y) | 0) !== y) return -1;
@@ -646,8 +838,10 @@ function onTap(sx, sy) {
     // A label wins the tap: it draws over the board.
     const ni = noteHit(sx, sy);
     if (ni >= 0) { editNote(ni); return; }
-    // A tap on bare board closes the window, as on the desktop.
-    inspect(board.entityAt(x, y));
+    // A tap on bare board closes the window, as on the desktop. A hidden
+    // layer's entities are not there to tap; an inactive one's can be
+    // inspected (read only), which is how its layer is made current.
+    inspect(seeAt(x, y));
     return;
   }
   if (mode !== "build") return;
@@ -697,8 +891,9 @@ function onTap(sx, sy) {
   }
   if (sel) { selectTap(x, y); return; }
   // Idle: a tap on an entity selects it, whatever the hand holds; a tap on
-  // empty board is the held tool's.
-  const row = board.entityAt(x, y);
+  // empty board is the held tool's. An inactive layer's entity is not
+  // there to select.
+  const row = pickAt(x, y);
   // With the belt planner held, a tap on a placed belt starts a run FROM it:
   // that belt is turned to follow the run on Build. Machines and underground
   // ends still select; a long press still selects a belt's whole run.
@@ -791,7 +986,7 @@ function busFor(route) {
     const start = [run.start[0] + k * v0[0], run.start[1] + k * v0[1]];
     const end = [run.end[0] + k * vec.v[0], run.end[1] + k * vec.v[1]];
     if (!inBoard(start) || !inBoard(end)) continue;
-    const row = board.entityAt(start[0], start[1]);
+    const row = pickAt(start[0], start[1]);
     const over = k === 0 ? (run.over && overStart(start[0], start[1]) ? run.over : 0)
                          : row >= 0 && isBeltRow(row) ? row : 0;
     const free = (x, y) => (over && x === start[0] && y === start[1]) || claims.free(x, y);
@@ -887,7 +1082,8 @@ function commitRun() {
 // machine takes the machine, as erasing does on the desktop).
 function clearCells(cells) {
   const rows = new Set();
-  for (const c of cells) { const r = board.entityAt(c.x, c.y); if (r >= 0) rows.add(r); }
+  // Force build never deletes what an inactive layer holds.
+  for (const c of cells) { const r = pickAt(c.x, c.y); if (r >= 0) rows.add(r); }
   if (!rows.size) return;
   if (rows.has(inspectRow)) inspect(-1);
   board.eraseRows([...rows]);
@@ -1019,6 +1215,8 @@ function placeOnce() {
   const pls = placements();
   let any = false;
   pls.forEach((pl, k) => { if (placeOne(pl, k === 0)) any = true; });
+  // Only the cut's first placement is the move; pasting it again copies.
+  if (any && place) place.keepLayers = false;
   if (any) board.derive();
   redraw();
   return any;
@@ -1029,11 +1227,18 @@ function placeOnce() {
 // machine or raw belt only -- never for a copy, and never for a stamp,
 // which already places whatever fits.
 function placeOne(pl, original) {
-  if (pl.kind === "stamp") return board.placeEntries(pl.entries, pl.at, { derive: false }).size > 0;
+  if (pl.kind === "stamp") {
+    // A cut being put down is a move: its entities keep their layers. Any
+    // other paste makes copies, which go on the current layer.
+    const keep = original && place?.keepLayers;
+    const entries = keep ? pl.entries : pl.entries.map(e => ({ ...e, layer: undefined }));
+    return board.placeEntries(entries, pl.at, { derive: false }).size > 0;
+  }
   const blocked = placementCells(pl).filter(([x, y]) => !board.isFree(x, y));
   if (blocked.length) {
     if (!original || !TUNE.forceBuild) return false;
     clearCells(blocked.map(([x, y]) => ({ x, y })));
+    if (placementCells(pl).some(([x, y]) => !board.isFree(x, y))) return false;   // an inactive layer is in the way
   }
   const [x, y] = pl.origin;
   if (pl.kind === "rawbelt") board.spawnBelt(x, y, pl.dir, pl.value);
@@ -1130,7 +1335,7 @@ function dropAll() { if (sel) drop(sel.stamp.entries.map((_, i) => i)); }
 function selectTap(x, y) {
   const i = selIndexAt(x, y);
   if (i >= 0) { drop([i]); return; }
-  const row = board.entityAt(x, y);
+  const row = pickAt(x, y);
   if (row >= 0) lift([row]);
   else dropAll();
 }
@@ -1141,7 +1346,7 @@ function boxAdd(r) {
   const rows = new Set();
   for (let y = r.y; y < r.y + r.h; y++) {
     for (let x = r.x; x < r.x + r.w; x++) {
-      const row = board.entityAt(x, y);
+      const row = pickAt(x, y);
       if (row >= 0) rows.add(row);
     }
   }
@@ -1210,7 +1415,7 @@ function selectCommand(c) {
   if (c === "delete") { setSel([]); return; }
   const pose = [sel.px, sel.py];
   const id = shell.addStamp(sel.stamp);
-  if (c === "cut") { setSel([]); enterPaste(id, pose); return; }
+  if (c === "cut") { setSel([]); enterPaste(id, pose); if (place) place.keepLayers = true; return; }
   // Copy: the selection goes back down. If all of it fit, there is nothing
   // left selected and the copy is ready to paste; anything that could not go
   // back stays selected for the player to deal with.
@@ -1255,7 +1460,9 @@ function onLongPress(sx, sy) {
     return board.beltNode(cx, cy);
   };
   const emits = emitsWith(board, emitMask(board, abs, at));
-  const cells = traceRun(node, (cx, cy, d) => board.incoming(cx, cy, d, emits), x, y);
+  // A hold on an inactive layer's belt is a hold on nothing: it arms a box.
+  const lockedHere = board.entityAt(x, y) >= 0 && pickAt(x, y) < 0 && selIndexAt(x, y) < 0;
+  const cells = lockedHere ? [] : traceRun(node, (cx, cy, d) => board.incoming(cx, cy, d, emits), x, y);
   if (!cells.length) {
     // A hold on a selected entity stays a press: a slow drag from it still
     // moves the selection, as it always did.
@@ -1269,7 +1476,8 @@ function onLongPress(sx, sy) {
     redraw();
     return "drag";
   }
-  const rows = cells.filter(c => c.row !== undefined).map(c => c.row);
+  // The run is traced whole, but only its active cells are lifted.
+  const rows = cells.filter(c => c.row !== undefined && pickable(c.row)).map(c => c.row);
   if (rows.length) lift(rows);
   else drop(cells.map(c => c.sel));
   return true;
@@ -1631,6 +1839,11 @@ async function init() {
     onSelectVector: () => { if (vec.picking === "select") closePicker(false); else if (!vec.picking) openSelectPicker(); },
     onIndexPreview: (o) => indexPreview(o),
     onIndexApply: (o) => indexApply(o),
+    onMakeLayerCurrent: () => {
+      if (inspectRow < 0) return;
+      setCurrent(board.layers, board.layerOf(inspectRow));
+      layersChanged(false);
+    },
     onUndo: () => undo(),
     onRedo: () => redo(),
     onCheckpoint: () => checkpoint(),
@@ -1643,12 +1856,14 @@ async function init() {
     onLoadSave: (name) => loadBundled(name).catch(e => alert(e.message)),
     onOpenFile: () => fileInput.click(),
     onFit: () => { if (board) cam.frame(board.bounds); redraw(); },
-    onView: (v) => { view = v; redraw(); },
+    onView: (v) => { view = v; layersChanged(false); },
     onTune: (t) => { setTune(t); redraw(); },
     onClearStamps: () => shell.clearStamps(),
     onCloseStatus: () => inspect(-1),
-    onEmit: (row, v) => { board.setEmit(row, v); shell.setInspectValue(handValueOf(row)); redraw(); },
-    onSeed: (row, on, v) => { board.setSeed(row, on, v); shell.setInspectValue(handValueOf(row)); redraw(); },
+    // An inactive layer's entity is read only: the edit is refused and the
+    // pane shows the value it still holds.
+    onEmit: (row, v) => { if (!pickable(row)) { syncInspect(); return; } board.setEmit(row, v); shell.setInspectValue(handValueOf(row)); redraw(); },
+    onSeed: (row, on, v) => { if (!pickable(row)) { syncInspect(); return; } board.setSeed(row, on, v); shell.setInspectValue(handValueOf(row)); redraw(); },
     onSaveLocal: (name) => saveLocal(name),
     onLoadLocal: (name) => loadLocal(name),
     onExportLocal: (name) => exportLocal(name),
@@ -1656,6 +1871,7 @@ async function init() {
   });
   panel.setLocalSaves(listSaves());
   view = { ...panel.view };
+  layerPanel = new LayerPanel(document.getElementById("stage"), layerActions);
   setTune(panel.dev);
 
   resize();

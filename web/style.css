@@ -687,3 +687,142 @@ html, body {
 .numcustom input:focus { outline: none; border-color: var(--accent); }
 .numcustom[data-selected="true"] input { background: var(--sel-bg); color: var(--sel-ink); border-color: var(--sel-edge); }
 .numcustom input[aria-invalid="true"] { border-color: var(--danger); }
+
+/* ----------------------------------------------------------------------
+   THE LAYER PANEL (layerpanel.js): floated in the board's top-left corner
+   while View > layers is on. Compact rows, so dozens of layers scroll in a
+   short list rather than taking the board.
+   ---------------------------------------------------------------------- */
+/* Just under the Tweakpane's title bar, which spans most of a phone's
+   width; an expanded pane draws over it (z-index 5), as asked for. */
+.layerpanel {
+  position: absolute;
+  top: calc(6 * var(--u) + 32px);
+  left: calc(6 * var(--u));
+  width: min(calc(190 * var(--u)), calc(100% - 12 * var(--u)));
+  max-height: calc(100% - 12 * var(--u) - 32px);
+  display: flex;
+  flex-direction: column;
+  box-sizing: border-box;
+  background: rgba(22, 24, 29, 0.94);
+  border: var(--border) solid var(--edge);
+  border-radius: var(--r);
+  z-index: 4;
+  font-size: calc(11 * var(--u));
+  color: var(--ink);
+  touch-action: manipulation;
+}
+.layerpanel[data-open="false"] { display: none; }
+.layerpanel[data-folded="true"] .ly-body { display: none; }
+.layerpanel button { font: inherit; color: inherit; touch-action: manipulation; }
+.layerpanel svg {
+  fill: none; stroke: currentColor; stroke-width: 2;
+  stroke-linecap: round; stroke-linejoin: round;
+}
+.ly-head {
+  appearance: none; background: none; border: 0;
+  display: flex; align-items: center; gap: calc(6 * var(--u));
+  padding: calc(5 * var(--u)) calc(7 * var(--u));
+  font-size: calc(var(--label-fs) * var(--u)) !important;
+  letter-spacing: var(--label-spacing);
+  text-transform: uppercase;
+  color: var(--ink-dim) !important;
+  text-align: left;
+}
+.ly-head svg { width: calc(14 * var(--u)); height: calc(14 * var(--u)); }
+.ly-fold { margin-left: auto; }
+.ly-fold::after { content: "\25B4"; }
+.layerpanel[data-folded="true"] .ly-fold::after { content: "\25BE"; }
+.ly-body {
+  display: flex; flex-direction: column; gap: calc(5 * var(--u));
+  padding: 0 calc(5 * var(--u)) calc(6 * var(--u));
+  min-height: 0;
+}
+.ly-list {
+  display: flex; flex-direction: column; gap: calc(2 * var(--u));
+  max-height: calc(28 * 7 * var(--u));
+  overflow-y: auto;
+  overscroll-behavior: contain;
+}
+.ly-row {
+  display: grid;
+  grid-template-columns: calc(16 * var(--u)) minmax(0, 1fr) auto calc(24 * var(--u)) calc(24 * var(--u));
+  align-items: center;
+  gap: calc(4 * var(--u));
+  min-height: calc(26 * var(--u));
+  padding: 0 calc(3 * var(--u));
+  border-radius: calc(4 * var(--u));
+  border: var(--border) solid transparent;
+}
+.ly-row[data-current="true"] { background: var(--sel-bg); border-color: var(--sel-edge); }
+.ly-row[data-hidden="true"] .ly-name, .ly-row[data-hidden="true"] .ly-count { color: var(--ink-dim); }
+.ly-swatch {
+  position: relative;
+  width: calc(14 * var(--u)); height: calc(14 * var(--u));
+  border-radius: calc(3 * var(--u));
+  border: var(--border) solid rgba(255, 255, 255, 0.25);
+  box-sizing: border-box;
+}
+.ly-swatch[data-none="true"] { border-style: dashed; border-color: var(--edge); }
+/* The native colour input, invisible over the swatch: a tap opens the
+   platform's picker. */
+.ly-swatch input {
+  position: absolute; inset: -4px;
+  width: calc(100% + 8px); height: calc(100% + 8px);
+  opacity: 0; padding: 0; border: 0; cursor: pointer;
+}
+.ly-name {
+  appearance: none; background: none; border: 0; padding: calc(4 * var(--u)) 0;
+  text-align: left; min-width: 0;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.ly-row[data-current="true"] .ly-name { color: var(--sel-ink); font-weight: 600; }
+.ly-count { color: var(--ink-dim); font-variant-numeric: tabular-nums; font-size: calc(10 * var(--u)); }
+.ly-tog {
+  appearance: none; background: none; border: 0; padding: calc(3 * var(--u));
+  width: calc(24 * var(--u)); height: calc(24 * var(--u));
+  display: flex; align-items: center; justify-content: center;
+  color: var(--ink);
+}
+.ly-tog[data-on="false"] { color: var(--ink-dim); }
+.ly-tog:disabled { opacity: 0.35; }
+.ly-tog svg { width: 100%; height: 100%; }
+.ly-add {
+  appearance: none; background: none;
+  border: var(--border) dashed var(--edge); border-radius: calc(4 * var(--u));
+  height: calc(24 * var(--u));
+  display: flex; align-items: center; justify-content: center;
+  color: var(--ink-dim);
+}
+.ly-add svg { width: calc(14 * var(--u)); height: calc(14 * var(--u)); }
+.ly-acts { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: calc(4 * var(--u)); }
+.ly-act {
+  aspect-ratio: auto !important;
+  gap: calc(4 * var(--u));
+  padding: calc(5 * var(--u)) calc(2 * var(--u)) !important;
+  font-size: calc(10 * var(--u)) !important;
+}
+.ly-act svg { width: calc(12 * var(--u)); height: calc(12 * var(--u)); flex: none; }
+.ly-act[data-disabled="true"] { opacity: 0.35; }
+.ly-slider {
+  display: grid;
+  grid-template-columns: calc(34 * var(--u)) minmax(0, 1fr) calc(26 * var(--u));
+  align-items: center; gap: calc(4 * var(--u));
+  color: var(--ink-dim);
+  font-size: calc(10 * var(--u));
+}
+.ly-slider input { width: 100%; margin: 0; accent-color: var(--accent); }
+.ly-sval { text-align: right; font-variant-numeric: tabular-nums; }
+
+/* The Hand's bar: the inspected entity's layer, and Make current. */
+.laychip {
+  display: flex; align-items: center; gap: calc(5 * var(--u));
+  flex: 0 0 auto;
+  color: var(--ink);
+  font-size: calc(11 * var(--u));
+  max-width: calc(110 * var(--u));
+}
+.laychip .ly-swatch { flex: none; }
+.act-laycur { width: auto; }
+.act-laycur .sw-name { max-width: none; }
+.laychip span:last-child { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }

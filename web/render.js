@@ -43,6 +43,10 @@ const COL = {
   itemHalo: "rgba(15,18,23,0.85)",
 };
 
+// The colours a layer tint blends from (main.js), where nothing else has
+// recoloured the entity.
+export const BASE_COLOURS = { belt: COL.belt, under: COL.under };
+
 // world.frag's ITEM_RADIUS / ITEM_RING.
 const ITEM = { r: 0.22, ring: 0.055 };
 // An item's number, as a fraction of a cell, and the zoom band it fades in
@@ -135,13 +139,16 @@ export function render(ctx, board, cam, dpr, opts = {}) {
   const hide = view.hide?.length ? new Set(view.hide.map(([x, y]) => `${x},${y}`)) : null;
   // View > belts off hides placed belts and underground ends (ghosts of a
   // run being planned still draw).
+  // `lists`: the board's own lists with hidden layers' entities left out
+  // (main.js filters them once per change, not per frame).
+  const L = view.lists || board;
   if (view.belts !== false) {
-    drawBelts(ctx, hide ? board.belts.filter(b => !hide.has(`${b.x},${b.y}`)) : board.belts, z, on, S, view.seedTint, view.beltTint || null);
-    drawUnders(ctx, board.unders, z, on, S, view.beltTint || null);
+    drawBelts(ctx, hide ? L.belts.filter(b => !hide.has(`${b.x},${b.y}`)) : L.belts, z, on, S, view.seedTint, view.beltTint || null);
+    drawUnders(ctx, L.unders, z, on, S, view.underTint || view.beltTint || null);
   }
   // View > sources off: Sources are not drawn (there are hundreds on a
   // computer, and they hide the machines worth looking at). Still there.
-  const structs = view.sources === false ? board.structs.filter(s => board.T.types[s.type].name !== "source") : board.structs;
+  const structs = view.sources === false ? L.structs.filter(s => board.T.types[s.type].name !== "source") : L.structs;
   drawStructs(ctx, board.T, structs, z, px, on, S, view.ports, view.labels, view.gateTint || null);
 
   ctx.strokeStyle = COL.border;
@@ -154,7 +161,7 @@ export function render(ctx, board, cam, dpr, opts = {}) {
   // Items last among the board's contents: cargo on a cell, over any tint,
   // so a red wash never changes the colour that says an item's sign.
   let cargo = null;
-  if (view.sim && view.items !== false) cargo = drawItems(ctx, view.sim, view.alpha || 0, z, on, S);
+  if (view.sim && view.items !== false) cargo = drawItems(ctx, view.sim, view.alpha || 0, z, on, S, view.hiddenCells, board.width);
 
   // The vector picker's highlights, over the ghosts they move.
   if (view.vector) drawVectorMarks(ctx, view.vector, px);
@@ -172,6 +179,7 @@ export function render(ctx, board, cam, dpr, opts = {}) {
   if (cargo) drawItemLabels(ctx, cargo, cam, dpr);
   if (view.notes !== false && board.notes?.length) drawNotes(ctx, board.notes, cam, dpr, view.noteSel ?? -1, !!view.noteGrips);
   if (view.indexLabels?.length) drawIndexLabels(ctx, view.indexLabels, cam, dpr);
+  if (view.layerLabels?.length) drawLayerLabels(ctx, view.layerLabels, cam, dpr);
 
   if (view.labels && z >= LOD.marks) {
     drawLabels(ctx, board.T, structs, cam, dpr, on);
@@ -618,7 +626,9 @@ function drawVectorMarks(ctx, marks, px) {
 // forecast. Here they only become discs. A result waiting in an output zone
 // is an ordinary disc on the out-edge, half on the machine and half on the
 // belt. Items draw after the machines, so over their control overlays.
-function drawItems(ctx, sim, alpha, z, on, S) {
+// `hidden`: a cell mask of hidden layers' entities, or null -- an item over
+// one is not drawn (one byte read per item, and only while a layer is hidden).
+function drawItems(ctx, sim, alpha, z, on, S, hidden = null, W = 0) {
   const text = textOpacity(z);
   const { pts } = itemPoints(sim, alpha, {
     visible: (x0, y0, x1, y1) => on(x0, y0, x1 - x0, y1 - y0),
@@ -628,6 +638,7 @@ function drawItems(ctx, sim, alpha, z, on, S) {
   for (let i = 0; i < pts.length; i += 3) {
     const x = pts[i], y = pts[i + 1], value = pts[i + 2];
     if (!on(x - 0.5, y - 0.5)) continue;
+    if (hidden && hidden[Math.floor(y) * W + Math.floor(x)]) continue;
     (value > 0 ? pos : neg).push(x, y);
     if (text > 0) labels.push(x, y, value);
   }
@@ -682,4 +693,28 @@ function drawItemLabels(ctx, cargo, cam, dpr) {
     ctx.fillText(t, sx, sy);
   }
   ctx.globalAlpha = 1;
+}
+
+// Layer labels (layers.js): each layer's name at the centre of mass of its
+// entities, sized in world cells like the board's own labels, in the
+// layer's colour over a black box so it reads over anything. Screen space,
+// over everything. Below a few pixels of text a label is not drawn at all.
+function drawLayerLabels(ctx, labels, cam, dpr) {
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  ctx.textAlign = "center";
+  ctx.textBaseline = "middle";
+  for (const l of labels) {
+    const px = l.size * cam.zoom;
+    if (px < 4) continue;
+    const [sx, sy] = cam.worldToScreen(l.x, l.y);
+    ctx.font = `700 ${px.toFixed(1)}px system-ui, sans-serif`;
+    const w = ctx.measureText(l.text).width;
+    const padX = px * 0.35, padY = px * 0.2;
+    const bw = w + 2 * padX, bh = px * 1.2 + 2 * padY;
+    if (sx + bw / 2 < 0 || sx - bw / 2 > cam.w || sy + bh / 2 < 0 || sy - bh / 2 > cam.h) continue;
+    ctx.fillStyle = "rgba(0,0,0,0.82)";
+    ctx.fillRect(sx - bw / 2, sy - bh / 2, bw, bh);
+    ctx.fillStyle = l.colour;
+    ctx.fillText(l.text, sx, sy);
+  }
 }

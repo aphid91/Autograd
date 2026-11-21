@@ -109,6 +109,9 @@ export class Shell {
       planning: null,
       // Hand: { values, current } while Status shows a Source or a belt.
       inspectValue: null,
+      // The inspected entity's layer, while View > layers is on:
+      // { name, colour, current } or null.
+      inspectLayer: null,
       // The vector (main.js owns it; see vector.js):
       //   on       vectored building is on: what is built repeats along v
       //   picking  the vector picker has the bar and the drags: "build"
@@ -442,7 +445,7 @@ export class Shell {
     const beltRun = s.planning?.kind === "belt";
 
     const rowMode = s.vector.picking ? "vector" : planning ? s.planning.kind
-      : s.mode === "hand" && s.inspectValue ? "inspect"
+      : s.mode === "hand" && (s.inspectValue || s.inspectLayer) ? "inspect"
       : this.selectActive ? "select" : s.mode;
     this.els.bar.dataset.mode = rowMode;
     const row = this.els.swatches;
@@ -767,6 +770,28 @@ export class Shell {
   // The Hand: while Status is open on a Source or a belt, the bar offers
   // its number -- the emit value, or the seed (tap the lit one to unseed).
   renderHand(row) {
+    // The layer first: "Layer: name", and Make current unless it already is.
+    const il = this.state.inspectLayer;
+    if (il) {
+      const chip = document.createElement("div");
+      chip.className = "laychip";
+      const sw = document.createElement("span");
+      sw.className = "ly-swatch";
+      if (il.colour) sw.style.background = il.colour; else sw.dataset.none = "true";
+      const name = document.createElement("span");
+      name.textContent = il.name;
+      const lbl = document.createElement("span");
+      lbl.className = "rowlabel";
+      lbl.textContent = "Layer";
+      chip.append(lbl, sw, name);
+      row.append(chip);
+      if (!il.current) {
+        row.append(this.swatch({
+          art: icon("layers"), name: "Make current", cls: "actsw act-laycur",
+          onTap: () => this.cb.onMakeLayerCurrent?.(),
+        }));
+      }
+    }
     const iv = this.state.inspectValue;
     if (!iv) return;
     const label = document.createElement("span");
@@ -778,6 +803,12 @@ export class Shell {
 
   setInspectValue(iv) {
     this.state.inspectValue = iv;
+    this.render();
+  }
+
+  setInspectLayer(il) {
+    if (JSON.stringify(il) === JSON.stringify(this.state.inspectLayer)) return;
+    this.state.inspectLayer = il;
     this.render();
   }
 

@@ -35,6 +35,10 @@ for (const save of ["cpu.npz", "ram.npz"]) {
     else assert.deepEqual(JSON.parse(after.annotations.data), JSON.parse(before.annotations.data));
     delete after.annotations;
     delete before.annotations;
+    // The layer table (layers.js), which the desktop ignores. A save that
+    // never had one gets the default: Background alone.
+    assert.deepEqual(JSON.parse(after.layers.data).list.map(l => l.name), ["Background"]);
+    delete after.layers;
     assert.deepEqual(Object.keys(after).sort(), Object.keys(before).sort());
     for (const k of Object.keys(before)) {
       if (k === "entities") continue;

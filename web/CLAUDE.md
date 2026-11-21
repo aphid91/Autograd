@@ -10,7 +10,7 @@ CLAUDE.md for what the game *is*; most of its engineering notes are about
 the schedulers and the GPU, which do not apply here.
 
 Current state: **the phone shell, the belt planner, machine placement,
-per-instance settings, select / cut / copy / paste, and the simulation.** It
+per-instance settings, select / cut / copy / paste, layers, and the simulation.** It
 loads a save, pans (one finger) and zooms (pinch, or the wheel), lays belt
 runs (auto-tunnelling under obstacles), places machines and raw belts, edits
 a Source's emit value or a belt's seed, selects, moves, turns, deletes,
@@ -221,6 +221,71 @@ and written back untouched, not drawn.
   a change in progress until it ends (otherwise every frame of a drag was
   a step).
 - Not yet: labels do not travel with a selection, copy or paste.
+
+### Layers
+
+AutoCAD-LT-style layers: named groups that **partition** the entities, all
+on the one shared grid. [layers.js](layers.js) is the model (pure, tested in
+`tests/layers.test.mjs`), [layerpanel.js](layerpanel.js) the panel, and
+main.js's "layers" section applies them. View > **layers** shows the panel
+(top left, under the Tweakpane's title bar); while it is off, layers change
+nothing -- everything draws and can be touched -- but new entities still go
+on the current layer.
+
+- **The tag is in the entity row, slot `F_LAYER` (27)**: the last slot
+  spare at the desktop's stride (24..25 a belt's seed, 26 the desktop's
+  sleep flag). Not exported in `types.json` (the desktop is not changed for
+  this), so `Board` checks at load that nothing else claims it. In the row
+  it rides snapshots, undo and saves for free, and a zeroed row -- anything
+  placed by the desktop or an old save -- is on 0, **Background**.
+- **The table** (names, colours, flags, sliders, current) is a JSON string
+  under the save's `layers` key, like `annotations`; the desktop ignores it.
+  Malformed entries are repaired, not refused. Ids are handles, never
+  reused. A row naming an id the table lacks gets a "Layer n" entry rather
+  than being folded into Background.
+- **Current** is always visible and active; making a layer current turns
+  both on. **Hidden implies inactive** (the stored `active` survives, so
+  showing a layer again restores it). Background cannot be renamed or
+  deleted and takes no tint or label.
+- **Inactive means untouchable**: every cell lookup an interaction makes
+  goes through `pickAt()` -- tap-select, box, long press (the run is traced
+  whole and only its active cells lift; a hold on a locked belt arms a box),
+  vectored selection's match, a run starting on a belt, force build (which
+  never deletes a locked entity). The Hand inspects through `seeAt()`:
+  hidden entities are not there, inactive ones inspect **read only** (no
+  number swatches; Status edits are refused). Hidden entities still occupy
+  their cells and still simulate.
+- **Which layer a new entity gets**: a builder tool (belts, machines, raw
+  belts, a baked stamp, the planner's undergrounds) places on the current
+  layer (`Board.tagLayer`). A selection keeps each entity's layer through
+  lift, move, turn and put-down (`capture()` records it, `placeEntries()`
+  honours `entry.layer`). A **cut**'s first placement is a move and keeps
+  them (`place.keepLayers`); every other paste -- a copy, a repeat paste,
+  vector copies -- is a copy and goes on the current layer. **Adopt**
+  rewrites the lifted entries' layer; it lands when the selection goes down.
+- **Undo**: `board.layersRev` is part of the history key, bumped for
+  membership, names and colours (deleting a layer retags its rows to
+  Background without a derive, so none of this restarts the simulation).
+  Visibility, current and the sliders are view: not steps, and a restore
+  keeps the view as it stands.
+- **Drawing** (`layerView()` in main.js) is rebuilt only when the board, the
+  table or its view changes: the visible lists (only while something is
+  hidden), a hidden-cell mask that culls items (one byte read per item),
+  each layer's member count and centre of mass, and the tints. A tint
+  blends the layer's colour over what the entity would otherwise wear --
+  its own colour **or a status colour** -- by the layer's own amount, so at
+  1 the layer wins and below it both read. Lifted selections and ghosts are
+  not tinted.
+- **The sliders set every active layer** (not Background); each layer keeps
+  its value after. They show the current layer's values (with Background
+  current, the first active layer's). The label is the layer's name at its
+  centre of mass, its height in world cells (zooming like the board's own
+  labels), in its colour over a black box; 0 is off.
+- **The Hand's bar** shows `Layer: name` for the inspected entity, and
+  **Make current** unless it already is.
+- The panel redraws only when its model changes, and never under a finger:
+  the sliders are built once, and a colour is reported on `change` (the
+  picker closing), since rebuilding a row mid-pick would close the picker.
 
 ### The Dev folder
 
@@ -952,6 +1017,8 @@ asserting every array matches and exactly the edited value differs.
 | `notes.js` | labels: the desktop's text-box records, hit-testing, wrapping, fitting a box to its text |
 | `indexer.js` | indexing: the orders, the value tables, the file parser, a·x+b |
 | `vector.js` | vectors: offsets, turns, the claims overlay, laying copies, following a chain |
+| `layers.js` | layers: the table, its rules (current, visible, active), parsing, stats (counts, centres, hidden cells) |
+| `layerpanel.js` | the layer panel's DOM: rows, +, Rename / Delete / Adopt, the tint and label sliders |
 | `tests/` | `node --test` suites for the pure modules |
 | `types.json` | generated — do not edit |
 | `build.sh` | assembles `_site/`, and stamps `sw.js` with its file list and version |
