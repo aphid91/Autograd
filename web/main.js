@@ -997,6 +997,22 @@ const seeAtRow = (row) => (!layersOn() || isVisible(board.layers, board.layerOf(
 const layerActions = {
   onSelect: (id) => { setCurrent(board.layers, id); layersChanged(false); },
   onIsolate: (id) => { if (isolate(board.layers, id)) layersChanged(false); },
+  // Double tap: every entity on the layer joins the selection (the first
+  // tap already made it current, so all of it is active and visible).
+  // Selecting is a state of Build, so the shell goes there; a run, a
+  // placement or a paste in progress is dropped first, as a tap on an
+  // entity would not reach them otherwise.
+  onSelectAll: (id) => {
+    setCurrent(board.layers, id);
+    if (shell.state.mode !== "build") shell.setMode("build");
+    if (run) cancelRun();
+    if (shell.activeStamp) exitPaste();
+    else if (place) endPlace();
+    const E = T.entity, rows = [];
+    for (let r = 1; r < board.rows; r++) if (board.field(r, E.F_ALIVE) && board.layerOf(r) === id) rows.push(r);
+    lift(rows);
+    layersChanged(false);
+  },
   onAdd: () => { addLayer(board.layers); layersChanged(true); },
   onRename: () => {
     const t = board.layers, l = byId(t, t.current);

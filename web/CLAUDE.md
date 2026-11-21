@@ -324,6 +324,14 @@ on the current layer.
   is the only active layer and every **visible** layer is active again (a
   hidden one keeps its own flag). View, not an undo step. Right-click on a
   mouse; the hold swallows the click its release makes.
+- **Double tap a layer's name to select all of it**: the first tap makes it
+  current as usual, the second (within 350 ms) lifts every entity on it
+  into the selection -- adding, as selecting always does. Selecting is a
+  state of Build, so the shell switches there, dropping a run, placement or
+  paste in progress. The timing is kept on the panel (`lastTap`), not the
+  button: the first tap makes the layer current, which rebuilds its row, so
+  the second tap lands on a new element. Background's 5,145 entities on
+  `cpu.npz` lift in about 16 ms.
 - **Inactive layers are washed out**: their cells get a `saturation`
   composite with grey (colour drained) and then a dark wash, in one batched
   pass after the items, so body, glyph, ports and items all fade; Source

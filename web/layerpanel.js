@@ -1,6 +1,7 @@
 // The layer panel: a small floating list in the board's top-left corner,
 // shown while View > layers is on. One row per layer -- colour swatch, name
-// (tap to make it current, long press to isolate it), member count, the
+// (tap to make it current, double tap to select all of it, long press to
+// isolate it), member count, the
 // visible toggle (an eye) and the active one (a star, filled when active) --
 // then a + row, the commands (Rename, Delete, Adopt selection) and the two
 // sliders (tint, label size), which set every active layer at once.
@@ -15,6 +16,7 @@ import { icon } from "./icons.js";
 import { LABEL_MAX } from "./layers.js";
 
 const HOLD_MS = 500, HOLD_SLOP = 10;   // a long press, as the shell's
+const DOUBLE_TAP_MS = 350;
 
 const el = (tag, cls, attrs = {}) => {
   const e = document.createElement(tag);
@@ -115,8 +117,18 @@ export class LayerPanel {
 
       const name = el("button", "ly-name", { type: "button" });
       name.textContent = r.name;
-      name.title = `${r.current ? "The current layer" : "Make current"}; hold to isolate`;
-      this.wirePress(name, () => this.cb.onSelect(r.id), () => this.cb.onIsolate(r.id));
+      name.title = `${r.current ? "The current layer" : "Make current"}; double tap to select it all; hold to isolate`;
+      // A second tap on the same layer soon after the first selects all of
+      // it. Kept on the panel, not the button: the first tap makes the layer
+      // current, which rebuilds the row, so the second lands on a new one.
+      this.wirePress(name, () => {
+        const now = performance.now(), last = this.lastTap;
+        this.lastTap = { id: r.id, t: now };
+        if (last && last.id === r.id && now - last.t < DOUBLE_TAP_MS) {
+          this.lastTap = null;
+          this.cb.onSelectAll(r.id);
+        } else this.cb.onSelect(r.id);
+      }, () => { this.lastTap = null; this.cb.onIsolate(r.id); });
 
       const count = el("span", "ly-count");
       count.textContent = String(r.count);
