@@ -21,7 +21,8 @@ export const TUNE_DEFAULTS = {
   tapMarginPx: 20,       // how near a ghost or a run's tip a tap counts as on it
   // Zoom thresholds, in CSS px per cell: below each, that detail is not
   // drawn (render.js's LOD reads these live).
-  lodBeltSolid: 4,       // belts become solid squares
+  lodZoom: 0,            // 0: the zoom thresholds test the real zoom; above 0, this value instead
+  lodBeltSolid: 0,       // belts become solid squares (0: never)
   lodGrid: 6,            // grid lines
   lodMarks: 5,           // machine glyphs and Source values
   lodPorts: 8,           // port arrows
@@ -53,6 +54,7 @@ export const TUNE_SPEC = [
   ["tapMarginPx", "tap margin px", { min: 0, max: 60, step: 1 }],
   // A divider, then the zoom thresholds.
   ["---", "zoom thresholds (px/cell)"],
+  ["lodZoom", "override zoom", { min: 0, max: 60, step: 0.5 }],
   ["lodBeltSolid", "solid belts below", { min: 0, max: 40, step: 0.5 }],
   ["lodGrid", "grid from", { min: 0, max: 40, step: 0.5 }],
   ["lodMarks", "glyphs, values from", { min: 0, max: 40, step: 0.5 }],

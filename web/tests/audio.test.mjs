@@ -1,0 +1,511 @@
+// Audio: the synth (audio-dsp.js) rendered under node, and the recorder
+// (audio.js) on a real save. No Web Audio here -- the worklet is a thin
+// wrapper over GatesSynth, and the recorder only needs a port.
+
+import { test } from "node:test";
+import assert from "node:assert/strict";
+import { readFileSync, existsSync } from "node:fs";
+import { fileURLToPath } from "node:url";
+import { dirname, join } from "node:path";
+import { GatesSynth } from "../audio-dsp.js";
+import { Recorder } from "../audio.js";
+import { bakeAudio, wavBytes } from "../audio-bake.js";
+import { AUDIO_DEFAULTS, audioGroupOf, audioRecord, parseAudio, BAKE_MAX_SECONDS } from "../audio-params.js";
+import { Board } from "../board.js";
+import { Sim } from "../sim.js";
+import { stateLine } from "./sim_state.mjs";
+
+const here = dirname(fileURLToPath(import.meta.url));
+const root = join(here, "..", "..");
+const T = JSON.parse(readFileSync(join(here, "..", "types.json"), "utf8"));
+const SR = 48000;
+
+function synth(params = {}) {
+  const s = new GatesSynth(SR);
+  s.message({ type: "params", p: { ...AUDIO_DEFAULTS, softClip: false, ...params } });
+  return s;
+}
+
+// n ticks at `rate`, every one with the same active set and fire counts.
+function ticks(s, n, rate, active = [], f0 = 0, f1 = 0) {
+  const W = s.words, bits = new Uint32Array(n * W);
+  for (let k = 0; k < n; k++) for (const i of active) bits[k * W + (i >>> 5)] |= 1 << (i & 31);
+  s.message({ type: "ticks", n, words: W, rate, bits, f0: new Uint16Array(n).fill(f0), f1: new Uint16Array(n).fill(f1) });
+}
+
+// As paint() and the worklet interleave them: each 16 ms frame posts the
+// ticks it ran, and the audio thread renders a frame's worth.
+function stream(s, seconds, rate, active = [], f0 = 0, f1 = 0) {
+  const frame = SR * 16 / 1000, out = new Float32Array(Math.round(seconds * SR));
+  let bank = 0;
+  for (let at = 0; at < out.length; at += frame) {
+    bank += rate * 0.016;
+    const n = Math.floor(bank); bank -= n;
+    if (n) ticks(s, n, rate, active, f0, f1);
+    const end = Math.min(out.length, at + frame);
+    for (let i = at; i < end; i += 128) s.render(out.subarray(i, Math.min(end, i + 128)), Math.min(128, end - i));
+  }
+  return out;
+}
+
+function render(s, samples) {
+  const out = new Float32Array(samples);
+  for (let i = 0; i < samples; i += 128) s.render(out.subarray(i, i + 128), Math.min(128, samples - i));
+  return out;
+}
+
+// Frequency by upward zero crossings over the steady middle of a buffer.
+function freq(buf) {
+  const a = buf.subarray(buf.length / 4, buf.length * 3 / 4);
+  let first = -1, last = -1, n = 0;
+  for (let i = 1; i < a.length; i++) {
+    if (a[i - 1] < 0 && a[i] >= 0) { if (first < 0) first = i; last = i; n++; }
+  }
+  return (n - 1) * SR / (last - first);
+}
+
+test("a belt's pitch is the 1-tile pitch over its length: 10 tiles an octave above 20", () => {
+  const f = {};
+  for (const L of [10, 20]) {
+    const s = synth({ beltShape: 0 });
+    s.message({ type: "config", lengths: new Float64Array([L]), groups: [0, 0] });
+    f[L] = freq(stream(s, 1, 1000, [0]));
+  }
+  assert.ok(Math.abs(f[10] - AUDIO_DEFAULTS.beltMaxHz / 10) < 1, `10 tiles: ${f[10]} Hz`);
+  assert.ok(Math.abs(f[10] / f[20] - 2) < 0.01, `ratio ${f[10] / f[20]}`);
+});
+
+test("following the tick rate scales belt pitch by (rate / reference)^track", () => {
+  const s = synth({ beltShape: 0, beltTrack: 1, trackRef: 500 });
+  s.message({ type: "config", lengths: new Float64Array([10]), groups: [0, 0] });
+  const f = freq(stream(s, 1, 1000, [0]));
+  assert.ok(Math.abs(f - 2 * AUDIO_DEFAULTS.beltMaxHz / 10) < 2, `${f} Hz`);
+});
+
+test("nothing active and nothing firing is silence", () => {
+  const s = synth();
+  s.message({ type: "config", lengths: new Float64Array([4, 8, 16]), groups: [5, 5] });
+  ticks(s, 1000, 1000);
+  const out = render(s, SR / 2);
+  assert.equal(Math.max(...out.map(Math.abs)), 0);
+});
+
+test("fires every tick are a buzz at the tick rate", () => {
+  const s = synth({ g1DecayMs: 3 });
+  s.message({ type: "config", lengths: new Float64Array(0), groups: [0, 1] });
+  const out = stream(s, 1, 1000, [], 0, 1);
+  // The clicks repeat every tick (48 samples), more closely than at any
+  // shorter lag: the buzz's period is the tick's.
+  const a = out.subarray(SR / 2);
+  const corr = (lag) => { let c = 0, e = 0; for (let i = 0; i + lag < a.length; i++) { c += a[i] * a[i + lag]; e += a[i] * a[i]; } return c / e; };
+  const at = corr(48);
+  assert.ok(at > 0.95, `lag 48: ${at}`);
+  for (let lag = 8; lag < 44; lag++) assert.ok(corr(lag) < at - 0.05, `lag ${lag}: ${corr(lag)} vs ${at}`);
+});
+
+test("playback waits for the latency's worth, and an empty queue falls silent", () => {
+  const s = synth({ latencyMs: 100, releaseMs: 10 });
+  s.message({ type: "config", lengths: new Float64Array([4]), groups: [0, 0] });
+  ticks(s, 50, 1000, [0]);        // 50 ms: not enough to start
+  assert.equal(Math.max(...render(s, 4800).map(Math.abs)), 0);
+  ticks(s, 100, 1000, [0]);       // 150 ms queued: plays, then runs dry
+  const out = render(s, SR);
+  assert.ok(Math.max(...out.subarray(0, 4800).map(Math.abs)) > 0, "plays");
+  assert.equal(s.meter().voices, 0, "every voice released once the queue ran dry");
+  assert.equal(Math.max(...out.subarray(SR / 2).map(Math.abs)), 0, "silent after");
+});
+
+test("a deep backlog is skipped, not raced through", () => {
+  const s = synth({ latencyMs: 60 });
+  s.message({ type: "config", lengths: new Float64Array(0), groups: [0, 1] });
+  ticks(s, 1000, 1000, [], 0, 1);     // a whole second at once
+  render(s, 128);
+  const m = s.meter();
+  assert.ok(m.lagMs <= 61, `lag ${m.lagMs} ms`);
+  assert.ok(m.speed <= 1.25, `speed ${m.speed}`);
+});
+
+test("the voice limit: only active runs take voices, the rest are refused, a freed voice is reused", () => {
+  // 13 candidate runs, a limit of 8: with 4 active there is room for all.
+  const s = synth({ voiceLimit: 8, releaseMs: 5 });
+  s.message({ type: "config", lengths: new Float64Array(13).fill(4), groups: [0, 0] });
+  stream(s, 0.3, 1000, [0, 1, 2, 3]);
+  let m = s.meter();
+  assert.deepEqual([m.voices, m.active, m.refused], [4, 4, 0]);
+  // All 13 at once: 8 sound, 5 refused.
+  stream(s, 0.3, 1000, [...Array(13).keys()]);
+  m = s.meter();
+  assert.deepEqual([m.voices, m.active, m.refused], [8, 13, 5]);
+  // Two go quiet: once their voices have released, two refused runs take them.
+  stream(s, 0.3, 1000, [...Array(13).keys()].filter(i => i !== 0 && i !== 1));
+  m = s.meter();
+  assert.deepEqual([m.voices, m.active, m.refused], [8, 11, 3]);
+});
+
+test("a stop drops the queue and releases everything", () => {
+  const s = synth();
+  s.message({ type: "config", lengths: new Float64Array([4]), groups: [0, 0] });
+  stream(s, 0.5, 1000, [0]);
+  s.message({ type: "stop" });
+  render(s, SR / 2);
+  const m = s.meter();
+  assert.equal(m.voices, 0);
+  assert.equal(m.lagMs, 0);
+});
+
+test("Sources are silent; Swap, Route and Merge are group 0, the rest group 1", () => {
+  assert.equal(audioGroupOf("Source"), 2);
+  for (const c of ["Swap", "Route", "Merge"]) assert.equal(audioGroupOf(c), 0);
+  for (const c of ["Shear", "Mac", "Sink", "Floor", "Max", "Reciprocal"]) assert.equal(audioGroupOf(c), 1);
+});
+
+const save = join(root, "cpu.npz");
+test("the recorder on a real save: hears every tick but no forecast, and changes nothing", { skip: !existsSync(save) }, async () => {
+  const load = async () => {
+    const bytes = readFileSync(save);
+    const board = await Board.fromNpz(T, bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength));
+    return new Sim(T, board);
+  };
+  const plain = await load(), heard = await load();
+  const msgs = [];
+  const rec = new Recorder({ postMessage: (m) => msgs.push(m) }, AUDIO_DEFAULTS);
+  rec.attach(heard);
+  const N = 60;
+  for (let i = 0; i < N; i++) {
+    plain.step();
+    heard.step();
+    heard.forecast();               // must not be recorded
+    if (i % 10 === 9) rec.flush(30);
+  }
+  assert.equal(stateLine(heard), stateLine(plain), "recording does not perturb the tick");
+
+  const config = msgs.find(m => m.type === "config");
+  const batches = msgs.filter(m => m.type === "ticks");
+  assert.equal(batches.reduce((n, b) => n + b.n, 0), N, "one recorded tick per step");
+  const cands = heard.order.filter(s => s.length <= AUDIO_DEFAULTS.beltCutoff);
+  assert.deepEqual([...config.lengths], cands.map(s => s.length));
+  const groups = [0, 0];
+  for (const g of heard.gates) { const k = audioGroupOf(g.td.class); if (k < 2) groups[k]++; }
+  assert.deepEqual(config.groups, groups);
+  assert.ok(heard.gates.some(g => g.td.class === "Source"), "the save has Sources to leave out");
+
+  // Some runs move and some gates fire, and no more fire than there are.
+  let fires = 0, anyActive = false;
+  for (const b of batches) {
+    for (let k = 0; k < b.n; k++) {
+      assert.ok(b.f0[k] <= groups[0] && b.f1[k] <= groups[1]);
+      fires += b.f0[k] + b.f1[k];
+    }
+    if (b.bits.some(w => w !== 0)) anyActive = true;
+  }
+  assert.ok(fires > 0, "gates fired");
+  assert.ok(anyActive, "runs moved");
+
+  // Detached, the sim no longer calls it.
+  rec.detach();
+  assert.equal(heard.audio, null);
+});
+
+// --- start tick, fade, hold, baking ---------------------------------------------
+
+function ticksAt(s, tick0, n, rate, active = [], f0 = 0, f1 = 0) {
+  const W = s.words, bits = new Uint32Array(n * W);
+  for (let k = 0; k < n; k++) for (const i of active) bits[k * W + (i >>> 5)] |= 1 << (i & 31);
+  s.message({ type: "ticks", n, tick0, words: W, rate, bits, f0: new Uint16Array(n).fill(f0), f1: new Uint16Array(n).fill(f1) });
+}
+const peakOf = (a) => a.reduce((m, x) => Math.max(m, Math.abs(x)), 0);
+
+test("silent before the start tick, then a fade in over fadeMs", () => {
+  const s = new GatesSynth(SR, { offline: true });
+  s.message({ type: "params", p: { ...AUDIO_DEFAULTS, softClip: false, beltShape: 0, startTick: 100, fadeMs: 200 } });
+  s.message({ type: "config", lengths: new Float64Array([10]), groups: [0, 0] });
+  ticksAt(s, 0, 1000, 1000, [0]);            // 1 tick per ms
+  const out = render(s, SR);
+  assert.equal(peakOf(out.subarray(0, 99 * 48)), 0, "silent before tick 100");
+  const early = peakOf(out.subarray(100 * 48, 110 * 48)), late = peakOf(out.subarray(400 * 48, 500 * 48));
+  assert.ok(early > 0 && early < late * 0.15, `fading in: ${early} then ${late}`);
+  assert.ok(peakOf(out.subarray(250 * 48, 260 * 48)) < late * 0.9, "still fading at 150 ms");
+});
+
+test("hold on underrun: the voices sound through a gap in the ticks, and carry on", () => {
+  for (const hold of [false, true]) {
+    const s = synth({ holdUnderrun: hold, latencyMs: 20, releaseMs: 5 });
+    s.message({ type: "config", lengths: new Float64Array([10]), groups: [0, 0] });
+    stream(s, 0.2, 1000, [0]);
+    const gap = render(s, SR / 10);          // 100 ms with no ticks
+    // The queue's last 20 ms play out first; by the gap's end a release
+    // is long finished and a hold is still sounding.
+    const tail = peakOf(gap.subarray(gap.length * 0.9));
+    if (hold) assert.ok(tail > 0.01, `held: ${tail}`);
+    else assert.ok(tail < 1e-4, `released: ${tail}`);
+    // And the next ticks carry on at once, with no refill wait.
+    if (hold) {
+      ticks(s, 5, 1000, [0]);
+      render(s, 128);
+      assert.ok(s.meter().ticks > 0, "playing again");
+    }
+  }
+});
+
+test("offline, tick k starts at sample k * sampleRate / rate exactly", () => {
+  const s = new GatesSynth(SR, { offline: true });
+  s.message({ type: "params", p: { ...AUDIO_DEFAULTS, softClip: false } });
+  s.message({ type: "config", lengths: new Float64Array(0), groups: [0, 1] });
+  const n = 40, W = 0, f1 = new Uint16Array(n);
+  f1[37] = 1;                                  // one fire, on tick 37
+  s.message({ type: "ticks", n, tick0: 0, words: W, rate: 300, bits: new Uint32Array(0), f0: new Uint16Array(n), f1 });
+  const out = render(s, Math.ceil(40 * SR / 300));
+  const first = out.findIndex(x => x !== 0);
+  assert.equal(first, Math.round(37 * SR / 300));
+});
+
+test("WAV: a 16-bit PCM mono header and the samples", () => {
+  const buf = wavBytes(new Float32Array([0, 1, -1, 0.5]), 44100), v = new DataView(buf);
+  const str = (o, n) => String.fromCharCode(...new Uint8Array(buf, o, n));
+  assert.equal(str(0, 4), "RIFF"); assert.equal(str(8, 4), "WAVE"); assert.equal(str(36, 4), "data");
+  assert.equal(v.getUint32(24, true), 44100);
+  assert.equal(v.getUint16(34, true), 16);
+  assert.deepEqual([0, 1, 2, 3].map(i => v.getInt16(44 + 2 * i, true)), [0, 32767, -32768, 16383]);
+});
+
+test("baking a real save: the live sim is untouched, a bake is repeatable, restoreFrom replays it", { skip: !existsSync(save) }, async () => {
+  const bytes = readFileSync(save);
+  const board = await Board.fromNpz(T, bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength));
+  const live = new Sim(T, board);
+  live.reset();
+  const snap = live.clone();
+  const before = stateLine(live);
+  const params = { ...AUDIO_DEFAULTS, startTick: 20, fadeMs: 50 };
+  const opts = { start: snap, params, rate: 240, seconds: 0.5, sampleRate: SR };
+  const a = await bakeAudio(opts), b = await bakeAudio(opts);
+  assert.equal(stateLine(live), before, "the live sim never moved");
+  assert.equal(stateLine(snap), before, "nor did the snapshot");
+  assert.equal(a.t0, 20); assert.equal(a.end, 20 + 120);
+  assert.equal(a.samples.length, Math.round(120 * SR / 240));
+  assert.ok(peakOf(a.samples) > 0, "it made a sound");
+  assert.deepEqual(a.samples, b.samples, "the same bake twice is the same audio");
+
+  // Played on, then Reset to the bake's start: the same ticks again.
+  for (let i = 0; i < 50; i++) live.step();
+  const mid = stateLine(live);
+  live.restoreFrom(snap);
+  assert.equal(stateLine(live), before, "restoreFrom is the bake's start");
+  for (let i = 0; i < 50; i++) live.step();
+  assert.equal(stateLine(live), mid, "and replays the same ticks");
+});
+
+// --- length window, per-length gain, low cut -------------------------------------
+
+test("only runs between the min and max length are candidates", { skip: !existsSync(save) }, async () => {
+  const bytes = readFileSync(save);
+  const board = await Board.fromNpz(T, bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength));
+  const sim = new Sim(T, board);
+  const msgs = [];
+  const rec = new Recorder({ postMessage: (m) => msgs.push(m) }, { ...AUDIO_DEFAULTS, beltMinLen: 4, beltCutoff: 12 });
+  rec.attach(sim);
+  sim.step();
+  const want = sim.order.filter(s => s.length >= 4 && s.length <= 12).map(s => s.length);
+  assert.ok(want.length > 0 && want.length < sim.order.length);
+  assert.deepEqual([...msgs.find(m => m.type === "config").lengths], want);
+  rec.setLengths(1, 64);                     // a change reconfigures on the next tick
+  sim.step();
+  assert.deepEqual([...msgs.filter(m => m.type === "config").pop().lengths],
+                   sim.order.filter(s => s.length <= 64).map(s => s.length));
+});
+
+test("per-length gain scales lengths 1-6 only, live", () => {
+  const level = (L, p, change) => {
+    const s = synth({ beltShape: 0, ...p });
+    s.message({ type: "config", lengths: new Float64Array([L]), groups: [0, 0] });
+    const out = stream(s, 0.5, 1000, [0]);
+    if (!change) return peakOf(out.subarray(SR / 4));
+    s.message({ type: "params", p: { ...AUDIO_DEFAULTS, softClip: false, beltShape: 0, ...change } });
+    return peakOf(stream(s, 0.5, 1000, [0]).subarray(SR / 4));
+  };
+  const full = level(3, {});
+  assert.ok(Math.abs(level(3, { lenGain3: 0.5 }) / full - 0.5) < 0.01, "length 3 at half");
+  assert.ok(Math.abs(level(4, { lenGain3: 0.5 }) / level(4, {}) - 1) < 0.01, "length 4 untouched");
+  assert.ok(Math.abs(level(7, { lenGain1: 0, lenGain6: 0 }) / level(7, {}) - 1) < 0.01, "7 and up at 1");
+  assert.ok(Math.abs(level(3, {}, { lenGain3: 0.25 }) / full - 0.25) < 0.01, "a sounding voice follows the dial");
+});
+
+test("the low cut takes out the rumble and leaves the middle", () => {
+  const level = (L, cut) => {
+    const s = synth({ beltShape: 0, lowCutHz: cut });
+    s.message({ type: "config", lengths: new Float64Array([L]), groups: [0, 0] });
+    return peakOf(stream(s, 0.6, 1000, [0]).subarray(SR / 3));
+  };
+  // 1760 / 40 = 44 Hz against a 200 Hz cut; 1760 / 2 = 880 Hz.
+  assert.ok(level(40, 200) < level(40, 0) * 0.1, `44 Hz: ${level(40, 200)} vs ${level(40, 0)}`);
+  assert.ok(level(2, 200) > level(2, 0) * 0.95, "880 Hz passes");
+});
+
+// --- audio settings in a save ------------------------------------------------------
+
+test("a save carries its audio settings through write and read; older saves have none", { skip: !existsSync(save) }, async () => {
+  const bytes = readFileSync(save);
+  const board = await Board.fromNpz(T, bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength));
+  assert.equal(board.audio, null, "a save from before has no audio settings");
+  const dials = { ...AUDIO_DEFAULTS, beltMaxHz: 990, lenGain2: 0.25, softClip: false, startTick: 120 };
+  board.audio = audioRecord(dials, { seconds: 12, rate: 480 });
+  const out = new Uint8Array(await board.toNpz());
+  const back = await Board.fromNpz(T, out.buffer);
+  assert.deepEqual(back.audio, { dials, bake: { seconds: 12, rate: 480 } });
+  // Through the autosave's path too (a snapshot).
+  const snapOut = new Uint8Array(await board.toNpz(board.snapshot()));
+  assert.deepEqual((await Board.fromNpz(T, snapOut.buffer)).audio.dials, dials);
+});
+
+test("a save's audio record is cleaned: unknown, mistyped and out-of-range dials go, the rest stay", () => {
+  const rec = parseAudio(JSON.stringify({
+    dials: { master: 0.8, beltCutoff: 99999, fadeMs: -5, softClip: "yes", nonsense: 3, beltShape: NaN, lenGain1: 0.3 },
+    bake: { seconds: 9999, rate: 30 },
+  }));
+  assert.deepEqual(rec.dials, { master: 0.8, beltCutoff: 512, fadeMs: 0, lenGain1: 0.3 });
+  assert.deepEqual(rec.bake, { seconds: BAKE_MAX_SECONDS, rate: 30 });
+  assert.equal(parseAudio("{not json"), null, "a corrupt blob costs the settings, not the board");
+  assert.equal(parseAudio(""), null);
+  assert.equal(parseAudio(JSON.stringify({ dials: {}, bake: { seconds: -1, rate: 5 } })).bake, null);
+});
+
+// --- the sound selection ----------------------------------------------------------
+
+async function loadCpu() {
+  const bytes = readFileSync(save);
+  return Board.fromNpz(T, bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength));
+}
+
+test("the board's content hash: same after lifting and putting back in place, ticking, or a label edit; not after a move or a value change", { skip: !existsSync(save) }, async () => {
+  const board = await loadCpu();
+  const h0 = board.contentHash();
+  // Ticking rewrites gate channels in the entity table: not content.
+  const sim = new Sim(T, board);
+  for (let i = 0; i < 30; i++) sim.step();
+  assert.equal(board.contentHash(), h0, "ticking is not a change");
+  // Lift some machines and put them back where they were: new rows, same board.
+  const rows = board.structs.slice(0, 6).map(s => s.row);
+  const entries = board.capture(rows);
+  board.eraseRows(rows);
+  assert.notEqual(board.contentHash(), h0, "lifted is different");
+  board.placeEntries(entries, entries.map(e => [e.dx, e.dy]));
+  assert.equal(board.contentHash(), h0, "put back in place is the same board");
+  board.notes.push({ kind: "text", colour: "white", size: 0.9, text: "x", rect: [0, 0, 2, 1] });
+  assert.equal(board.contentHash(), h0, "a label is not sound content");
+  // Moved: a change.
+  const one = board.structs[0].row, [e] = board.capture([one]);
+  board.eraseRows([one]);
+  let moved = false;
+  for (const [mx, my] of [[0, 40], [40, 0], [0, -40], [-40, 0]]) {
+    if (!board.entryBlocked(e, e.dx + mx, e.dy + my).length) { board.placeEntries([e], [[e.dx + mx, e.dy + my]]); moved = true; break; }
+  }
+  assert.ok(moved);
+  const h1 = board.contentHash();
+  assert.notEqual(h1, h0, "moved is a change");
+  // A Source's value is content.
+  const src = board.structs.find(s => T.types[s.type].name === "source");
+  board.setEmit(src.row, 12.5);
+  assert.notEqual(board.contentHash(), h1, "a Source's value is content");
+});
+
+test("a sound selection: only runs and gates touching its cells are heard, and the normalisation counts them", { skip: !existsSync(save) }, async () => {
+  const board = await loadCpu();
+  const sim = new Sim(T, board), W = board.width;
+  const seg = sim.order.find(s => s.length >= 3 && s.length <= 10);
+  const gate = sim.gates.find(g => g.td.class === "Shear");
+  const [gx, gy] = sim.originOf(gate.row);
+  // One cell of the run (its middle: a part selects the whole run) and one of the gate.
+  const [mx, my] = seg.cells[1];
+  const cells = new Set([my * W + mx, gy * W + gx]);
+  const msgs = [];
+  const rec = new Recorder({ postMessage: (m) => msgs.push(m) }, AUDIO_DEFAULTS, cells);
+  rec.attach(sim);
+  sim.step();
+  const cfg = msgs.find(m => m.type === "config");
+  const want = sim.order.filter(s => s.length <= AUDIO_DEFAULTS.beltCutoff && s.cells.some(([x, y]) => cells.has(y * W + x)));
+  assert.deepEqual([...cfg.lengths], want.map(s => s.length));
+  assert.ok(want.includes(seg));
+  assert.deepEqual(cfg.groups, [0, 1], "one gate, group 1");
+  assert.deepEqual(rec.selInfo, { runs: want.length, gates: 1 });
+  // Every other gate fires into the silent group.
+  assert.ok(sim.gates.filter(g => g !== gate).every(g => g.agroup === 2));
+  // Cleared: the whole board again.
+  rec.setSelection(null);
+  sim.step();
+  assert.ok(msgs.filter(m => m.type === "config").pop().lengths.length > want.length);
+  assert.equal(rec.selInfo, null);
+});
+
+test("sluggishness: attack and release scale with (length / 10)^s, exact for a 10-tile run", () => {
+  const coef = (ms) => 1 - Math.exp(-1 / (SR * ms / 1000));
+  for (const s of [0, 1, -1, 2]) {
+    const syn = synth({ attackMs: 20, releaseMs: 80, sluggish: s });
+    syn.message({ type: "config", lengths: new Float64Array([10, 20, 5]), groups: [0, 0] });
+    stream(syn, 0.2, 1000, [0, 1, 2]);
+    const v = (i) => syn.voiceOf[i];
+    for (const [i, L] of [[0, 10], [1, 20], [2, 5]]) {
+      const k = Math.pow(L / 10, s);
+      assert.ok(Math.abs(syn.vAtk[v(i)] - coef(20 * k)) < 1e-12, `s ${s} L ${L} attack`);
+      assert.ok(Math.abs(syn.vRel[v(i)] - coef(80 * k)) < 1e-12, `s ${s} L ${L} release`);
+    }
+  }
+  // And a sounding voice follows the dial.
+  const syn = synth({ attackMs: 20, sluggish: 0 });
+  syn.message({ type: "config", lengths: new Float64Array([20]), groups: [0, 0] });
+  stream(syn, 0.2, 1000, [0]);
+  syn.message({ type: "params", p: { ...AUDIO_DEFAULTS, softClip: false, attackMs: 20, sluggish: 1 } });
+  assert.ok(Math.abs(syn.vAtk[syn.voiceOf[0]] - coef(40)) < 1e-12);
+});
+
+test("min-length Hz: the dial is a min-length run's pitch, so a run twice as long is an octave down", () => {
+  const s = synth({ beltShape: 0, beltMinLen: 2 });
+  s.message({ type: "config", lengths: new Float64Array([4]), groups: [0, 0] });
+  const f = freq(stream(s, 1, 1000, [0]));
+  assert.ok(Math.abs(f - AUDIO_DEFAULTS.beltMaxHz / 2) < 2, `${f} Hz`);
+});
+
+test("pitch tilt: gain times (length / min length)^tilt, capped at +24 dB", () => {
+  const level = (L, p) => {
+    const s = synth({ beltShape: 0, ...p });
+    s.message({ type: "config", lengths: new Float64Array([L]), groups: [0, 0] });
+    return peakOf(stream(s, 0.5, 1000, [0]).subarray(SR / 4));
+  };
+  const base = { beltMinLen: 4 };
+  assert.ok(Math.abs(level(16, { ...base, pitchTilt: 1 }) / level(16, base) - 4) < 0.05, "tilt 1: 4x the length, 4x the amplitude");
+  assert.ok(Math.abs(level(8, { ...base, pitchTilt: 2 }) / level(8, base) - 4) < 0.05, "tilt 2: 2x the length, 4x");
+  assert.ok(Math.abs(level(4, { ...base, pitchTilt: 2 }) / level(4, base) - 1) < 0.01, "a min-length run is unchanged");
+  const cap = Math.pow(10, 24 / 20);
+  assert.ok(Math.abs(level(64, { ...base, beltCutoff: 64, pitchTilt: 2, master: 0.01 }) / level(64, { ...base, beltCutoff: 64, master: 0.01 }) - cap) < 0.1, "capped at +24 dB");
+});
+
+test("a slow tick rate keeps sounding: no crash, no dropouts, and back to fast after", () => {
+  // 1000 tps, then 5 and 10 (one tick outlasts the 60 ms latency), then 1000.
+  // Once, the start-up took the only queued tick and the skip check, on its
+  // stale figure, skip()'d an empty queue: a throw, which silences a real
+  // AudioWorkletProcessor for good.
+  const s = synth({ releaseMs: 40 });
+  s.message({ type: "config", lengths: new Float64Array([4, 8]), groups: [0, 1] });
+  const quietest = (out) => {
+    let lo = Infinity;
+    for (let i = 0; i + 4800 <= out.length; i += 4800) lo = Math.min(lo, peakOf(out.subarray(i, i + 4800)));
+    return lo;
+  };
+  stream(s, 1, 1000, [0, 1], 0, 1);
+  for (const rate of [5, 10, 2]) {
+    const out = stream(s, 3, rate, [0, 1], 0, 1);
+    assert.ok(quietest(out.subarray(SR)) > 0.05, `${rate} tps: never silent for 100 ms once started`);
+  }
+  const back = stream(s, 1, 1000, [0, 1], 0, 1);
+  assert.ok(quietest(back.subarray(SR / 4)) > 0.05, "fast again");
+});
+
+test("at 1 tps every tick is played, one a second", () => {
+  // A flat 1 s cap on the queue held less than the 1.5 ticks playback waits
+  // for, so it dropped ticks: the drone moved every other tick, or not at all.
+  for (const rate of [0.5, 1, 2]) {
+    const s = synth();
+    s.message({ type: "config", lengths: new Float64Array([4]), groups: [0] });
+    stream(s, 14 / rate, rate, [0], 0, 0);
+    const behind = 14 - s.ticksPlayed;
+    assert.ok(behind >= 1 && behind <= 3, `${rate} tps: ${s.ticksPlayed} of 14 ticks played`);
+  }
+});

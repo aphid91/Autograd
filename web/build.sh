@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
-# Assemble the static site: the web app plus every .npz at the repo root,
-# listed in saves/index.json. Used by the Pages workflow and for local runs:
+# Assemble the static site: the web app plus every .npz in web/saves/ (the
+# bundled boards; the repo root's saves are the desktop's and the tests'
+# fixtures, and are not shipped), listed in saves/index.json. Used by the Pages workflow and for local runs:
 #
 #   bash web/build.sh && python3 -m http.server -d _site 8000
 set -euo pipefail
@@ -12,7 +13,7 @@ mkdir -p "$OUT/saves"
 cp "$ROOT"/web/index.html "$ROOT"/web/style.css "$ROOT"/web/*.js "$ROOT"/web/types.json "$OUT"/
 cp "$ROOT"/web/manifest.webmanifest "$OUT"/
 cp -r "$ROOT"/web/vendor "$ROOT"/web/icons "$OUT"/
-cp "$ROOT"/*.npz "$OUT/saves/"
+cp "$ROOT"/web/saves/*.npz "$OUT/saves/"
 (cd "$OUT/saves" && ls *.npz) \
   | python3 -c 'import json, sys; print(json.dumps([l.strip() for l in sys.stdin]))' \
   > "$OUT/saves/index.json"

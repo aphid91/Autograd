@@ -16,7 +16,7 @@
 // one is committed (only when nothing is lifted -- see main.js), and applies
 // whatever undo() / redo() hand back.
 
-export const UNDO_DEPTH = 3;
+export const UNDO_DEPTH = 15;
 
 export class History {
   constructor(depth = UNDO_DEPTH) {

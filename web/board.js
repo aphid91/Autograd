@@ -8,6 +8,7 @@
 import { readNpz, writeNpz } from "./npz.js";
 import { parseNotes } from "./notes.js";
 import { F_LAYER, BACKGROUND, parseLayers, serialiseLayers, adoptOrphans, byId } from "./layers.js";
+import { parseAudio } from "./audio-params.js";
 
 export const FORMAT_VERSION = 1;
 
@@ -44,6 +45,11 @@ export class Board {
     this.layers = parseLayers(arrays.layers?.data);
     adoptOrphans(this.layers, this.rowLayers());
     this.layersRev = 0;
+    // The save's audio settings (audio-params.js), or null if it has none.
+    // main.js keeps this the dials in front of the player, so every save
+    // writes them; not part of a snapshot, so undo never touches them.
+    this.audio = parseAudio(arrays.audio?.data);
+    this.audioRev = 0;
     this.derive();
   }
 
@@ -79,14 +85,14 @@ export class Board {
   async toNpz(snap = null) {
     const E = this.T.entity;
     const src = snap || this;
-    const grid = src.grid.slice();
+    const grid = snap ? expandGrid(snap, this.grid.length) : this.grid.slice();
     for (let i = 3; i < grid.length; i += 4) grid[i] = 0;
     const notes = snap ? snap.notes : JSON.stringify(this.notes);
     return writeNpz({
       version: { descr: "<i4", shape: [1], data: new Int32Array([FORMAT_VERSION]) },
       size: { descr: "<i4", shape: [2], data: new Int32Array([this.width, this.height]) },
       grid: { descr: "<i4", shape: [this.height, this.width, 4], data: grid },
-      entities: { descr: "<f4", shape: [src.rows, E.STRIDE], data: src.entities },
+      entities: { descr: "<f4", shape: [src.rows, E.STRIDE], data: snap ? expandEntities(snap, E.STRIDE) : src.entities },
       annotations: { descr: "<U", shape: [], data: notes },
       // The live table, even when writing a snapshot: its view flags are
       // not undo state, and a layer named only by a snapshot's rows comes
@@ -95,7 +101,30 @@ export class Board {
       next_row: { descr: "<i4", shape: [1], data: new Int32Array([src.nextRow]) },
       free_rows: { descr: "<i4", shape: [src.freeRows.length], data: new Int32Array(src.freeRows) },
       live_count: { descr: "<i4", shape: [1], data: new Int32Array([src.liveCount]) },
+      ...(this.audio ? { audio: { descr: "<U", shape: [], data: JSON.stringify(this.audio) } } : {}),
     });
+  }
+
+  // What the board IS, as a hash: every occupied cell's position, type,
+  // facing, footprint offset and flags, and a Source's value and a belt's
+  // seed value. Not the row ids -- putting a selection back where it was can
+  // take different rows, and that is no change -- and not gate channels,
+  // which the simulation rewrites every tick. The audio selection resets
+  // when this moves (main.js).
+  contentHash() {
+    const g = this.grid, E = this.T.entity, C = this.T.cell;
+    const f32 = new Float32Array(1), u32 = new Uint32Array(f32.buffer);
+    let h = 2166136261 >>> 0;
+    const mix = (v) => { h = Math.imul(h ^ (v | 0), 16777619) >>> 0; };
+    for (let i = 0; i < g.length; i += 4) {
+      const x = g[i];
+      if (!x) continue;
+      mix(i); mix(x & ((1 << C.ID_SHIFT) - 1)); mix(g[i + 1]); mix(g[i + 2] & ~C.GHOST_MASK);
+      const row = this.cellId(x);
+      if (this.T.types[(x >> C.TYPE_SHIFT) & C.TYPE_MASK]?.name === "source") { f32[0] = this.field(row, E.F_EMIT); mix(u32[0]); }
+      if (g[i + 2] & C.SEED_BIT) { f32[0] = this.field(row, E.F_SEED_VALUE); mix(u32[0]); }
+    }
+    return h;
   }
 
   // --- raw access -------------------------------------------------------
@@ -172,11 +201,30 @@ export class Board {
 
   // --- undo -------------------------------------------------------------
   // The whole editable state, copied: the grid, the entity table and the
-  // row allocator. Everything else on a Board is derived from these. About
-  // 5 MB on a 512x512 board, which is why history.js keeps only a few.
+  // row allocator. Everything else on a Board is derived from these. The
+  // grid is kept SPARSE -- the occupied cells' indices and their four words
+  // -- since a 512x512 grid is 4 MB and nearly all of it zero; a dense copy
+  // made each snapshot about 6 MB, and 16 of them (history.js) too much for
+  // a phone. Sparse, and with the entity table's zero tail trimmed,
+  // cpu.npz's is about 0.6 MB.
   snapshot() {
+    const g = this.grid, n = g.length >> 2;
+    let count = 0;
+    for (let c = 0; c < n; c++) {
+      const i = c << 2;
+      if (g[i] | g[i + 1] | g[i + 2] | g[i + 3]) count++;
+    }
+    const cells = new Int32Array(count), words = new Int32Array(count * 4);
+    for (let c = 0, k = 0; c < n; c++) {
+      const i = c << 2;
+      if (g[i] | g[i + 1] | g[i + 2] | g[i + 3]) {
+        cells[k] = c;
+        words.set(g.subarray(i, i + 4), k * 4);
+        k++;
+      }
+    }
     return {
-      grid: this.grid.slice(), entities: this.entities.slice(), rows: this.rows,
+      cells, words, entities: this.entities.slice(0, usedLength(this.entities)), rows: this.rows,
       nextRow: this.nextRow, freeRows: this.freeRows.slice(), liveCount: this.liveCount,
       notes: JSON.stringify(this.notes),
       layers: serialiseLayers(this.layers),
@@ -187,8 +235,10 @@ export class Board {
   // later redo) and re-derive -- an edit like any other.
   restore(s) {
     const S = this.T.entity.STRIDE;
-    this.grid.set(s.grid);
-    this.entities = s.entities.slice();
+    this.grid.fill(0);
+    scatterGrid(s, this.grid);
+    this.entities = new Float32Array(s.rows * S);
+    this.entities.set(s.entities);
     this.rows = s.rows;
     this.arrays.entities = { ...this.arrays.entities, shape: [this.rows, S], data: this.entities };
     this.nextRow = s.nextRow;
@@ -644,4 +694,33 @@ export class Board {
     }
     return -1;
   }
+}
+
+// The entity table grows by doubling, so its tail is mostly zero rows: a
+// snapshot keeps it only up to the last non-zero value.
+// Compared as bits, so a -0 is kept.
+function usedLength(a) {
+  const bits = new Uint32Array(a.buffer, a.byteOffset, a.length);
+  let n = a.length;
+  while (n > 0 && bits[n - 1] === 0) n--;
+  return n;
+}
+
+function expandEntities(s, stride) {
+  const out = new Float32Array(s.rows * stride);
+  out.set(s.entities);
+  return out;
+}
+
+// A snapshot's sparse grid (Board.snapshot()) written into `grid`, which
+// must already be zero.
+function scatterGrid(s, grid) {
+  const { cells, words } = s;
+  for (let k = 0; k < cells.length; k++) grid.set(words.subarray(k * 4, k * 4 + 4), cells[k] * 4);
+}
+
+function expandGrid(s, length) {
+  const grid = new Int32Array(length);
+  scatterGrid(s, grid);
+  return grid;
 }

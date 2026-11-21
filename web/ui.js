@@ -20,8 +20,8 @@ const LONG_PRESS_SLOP = 10;  // px a held finger may wander
 const STAMP_HISTORY = 12;
 
 export const MODES = ["build", "hand"];
-// Select mode's bar: Box is a one-shot tool (the next drag is a rectangle);
-// the other three are COMMANDS on the current selection, not modes.
+// Select mode's bar: COMMANDS on the current selection, not modes. A box
+// select is a long press off a belt, then a drag (main.js).
 export const COMMANDS = ["delete", "cut", "copy"];
 const COMMAND_ICON = { delete: "trash", cut: "cut", copy: "copy" };
 const COMMAND_LABEL = { delete: "Delete", cut: "Cut", copy: "Copy" };
@@ -89,17 +89,18 @@ export class Shell {
       mode: MODES.includes(saved.mode) ? saved.mode : "build",
       slots,
       selected: Number.isInteger(saved.selected) && saved.selected < slots.length ? saved.selected : -1,
-      boxArmed: false,     // select mode: the next drag is a box
       selCount: 0,         // how many entities are selected (main.js says)
       pasteStamp: null,    // select mode: the stamp being pasted, by id
       stamps: [],          // most recent first; in-session, like the desktop
       // The simulation starts paused, so loading a save never sets it going.
       paused: true,
       // Ticks per second. Persisted; a stored value out of range is dropped.
-      rate: Number.isFinite(saved.rate) && saved.rate >= RATE_MIN && saved.rate <= RATE_MAX ? saved.rate : 1,
+      rate: Number.isFinite(saved.rate) && saved.rate >= RATE_MIN && saved.rate <= RATE_MAX ? saved.rate : 30,
       // The rate panel above the Sim buttons, toggled by a long press on
-      // Play/Pause. Not persisted: it is opened to change something.
-      simPanel: false,
+      // Play/Pause. Persisted, and open on a first visit, so it is found.
+      simPanel: typeof saved.simPanel === "boolean" ? saved.simPanel : true,
+      // Whether the "long press" hint has been shown (on the first close).
+      simHinted: saved.simHinted === true,
       customOpen: false,   // the Custom entry row is showing
       // While main.js is planning something, what the bar should show:
       //   { kind: "belt", routeName, routeIcon }   a belt run
@@ -135,7 +136,7 @@ export class Shell {
 
   changed() {
     const s = this.state;
-    store({ mode: s.mode, slots: s.slots, selected: s.selected, rate: s.rate });
+    store({ mode: s.mode, slots: s.slots, selected: s.selected, rate: s.rate, simPanel: s.simPanel, simHinted: s.simHinted });
     this.render();
     this.cb.onChange?.(s);
   }
@@ -292,7 +293,7 @@ export class Shell {
     if (this.state.mode === m) return;
     this.state.mode = m;
     // Leaving Build ends a paste or a Box; the stamp history survives.
-    if (m !== "build") { this.state.pasteStamp = null; this.state.boxArmed = false; }
+    if (m !== "build") this.state.pasteStamp = null;
     this.changed();
   }
 
@@ -346,9 +347,26 @@ export class Shell {
   }
 
   toggleSimPanel(open = !this.state.simPanel) {
-    this.state.simPanel = open;
-    if (!open) this.state.customOpen = false;
-    this.render();
+    const s = this.state;
+    s.simPanel = open;
+    if (!open) s.customOpen = false;
+    // The first close ever says how to get it back.
+    if (!open && !s.simHinted) {
+      s.simHinted = true;
+      this.hint("long press play/pause for tick controls");
+    }
+    this.changed();
+  }
+
+  // A message over the Sim section for a few seconds.
+  hint(text, ms = 2500) {
+    const sec = this.els.controls.querySelector("#simsec");
+    let h = sec.querySelector(".sim-hint");
+    if (!h) { h = document.createElement("div"); h.className = "sim-hint"; h.setAttribute("role", "status"); sec.append(h); }
+    h.textContent = text;
+    h.dataset.open = "true";
+    clearTimeout(this.hintTimer);
+    this.hintTimer = setTimeout(() => { h.dataset.open = "false"; }, ms);
   }
 
   // The panel's buttons: a preset per rate, then Custom, which opens a text
@@ -798,7 +816,9 @@ export class Shell {
     label.className = "rowlabel";
     label.textContent = iv.kind === "emit" ? "Emits" : "Seed";
     row.append(label, this.numberGrid(iv.values, iv.current, (v) => this.cb.onInspectValue?.(v)));
-    if (iv.kind === "emit") row.append(this.customValue(iv.values, iv.current, (v) => this.cb.onInspectValue?.(v)));
+    // A box for any other number: a Source's emit value or a belt's seed.
+    // (Typing the seed it already has is no change, so it never unseeds.)
+    row.append(this.customValue(iv.values, iv.current, (v) => this.cb.onInspectValue?.(v)));
   }
 
   setInspectValue(iv) {
@@ -830,11 +850,6 @@ export class Shell {
   renderSelect(row) {
     const s = this.state;
     if (s.indexing) { this.renderIndexing(row); return; }
-    row.append(this.swatch({
-      art: icon("box"), name: "Box", cls: "actsw act-box",
-      selected: s.boxArmed,
-      onTap: () => { s.boxArmed = !s.boxArmed; this.changed(); },
-    }));
     for (const c of COMMANDS) {
       const sw = this.swatch({
         art: icon(COMMAND_ICON[c]), name: COMMAND_LABEL[c], cls: `actsw act-${c}`,
@@ -920,7 +935,6 @@ export class Shell {
 
   setPasting(id) {
     this.state.pasteStamp = id;
-    this.state.boxArmed = false;
     this.changed();
   }
 
@@ -928,8 +942,6 @@ export class Shell {
     const s = this.state;
     if (s.selCount === n) return;
     s.selCount = n;
-    // Nothing left to add to: a Box armed for this selection goes with it.
-    if (!n) s.boxArmed = false;
     this.render();
   }
 

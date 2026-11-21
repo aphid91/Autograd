@@ -55,13 +55,21 @@ const ITEM_TEXT = { size: 0.3, glyph: 0.336 };   // its fade band: TUNE.itemText
 
 // Below this zoom (CSS px per cell) detail is not drawn at all.
 // Live from the Dev folder's zoom thresholds (tune.js).
+//
+// Dev > override zoom, above 0, decides the detail as if the zoom were that
+// value, at any real zoom. Every threshold is compared against the real zoom
+// `z` (which also sets sizes, so it cannot simply be swapped), so the
+// override rescales each threshold instead: z >= t * z / o exactly when
+// o >= t. `lodZ` is the zoom of the render in progress, set by render().
+let lodZ = 1;
+const lod = (t) => (TUNE.lodZoom > 0 ? t * lodZ / TUNE.lodZoom : t);
 const LOD = {
-  get beltSolid() { return TUNE.lodBeltSolid; },
-  get gridLines() { return TUNE.lodGrid; },
-  get chevrons() { return TUNE.lodChevrons; },
-  get ports() { return TUNE.lodPorts; },
-  get marks() { return TUNE.lodMarks; },
-  get portEdge() { return TUNE.lodPortEdge; },
+  get beltSolid() { return lod(TUNE.lodBeltSolid); },
+  get gridLines() { return lod(TUNE.lodGrid); },
+  get chevrons() { return lod(TUNE.lodChevrons); },
+  get ports() { return lod(TUNE.lodPorts); },
+  get marks() { return lod(TUNE.lodMarks); },
+  get portEdge() { return lod(TUNE.lodPortEdge); },
 };
 
 // A Source's number, in CSS px: 1.75x the first cut, bounded by the body's
@@ -79,6 +87,7 @@ const emitShown = (s, z, labels) => s.emit !== null && labels && z >= LOD.marks;
 import { structGlyph } from "./glyphs.js";
 import { TUNE } from "./tune.js";
 import { itemPoints } from "./flow.js";
+import { drawPixels } from "./pixel.js";
 import { css as noteCss, isText, sizeOf, wrap, PAD, LINE } from "./notes.js";
 
 const css = (c) => `rgb(${(c[0] * 255) | 0},${(c[1] * 255) | 0},${(c[2] * 255) | 0})`;
@@ -97,6 +106,7 @@ export const DEFAULT_VIEW = { grid: true, ports: true, labels: true, seedTint: t
 export function render(ctx, board, cam, dpr, opts = {}) {
   const view = { ...DEFAULT_VIEW, ...opts };
   const z = cam.zoom;
+  lodZ = z;
   ctx.setTransform(1, 0, 0, 1, 0, 0);
   ctx.fillStyle = COL.void;
   ctx.fillRect(0, 0, ctx.canvas.width, ctx.canvas.height);
@@ -148,20 +158,44 @@ export function render(ctx, board, cam, dpr, opts = {}) {
   }
   // View > sources off: Sources are not drawn (there are hundreds on a
   // computer, and they hide the machines worth looking at). Still there.
-  const structs = view.sources === false ? L.structs.filter(s => board.T.types[s.type].name !== "source") : L.structs;
+  // View > gates off hides every machine, Sources included -- for a look at
+  // the belts underneath. Still there, and still tappable.
+  const structs = view.gates === false ? []
+    : view.sources === false ? L.structs.filter(s => board.T.types[s.type].name !== "source") : L.structs;
   drawStructs(ctx, board.T, structs, z, px, on, S, view.ports, view.labels, view.gateTint || null);
 
   ctx.strokeStyle = COL.border;
   ctx.lineWidth = 2 * px;
   ctx.strokeRect(0, 0, board.width, board.height);
 
+  // The planning ghosts go under the items -- or, while the pixel overlay
+  // is on, over it, so what is being placed stays visible on the screen.
   const ghosts = (view.ghosts || [view.ghost]).filter(Boolean);
-  for (const g of ghosts) drawGhost(ctx, board.T, g, z, px, on, S, view.ports, view.labels, view.seedTint);
+  const drawGhosts = () => { for (const g of ghosts) drawGhost(ctx, board.T, g, z, px, on, S, view.ports, view.labels, view.seedTint); };
+  if (!view.pixels) drawGhosts();
 
   // Items last among the board's contents: cargo on a cell, over any tint,
   // so a red wash never changes the colour that says an item's sign.
   let cargo = null;
   if (view.sim && view.items !== false) cargo = drawItems(ctx, view.sim, view.alpha || 0, z, on, S, view.hiddenCells, board.width);
+
+  // The pixel overlay (pixel.js): over the board and its items.
+  if (view.pixels) {
+    drawPixels(ctx, board, view.pixels.screen, view.pixels.alpha, view.pixels.max, on);
+    drawGhosts();
+  }
+
+  // The video frame (Video folder open): the crop box now, solid, and the
+  // end camera's, dashed. Screen-pixel lines, over everything on the board.
+  if (view.frameBoxes) {
+    ctx.lineWidth = 2 * px;
+    for (const b of view.frameBoxes) {
+      ctx.setLineDash(b.dashed ? [8 * px, 6 * px] : []);
+      ctx.strokeStyle = b.dashed ? "rgba(255,200,80,0.9)" : "rgba(255,255,255,0.85)";
+      ctx.strokeRect(b.cx - b.hw, b.cy - b.hh, 2 * b.hw, 2 * b.hh);
+    }
+    ctx.setLineDash([]);
+  }
 
   // The vector picker's highlights, over the ghosts they move.
   if (view.vector) drawVectorMarks(ctx, view.vector, px);
@@ -178,6 +212,25 @@ export function render(ctx, board, cam, dpr, opts = {}) {
 
   if (cargo) drawItemLabels(ctx, cargo, cam, dpr);
   if (view.notes !== false && board.notes?.length) drawNotes(ctx, board.notes, cam, dpr, view.noteSel ?? -1, !!view.noteGrips);
+  // Labels lifted into a selection, or about to be pasted: ghosted, and a
+  // selected one outlined as a lifted entity is.
+  for (const g of view.ghostNotes || []) {
+    ctx.save();
+    ctx.globalAlpha = TUNE.ghostAlpha;
+    drawNotes(ctx, g.notes, cam, dpr, -1);
+    ctx.restore();
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    ctx.strokeStyle = g.lifted ? COL.lifted : COL.select;
+    ctx.lineWidth = 2;
+    if (!g.lifted) ctx.setLineDash([6, 4]);
+    for (const n of g.notes) {
+      const [x, y, w, h] = n.rect;
+      const [sx0, sy0] = cam.worldToScreen(x, y);
+      const [sx1, sy1] = cam.worldToScreen(x + w, y - h);
+      ctx.strokeRect(sx0 - 2, sy0 - 2, sx1 - sx0 + 4, sy1 - sy0 + 4);
+    }
+    ctx.setLineDash([]);
+  }
   if (view.indexLabels?.length) drawIndexLabels(ctx, view.indexLabels, cam, dpr);
   if (view.layerLabels?.length) drawLayerLabels(ctx, view.layerLabels, cam, dpr);
 

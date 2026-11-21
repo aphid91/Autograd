@@ -12,25 +12,29 @@ import { Camera, attachGestures } from "./camera.js";
 import { render, BASE_COLOURS } from "./render.js";
 import { LayerPanel } from "./layerpanel.js";
 import { BACKGROUND, byId, addLayer, removeLayer, renameLayer, setCurrent, isVisible, isActive,
-         setForActive, layerStats, hexRgb, mix, parseCss, rgbCss } from "./layers.js";
+         setForActive, layerStats, mix, parseCss, rgbCss } from "./layers.js";
 import { Shell } from "./ui.js";
-import { Panel } from "./panel.js";
+import { Panel, STATUS_COLOUR_DEFAULTS } from "./panel.js";
 import { ROUTE_NAMES, ROUTE_H_FIRST, ROUTE_V_FIRST, chooseRoute, planRun, routeWorks, turnTip } from "./planner.js";
 import { originFor } from "./placer.js";
 import { VALUE_CHOICES, hasValue, toolValue } from "./tools.js";
-import { makeStamp, mirrored, rotated, stampCells, subset } from "./stamp.js";
+import { makeStamp, mirrored, noteTouches, reversedGate, rotated, shiftNote, stampCells, subset } from "./stamp.js";
 import { emitMask, emitsWith, stampGhost } from "./ghost.js";
 import { traceRun } from "./segtrace.js";
 import { TUNE, setTune } from "./tune.js";
-import { Sim, Clock } from "./sim.js";
+import { Sim, Clock, RATE_MIN, RATE_MAX } from "./sim.js";
 import { History } from "./history.js";
+import { icon } from "./icons.js";
 import { DEFAULT, naturalOrder, tableValues, finalValues } from "./indexer.js";
-import { entrySize } from "./stamp.js";
-import { noteAt, gripAt, newRect, MIN_W, MIN_H } from "./notes.js";
+import { entrySize, typeByName } from "./stamp.js";
+import { installPixel, Screen } from "./pixel.js";
+import { cropBox, evenDim, frameBox, frameCount } from "./video-params.js";
+import { noteAt, gripAt, isText, newRect, MIN_W, MIN_H } from "./notes.js";
 import { Claims, followChain, offsets, layCopies, isZero, rotateVec, flipVec, moreCount, lessCount } from "./vector.js";
 import { deleteSave, getSave, listSaves, putSave } from "./saves.js";
+import { bakeKey, audioRecord, BAKE_DEFAULT_SECONDS, BAKE_MAX_SECONDS } from "./audio-params.js";
 
-const DEFAULT_SAVE = "default.npz";
+const DEFAULT_SAVE = "Default.npz";
 
 const canvas = document.getElementById("board");
 const ctx = canvas.getContext("2d", { alpha: false });
@@ -44,6 +48,7 @@ let shell = null;
 let panel = null;
 let layerPanel = null;
 let view = {};
+let statusColours = { ...STATUS_COLOUR_DEFAULTS };   // View > status colours
 let inspectRow = -1;   // a row, not a description: re-read it every time
 // The simulation of the loaded board, and the clock that paces it. A new
 // Sim per board, as a fresh desktop session per load: segment ids come from
@@ -129,12 +134,540 @@ const debug = window.gates = {
   get place() { return place; },
   get sel() { return sel; },
   selEntries: () => (sel ? selAbs() : []),
+  lift: (rows) => { lift(rows); redraw(); },
+  dropAll: () => { dropAll(); redraw(); },
+  get soundSel() { return soundSel; },
   placement: () => currentPlacement(),
   plan: () => currentPlan(),
 };
 
+// --- the pixel overlay --------------------------------------------------------
+//
+// View > pixel overlay above 0 hands the sim the Screen, and each Pixel's
+// fire records its colour on it (pixel.js); at 0 the sim has none and a
+// fire records nothing. Switching on starts blank, as does every edit and
+// Reset (the sim clears it on a rebuild).
+const screen = new Screen();
+function syncScreen() {
+  if (!sim) return;
+  const on = view.pixelAlpha > 0;
+  if (on && sim.screen !== screen) { screen.clear(); sim.screen = screen; }
+  else if (!on && sim.screen) { sim.screen = null; screen.clear(); }
+}
+
+// --- audio -------------------------------------------------------------------
+//
+// Off by default and loaded on demand: with it off, audio.js and the worklet
+// are never fetched and the tick's only cost is Sim.audio's null check.
+let audio = null;          // the running engine (audio.js startAudio), or null
+let audioStarting = false;
+let audioCtx = null;       // its context, from the tap that switched it on
+let soundWanted = false;   // the sound button's state (top-left of the board)
+// The player's choice, kept across sessions; on until they turn it off.
+const SOUND_KEY = "gates.web.sound.v1";
+function soundStored() {
+  try { return localStorage.getItem(SOUND_KEY) !== "off"; } catch { return true; }
+}
+function storeSound(on) {
+  try { localStorage.setItem(SOUND_KEY, on ? "on" : "off"); } catch { /* not kept */ }
+}
+// A browser starts audio only from a gesture, so a launch with sound on
+// shows the button on and starts it on the first tap or key anywhere --
+// pointerup / touchend / keydown, the events that count as activation on
+// a touch screen. A context made before then would only be suspended.
+// Until it runs, each gesture tries again (a resume can be refused).
+function armSound() {
+  const evs = ["pointerup", "touchend", "keydown"];
+  const go = (e) => {
+    if (!soundWanted) return done();
+    if (e.target?.closest?.("#sound-btn")) return;   // the button's own click decides
+    if (!audio && !audioStarting) setAudio(true);
+    else audioCtx?.resume?.();
+    if (audioCtx?.state === "running") done();
+  };
+  const done = () => { for (const ev of evs) document.removeEventListener(ev, go, true); };
+  for (const ev of evs) document.addEventListener(ev, go, true);
+}
+// The sound button: a speaker, crossed out while sound is off.
+function setSoundBtn(on) {
+  const b = document.getElementById("sound-btn");
+  if (!b) return;
+  b.innerHTML = icon(on ? "soundOn" : "soundOff");
+  b.setAttribute("aria-pressed", String(on));
+  b.title = on ? "Sound on (tap for off)" : "Sound off (tap for on)";
+}
+function setAudio(on) {
+  soundWanted = on;
+  setSoundBtn(on);
+  if (!on) {
+    bakedPlay = null;
+    if (audio) { audio.close(); audio = null; }
+    audioCtx = null;
+    panel.setAudioMeter("off");
+    return;
+  }
+  if (audio || audioStarting) return;
+  const Ctx = window.AudioContext || window.webkitAudioContext;
+  if (!Ctx || !window.AudioWorkletNode) { soundWanted = false; setSoundBtn(false); panel.setAudioMeter("no Web Audio here"); return; }
+  // Made and resumed here, inside the tap: iOS will not start a context
+  // created after an await.
+  const ctx = audioCtx = new Ctx({ latencyHint: "interactive" });
+  ctx.resume();
+  audioStarting = true;
+  panel.setAudioMeter("starting…");
+  import("./audio.js")
+    .then(m => m.startAudio(ctx, { ...panel.audio }, sim, (mm) => {
+      if (!audio) return;
+      if (mm.type === "error") { console.warn("audio:", mm.message); return; }   // the worklet recovered; say so in the console
+      panel.setAudioMeter(meterText(mm));
+    }))
+    .then(a => {
+      audioStarting = false;
+      if (!soundWanted) { a.close(); return; }   // switched off while starting
+      audio = a;
+      a.rec.setSelection(soundSel?.cells ?? null);
+      redraw();
+    })
+    .catch(e => {
+      audioStarting = false;
+      ctx.close().catch(() => {});
+      soundWanted = false;
+      setSoundBtn(false);
+      panel.setAudioMeter(`failed: ${e.message}`);
+    });
+}
+function meterText(m) {
+  const db = m.peak > 0 ? (20 * Math.log10(m.peak)).toFixed(1) : "-inf";
+  return `voices ${m.voices} / ${m.limit}` + (m.refused ? `  (${m.refused} refused)` : "") + "\n" +
+    `runs active ${m.active} of ${m.candidates}\n` +
+    `peak ${m.peak.toFixed(2)} (${db} dB)` + (m.clipped ? `  clipped ${m.clipped}` : "") + "\n" +
+    `lag ${Math.round(m.lagMs)} ms · speed ${m.speed.toFixed(2)}` +
+    (bakedPlay ? "  (baked)" : "") + "\n" + bakeStatus() +
+    (audioNote && performance.now() < audioNote.until ? `\n${audioNote.text}` : "") +
+    (audio?.rec.selInfo ? `\nsound selection: ${audio.rec.selInfo.runs} runs, ${audio.rec.selInfo.gates} gates` : "");
+}
+
+// --- audio settings in the save ------------------------------------------------
+//
+// Every save carries the dials and the bake dialog's seconds and rate
+// (board.audio; audio-params.js has the format). Loading a save that has
+// them applies them; one without leaves the dials as they are. Either way
+// board.audio is then the dials in front of the player, so the next save
+// writes them. A dial change is a change for the autosaves, like a label
+// edit, but it does not restart the simulation and is not an undo step.
+let bakeOpts = null;        // { seconds, rate } last used in the Bake dialog
+let audioNote = null;       // { text, until }: a line for the meter
+function loadAudioSettings() {
+  const saved = board.audio;
+  if (saved) {
+    panel.applyAudio(saved.dials);
+    if (saved.bake) bakeOpts = saved.bake;
+    if (audio) audio.setParams({ ...panel.audio });
+    audioNote = { text: "audio settings loaded from this save", until: performance.now() + 6000 };
+    if (!audio) panel.setAudioMeter(`off\n${audioNote.text}`);
+  } else if (!audio) panel.setAudioMeter("off");
+  board.audio = audioRecord(panel.audio, bakeOpts);
+}
+// The dials (or the bake options) moved: the board's record follows, and
+// the autosaves will write it.
+function touchAudio() {
+  if (!board) return;
+  board.audio = audioRecord(panel.audio, bakeOpts);
+  board.audioRev++;
+  edited = true;
+  prepareSave();
+}
+
+// --- video export ---------------------------------------------------------------
+//
+// Video (panel) renders a stretch of the simulation offline into an MP4
+// (video.js, after Fluoddity's recorder). It starts from the current tick,
+// on a copy of the sim, so the live board is not touched -- it is paused
+// while the render runs, and any edit stops it, keeping what was encoded.
+// With sound on, the same ticks are baked into its audio track.
+//
+// The camera moves from where it is when Record is pressed to the end state
+// captured by "Select end camera state" (if any), over the lerp window.
+let endCam = null;          // { cx, cy, zoom, w, h }, or null: a still camera
+let videoOpen = false;      // the Video folder is open: show the frame on the board
+let recording = null;       // { cancel } while a video renders
+const camState = () => ({ cx: cam.cx, cy: cam.cy, zoom: cam.zoom, w: cam.w, h: cam.h });
+
+// What the video frame covers, for the preview: the crop box now, and the
+// end camera's (dashed), in the video's aspect.
+function videoBoxes() {
+  if (!videoOpen) return null;
+  const v = panel.video, aspect = v.width / v.height;
+  const boxes = [{ ...cropBox(camState(), aspect), dashed: false }];
+  if (endCam) boxes.push({ ...cropBox(endCam, aspect), dashed: true });
+  return boxes;
+}
+
+// One video frame: the board as View draws it, never the editing marks.
+function drawVideoFrame(ctx, s, vcam, alpha) {
+  render(ctx, s.board, vcam, 1, {
+    ...view, sim: s, alpha, ghosts: [],
+    gateTint: view.gateStatus ? gateStatus(s) : null,
+    beltTint: view.beltStatus ? beltStatus(s) : null,
+    pixels: s.screen ? { screen: s.screen, alpha: view.pixelAlpha, max: view.pixelMax } : null,
+  });
+}
+
+// Fluoddity's saveFile.ts: the picker must be raised before any other await
+// in the click, or it loses the gesture. Three outcomes: a file to stream
+// into, no picker here (buffer and download), or the player said no.
+async function chooseVideoFile(name) {
+  if (typeof window.showSaveFilePicker !== "function") return { kind: "unavailable" };
+  try {
+    const handle = await window.showSaveFilePicker({ suggestedName: name, types: [{ description: "MP4 video", accept: { "video/mp4": [".mp4"] } }] });
+    return { kind: "file", writable: await handle.createWritable() };
+  } catch (e) {
+    return e?.name === "AbortError" ? { kind: "cancelled" } : { kind: "unavailable" };
+  }
+}
+
+async function recordVideoNow() {
+  if (recording) { recording.cancel = true; return; }
+  if (!sim || !board) return;
+  const settings = { ...panel.video };
+  // A short timestamp in the name, so takes of one scene do not collide:
+  // "CPU experiments 11-20 12_07_33.mp4" (underscores: no dots in a name).
+  const base = (panel.local.name || "gates").replace(/[^\w .-]+/g, "_").trim() || "gates";
+  const d = new Date(), two = (n) => String(n).padStart(2, "0");
+  const fileName = `${base} ${two(d.getMonth() + 1)}-${two(d.getDate())} ${two(d.getHours())}_${two(d.getMinutes())}_${two(d.getSeconds())}.mp4`;
+  endDryRun();       // a recording starts from the view play took over from
+  const choice = await chooseVideoFile(fileName);       // first await: keeps the gesture
+  if (choice.kind === "cancelled") return;
+  const own = { cancel: false };
+  recording = own;
+  panel.setVideoRecording(true);
+  shell.setPaused(true);
+  clock.paused = true;
+  const copy = sim.clone();
+  if (view.pixelAlpha > 0) copy.screen = new Screen();
+  const startCam = camState(), rev = board.revision, live = sim;
+  const withSound = !!audio;
+  panel.setVideoProgress("starting…");
+  try {
+    const [{ recordVideo }, bakeMod] = await Promise.all([import("./video.js"), withSound ? import("./audio-bake.js") : null]);
+    const res = await recordVideo({
+      sim: copy, settings, startCam, endCam, draw: drawVideoFrame,
+      audio: withSound ? { params: { ...panel.audio }, bake: bakeMod.bakeAudio, selection: soundSel?.cells ?? null } : null,
+      writable: choice.kind === "file" ? choice.writable : null,
+      onProgress: (p) => panel.setVideoProgress(p.phase === "audio"
+        ? `baking audio ${Math.round(p.fraction * 100)}%`
+        : `frame ${p.frame} of ${p.frames} (${Math.round(p.fraction * 100)}%)`),
+      shouldStop: () => own.cancel || sim !== live || board.revision !== rev,
+    });
+    if (res.kind === "buffered") {
+      const a = document.createElement("a");
+      a.href = URL.createObjectURL(res.blob);
+      a.download = fileName;
+      a.click();
+      setTimeout(() => URL.revokeObjectURL(a.href), 10000);
+    }
+    panel.setVideoProgress(res.kind === "empty" ? "nothing recorded"
+      : `saved ${res.frames} frames${res.frames < frameCount(settings) ? " (stopped early)" : ""}`);
+  } catch (e) {
+    console.error(e);
+    panel.setVideoProgress(`failed: ${e.message}`);
+  } finally {
+    recording = null;
+    panel.setVideoRecording(false);
+  }
+}
+
+// --- the sound selection ------------------------------------------------------------
+//
+// Audio > Set audio selection: with entities selected, only they sound (a
+// run if any of its cells is selected, a gate if any of its cells is); with
+// nothing selected, everything does again. The cells are taken where the
+// selection sits at the press, and kept after deselecting.
+//
+// It is reset by any change to the board -- and selecting is itself an edit
+// here (the selection is lifted off the board), so "a change" is a change of
+// CONTENT: Board.contentHash(), which ignores row ids and per-tick channel
+// values. The reference is the first stable board after the press (nothing
+// lifted), so deselecting in place keeps it and moving the selection, any
+// other edit, an undo or a load resets it. Normalisation then counts only
+// what is selected (audio.js), so an isolated part fills the mix.
+let soundSel = null;      // { cells: Set<y*W+x>, ref: hash | null, rev, id }
+let soundSelN = 0;
+const soundSelId = () => soundSel?.id ?? 0;
+function setSoundSelection() {
+  if (!sel || !sel.stamp.entries.length) { clearSoundSel(); return; }
+  const [ox, oy] = selOrigin(), W = board.width;
+  const cells = new Set(stampCells(T, sel.stamp, ox, oy).map(([x, y]) => y * W + x));
+  soundSel = { cells, ref: null, rev: -1, id: ++soundSelN };
+  audio?.rec.setSelection(cells);
+  panel.setAudioSelection(true);
+}
+function clearSoundSel() {
+  if (!soundSel) return;
+  soundSel = null;
+  audio?.rec.setSelection(null);
+  panel.setAudioSelection(false);
+}
+// Each frame: once nothing is lifted, any change of content since the
+// reference resets it.
+function checkSoundSel() {
+  if (!soundSel || sel || !board || board.revision === soundSel.rev) return;
+  soundSel.rev = board.revision;
+  const h = board.contentHash();
+  if (soundSel.ref === null) soundSel.ref = h;
+  else if (h !== soundSel.ref) clearSoundSel();
+}
+
+// --- the camera's dry run -----------------------------------------------------------
+//
+// With an end camera set, pressing play flies the view along the path a
+// recording started now would take: the view at the press is the start, and
+// the tick on screen decides the frame (frame f is tick t0 + f * tps / 60,
+// as in video.js), so the camera always matches the content, at any play
+// rate. The view is set so the crop box IS that frame. It holds the end
+// view once the path is done. The video and camera dials apply live, so the
+// fades can be tuned while watching.
+//
+// Any disturbance -- pause, a pan or zoom of any kind, an edit (undo
+// included), Reset, a load, unsetting the end camera, starting a real
+// recording -- puts the view back where it was when play was pressed. A
+// manual camera move is detected by the camera no longer being where the
+// dry run last put it, which catches drag, pinch, wheel, the pan glide and
+// Fit board alike without touching camera.js.
+let dry = null;   // { start, t0, sim, rev, set }: set = the view last applied
+function startDryRun() {
+  if (!endCam || !sim || recording) { dry = null; return; }
+  dry = { start: camState(), t0: sim.tick, sim, rev: board.revision, set: null };
+}
+function endDryRun() {
+  if (!dry) return;
+  const st = dry.start;
+  dry = null;
+  cam.cx = st.cx; cam.cy = st.cy; cam.zoom = st.zoom;
+  redraw();
+}
+function driveDryRun() {
+  if (!dry) return;
+  const moved = dry.set && (cam.cx !== dry.set.cx || cam.cy !== dry.set.cy || cam.zoom !== dry.set.zoom);
+  if (moved || !endCam || clock.paused || sim !== dry.sim || board.revision !== dry.rev) { endDryRun(); return; }
+  const v = panel.video, frames = frameCount(v);
+  const f = Math.min(frames - 1, Math.max(0, (sim.tick + clock.alpha - dry.t0) * 60 / v.tps));
+  const box = frameBox(dry.start, endCam, v, f, frames);
+  // The view whose crop box is `box`: the crop is the largest box of the
+  // video's aspect in the view, so its half-width is min(w/2, h/2 * aspect) / zoom.
+  const aspect = v.width / v.height;
+  cam.cx = box.cx; cam.cy = box.cy;
+  cam.zoom = Math.min(cam.w / 2, (cam.h / 2) * aspect) / box.hw;
+  dry.set = { cx: cam.cx, cy: cam.cy, zoom: cam.zoom };
+}
+
+// --- baked audio ------------------------------------------------------------------
+//
+// A stretch of ticks rendered ahead of time (audio-bake.js), played back
+// from a buffer while the live sim is on exactly that stretch. It starts
+// with a Reset and keeps that tick-0 state (`snap`): while the bake is
+// valid, Reset restores it rather than rebuilding, since a rebuild renumbers
+// the runs and the numbering decides the belt phase's order -- only the
+// same state is sure to replay the same ticks.
+//
+// While it plays, the audio is the clock: each frame steps the sim to the
+// tick being heard, with a bigger step budget, so frames drop rather than
+// the board drifting from the sound.
+let bake = null;           // { snap, sim, revision, rebuilds, rate, key, t0, end, samples, sampleRate, buf }
+let bakedPlay = null;      // { t0Time }: context time at which tick bake.t0 is heard
+let baking = null;         // { cancel } while a bake runs
+const BAKED_BUDGET_MS = 100;
+
+// Same board, same run numbering, same sim: Reset can return to the bake's start.
+const bakeLive = () => !!(bake && sim === bake.sim && board.revision === bake.revision &&
+                          sim.stats.rebuilds === bake.rebuilds);
+function bakeStale() {
+  if (!bake) return null;
+  if (!bakeLive()) return "the board changed";
+  if (bake.key !== bakeKey(panel.audio)) return "the dials changed";
+  if (bake.sel !== soundSelId()) return "the sound selection changed";
+  if (clock.rate !== bake.rate) return `the rate is not ${bake.rate}`;
+  return null;
+}
+// The live sim is inside the baked stretch and the bake still says what it would play.
+const bakePlayable = () => !!(audio && bake && !bakeStale() && sim.tick < bake.end);
+function bakeStatus() {
+  if (baking) return "bake: baking…";
+  if (!bake) return "bake: none";
+  const why = bakeStale(), secs = ((bake.end - bake.t0) / bake.rate).toFixed(1);
+  return `bake: ${secs} s @ ${bake.rate} tps, ticks ${bake.t0}–${bake.end}` + (why ? ` -- stale: ${why}` : "");
+}
+
+function startBakedPlay() {
+  audio.rec.stop();
+  audio.rec.detach();                // nothing to record: the buffer is the sound
+  if (!bake.buf) bake.buf = audio.buffer(bake.samples, bake.sampleRate);
+  const ac = audio.ctx, lead = 0.03;
+  const at = sim.tick + clock.alpha;
+  // Tick `at` starts sounding `lead` from now (out of the speakers a
+  // further outputLatency on, which the clock below takes off again).
+  const t0Time = ac.currentTime + lead - (at - bake.t0) / bake.rate;
+  audio.playBaked(bake.buf, Math.max(ac.currentTime + lead, t0Time), Math.max(0, (at - bake.t0) / bake.rate));
+  bakedPlay = { t0Time };
+}
+function stopBakedPlay() {
+  if (!bakedPlay) return;
+  bakedPlay = null;
+  if (audio) { audio.stopBaked(); audio.rec.attach(sim); }
+}
+// The fractional tick being heard now.
+function bakedTick() {
+  const ac = audio.ctx, out = ac.outputLatency || ac.baseLatency || 0;
+  return bake.t0 + (ac.currentTime - out - bakedPlay.t0Time) * bake.rate;
+}
+
+// The Bake dialog's Play / Pause: the baked buffer on its own, from where it
+// was paused (from the start once it has played through), with the
+// simulation left alone. On the sound's context if sound is on, else on one
+// made in this tap. Stopped by closing the dialog, a new bake, or Play on
+// the board.
+let preview = null;       // { src, ctx, t0, from } while playing
+let previewAt = 0;        // seconds into the bake to resume from
+let previewCtx = null;    // our own context, when sound is off
+function stopPreview(keepPlace = true) {
+  if (!preview) { if (!keepPlace) previewAt = 0; return; }
+  const p = preview;
+  preview = null;
+  previewAt = keepPlace ? p.from + (p.ctx.currentTime - p.t0) : 0;
+  p.src.onended = null;
+  try { p.src.stop(); } catch { /* ended */ }
+  p.src.disconnect();
+  syncPreviewBtn();
+}
+function syncPreviewBtn() {
+  const b = document.getElementById("bake-play");
+  if (b) { b.textContent = preview ? "Pause" : "Play"; b.disabled = !bake || !!baking; }
+}
+function togglePreview() {
+  if (preview) { stopPreview(); return; }
+  if (!bake) return;
+  let ctx = audio?.ctx;
+  if (!ctx) {
+    const Ctx = window.AudioContext || window.webkitAudioContext;
+    if (!Ctx) return;
+    ctx = previewCtx ||= new Ctx();
+  }
+  ctx.resume();
+  const buf = ctx.createBuffer(1, bake.samples.length, bake.sampleRate);
+  buf.copyToChannel(bake.samples, 0);
+  if (previewAt >= buf.duration - 0.01) previewAt = 0;
+  const src = ctx.createBufferSource();
+  src.buffer = buf;
+  src.connect(ctx.destination);
+  src.start(0, previewAt);
+  src.onended = () => { if (preview?.src === src) { preview = null; previewAt = 0; syncPreviewBtn(); } };
+  preview = { src, ctx, t0: ctx.currentTime, from: previewAt };
+  syncPreviewBtn();
+}
+
+function openBakeDialog() {
+  const m = document.getElementById("bakemenu");
+  const secs = m.querySelector("#bake-seconds"), rate = m.querySelector("#bake-rate");
+  const status = m.querySelector("#bake-status"), go = m.querySelector("#bake-go");
+  const cancel = m.querySelector("#bake-cancel"), wav = m.querySelector("#bake-wav");
+  secs.value = String(bakeOpts?.seconds ?? (Number(secs.value) || BAKE_DEFAULT_SECONDS));
+  rate.value = String(bakeOpts?.rate ?? clock.rate);
+  const show = (text) => {
+    status.textContent = text ?? (`Starts with a Reset. Audio from tick ${panel.audio.startTick}` +
+      (panel.audio.fadeMs ? `, fading in over ${panel.audio.fadeMs} ms` : "") + ".\n" + bakeStatus());
+    go.disabled = !!baking; cancel.disabled = !baking; wav.disabled = !bake || !!baking;
+    syncPreviewBtn();
+  };
+  const close = () => { stopPreview(); m.dataset.open = "false"; };
+  m.querySelector("#bake-play").onclick = () => togglePreview();
+  m.querySelector("#bake-close").onclick = close;
+  let down = false;
+  m.onpointerdown = (e) => { down = e.target === m; };
+  m.onclick = (e) => { if (e.target === m && down) close(); down = false; };
+  cancel.onclick = () => { if (baking) baking.cancel = true; };
+  wav.onclick = () => bake && downloadWav();
+  go.onclick = () => {
+    const sv = Number(secs.value), rv = Number(rate.value);
+    if (!(sv > 0 && sv <= BAKE_MAX_SECONDS)) { show(`Duration must be between 0 and ${BAKE_MAX_SECONDS} s.`); return; }
+    if (!(rv >= RATE_MIN && rv <= RATE_MAX)) { show(`Tick rate must be ${RATE_MIN} to ${RATE_MAX}.`); return; }
+    if (bakeOpts?.seconds !== sv || bakeOpts?.rate !== rv) { bakeOpts = { seconds: sv, rate: rv }; touchAudio(); }
+    // Playing it back needs sound on; this tap is the gesture that may start it.
+    if (!audio && !audioStarting) { setAudio(true); storeSound(true); }
+    runBake(sv, rv, show);
+  };
+  show();
+  m.dataset.open = "true";
+}
+
+async function runBake(seconds, rate, show) {
+  if (!sim || baking) return;
+  shell.setPaused(true);
+  clock.paused = true;
+  stopBakedPlay();
+  stopPreview(false);
+  bake = null;
+  sim.reset();
+  clock.reset();
+  redraw();
+  const snap = sim.clone();
+  const own = { cancel: false };
+  baking = own;
+  const startSim = sim, revision = board.revision, rebuilds = sim.stats.rebuilds;
+  const params = { ...panel.audio }, key = bakeKey(params), sel = soundSelId();
+  const t = performance.now();
+  const { bakeAudio } = await import("./audio-bake.js");
+  let res = null;
+  try {
+    res = await bakeAudio({
+      start: snap, params, rate, seconds, sampleRate: audioCtx?.sampleRate || 48000, selection: soundSel?.cells ?? null,
+      onProgress: (f, tick, end) => show(`Baking… ${Math.round(f * 100)}%  (tick ${tick} of ${end})`),
+      shouldStop: () => own.cancel || sim !== startSim || board.revision !== revision,
+    });
+  } catch (e) {
+    show(`Bake failed: ${e.message}`);
+  }
+  baking = null;
+  if (!res) { show(res === null ? "Bake cancelled (or the board changed)." : undefined); return; }
+  bake = { snap, sim: startSim, revision, rebuilds, rate, key, sel, ...res, buf: null };
+  shell.setRate(rate);     // play it at the rate it was baked at
+  show(`Baked ${seconds} s at ${rate} tps in ${((performance.now() - t) / 1000).toFixed(1)} s. Press play.\n` + bakeStatus());
+  redraw();
+}
+
+function downloadWav() {
+  import("./audio-bake.js").then(({ wavBytes }) => {
+    const blob = new Blob([wavBytes(bake.samples, bake.sampleRate)], { type: "audio/wav" });
+    const a = document.createElement("a");
+    a.href = URL.createObjectURL(blob);
+    a.download = `${(panel.local.name || "gates").replace(/[^\w.-]+/g, "_")}-${bake.rate}tps-t${bake.t0}.wav`;
+    a.click();
+    setTimeout(() => URL.revokeObjectURL(a.href), 10000);
+  });
+}
+
 let queued = false;
 let lastNow = null;    // the previous playing frame's time, or null
+// Stepping stops after this many ms of a frame and drops the rest of the
+// ticks due, so a rate the board cannot sustain slows the sim instead of
+// starving the frame (and every later frame, as the backlog grows).
+const STEP_BUDGET_MS = 12;
+
+// View > fps counter: frames and ticks counted over a half-second window.
+const fpsEl = document.getElementById("fps");
+const fpsWin = { t0: null, frames: 0, ticks: 0 };
+function countFrame(now, ticks) {
+  if (!view.fps) { fpsEl.hidden = true; fpsWin.t0 = null; return; }
+  fpsEl.hidden = false;
+  // Paused, frames are drawn only on demand, so a rate would mean nothing.
+  if (!sim || clock.paused) { fpsEl.textContent = "paused"; fpsWin.t0 = null; return; }
+  if (fpsWin.t0 === null) { Object.assign(fpsWin, { t0: now, frames: 0, ticks: 0 }); return; }
+  fpsWin.frames++; fpsWin.ticks += ticks;
+  const dt = now - fpsWin.t0;
+  if (dt >= 500) {
+    fpsEl.textContent = `${Math.round(fpsWin.frames * 1000 / dt)} fps · ${Math.round(fpsWin.ticks * 1000 / dt)} tps`;
+    Object.assign(fpsWin, { t0: now, frames: 0, ticks: 0 });
+  }
+}
 function redraw() {
   if (queued) return;
   queued = true;
@@ -143,21 +676,45 @@ function redraw() {
 
 function paint(now) {
   queued = false;
+  let ran = 0;
   if (sim) {
     // An edit since the last frame re-derives the runs and starts fresh --
     // here rather than at each edit site, so no edit path can forget it.
     sim.sync();
-    if (!clock.paused) {
+    if (!clock.paused && bakePlayable()) {
+      // Baked: step to the tick being heard. The buffer runs on its own
+      // clock, so falling behind costs frames, never sync.
+      if (!bakedPlay) startBakedPlay();
+      const target = Math.min(bakedTick(), bake.end);
+      const t0 = performance.now();
+      while (sim.tick < Math.floor(target) && performance.now() - t0 < BAKED_BUDGET_MS) { sim.step(); ran++; }
+      clock.frac = Math.min(1, Math.max(0, target - sim.tick));
+    } else if (!clock.paused) {
+      if (bakedPlay) stopBakedPlay();   // out of the baked stretch: realtime from here
       // A stalled frame (a backgrounded tab) is clamped, and the clock caps
       // the backlog too, so coming back never freezes to catch up.
       const dt = lastNow === null ? 0 : Math.min(0.25, (now - lastNow) / 1000);
       const n = clock.advance(dt);
-      for (let i = 0; i < n; i++) sim.step();
+      const t0 = performance.now();
+      for (; ran < n; ran++) {
+        if (ran > 0 && performance.now() - t0 > STEP_BUDGET_MS) { clock.dropped += n - ran; break; }
+        sim.step();
+      }
     }
     shell.setTick(sim.tick);
     if (inspectRow >= 0) panel.setLive(liveText(inspectRow));
   }
+  driveDryRun();
+  checkSoundSel();
+  // Ship this frame's ticks to the audio thread; paused, let it fall silent.
+  if (audio) {
+    if (clock.paused) stopBakedPlay();
+    if (bakedPlay) { /* the buffer is playing */ }
+    else if (sim && !clock.paused) audio.rec.flush(clock.rate);
+    else audio.rec.stop();
+  }
   lastNow = sim && !clock.paused ? now : null;
+  countFrame(now, ran);
   recordStep();
   const t0 = performance.now();
   const info = board ? board.describe(inspectRow) : null;
@@ -175,6 +732,9 @@ function paint(now) {
   const bTint = view.beltStatus ? beltStatus() : null;
   render(ctx, board, cam, dpr, { ...view, selected: info, ghosts, sim, alpha: clock.alpha, hide, vector: vectorMarks(),
                                 indexLabels: indexLabels(), noteSel: noteEdit, noteGrips: labelHeld(),
+                                ghostNotes: ghostNotes(),
+                                pixels: sim?.screen ? { screen, alpha: view.pixelAlpha, max: view.pixelMax } : null,
+                                frameBoxes: videoBoxes(),
                                 gateTint: lv ? lv.gateTint(gTint) : gTint,
                                 beltTint: lv ? lv.beltTint(bTint, BASE_COLOURS.belt) : bTint,
                                 underTint: lv ? lv.beltTint(bTint, BASE_COLOURS.under) : null,
@@ -201,6 +761,7 @@ function recordStep() {
   if (grab?.note || noteEdit >= 0) return;
   history.commit(board.snapshot());
   committed = editKey();
+  edited = true;   // the autosaves may write from now on
   syncHistory();
   prepareSave();
 }
@@ -441,14 +1002,17 @@ const layerActions = {
 // does not have what its own firing rule needs (a Merge needs its control
 // and the lane that selects, a Sink any one lane; a Source never starves);
 // RUNNING (green) otherwise. Dangling outputs discard and never block.
-const STATUS_COL = { blocked: [0.86, 0.72, 0.18], starved: [0.78, 0.26, 0.24], running: [0.27, 0.66, 0.33] };
-function gateStatus() {
+// The colours are the player's (View > status colours, panel.js).
+const hexRgb = (h) => [1, 3, 5].map(i => parseInt(h.slice(i, i + 2), 16) / 255);
+// `s` is the sim to read (the live one, or a video's copy).
+function gateStatus(s = sim) {
   const out = new Map();
-  if (!sim) return out;
-  sim.sync();
-  for (const g of sim.gates) {
-    const blocked = g.drains.some(c => sim.outHeld(g.row, c));
-    const starved = g.sim.n_in > 0 && !sim.inputsReady(g);
+  if (!s) return out;
+  s.sync();
+  const STATUS_COL = { blocked: hexRgb(statusColours.gateBlocked), starved: hexRgb(statusColours.gateStarved), running: hexRgb(statusColours.gateRunning) };
+  for (const g of s.gates) {
+    const blocked = g.drains.some(c => s.outHeld(g.row, c));
+    const starved = g.sim.n_in > 0 && !s.inputsReady(g);
     out.set(g.row, blocked ? STATUS_COL.blocked : starved ? STATUS_COL.starved : STATUS_COL.running);
   }
   return out;
@@ -459,16 +1023,16 @@ function gateStatus() {
 // leave on the coming tick (the forecast has no pop), so items are stuck on
 // it (and, by default, nothing on it is moving either -- see below); GREEN
 // otherwise (carrying, and moving). Returns (x, y) -> colour.
-const BELT_STATUS_COL = { empty: "rgb(176,72,66)", stalled: "rgb(214,180,58)", moving: "rgb(80,160,92)" };
-function beltStatus() {
-  if (!sim) return null;
-  sim.sync();
-  const F = sim.forecast();
+function beltStatus(s = sim) {
+  if (!s) return null;
+  const BELT_STATUS_COL = { empty: statusColours.beltEmpty, stalled: statusColours.beltStalled, moving: statusColours.beltMoving };
+  s.sync();
+  const F = s.forecast();
   const bySid = new Map();
-  for (const seg of sim.segments.values()) {
+  for (const seg of s.segments.values()) {
     let st = "moving";
     if (seg.head === seg.tail) st = "empty";
-    else if (sim.positionOf(seg, seg.head, sim.tick) >= seg.length * sim.UNIT && !F.pops.has(seg)) {
+    else if (s.positionOf(seg, seg.head, s.tick) >= seg.length * s.UNIT && !F.pops.has(seg)) {
       st = "stalled";
       // View > "stalled but moving: green": a stalled run whose items are
       // still moving -- one is pushed on this tick, or the newest is still
@@ -476,14 +1040,14 @@ function beltStatus() {
       // they all have) -- is not static, and reads green. O(1) per run.
       if (view.beltActive !== false) {
         const k = seg.tail - 1;
-        const moving = sim.positionOf(seg, k, sim.tick, 1) > sim.positionOf(seg, k, sim.tick, 0);
+        const moving = s.positionOf(seg, k, s.tick, 1) > s.positionOf(seg, k, s.tick, 0);
         if (moving || F.pushes.has(seg)) st = "moving";
       }
     }
     bySid.set(seg.sid, BELT_STATUS_COL[st]);
   }
-  const W = board.width;
-  return (x, y) => bySid.get(sim.segAt[y * W + x]) || null;
+  const W = s.board.width;
+  return (x, y) => bySid.get(s.segAt[y * W + x]) || null;
 }
 
 // What the Status pane's live readout says about a row: a gate's channels,
@@ -531,6 +1095,11 @@ function resize() {
   canvas.width = Math.round(r.width * dpr);
   canvas.height = Math.round(r.height * dpr);
   cam.resize(r.width, r.height);
+  // A first video size: the board's own size on screen, in device pixels --
+  // here, once the canvas has a real size (before, it is the default 300x150).
+  if (panel && (!panel.video.width || !panel.video.height) && r.width > 0 && r.height > 0) {
+    panel.setVideoSize(evenDim(canvas.width), evenDim(canvas.height));
+  }
   redraw();
 }
 
@@ -789,10 +1358,11 @@ function indexApply(o) {
 
 function openSelectPicker() {
   if (!sel) return;
+  // A selection of labels alone has no entity to anchor on: its box's corner.
   const first = selAbs()[0];
   vec.picking = "select";
   vec.sv = [0, 0];
-  vec.anchor = [first.dx, first.dy];
+  vec.anchor = first ? [first.dx, first.dy] : selOrigin();
   grab = null;
   syncVector();
 }
@@ -802,6 +1372,7 @@ function confirmSelectVector() {
   closePicker(true);
   if (!sel || isZero(v)) return;
   const pattern = selAbs();
+  if (!pattern.length) return;   // labels are not followed: no pattern to match
   const rows = [];
   for (const off of followChain(v, (o) => {
     const found = pattern.map(e => matchRow(e, e.dx + o[0], e.dy + o[1]));
@@ -889,7 +1460,7 @@ function onTap(sx, sy) {
     } else commitRun();
     return;
   }
-  if (sel) { selectTap(x, y); return; }
+  if (sel) { selectTap(x, y, wx, wy); return; }
   // Idle: a tap on an entity selects it, whatever the hand holds; a tap on
   // empty board is the held tool's. An inactive layer's entity is not
   // there to select.
@@ -1114,7 +1685,7 @@ function placer() {
 }
 
 function typeIdOf(name) {
-  return Number(Object.keys(T.types).find(k => T.types[k].name === name));
+  return typeByName(T, name)?.id ?? NaN;
 }
 
 // The tool at the ghost's position: what would be built, and where it is
@@ -1166,7 +1737,8 @@ function placementAt(tool, origin) {
     const st = tool.stamp;
     const at = st.entries.map(e => [origin[0] + e.dx, origin[1] + e.dy]);
     const ghost = stampGhost(board, st.entries, at);
-    return { tool, kind: "stamp", origin, w: st.w, h: st.h, entries: st.entries, at, ghost, blocked: ghost.blocked };
+    const notes = (st.notes || []).map(n => shiftNote(n, origin[0], origin[1]));
+    return { tool, kind: "stamp", origin, w: st.w, h: st.h, entries: st.entries, at, ghost, blocked: ghost.blocked, notes };
   }
   const dir = tool.dir | 0, flip = !!tool.flip;
   if (tool.kind === "rawbelt") {
@@ -1232,6 +1804,9 @@ function placeOne(pl, original) {
     // other paste makes copies, which go on the current layer.
     const keep = original && place?.keepLayers;
     const entries = keep ? pl.entries : pl.entries.map(e => ({ ...e, layer: undefined }));
+    // Labels always fit. A label edit is not a board edit (it must not
+    // restart the simulation), so only placed entities count for the derive.
+    if (pl.notes.length) { board.notes.push(...pl.notes.map(n => ({ ...n, rect: n.rect.slice() }))); board.notesRev++; }
     return board.placeEntries(entries, pl.at, { derive: false }).size > 0;
   }
   const blocked = placementCells(pl).filter(([x, y]) => !board.isFree(x, y));
@@ -1272,6 +1847,12 @@ function onGhost(sx, sy) {
 //   drag from a selected one  move the whole selection
 //   drag with Box armed       a rectangle that adds what it touches
 //   Turn buttons              turn / mirror the selection as one stamp
+//
+// Labels join it too: a box picks up every (visible) label it touches, and
+// they are lifted off board.notes into the stamp's `notes`, so they move,
+// turn, delete, cut, copy and paste with the rest (stamp.js keeps them
+// upright). A label always fits, so it goes back down whenever the whole
+// selection does; a tap on a selected label puts that one back.
 
 const selOrigin = () => originFor(sel.stamp.w, sel.stamp.h, sel.px, sel.py);
 
@@ -1281,16 +1862,26 @@ function selAbs() {
   return sel.stamp.entries.map(e => ({ ...e, dx: ox + e.dx, dy: oy + e.dy }));
 }
 
-// Replace the selection with these absolute entries. The pose is re-centred
-// on their box, so a turn after a membership change pivots on what is
-// actually selected.
-function setSel(abs) {
-  if (!abs.length) sel = null;
+// The selection's labels with absolute rects.
+function selNotes() {
+  if (!sel) return [];
+  const [ox, oy] = selOrigin();
+  return (sel.stamp.notes || []).map(n => shiftNote(n, ox, oy));
+}
+
+// The selected label at world point (wx, wy), or -1.
+const selNoteAt = (wx, wy) => (sel && notesOn() ? noteAt(selNotes(), wx, wy) : -1);
+
+// Replace the selection with these absolute entries and labels (by default
+// the labels it already holds). The pose is re-centred on their box, so a
+// turn after a membership change pivots on what is actually selected.
+function setSel(abs, notes = selNotes()) {
+  if (!abs.length && !notes.length) sel = null;
   else {
-    const { stamp, origin } = makeStamp(T, abs);
+    const { stamp, origin } = makeStamp(T, abs, notes);
     sel = { stamp, px: origin[0] + stamp.w / 2, py: origin[1] + stamp.h / 2 };
   }
-  shell.setSelection(sel ? sel.stamp.entries.length : 0);
+  shell.setSelection(sel ? sel.stamp.entries.length + sel.stamp.notes.length : 0);
   // Nothing left selected: the selection's picker has nothing to repeat,
   // and there is nothing left to index.
   if (!sel && vec.picking === "select") closePicker(false);
@@ -1307,14 +1898,37 @@ function selIndexAt(x, y) {
   return hit ? hit[2] : -1;
 }
 
-function lift(rows) {
+// Lift entity rows, and labels (the board.notes records themselves), into
+// the selection.
+function lift(rows, notes = []) {
   rows = [...new Set(rows)].filter(r => r > 0);
-  if (!rows.length) return;
+  notes = [...new Set(notes)].filter(n => board.notes.includes(n));
+  if (!rows.length && !notes.length) return;
   const abs = sel ? selAbs() : [];
-  const caught = board.capture(rows).map(e => ({ ...e, partner: e.partner === null ? null : e.partner + abs.length }));
-  board.eraseRows(rows);
-  if (rows.includes(inspectRow)) inspect(-1);
-  setSel([...abs, ...caught]);
+  const held = selNotes();
+  let caught = [];
+  if (rows.length) {
+    caught = board.capture(rows).map(e => ({ ...e, partner: e.partner === null ? null : e.partner + abs.length }));
+    board.eraseRows(rows);
+    if (rows.includes(inspectRow)) inspect(-1);
+  }
+  if (notes.length) {
+    for (const n of notes) board.notes.splice(board.notes.indexOf(n), 1);
+    noteEdit = -1;   // indices moved; no editor is open during a selection anyway
+    board.notesRev++;
+  }
+  setSel([...abs, ...caught], [...held, ...notes]);
+}
+
+// Put the selection's labels `which` (indices into selNotes()) back on the
+// board where the selection now has them. A label always fits.
+function dropNotes(which) {
+  if (!sel || !which.length) return;
+  const all = selNotes();
+  const want = new Set(which);
+  for (const k of which) board.notes.push(all[k]);
+  board.notesRev++;
+  setSel(selAbs(), all.filter((_, k) => !want.has(k)));
 }
 
 // Place the selected entries `which` (indices) back on the board where the
@@ -1330,9 +1944,17 @@ function drop(which) {
   setSel(subset(abs, i => !placedOrig.has(i)));
 }
 
-function dropAll() { if (sel) drop(sel.stamp.entries.map((_, i) => i)); }
+// Everything that fits goes down, and every label.
+function dropAll() {
+  if (!sel) return;
+  dropNotes(sel.stamp.notes.map((_, k) => k));
+  if (sel) drop(sel.stamp.entries.map((_, i) => i));
+}
 
-function selectTap(x, y) {
+function selectTap(x, y, wx, wy) {
+  // A selected label draws over the rest, so it wins the tap: it goes back.
+  const k = selNoteAt(wx, wy);
+  if (k >= 0) { dropNotes([k]); return; }
   const i = selIndexAt(x, y);
   if (i >= 0) { drop([i]); return; }
   const row = pickAt(x, y);
@@ -1340,8 +1962,10 @@ function selectTap(x, y) {
   else dropAll();
 }
 
-// Add every board entity the box touches to the selection. It only adds:
-// what is already selected stays selected.
+// Add every board entity the box touches to the selection, and every label
+// whose box it touches (if labels are showing: hidden ones take no taps,
+// so they take no boxes either). It only adds: what is already selected
+// stays selected.
 function boxAdd(r) {
   const rows = new Set();
   for (let y = r.y; y < r.y + r.h; y++) {
@@ -1350,7 +1974,19 @@ function boxAdd(r) {
       if (row >= 0) rows.add(row);
     }
   }
-  lift([...rows]);
+  const notes = notesOn() ? board.notes.filter(n => isText(n) && noteTouches(n, r)) : [];
+  lift([...rows], notes);
+}
+
+// Labels off the board that still draw: the selection's (outlined, as a
+// lifted entity is) and those a paste would place, ghosted.
+function ghostNotes() {
+  if (!board || !notesOn()) return null;
+  const out = [];
+  const held = selNotes();
+  if (held.length) out.push({ notes: held, lifted: true });
+  for (const pl of placements()) if (pl.kind === "stamp" && pl.notes.length) out.push({ notes: pl.notes, lifted: false });
+  return out.length ? out : null;
 }
 
 function selGhost() {
@@ -1375,8 +2011,11 @@ function selectTurn(cw) {
 // read from the selection as it was, all at once, before any is changed --
 // through the same emit mask the run tracer uses, since the selection is
 // lifted off the board. An underground end swaps entrance for exit AND
-// reverses, as the desktop's empty-hand R does to a placed pair. Machines
-// are not touched. The change lands when the selection goes down.
+// reverses, as the desktop's empty-hand R does to a placed pair. The machines
+// with a natural inverse turn into it (reversedGate(): Swap and Reciprocal
+// half-turn, Merge and Route trade places and half-turn), so a copied tree of
+// them, reversed, undoes what the original did; other machines are not
+// touched. The change lands when the selection goes down.
 function selectReverse() {
   if (!sel) return;
   const abs = selAbs();
@@ -1394,7 +2033,7 @@ function selectReverse() {
   sel.stamp.entries = sel.stamp.entries.map((e, i) => {
     if (e.type === "belt") return { ...e, dir: dirs[i] };
     if (e.type === "under") return { ...e, dir: dirs[i], exit: !e.exit };
-    return e;
+    return reversedGate(e);
   });
   redraw();
 }
@@ -1412,10 +2051,10 @@ function selectFlip() {
 // cancel; a copy's ghost sits over the originals.
 function selectCommand(c) {
   if (!sel) return;
-  if (c === "delete") { setSel([]); return; }
+  if (c === "delete") { setSel([], []); return; }
   const pose = [sel.px, sel.py];
   const id = shell.addStamp(sel.stamp);
-  if (c === "cut") { setSel([]); enterPaste(id, pose); if (place) place.keepLayers = true; return; }
+  if (c === "cut") { setSel([], []); enterPaste(id, pose); if (place) place.keepLayers = true; return; }
   // Copy: the selection goes back down. If all of it fit, there is nothing
   // left selected and the copy is ready to paste; anything that could not go
   // back stays selected for the player to deal with.
@@ -1428,7 +2067,7 @@ function selectCommand(c) {
 // given, puts the ghost up straight away at that centre point.
 function enterPaste(id, pose = null) {
   dropAll();
-  if (sel) setSel([]);
+  if (sel) setSel([], []);
   place = pose ? { px: pose[0], py: pose[1] } : null;
   shell.setPasting(id);
   syncBar();
@@ -1466,7 +2105,7 @@ function onLongPress(sx, sy) {
   if (!cells.length) {
     // A hold on a selected entity stays a press: a slow drag from it still
     // moves the selection, as it always did.
-    if (sel && selIndexAt(x, y) >= 0) return false;
+    if (sel && (selIndexAt(x, y) >= 0 || selNoteAt(...cam.screenToWorld(sx, sy)) >= 0)) return false;
     // Anywhere else but a belt, the hold arms a box selection at the press,
     // drawn at once so the hold reads as having taken. The finger now drags
     // the box out; lifting it without moving does nothing.
@@ -1511,8 +2150,7 @@ const dragHooks = {
     if (run || place) return true;
     if (!shell.selecting) return false;
     if (sx === undefined) return false;
-    if (shell.state.boxArmed) return true;
-    return selIndexAt(...cellUnder(sx, sy)) >= 0;
+    return selIndexAt(...cellUnder(sx, sy)) >= 0 || selNoteAt(...cam.screenToWorld(sx, sy)) >= 0;
   },
   begin(sx, sy) {
     const world0 = cam.screenToWorld(sx, sy);
@@ -1534,7 +2172,6 @@ const dragHooks = {
     // read as confusing in practice: Cancel and re-tap is the way to move it.
     if (run) grab = { cell0: run.end.slice(), world0 };
     else if (place) grab = { p0: [place.px, place.py], world0 };
-    else if (shell.state.boxArmed) { grab = { box: world0 }; boxRect = rectOf(world0, world0); }
     else if (sel) grab = { sel: true, p0: [sel.px, sel.py], world0 };
   },
   move(sx, sy) {
@@ -1597,9 +2234,6 @@ const dragHooks = {
       const r = boxRect;
       boxRect = null;
       boxAdd(r);
-      // Box is one-shot: after its rectangle, back to plain selecting.
-      shell.state.boxArmed = false;
-      shell.changed();
     }
     grab = null;
     redraw();
@@ -1617,9 +2251,15 @@ function rectOf(a, b) {
 
 async function show(name, bytes) {
   try {
+    endDryRun();      // before the new board's framing, which then stands
+    clearSoundSel();  // a new board: everything sounds again
     board = await Board.fromNpz(T, bytes);
     panel.setBoardName(name.replace(/\.npz$/i, ""));
+    loadAudioSettings();
     sim = new Sim(T, board);
+    syncScreen();
+    stopBakedPlay();
+    if (audio) audio.rec.attach(sim);
     clock.reset();
     shell.setPaused(true);   // a freshly loaded board waits to be started
     run = null;
@@ -1647,8 +2287,10 @@ async function show(name, bytes) {
 
 // --- autosave and the save on close -------------------------------------------
 //
-// Two browser saves the app keeps by itself, listed with the others:
-//   "auto save"  every AUTOSAVE_MS, when the board changed since the last one
+// Browser saves the app keeps by itself, listed with the others:
+//   "auto save"  every 30 s, when the board changed since that slot's last
+//   "autosave5"  every 5 min, likewise -- an older copy to fall back on
+//   "autosave15" every 15 min, likewise
 //   "exitsave"   whenever the app is hidden -- closed, switched away from,
 //                the screen locked. On a phone that is the only warning a
 //                close gives, and nothing asynchronous can be relied on to
@@ -1658,15 +2300,26 @@ async function show(name, bytes) {
 // Both write the history's current state -- the last stable board -- so a
 // selection half-lifted off the board is saved where it was picked up. On
 // opening, the exitsave is loaded, unless the auto save is newer; each
-// remembers the name of the board it holds.
-const AUTOSAVE_MS = 30000;
+// remembers the name of the board it holds. The two slower tiers are
+// backups loaded by hand; resuming never picks them.
+//
+// NOTHING is written -- no tier, no exitsave -- until the player has edited
+// the board this session. Opening the app must not clobber the saves it was
+// opened to choose between: an old autosave could otherwise be overwritten
+// by whatever the app resumed before the player got round to loading it.
+// Loading a board is not an edit.
 const AUTO_NAME = "auto save", EXIT_NAME = "exitsave";
+const AUTOSAVES = [
+  { name: AUTO_NAME, ms: 30 * 1000 },
+  { name: "autosave5", ms: 5 * 60 * 1000 },
+  { name: "autosave15", ms: 15 * 60 * 1000 },
+];
+let edited = false;       // has the player changed the board this session?
 let boardName = "";
 let loadGen = 0;          // which load the prepared bytes belong to
 let ready = null;         // { key, bytes }: the current state, compressed
 let preparing = false;
-let autosavedKey = null;
-const saveKey = () => `${loadGen}:${committed}`;
+const saveKey = () => `${loadGen}:${committed}:${board?.audioRev ?? 0}`;
 
 async function prepareSave() {
   if (!board || preparing) return;
@@ -1684,7 +2337,7 @@ async function prepareSave() {
 }
 
 function writeAuto(name) {
-  if (!ready) return false;
+  if (!ready || !edited) return false;
   try {
     putSave(name, ready.bytes, { board: ready.name });
     return true;
@@ -1694,10 +2347,11 @@ function writeAuto(name) {
   }
 }
 
-function autosave() {
-  if (!ready || ready.key === autosavedKey) return;
-  if (writeAuto(AUTO_NAME)) {
-    autosavedKey = ready.key;
+// One tier's tick: write if the board moved on since this tier last wrote.
+function autosave(tier) {
+  if (!ready || ready.key === tier.key) return;
+  if (writeAuto(tier.name)) {
+    tier.key = ready.key;
     panel.setLocalSaves(listSaves());
   }
 }
@@ -1778,7 +2432,7 @@ async function loadBundled(name) {
 }
 
 async function init() {
-  T = await (await fetch("types.json")).json();
+  T = installPixel(await (await fetch("types.json")).json());
 
   let lastMode = null;
   shell = new Shell(T, {
@@ -1823,8 +2477,23 @@ async function init() {
     // Tapping the stamp being pasted puts it away; any other starts pasting it.
     onPasteStamp: (id) => { if (shell.state.pasteStamp === id) exitPaste(); else enterPaste(id); },
     // ctrl+R: tick 0, every item gone, seeds back on; the factory stays.
-    onReset: () => { if (sim) { sim.reset(); clock.reset(); } redraw(); },
-    onPause: (paused) => { clock.paused = paused; redraw(); },
+    // With a live bake, back to the bake's own tick-0 state, so playing
+    // replays exactly what was baked.
+    onReset: () => {
+      endDryRun();
+      if (sim) {
+        stopBakedPlay();
+        if (bakeLive()) sim.restoreFrom(bake.snap); else sim.reset();
+        clock.reset();
+        if (audio) audio.rec.stop();
+      }
+      redraw();
+    },
+    onPause: (paused) => {
+      clock.paused = paused;
+      if (paused) endDryRun(); else { startDryRun(); stopPreview(); }
+      redraw();
+    },
     onRate: (rate) => { clock.setRate(rate); redraw(); },
     onBuildTap: () => {
       if (vec.picking === "build") closePicker(true);
@@ -1856,7 +2525,16 @@ async function init() {
     onLoadSave: (name) => loadBundled(name).catch(e => alert(e.message)),
     onOpenFile: () => fileInput.click(),
     onFit: () => { if (board) cam.frame(board.bounds); redraw(); },
-    onView: (v) => { view = v; layersChanged(false); },
+    onView: (v) => { view = v; syncScreen(); layersChanged(false); },
+    onColours: (c) => { statusColours = c; redraw(); },
+    onAudioEnable: (on) => setAudio(on),
+    onBake: () => openBakeDialog(),
+    onAudioSelection: () => { setSoundSelection(); redraw(); },
+    onVideoRecord: () => recordVideoNow(),
+    onVideoEndCamera: (set) => { endDryRun(); endCam = set ? camState() : null; panel.setVideoEndCamera(!!endCam); redraw(); },
+    onVideoOpen: (open) => { videoOpen = open; redraw(); },
+    onVideo: () => redraw(),
+    onAudio: (p) => { if (audio) audio.setParams(p); touchAudio(); },
     onTune: (t) => { setTune(t); redraw(); },
     onClearStamps: () => shell.clearStamps(),
     onCloseStatus: () => inspect(-1),
@@ -1871,11 +2549,19 @@ async function init() {
   });
   panel.setLocalSaves(listSaves());
   view = { ...panel.view };
+  syncScreen();
+
+  statusColours = { ...panel.colours };
   layerPanel = new LayerPanel(document.getElementById("stage"), layerActions);
   setTune(panel.dev);
 
   resize();
   new ResizeObserver(resize).observe(canvas);
+  const soundBtn = document.getElementById("sound-btn");
+  soundWanted = soundStored();
+  setSoundBtn(soundWanted);
+  if (soundWanted) { panel.setAudioMeter("starts on your first tap"); armSound(); }
+  soundBtn.addEventListener("click", () => { setAudio(!soundWanted); storeSound(soundWanted); soundBtn.blur(); });
   attachGestures(canvas, cam, redraw, { onTap, onLongPress, drag: dragHooks, momentum: () => view.momentum !== false });
 
   fileInput.addEventListener("change", async () => {
@@ -1908,7 +2594,7 @@ async function init() {
   if (resume) await loadLocal(resume.name);
   else if (first) await loadBundled(first).catch(e => alert(e.message));
 
-  setInterval(autosave, AUTOSAVE_MS);
+  for (const tier of AUTOSAVES) setInterval(() => autosave(tier), tier.ms);
   document.addEventListener("visibilitychange", () => { if (document.visibilityState === "hidden") exitSave(); });
   window.addEventListener("pagehide", exitSave);
 }

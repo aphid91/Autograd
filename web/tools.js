@@ -52,7 +52,7 @@ export function isKnown(T, slot) {
 }
 
 function typeOf(T, name) {
-  return Object.values(T.types).find(t => t.name === name);
+  return typeByName(T, name)?.td;
 }
 
 // The number a placement carries. A Source always emits something and
@@ -185,6 +185,12 @@ export function stampArt(T, stamp) {
       const c = t.td.colour || [0.5, 0.5, 0.5];
       body += `<rect x="${e.dx + 0.06}" y="${e.dy + 0.06}" width="${o.w - 0.12}" height="${o.h - 0.12}" fill="${css(c)}"/>`;
     }
+  }
+  // Labels as their boxes' outlines, so a stamp of labels alone is not blank.
+  for (const n of stamp.notes || []) {
+    if (!Array.isArray(n.rect)) continue;
+    const [x, y, w, h] = n.rect;
+    body += `<rect x="${x}" y="${y - h}" width="${w}" height="${h}" fill="none" stroke="#ffd84a" stroke-opacity="0.8" stroke-width="${Math.max(stamp.w, stamp.h, 1) * 0.03}"/>`;
   }
   return frame(Math.max(1, stamp.w), Math.max(1, stamp.h), body);
 }
