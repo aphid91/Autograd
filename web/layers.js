@@ -178,9 +178,18 @@ export function isolate(t, id) {
 // that still fits in that many lines (so the lines come out even, not one
 // long line and a short tail). Words are never split. `measure(text)` is any
 // width in the units of `lineH`: wrapping is the same at every size, so the
-// renderer measures once at a reference size and caches the result.
+// renderer measures once at a reference size and caches the result. A
+// "//" in the name forces the breaks instead (see LABEL_BREAK).
 export const LABEL_ASPECT = 4;
+export const LABEL_BREAK = "//";
 export function wrapLabel(text, measure, lineH, aspect = LABEL_ASPECT) {
+  // "//" is a forced break (a single slash is ordinary text): the player's
+  // lines are used exactly, each trimmed, empty ones dropped, and nothing is
+  // wrapped automatically -- a name with breaks in it is laid out by hand.
+  if (String(text).includes(LABEL_BREAK)) {
+    const lines = String(text).split(LABEL_BREAK).map(l => l.trim().replace(/\s+/g, " ")).filter(Boolean);
+    return lines.length ? lines : [""];
+  }
   const words = String(text).split(/\s+/).filter(Boolean);
   if (words.length < 2) return [words.join(" ")];
   const total = measure(words.join(" "));

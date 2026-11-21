@@ -319,6 +319,10 @@ on the current layer.
   even rather than one long line and a tail. Words are never split, and
   short names stay one line. Wrapping is the same at every size, so the
   renderer measures once at 100 px and caches the lines per name.
+  **`//` forces the breaks** (`LABEL_BREAK`; a single slash is ordinary
+  text, so `in/out` survives): the lines are used exactly as typed, each
+  trimmed and empty ones dropped, with no automatic wrapping on top. The
+  panel and the Hand chip show the name as typed, `//` and all.
 - **Long press a layer's name to isolate it**: it becomes current and every
   other layer, Background included, inactive. Long press it again while it
   is the only active layer and every **visible** layer is active again (a

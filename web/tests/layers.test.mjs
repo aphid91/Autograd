@@ -230,3 +230,14 @@ test("the label slider's cap is 6, and a saved value past it is clamped", () => 
   const t = parseLayers(JSON.stringify({ list: [{ id: 1, name: "x", label: 12 }] }));
   assert.equal(byId(t, 1).label, 6);
 });
+
+test("labels: '//' forces a break, a single slash does not", () => {
+  const m = (s) => s.length * 0.55;
+  assert.deepEqual(wrapLabel("Carry // lookahead", m, 1.2), ["Carry", "lookahead"]);
+  assert.deepEqual(wrapLabel("  Bank A//  bits 0/1 //", m, 1.2), ["Bank A", "bits 0/1"]);
+  // Forced lines are used as typed: a long one is not wrapped further.
+  const long = "Calculate bottom 13 digits in sequence";
+  assert.deepEqual(wrapLabel(`${long}//x`, m, 1.2), [long, "x"]);
+  assert.deepEqual(wrapLabel("a/b/c", m, 1.2), ["a/b/c"]);
+  assert.deepEqual(wrapLabel("//", m, 1.2), [""]);
+});
