@@ -25,7 +25,7 @@ export const PALETTE = [
 ];
 
 // The largest a label may be, in cells of text height.
-export const LABEL_MAX = 12;
+export const LABEL_MAX = 6;
 
 function background() {
   return { id: BACKGROUND, name: "Background", colour: null, visible: true, active: true, tint: 0, label: 0 };
@@ -151,6 +151,62 @@ export function isVisible(t, id) {
 export function isActive(t, id) {
   const l = byId(t, id) || t.list[0];
   return l.id === t.current || (l.visible && l.active);
+}
+
+// Isolate (a long press on a layer): make it current -- the current layer
+// is always active -- and every other layer inactive, Background included.
+// Pressed on a layer that already is the only active one, it undoes that:
+// every visible layer becomes active again. Returns which it did.
+export function isOnlyActive(t, id) {
+  return t.list.every(l => (l.id === id) === isActive(t, l.id));
+}
+
+export function isolate(t, id) {
+  if (!byId(t, id)) return null;
+  if (isOnlyActive(t, id)) {
+    for (const l of t.list) if (l.visible) l.active = true;
+    return "all";
+  }
+  setCurrent(t, id);
+  for (const l of t.list) if (l.id !== id) l.active = false;
+  return "isolated";
+}
+
+// A layer label's lines. A short name is one line; a long one -- "Calculate
+// bottom 13 digits in sequence" -- wraps into a block about ASPECT times as
+// wide as it is tall, the line count chosen so, then the narrowest width
+// that still fits in that many lines (so the lines come out even, not one
+// long line and a short tail). Words are never split. `measure(text)` is any
+// width in the units of `lineH`: wrapping is the same at every size, so the
+// renderer measures once at a reference size and caches the result.
+export const LABEL_ASPECT = 4;
+export function wrapLabel(text, measure, lineH, aspect = LABEL_ASPECT) {
+  const words = String(text).split(/\s+/).filter(Boolean);
+  if (words.length < 2) return [words.join(" ")];
+  const total = measure(words.join(" "));
+  const n = Math.round(Math.sqrt(total / (aspect * lineH)));
+  if (n <= 1) return [words.join(" ")];
+  const ws = words.map(w => measure(w)), space = measure(" ");
+  const lay = (width) => {
+    const lines = [];
+    let cur = [], w = 0;
+    words.forEach((word, i) => {
+      const add = cur.length ? space + ws[i] : ws[i];
+      if (cur.length && w + add > width) { lines.push(cur.join(" ")); cur = [word]; w = ws[i]; }
+      else { cur.push(word); w += add; }
+    });
+    lines.push(cur.join(" "));
+    return lines;
+  };
+  // The narrowest width that keeps to n lines: a bisection, since the line
+  // count only falls as the width grows.
+  let lo = Math.max(...ws), hi = total;
+  if (lay(lo).length <= n) return lay(lo);
+  for (let i = 0; i < 24; i++) {
+    const mid = (lo + hi) / 2;
+    if (lay(mid).length <= n) hi = mid; else lo = mid;
+  }
+  return lay(hi);
 }
 
 // The sliders set every active layer at once, each layer keeping its own

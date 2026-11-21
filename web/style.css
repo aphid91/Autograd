@@ -828,6 +828,7 @@ html, body {
   opacity: 0; padding: 0; border: 0; cursor: pointer;
 }
 .ly-name {
+  -webkit-user-select: none; user-select: none; -webkit-touch-callout: none;
   appearance: none; background: none; border: 0; padding: calc(4 * var(--u)) 0;
   text-align: left; min-width: 0;
   overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
@@ -841,7 +842,12 @@ html, body {
   color: var(--ink);
 }
 .ly-tog[data-on="false"] { color: var(--ink-dim); }
-.ly-tog:disabled { opacity: 0.35; }
+/* Off and disabled (a hidden layer's star) reads fainter still; on and
+   disabled (the current layer, always visible and active) stays bright. */
+.ly-tog:disabled[data-on="false"] { opacity: 0.35; }
+/* The star: filled and bright when active, a dim outline when not. */
+.ly-star[data-on="true"] { color: var(--accent); }
+.ly-star[data-on="true"] svg path { fill: currentColor; }
 .ly-tog svg { width: 100%; height: 100%; }
 .ly-add {
   appearance: none; background: none;

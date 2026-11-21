@@ -1,6 +1,7 @@
 // The layer panel: a small floating list in the board's top-left corner,
 // shown while View > layers is on. One row per layer -- colour swatch, name
-// (tap to make it current), member count, visible and active toggles --
+// (tap to make it current, long press to isolate it), member count, the
+// visible toggle (an eye) and the active one (a star, filled when active) --
 // then a + row, the commands (Rename, Delete, Adopt selection) and the two
 // sliders (tint, label size), which set every active layer at once.
 //
@@ -12,6 +13,8 @@
 
 import { icon } from "./icons.js";
 import { LABEL_MAX } from "./layers.js";
+
+const HOLD_MS = 500, HOLD_SLOP = 10;   // a long press, as the shell's
 
 const el = (tag, cls, attrs = {}) => {
   const e = document.createElement(tag);
@@ -112,8 +115,8 @@ export class LayerPanel {
 
       const name = el("button", "ly-name", { type: "button" });
       name.textContent = r.name;
-      name.title = r.current ? "The current layer" : "Make current";
-      name.addEventListener("click", () => this.cb.onSelect(r.id));
+      name.title = `${r.current ? "The current layer" : "Make current"}; hold to isolate`;
+      this.wirePress(name, () => this.cb.onSelect(r.id), () => this.cb.onIsolate(r.id));
 
       const count = el("span", "ly-count");
       count.textContent = String(r.count);
@@ -123,12 +126,32 @@ export class LayerPanel {
       // hidden layer's active toggle shows off and is disabled.
       const vis = this.toggle("ly-vis", r.visible ? "eye" : "eyeOff", r.visible, r.current,
                               r.visible ? "Hide" : "Show", () => this.cb.onVisible(r.id, !r.visible));
-      const act = this.toggle("ly-lock", r.active ? "unlock" : "lock", r.active, r.current || !r.visible,
+      const act = this.toggle("ly-star", "star", r.active, r.current || !r.visible,
                               r.active ? "Make inactive" : "Make active", () => this.cb.onActive(r.id, !r.active));
       row.append(sw, name, count, vis, act);
       this.list.append(row);
     }
     this.list.scrollTop = keep;
+  }
+
+  // A tap, or a long press (right-click on a mouse) -- which then swallows
+  // the click its own release makes, so a hold never also selects.
+  wirePress(b, onTap, onHold) {
+    let timer = null, held = false, x0 = 0, y0 = 0;
+    const cancel = () => { if (timer !== null) clearTimeout(timer); timer = null; };
+    b.addEventListener("pointerdown", (e) => {
+      held = false;
+      if (e.pointerType === "mouse") return;
+      x0 = e.clientX; y0 = e.clientY;
+      cancel();
+      timer = setTimeout(() => { timer = null; held = true; onHold(); }, HOLD_MS);
+    });
+    b.addEventListener("pointermove", (e) => {
+      if (timer !== null && Math.hypot(e.clientX - x0, e.clientY - y0) > HOLD_SLOP) cancel();
+    });
+    for (const ev of ["pointerup", "pointercancel", "pointerleave"]) b.addEventListener(ev, cancel);
+    b.addEventListener("contextmenu", (e) => { e.preventDefault(); if (!held) onHold(); held = true; });
+    b.addEventListener("click", () => { if (held) { held = false; return; } onTap(); });
   }
 
   toggle(cls, art, on, disabled, label, onTap) {

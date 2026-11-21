@@ -12,7 +12,7 @@ import { Camera, attachGestures } from "./camera.js";
 import { render, BASE_COLOURS } from "./render.js";
 import { LayerPanel } from "./layerpanel.js";
 import { BACKGROUND, byId, addLayer, removeLayer, renameLayer, setCurrent, isVisible, isActive,
-         setForActive, layerStats, mix, parseCss, rgbCss } from "./layers.js";
+         setForActive, layerStats, mix, parseCss, rgbCss, isolate } from "./layers.js";
 import { Shell } from "./ui.js";
 import { Panel, STATUS_COLOUR_DEFAULTS } from "./panel.js";
 import { ROUTE_NAMES, ROUTE_H_FIRST, ROUTE_V_FIRST, chooseRoute, planRun, routeWorks, turnTip } from "./planner.js";
@@ -311,7 +311,7 @@ let recLayers = null;
 function drawVideoFrame(ctx, s, vcam, alpha) {
   render(ctx, s.board, vcam, 1, {
     ...view, sim: s, alpha, ghosts: [],
-    ...layerOpts(recLayers, view.gateStatus ? gateStatus(s) : null, view.beltStatus ? beltStatus(s) : null),
+    ...layerOpts(recLayers, view.gateStatus ? gateStatus(s) : null, view.beltStatus ? beltStatus(s) : null, true),
     pixels: s.screen ? { screen: s.screen, alpha: view.pixelAlpha, max: view.pixelMax } : null,
   });
 }
@@ -879,9 +879,27 @@ function layerView() {
     }
     return c;
   };
+  // Visible but inactive: what cannot be touched, washed out so it reads as
+  // such. Cell rects for the one batched pass, plus the rows and cells the
+  // renderer's screen-space text (Source values, item numbers) fades by.
+  let dim = null;
+  if (t.list.some(l => isVisible(t, l.id) && !isActive(t, l.id))) {
+    const W = board.width, cells = new Uint8Array(W * board.height), rows = new Set(), rects = [];
+    const dimmed = (row) => { const id = board.layerOf(row); return isVisible(t, id) && !isActive(t, id); };
+    const add = (row, x, y, w, h) => {
+      if (!dimmed(row)) return;
+      rows.add(row);
+      rects.push([x, y, w, h]);
+      for (let dy = 0; dy < h; dy++) cells.fill(1, (y + dy) * W + x, (y + dy) * W + x + w);
+    };
+    for (const b of board.belts) add(b.row, b.x, b.y, 1, 1);
+    for (const u of board.unders) add(u.row, u.x, u.y, 1, 1);
+    for (const st of board.structs) add(st.row, st.x, st.y, st.w, st.h);
+    dim = { rects, rows, cells };
+  }
   let plainGate = null;     // the machines' map with no status colours, built once
   const lv = {
-    lists, labels, stats, hidden: stats.hidden,
+    lists, labels, stats, dim, hidden: stats.hidden,
     // `status`: View > gate status colours' row -> rgb map, or null.
     gateTint(status) {
       if (!tints.size) return status;
@@ -915,8 +933,11 @@ function layerView() {
 // What a layer view adds to a render: tints over the status colours (or in
 // their place), the visible lists, the hidden-cell mask and the labels.
 // One place, so the screen and a video frame cannot draw layers differently.
-function layerOpts(lv, gTint, bTint) {
+// `forVideo`: the inactive washout is left out -- what can be touched is an
+// editing matter, like the selection and the ghosts.
+function layerOpts(lv, gTint, bTint, forVideo = false) {
   return {
+    dim: !forVideo && lv?.dim || null,
     gateTint: lv ? lv.gateTint(gTint) : gTint,
     beltTint: lv ? lv.beltTint(bTint, BASE_COLOURS.belt) : bTint,
     underTint: lv ? lv.beltTint(bTint, BASE_COLOURS.under) : null,
@@ -975,6 +996,7 @@ const seeAtRow = (row) => (!layersOn() || isVisible(board.layers, board.layerOf(
 
 const layerActions = {
   onSelect: (id) => { setCurrent(board.layers, id); layersChanged(false); },
+  onIsolate: (id) => { if (isolate(board.layers, id)) layersChanged(false); },
   onAdd: () => { addLayer(board.layers); layersChanged(true); },
   onRename: () => {
     const t = board.layers, l = byId(t, t.current);

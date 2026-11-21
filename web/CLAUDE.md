@@ -312,7 +312,29 @@ on the current layer.
   its value after. They show the current layer's values (with Background
   current, the first active layer's). The label is the layer's name at its
   centre of mass, its height in world cells (zooming like the board's own
-  labels), in its colour over a black box; 0 is off.
+  labels, 0 to 6, 0 off), in its colour over a black box.
+- **A long name wraps** (`wrapLabel()`): into about `sqrt(width / (4 ×
+  line height))` lines, so the block comes out roughly four times as wide
+  as tall, then the narrowest width that keeps that many lines, so they are
+  even rather than one long line and a tail. Words are never split, and
+  short names stay one line. Wrapping is the same at every size, so the
+  renderer measures once at 100 px and caches the lines per name.
+- **Long press a layer's name to isolate it**: it becomes current and every
+  other layer, Background included, inactive. Long press it again while it
+  is the only active layer and every **visible** layer is active again (a
+  hidden one keeps its own flag). View, not an undo step. Right-click on a
+  mouse; the hold swallows the click its release makes.
+- **Inactive layers are washed out**: their cells get a `saturation`
+  composite with grey (colour drained) and then a dark wash, in one batched
+  pass after the items, so body, glyph, ports and items all fade; Source
+  values and item numbers over them, drawn later in screen space, fade to
+  30%. Not in video frames: what can be touched is an editing matter, like
+  the selection.
+- **The toggles**: an eye for visible, a **star** for active -- filled and
+  amber when active, a dim outline when not -- since fill against outline
+  reads at a glance where an open lock against a closed one did not. The
+  current layer's pair show on (and cannot be turned off); a hidden
+  layer's star is faint and disabled.
 - **The Hand's bar** shows `Layer: name` for the inspected entity, and
   **Make current** unless it already is.
 - The panel redraws only when its model changes, and never under a finger:

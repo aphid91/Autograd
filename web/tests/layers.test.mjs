@@ -11,6 +11,7 @@ import { readNpz } from "../npz.js";
 import {
   F_LAYER, BACKGROUND, defaultLayers, parseLayers, serialiseLayers, addLayer, removeLayer,
   renameLayer, setCurrent, isVisible, isActive, setForActive, layerStats, byId,
+  isolate, isOnlyActive, wrapLabel, LABEL_MAX,
 } from "../layers.js";
 
 const here = dirname(fileURLToPath(import.meta.url));
@@ -189,4 +190,43 @@ test("a save carries the table and the tags; rows naming an unknown layer get on
   assert.ok(back.layers.next > 42);
   const raw = await readNpz(buf(new Uint8Array(await b.toNpz())));
   assert.ok(JSON.parse(raw.layers.data).list.length >= 2);
+});
+
+test("isolate: one layer active and current; again, every visible layer back", () => {
+  const t = defaultLayers();
+  const a = addLayer(t), b = addLayer(t), c = addLayer(t);
+  byId(t, c).visible = false;
+  assert.equal(isolate(t, b), "isolated");
+  assert.equal(t.current, b);
+  assert.deepEqual(t.list.map(l => isActive(t, l.id)), [false, false, true, false]);
+  assert.ok(isOnlyActive(t, b));
+  assert.equal(isolate(t, b), "all");
+  // Every visible layer, Background included; the hidden one stays inactive.
+  assert.deepEqual(t.list.map(l => isActive(t, l.id)), [true, true, true, false]);
+  // Isolating a hidden layer shows it: it becomes current.
+  isolate(t, c);
+  assert.ok(isVisible(t, c) && isOnlyActive(t, c));
+  void a;
+});
+
+test("labels: short names stay one line, long ones wrap into even lines", () => {
+  const m = (s) => s.length * 0.55;   // a stand-in for measureText, in text heights
+  assert.deepEqual(wrapLabel("Adder", m, 1.2), ["Adder"]);
+  assert.deepEqual(wrapLabel("Layer 12", m, 1.2), ["Layer 12"]);
+  assert.deepEqual(wrapLabel("Calculate bottom 13 digits in sequence", m, 1.2),
+                   ["Calculate bottom 13", "digits in sequence"]);
+  const long = "A very long description of the carry lookahead logic for the upper adder bank";
+  const lines = wrapLabel(long, m, 1.2);
+  assert.equal(lines.join(" "), long);         // every word, in order, none split
+  assert.ok(lines.length >= 3);
+  const ws = lines.map(m);
+  assert.ok(Math.max(...ws) - Math.min(...ws) < 6, `balanced: ${lines}`);
+  // A single word longer than any line is not split.
+  assert.deepEqual(wrapLabel("Supercalifragilisticexpialidocious", m, 1.2), ["Supercalifragilisticexpialidocious"]);
+});
+
+test("the label slider's cap is 6, and a saved value past it is clamped", () => {
+  assert.equal(LABEL_MAX, 6);
+  const t = parseLayers(JSON.stringify({ list: [{ id: 1, name: "x", label: 12 }] }));
+  assert.equal(byId(t, 1).label, 6);
 });

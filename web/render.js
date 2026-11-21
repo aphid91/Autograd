@@ -85,6 +85,7 @@ function emitSize(s, z) {
 const emitShown = (s, z, labels) => s.emit !== null && labels && z >= LOD.marks;
 
 import { structGlyph } from "./glyphs.js";
+import { wrapLabel } from "./layers.js";
 import { TUNE } from "./tune.js";
 import { itemPoints } from "./flow.js";
 import { drawPixels } from "./pixel.js";
@@ -115,6 +116,7 @@ export function render(ctx, board, cam, dpr, opts = {}) {
   // World transform: x right, y up, one unit per cell.
   ctx.setTransform(dpr * z, 0, 0, -dpr * z,
                    dpr * (cam.w / 2 - cam.cx * z), dpr * (cam.h / 2 + cam.cy * z));
+  const world = ctx.getTransform();
   const px = 1 / z;   // one CSS pixel, in world units
   const v = cam.visible(1);
   const on = (x, y, w = 1, h = 1) => x + w >= v.x0 && x <= v.x1 && y + h >= v.y0 && y <= v.y1;
@@ -177,7 +179,12 @@ export function render(ctx, board, cam, dpr, opts = {}) {
   // Items last among the board's contents: cargo on a cell, over any tint,
   // so a red wash never changes the colour that says an item's sign.
   let cargo = null;
-  if (view.sim && view.items !== false) cargo = drawItems(ctx, view.sim, view.alpha || 0, z, on, S, view.hiddenCells, board.width);
+  if (view.sim && view.items !== false) cargo = drawItems(ctx, view.sim, view.alpha || 0, z, on, S, view.hiddenCells, board.width, view.dim?.cells);
+
+  // Layers: what an inactive layer holds is washed out -- colour drained,
+  // then darkened -- body, glyph, ports and items alike, so what can be
+  // touched stands out. Over the items, under the editing marks.
+  if (view.dim) drawDim(ctx, view.dim.rects, on, world);
 
   // The pixel overlay (pixel.js): over the board and its items.
   if (view.pixels) {
@@ -235,7 +242,7 @@ export function render(ctx, board, cam, dpr, opts = {}) {
   if (view.layerLabels?.length) drawLayerLabels(ctx, view.layerLabels, cam, dpr);
 
   if (view.labels && z >= LOD.marks) {
-    drawLabels(ctx, board.T, structs, cam, dpr, on);
+    drawLabels(ctx, board.T, structs, cam, dpr, on, view.dim?.rows);
     ctx.globalAlpha = 0.7;
     for (const g of ghosts) if (g.structs?.length) drawLabels(ctx, board.T, g.structs, cam, dpr, on);
     ctx.globalAlpha = 1;
@@ -564,19 +571,47 @@ function port(path, x, y, f, inward) {
 
 // Text is drawn in screen space: under the world transform it would be
 // mirrored by the y flip.
-function drawLabels(ctx, T, structs, cam, dpr, on) {
+// `dimRows`: inactive layers' machines, whose values fade with their washout.
+function drawLabels(ctx, T, structs, cam, dpr, on, dimRows = null) {
   ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
   ctx.textAlign = "center";
   ctx.textBaseline = "middle";
   ctx.fillStyle = COL.label;
-  const z = cam.zoom;
+  const z = cam.zoom, a0 = ctx.globalAlpha;
   for (const s of structs) {
     if (!on(s.x, s.y, s.w, s.h) || !emitShown(s, z, true)) continue;
     const size = emitSize(s, z);
     ctx.font = `600 ${size.toFixed(1)}px system-ui, sans-serif`;
     const [sx, sy] = cam.worldToScreen(s.x + s.w / 2, s.y + s.h / 2);
+    ctx.globalAlpha = dimRows?.has(s.row) ? a0 * DIM_TEXT : a0;
     ctx.fillText(fmtNumber(s.emit), sx, sy);
   }
+  ctx.globalAlpha = a0;
+}
+
+// The inactive washout: the cells' colour drained ("saturation" with a grey
+// takes the hue and chroma out of what is beneath) and then darkened toward
+// the board's background. One path, culled to the view; under the world
+// transform, which `world` restores since text passes leave screen space.
+const DIM = { desat: 0.9, dark: "rgba(24,24,29,0.6)" };
+const DIM_TEXT = 0.3;   // what text over a washed-out cell keeps of its alpha
+function drawDim(ctx, rects, on, world) {
+  ctx.save();
+  ctx.setTransform(world);
+  ctx.beginPath();
+  let any = false;
+  for (const r of rects) if (on(r[0], r[1], r[2], r[3])) { ctx.rect(r[0], r[1], r[2], r[3]); any = true; }
+  if (any) {
+    ctx.globalCompositeOperation = "saturation";
+    ctx.globalAlpha = DIM.desat;
+    ctx.fillStyle = "#808080";
+    ctx.fill();
+    ctx.globalCompositeOperation = "source-over";
+    ctx.globalAlpha = 1;
+    ctx.fillStyle = DIM.dark;
+    ctx.fill();
+  }
+  ctx.restore();
 }
 
 // Labels (notes.js), as the desktop's annotation layer draws them: a faint
@@ -681,22 +716,23 @@ function drawVectorMarks(ctx, marks, px) {
 // belt. Items draw after the machines, so over their control overlays.
 // `hidden`: a cell mask of hidden layers' entities, or null -- an item over
 // one is not drawn (one byte read per item, and only while a layer is hidden).
-function drawItems(ctx, sim, alpha, z, on, S, hidden = null, W = 0) {
+function drawItems(ctx, sim, alpha, z, on, S, hidden = null, W = 0, dimCells = null) {
   const text = textOpacity(z);
   const { pts } = itemPoints(sim, alpha, {
     visible: (x0, y0, x1, y1) => on(x0, y0, x1 - x0, y1 - y0),
     reach: 0.5 + ITEM.r,
   });
-  const pos = [], neg = [], labels = [];
+  const pos = [], neg = [], labels = [], dimLabels = [];
   for (let i = 0; i < pts.length; i += 3) {
     const x = pts[i], y = pts[i + 1], value = pts[i + 2];
     if (!on(x - 0.5, y - 0.5)) continue;
-    if (hidden && hidden[Math.floor(y) * W + Math.floor(x)]) continue;
+    const k = Math.floor(y) * W + Math.floor(x);
+    if (hidden && hidden[k]) continue;
     (value > 0 ? pos : neg).push(x, y);
-    if (text > 0) labels.push(x, y, value);
+    if (text > 0) (dimCells && dimCells[k] ? dimLabels : labels).push(x, y, value);
   }
   discs(ctx, pos, neg);
-  return labels.length ? { labels, alpha: text } : null;
+  return labels.length || dimLabels.length ? { labels, dimLabels, alpha: text } : null;
 }
 
 // Discs: the ring's colour as a full disc, then the dark interior over it.
@@ -730,6 +766,7 @@ function textOpacity(z) {
 // with a dark halo so a digit spilling past the rim still reads.
 function drawItemLabels(ctx, cargo, cam, dpr) {
   const { labels, alpha } = cargo;
+  if (cargo.dimLabels?.length) drawItemLabels(ctx, { labels: cargo.dimLabels, alpha: alpha * DIM_TEXT }, cam, dpr);
   ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
   ctx.textAlign = "center";
   ctx.textBaseline = "middle";
@@ -750,8 +787,24 @@ function drawItemLabels(ctx, cargo, cam, dpr) {
 
 // Layer labels (layers.js): each layer's name at the centre of mass of its
 // entities, sized in world cells like the board's own labels, in the
-// layer's colour over a black box so it reads over anything. Screen space,
-// over everything. Below a few pixels of text a label is not drawn at all.
+// layer's colour over a black box so it reads over anything. A long name
+// wraps into a few balanced lines (wrapLabel()); the wrap does not depend on
+// size, so it is worked out once per name at a reference size and cached.
+// Screen space, over everything. Below a few pixels of text a label is not
+// drawn at all.
+const LAYER_FONT = (px) => `700 ${px.toFixed(1)}px system-ui, sans-serif`;
+const LAYER_LINE = 1.2;          // line height, in text heights
+const wrapCache = new Map();     // name -> lines
+function layerLines(ctx, text) {
+  let lines = wrapCache.get(text);
+  if (!lines) {
+    ctx.font = LAYER_FONT(100);
+    lines = wrapLabel(text, (t) => ctx.measureText(t).width / 100, LAYER_LINE);
+    if (wrapCache.size > 500) wrapCache.clear();
+    wrapCache.set(text, lines);
+  }
+  return lines;
+}
 function drawLayerLabels(ctx, labels, cam, dpr) {
   ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
   ctx.textAlign = "center";
@@ -759,15 +812,17 @@ function drawLayerLabels(ctx, labels, cam, dpr) {
   for (const l of labels) {
     const px = l.size * cam.zoom;
     if (px < 4) continue;
+    const lines = layerLines(ctx, l.text);
     const [sx, sy] = cam.worldToScreen(l.x, l.y);
-    ctx.font = `700 ${px.toFixed(1)}px system-ui, sans-serif`;
-    const w = ctx.measureText(l.text).width;
+    ctx.font = LAYER_FONT(px);
+    const w = Math.max(...lines.map(t => ctx.measureText(t).width));
+    const lh = px * LAYER_LINE;
     const padX = px * 0.35, padY = px * 0.2;
-    const bw = w + 2 * padX, bh = px * 1.2 + 2 * padY;
+    const bw = w + 2 * padX, bh = lh * lines.length + 2 * padY;
     if (sx + bw / 2 < 0 || sx - bw / 2 > cam.w || sy + bh / 2 < 0 || sy - bh / 2 > cam.h) continue;
     ctx.fillStyle = "rgba(0,0,0,0.82)";
     ctx.fillRect(sx - bw / 2, sy - bh / 2, bw, bh);
     ctx.fillStyle = l.colour;
-    ctx.fillText(l.text, sx, sy);
+    lines.forEach((t, i) => ctx.fillText(t, sx, sy + (i - (lines.length - 1) / 2) * lh));
   }
 }
