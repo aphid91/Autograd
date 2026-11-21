@@ -770,6 +770,28 @@ html, body {
 .layerpanel[data-open="false"] { display: none; }
 #fps:not([hidden]) ~ .layerpanel { --ly-top: calc(72 * var(--u)); }
 .layerpanel[data-folded="true"] .ly-body { display: none; }
+/* The resize grip: a right angle in the bottom-right corner, as a label's
+   (notes) grip, with a finger-sized target around it. */
+.ly-grip {
+  position: absolute;
+  right: 0; bottom: 0;
+  width: calc(26 * var(--u)); height: calc(26 * var(--u));
+  touch-action: none;
+  cursor: nwse-resize;
+}
+.ly-grip::after {
+  content: "";
+  position: absolute;
+  right: calc(4 * var(--u)); bottom: calc(4 * var(--u));
+  width: calc(9 * var(--u)); height: calc(9 * var(--u));
+  border-right: 2px solid var(--ink-dim);
+  border-bottom: 2px solid var(--ink-dim);
+  border-bottom-right-radius: 2px;
+}
+.layerpanel[data-resizing="true"] .ly-grip::after { border-color: var(--accent); }
+.layerpanel[data-folded="true"] .ly-grip { display: none; }
+/* Room under the sliders so the grip does not sit on the Label one. */
+.layerpanel .ly-body { padding-bottom: calc(14 * var(--u)); }
 .layerpanel button { font: inherit; color: inherit; touch-action: manipulation; }
 .layerpanel svg {
   fill: none; stroke: currentColor; stroke-width: 2;
@@ -888,3 +910,4 @@ html, body {
 .act-laycur { width: auto; }
 .act-laycur .sw-name { max-width: none; }
 .laychip span:last-child { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.ly-act span { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }

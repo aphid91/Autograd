@@ -349,6 +349,17 @@ on the current layer.
   layer's star is faint and disabled.
 - **The Hand's bar** shows `Layer: name` for the inspected entity, and
   **Make current** unless it already is.
+- **The grip** in the panel's bottom-right corner resizes it: across sets
+  the width (the name column takes it all, so names show more or less;
+  the count, eye and star keep their size, and Rename / Delete / Adopt and
+  the sliders stretch, their labels ellipsizing when narrow), down sets
+  how tall the list may grow before it scrolls. It follows the finger's
+  motion from the press, the list from its **real** height rather than its
+  limit (so on a short list dragging up shrinks it at once). At least 180
+  px wide and one row tall, clamped to the board; kept in localStorage
+  (`gates.web.layers.size.v1`), not in the save, since it is about the
+  screen rather than the board. The grip captures the pointer, so a drag
+  from it never pans the board.
 - The panel redraws only when its model changes, and never under a finger:
   the sliders are built once, and a colour is reported on `change` (the
   picker closing), since rebuilding a row mid-pick would close the picker.

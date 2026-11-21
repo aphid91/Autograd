@@ -17,6 +17,14 @@ import { LABEL_MAX } from "./layers.js";
 
 const HOLD_MS = 500, HOLD_SLOP = 10;   // a long press, as the shell's
 const DOUBLE_TAP_MS = 350;
+const MIN_W = 180, MIN_LIST_H = 28;     // CSS px: a few letters of a name; about one row
+const SIZE_KEY = "gates.web.layers.size.v1";
+function loadSize() {
+  try { const v = JSON.parse(localStorage.getItem(SIZE_KEY) || "null"); return v && typeof v === "object" ? v : null; } catch { return null; }
+}
+function saveSize(v) {
+  try { localStorage.setItem(SIZE_KEY, JSON.stringify({ w: v.w, listH: v.listH })); } catch { /* not kept */ }
+}
 
 const el = (tag, cls, attrs = {}) => {
   const e = document.createElement(tag);
@@ -56,8 +64,14 @@ export class LayerPanel {
     this.label = this.slider("Label", 0, LABEL_MAX, 0.5, (v) => cb.onLabel(v));
 
     this.body.append(this.list, add, acts, this.tint.wrap, this.label.wrap);
-    this.root.append(head, this.body);
+    // The resize grip, bottom-right: across sets the panel's width (the
+    // names take it up; the buttons and sliders stretch), down sets how tall
+    // the list is before it scrolls. Kept across sessions.
+    this.grip = el("div", "ly-grip", { role: "separator", "aria-label": "Resize layers panel", title: "Drag to resize" });
+    this.wireGrip(this.grip);
+    this.root.append(head, this.body, this.grip);
     host.append(this.root);
+    this.applySize(loadSize());
   }
 
   act(art, name, onTap) {
@@ -79,6 +93,48 @@ export class LayerPanel {
   }
 
   show(on) { this.root.dataset.open = String(!!on); }
+
+  // { w, listH } in CSS px, either absent for the stylesheet's default.
+  // Clamped to the board, so a size saved on a larger screen still fits.
+  applySize(size) {
+    this.size = size || {};
+    const host = this.root.parentElement?.getBoundingClientRect();
+    if (Number.isFinite(this.size.w)) {
+      const max = host ? host.width - 12 : Infinity;
+      this.root.style.width = `${Math.round(Math.max(MIN_W, Math.min(max, this.size.w)))}px`;
+    }
+    if (Number.isFinite(this.size.listH)) {
+      this.list.style.maxHeight = `${Math.round(Math.max(MIN_LIST_H, this.size.listH))}px`;
+    }
+  }
+
+  // The grip follows the finger's motion from where it was pressed: width
+  // from the panel's width then, the list's height from its height then (its
+  // real height, not its limit, so a short list shrinks at once rather than
+  // only after the drag passes its unused allowance).
+  wireGrip(g) {
+    let drag = null;
+    g.addEventListener("pointerdown", (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      g.setPointerCapture(e.pointerId);
+      drag = { id: e.pointerId, x0: e.clientX, y0: e.clientY,
+               w0: this.root.getBoundingClientRect().width, h0: this.list.clientHeight };
+      this.root.dataset.resizing = "true";
+    });
+    g.addEventListener("pointermove", (e) => {
+      if (!drag || e.pointerId !== drag.id) return;
+      this.applySize({ w: drag.w0 + e.clientX - drag.x0, listH: drag.h0 + e.clientY - drag.y0 });
+    });
+    const end = (e) => {
+      if (!drag || e.pointerId !== drag.id) return;
+      drag = null;
+      this.root.dataset.resizing = "false";
+      saveSize(this.size);
+    };
+    g.addEventListener("pointerup", end);
+    g.addEventListener("pointercancel", end);
+  }
 
   // model: { rows: [{ id, name, colour, visible, active, current, count }],
   //          tint, label, selCount, canEdit }
