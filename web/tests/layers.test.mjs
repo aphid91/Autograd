@@ -167,6 +167,8 @@ test("stats: counts, centre of mass, and the hidden-cell mask", () => {
   assert.equal(s.counts.get(L), 2);
   assert.equal(s.counts.get(BACKGROUND), 1);
   assert.deepEqual(s.centres.get(L), [3.5, 2.5]);
+  // Background is counted but never has a centre: it never has a label.
+  assert.equal(s.centres.has(BACKGROUND), false);
   assert.equal(s.hidden, null);
   byId(b.layers, L).visible = false;
   s = layerStats(b, b.layers);

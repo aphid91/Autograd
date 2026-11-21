@@ -901,6 +901,7 @@ html, body {
 /* Layer labels switched off (a long press on "Label"): the slider dimmed. */
 .ly-slider[data-off="true"] input, .ly-slider[data-off="true"] .ly-sval { opacity: 0.3; }
 .ly-slider[data-off="true"] .ly-sname { text-decoration: line-through; }
+.ly-slider[data-na="true"] input, .ly-slider[data-na="true"] .ly-sval { opacity: 0.3; }
 
 /* The Hand's bar: the inspected entity's layer -- colour and name -- with
    a small Make current button under them. */

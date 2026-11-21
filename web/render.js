@@ -239,7 +239,6 @@ export function render(ctx, board, cam, dpr, opts = {}) {
     ctx.setLineDash([]);
   }
   if (view.indexLabels?.length) drawIndexLabels(ctx, view.indexLabels, cam, dpr);
-  if (view.layerLabels?.length) drawLayerLabels(ctx, view.layerLabels, cam, dpr, view.layerLabelHits, view.layerLabelSel);
 
   if (view.labels && z >= LOD.marks) {
     drawLabels(ctx, board.T, structs, cam, dpr, on, view.dim?.rows);
@@ -247,6 +246,9 @@ export function render(ctx, board, cam, dpr, opts = {}) {
     for (const g of ghosts) if (g.structs?.length) drawLabels(ctx, board.T, g.structs, cam, dpr, on);
     ctx.globalAlpha = 1;
   }
+  // Layer labels last of all, over the Source values too: they name whole
+  // modules, and a value showing through one makes both unreadable.
+  if (view.layerLabels?.length) drawLayerLabels(ctx, view.layerLabels, cam, dpr, view.layerLabelHits, view.layerLabelSel);
 }
 
 // `tint`: View > belt status colours -- (x, y) -> a colour, or null for the

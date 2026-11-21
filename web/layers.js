@@ -260,6 +260,7 @@ export function layerStats(board, t) {
   const anyHidden = t.list.some(l => !isVisible(t, l.id));
   const hidden = anyHidden ? new Uint8Array(board.width * board.height) : null;
   const orphans = new Set();
+  const bg = stats.get(BACKGROUND);
   for (let r = 1; r < board.rows; r++) {
     const o = r * S;
     if (!ent[o + E.F_ALIVE]) continue;
@@ -269,9 +270,13 @@ export function layerStats(board, t) {
     const x = ent[o + E.F_ORIGIN_X], y = ent[o + E.F_ORIGIN_Y];
     const w = ent[o + E.F_W] || 1, h = ent[o + E.F_H] || 1;
     st.n++;
-    st.sx += (x + w / 2) * w * h;
-    st.sy += (y + h / 2) * w * h;
-    st.w += w * h;
+    // Background is counted but has no centre: it never has a label, and
+    // the sum would be over most of the board for nothing.
+    if (st !== bg) {
+      st.sx += (x + w / 2) * w * h;
+      st.sy += (y + h / 2) * w * h;
+      st.w += w * h;
+    }
     if (hidden && !isVisible(t, stats.has(id) ? id : BACKGROUND)) {
       for (let dy = 0; dy < h; dy++) hidden.fill(1, (y + dy) * board.width + x, (y + dy) * board.width + x + w);
     }

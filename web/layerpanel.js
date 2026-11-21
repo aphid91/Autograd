@@ -4,7 +4,8 @@
 // isolate it), member count, the
 // visible toggle (an eye) and the active one (a star, filled when active) --
 // then a + row, the commands (Rename, Delete, Adopt selection) and the two
-// sliders (tint, label size), which set every active layer at once.
+// sliders: tint, which sets every active layer at once, and label size,
+// which sets the current layer's.
 //
 // Like ui.js and panel.js it only requests: every change goes out through a
 // callback and main.js applies it. `update(model)` redraws the list only
@@ -153,7 +154,9 @@ export class LayerPanel {
     this.adoptBtn.dataset.disabled = String(!m.selCount);
     this.adoptBtn.querySelector("span").textContent = m.selCount ? `Adopt ${m.selCount}` : "Adopt";
     this.label.wrap.dataset.off = String(!m.labelsOn);
-    this.label.input.disabled = !m.labelsOn;
+    // Background current: it has no label, so there is nothing to size.
+    this.label.wrap.dataset.na = String(!m.labelEditable);
+    this.label.input.disabled = !m.labelsOn || !m.labelEditable;
     // A slider under the finger is left alone: its own input is the truth.
     for (const [s, v] of [[this.tint, m.tint], [this.label, m.label]]) {
       if (document.activeElement !== s.input) { s.input.value = String(v); s.out.textContent = fmt(v); }

@@ -308,11 +308,15 @@ on the current layer.
   its own colour **or a status colour** -- by the layer's own amount, so at
   1 the layer wins and below it both read. Lifted selections and ghosts are
   not tinted.
-- **The sliders set every active layer** (not Background); each layer keeps
-  its value after. They show the current layer's values (with Background
-  current, the first active layer's). The label is the layer's name at its
-  centre of mass, its height in world cells (zooming like the board's own
-  labels, 0 to 6, 0 off), in its colour over a black box.
+- **The tint slider sets every active layer** (not Background); each layer
+  keeps its value after. It shows the current layer's value (with
+  Background current, the first active layer's).
+- **The label slider sets the current layer only**, and is disabled with
+  Background current, which never has a label. The label is the layer's
+  name at its centre of mass, its height in world cells (zooming like the
+  board's own labels, 0 to 6, 0 off), in its colour over a black box, drawn
+  **last of all** -- over the Source values too. Background is counted in
+  `layerStats()` but never given a centre of mass.
 - **A long name wraps** (`wrapLabel()`): into about `sqrt(width / (4 ×
   line height))` lines, so the block comes out roughly four times as wide
   as tall, then the narrowest width that keeps that many lines, so they are

@@ -996,7 +996,9 @@ function syncLayerPanel(lv = layerView()) {
   layerPanel.update({
     rows: t.list.map(l => ({ id: l.id, name: l.name, colour: l.colour, visible: isVisible(t, l.id),
                              active: isActive(t, l.id), current: l.id === t.current, count: counts.get(l.id) || 0 })),
-    tint: ref?.tint ?? 0, label: ref?.label ?? 0, labelsOn: t.showLabels !== false,
+    tint: ref?.tint ?? 0, labelsOn: t.showLabels !== false,
+    // The label slider shows and sets the current layer only.
+    label: cur && cur.id !== BACKGROUND ? cur.label : 0, labelEditable: !!cur && cur.id !== BACKGROUND,
     selCount: sel ? sel.stamp.entries.length : 0,
     canEdit: t.current !== BACKGROUND,
   });
@@ -1073,7 +1075,12 @@ const layerActions = {
   onActive: (id, v) => { const l = byId(board.layers, id); if (l) l.active = v; layersChanged(false); },
   onColour: (id, hex) => { const l = byId(board.layers, id); if (l && l.colour !== hex) { l.colour = hex; layersChanged(true); } },
   onTint: (v) => { setForActive(board.layers, "tint", v); redraw(); },
-  onLabel: (v) => { setForActive(board.layers, "label", v); redraw(); },
+  // The label slider is the current layer's alone (Background has none);
+  // the tint slider still sets every active layer.
+  onLabel: (v) => {
+    const l = byId(board.layers, board.layers.current);
+    if (l && l.id !== BACKGROUND) { l.label = v; redraw(); }
+  },
   // A long press on the Label slider's name: every layer label off or on,
   // each keeping its own size. View, like visibility.
   onLabelsToggle: () => {
