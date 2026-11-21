@@ -1334,10 +1334,16 @@ the camera arithmetic, loaded always and tested in node;
   backpressure (Fluoddity's note): dropping it queues frames until the tab
   dies.
 - **What is drawn**: the board as View draws it -- grid, status colours,
-  the pixel overlay (the copy gets its own Screen, starting blank), labels
+  the pixel overlay (the copy gets its own Screen, starting blank), labels,
+  **layers** (hidden ones left out, items included, tints and layer labels)
   -- and never the selection, ghosts or other editing marks
   (`drawVideoFrame()` in main.js; `gateStatus()`/`beltStatus()` take the sim
-  to read for this).
+  to read for this). The layers are the view taken at Record
+  (`recLayers`), applied through the same `layerOpts()` the screen uses, so
+  the two cannot draw them differently; the copy shares the live board's
+  grid, table and lists (an edit stops the recording), so that view is
+  exact for every frame. Changing a layer's visibility or sliders mid-render
+  does not reach the video.
 - **Sound**: with Audio's switch on, the same ticks are baked
   (`bakeAudio(..., t0)`: a bake may now start mid-run, at the video's own
   first tick, so the soundtrack starts and ends with the picture; the start

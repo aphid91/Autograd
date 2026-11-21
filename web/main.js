@@ -304,11 +304,14 @@ function videoBoxes() {
 }
 
 // One video frame: the board as View draws it, never the editing marks.
+// Layers too, as the board shows them: the view taken when Record was
+// pressed (`recLayers`), since the copy shares the live board's grid, table
+// and lists and an edit stops the recording anyway.
+let recLayers = null;
 function drawVideoFrame(ctx, s, vcam, alpha) {
   render(ctx, s.board, vcam, 1, {
     ...view, sim: s, alpha, ghosts: [],
-    gateTint: view.gateStatus ? gateStatus(s) : null,
-    beltTint: view.beltStatus ? beltStatus(s) : null,
+    ...layerOpts(recLayers, view.gateStatus ? gateStatus(s) : null, view.beltStatus ? beltStatus(s) : null),
     pixels: s.screen ? { screen: s.screen, alpha: view.pixelAlpha, max: view.pixelMax } : null,
   });
 }
@@ -346,6 +349,7 @@ async function recordVideoNow() {
   const copy = sim.clone();
   if (view.pixelAlpha > 0) copy.screen = new Screen();
   const startCam = camState(), rev = board.revision, live = sim;
+  recLayers = layerView();
   const withSound = !!audio;
   panel.setVideoProgress("starting…");
   try {
@@ -373,6 +377,7 @@ async function recordVideoNow() {
     panel.setVideoProgress(`failed: ${e.message}`);
   } finally {
     recording = null;
+    recLayers = null;
     panel.setVideoRecording(false);
   }
 }
@@ -735,11 +740,7 @@ function paint(now) {
                                 ghostNotes: ghostNotes(),
                                 pixels: sim?.screen ? { screen, alpha: view.pixelAlpha, max: view.pixelMax } : null,
                                 frameBoxes: videoBoxes(),
-                                gateTint: lv ? lv.gateTint(gTint) : gTint,
-                                beltTint: lv ? lv.beltTint(bTint, BASE_COLOURS.belt) : bTint,
-                                underTint: lv ? lv.beltTint(bTint, BASE_COLOURS.under) : null,
-                                lists: lv?.lists || null, hiddenCells: lv?.hidden || null,
-                                layerLabels: lv?.labels || null });
+                                ...layerOpts(lv, gTint, bTint) });
   syncLayerPanel(lv);
   debug.renderMs = performance.now() - t0;
   if (sim && !clock.paused) redraw();
@@ -909,6 +910,19 @@ function layerView() {
   };
   lvCache = { board, key, lv };
   return lv;
+}
+
+// What a layer view adds to a render: tints over the status colours (or in
+// their place), the visible lists, the hidden-cell mask and the labels.
+// One place, so the screen and a video frame cannot draw layers differently.
+function layerOpts(lv, gTint, bTint) {
+  return {
+    gateTint: lv ? lv.gateTint(gTint) : gTint,
+    beltTint: lv ? lv.beltTint(bTint, BASE_COLOURS.belt) : bTint,
+    underTint: lv ? lv.beltTint(bTint, BASE_COLOURS.under) : null,
+    lists: lv?.lists || null, hiddenCells: lv?.hidden || null,
+    layerLabels: lv?.labels || null,
+  };
 }
 
 // The panel's model, pushed every frame (the panel redraws only on change).
