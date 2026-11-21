@@ -241,3 +241,28 @@ test("labels: '//' forces a break, a single slash does not", () => {
   assert.deepEqual(wrapLabel("a/b/c", m, 1.2), ["a/b/c"]);
   assert.deepEqual(wrapLabel("//", m, 1.2), [""]);
 });
+
+test("a label's offset and the labels switch survive a save; undo keeps the switch as it stands", async () => {
+  const t = defaultLayers();
+  const a = addLayer(t);
+  byId(t, a).labelDx = 2.5; byId(t, a).labelDy = -1.25;
+  t.showLabels = false;
+  const back = parseLayers(serialiseLayers(t));
+  assert.equal(byId(back, a).labelDx, 2.5);
+  assert.equal(byId(back, a).labelDy, -1.25);
+  assert.equal(back.showLabels, false);
+  // Old tables have neither: no offset, labels on.
+  const old = parseLayers(JSON.stringify({ list: [{ id: 1, name: "x" }] }));
+  assert.equal(byId(old, 1).labelDx, 0);
+  assert.equal(old.showLabels, true);
+
+  const b = blank();
+  const L = addLayer(b.layers);
+  byId(b.layers, L).labelDx = 3;
+  const snap = b.snapshot();
+  byId(b.layers, L).labelDx = 7;     // a drag: an undo step
+  b.layers.showLabels = false;       // view: not
+  b.restore(snap);
+  assert.equal(byId(b.layers, L).labelDx, 3);
+  assert.equal(b.layers.showLabels, false);
+});

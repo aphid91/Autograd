@@ -347,8 +347,26 @@ on the current layer.
   reads at a glance where an open lock against a closed one did not. The
   current layer's pair show on (and cannot be turned off); a hidden
   layer's star is faint and disabled.
-- **The Hand's bar** shows `Layer: name` for the inspected entity, and
-  **Make current** unless it already is.
+- **The Hand's bar** shows the inspected entity's layer -- its colour box
+  and name (shortened to about 110 px) -- with a small icon-only **Make
+  current** button under them, unless it already is current. No "Layer"
+  word: the colour box says what it is.
+- **Long press the word "Label"** (beside its slider) to switch every
+  layer label off or on (`showLabels` on the table, saved with it). Off,
+  the word is struck through and the slider dimmed and disabled; each
+  layer keeps its own size, so on again brings them all back as they were.
+  View, not an undo step, like visibility.
+- **In the Hand, a tap on a layer label picks it up** (a dashed outline) and
+  a drag from it moves it: an offset in cells from the layer's centre of
+  mass (`labelDx`/`labelDy`, saved with the table), so the label keeps its
+  place relative to the layer as members come and go. A drag follows the
+  finger's motion, never pans, and is one undo step when it ends. Layer
+  labels draw over everything, so they win a tap before notes and
+  entities; with one picked up, any other tap only puts it down. Leaving
+  the Hand, switching labels off or turning View > layers off also puts it
+  down. Hit-tested against the boxes the last render drew
+  (`labelHits`, filled by `drawLayerLabels()`), since only drawing knows a
+  label's measured size; the topmost wins.
 - **The grip** in the panel's bottom-right corner resizes it: across sets
   the width (the name column takes it all, so names show more or less;
   the count, eye and star keep their size, and Rename / Delete / Adopt and

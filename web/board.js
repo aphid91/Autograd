@@ -255,6 +255,7 @@ export class Board {
       if (w) Object.assign(l, { visible: w.visible, active: w.active, tint: w.tint, label: w.label });
     }
     if (byId(this.layers, was.current)) this.layers.current = was.current;
+    this.layers.showLabels = was.showLabels;
     adoptOrphans(this.layers, this.rowLayers());
     this.layersRev++;
     this.derive();

@@ -62,6 +62,11 @@ export class LayerPanel {
 
     this.tint = this.slider("Tint", 0, 1, 0.05, (v) => cb.onTint(v));
     this.label = this.slider("Label", 0, LABEL_MAX, 0.5, (v) => cb.onLabel(v));
+    // A long press on the word "Label" switches every layer label off or on;
+    // off, the slider is dimmed and disabled (each layer keeps its size).
+    const lname = this.label.wrap.querySelector(".ly-sname");
+    lname.title = "Hold to show or hide layer labels";
+    this.wirePress(lname, () => {}, () => cb.onLabelsToggle());
 
     this.body.append(this.list, add, acts, this.tint.wrap, this.label.wrap);
     // The resize grip, bottom-right: across sets the panel's width (the
@@ -82,7 +87,7 @@ export class LayerPanel {
   }
 
   slider(name, min, max, step, onInput) {
-    const wrap = el("label", "ly-slider");
+    const wrap = el("div", "ly-slider");
     const span = el("span", "ly-sname");
     span.textContent = name;
     const input = el("input", "", { type: "range", min: String(min), max: String(max), step: String(step) });
@@ -147,6 +152,8 @@ export class LayerPanel {
     this.deleteBtn.dataset.disabled = String(!m.canEdit);
     this.adoptBtn.dataset.disabled = String(!m.selCount);
     this.adoptBtn.querySelector("span").textContent = m.selCount ? `Adopt ${m.selCount}` : "Adopt";
+    this.label.wrap.dataset.off = String(!m.labelsOn);
+    this.label.input.disabled = !m.labelsOn;
     // A slider under the finger is left alone: its own input is the truth.
     for (const [s, v] of [[this.tint, m.tint], [this.label, m.label]]) {
       if (document.activeElement !== s.input) { s.input.value = String(v); s.out.textContent = fmt(v); }

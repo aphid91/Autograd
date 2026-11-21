@@ -740,7 +740,8 @@ function paint(now) {
                                 ghostNotes: ghostNotes(),
                                 pixels: sim?.screen ? { screen, alpha: view.pixelAlpha, max: view.pixelMax } : null,
                                 frameBoxes: videoBoxes(),
-                                ...layerOpts(lv, gTint, bTint) });
+                                ...layerOpts(lv, gTint, bTint),
+                                layerLabelHits: labelHits = [], layerLabelSel: labelSel });
   syncLayerPanel(lv);
   debug.renderMs = performance.now() - t0;
   if (sim && !clock.paused) redraw();
@@ -759,7 +760,7 @@ function recordStep() {
   if (!board || sel || editKey() === committed) return;
   // A label being dragged or typed into is a change in progress too: one
   // step when the drag ends or the editor closes, not one per frame.
-  if (grab?.note || noteEdit >= 0) return;
+  if (grab?.note || grab?.layerLabel || noteEdit >= 0) return;
   history.commit(board.snapshot());
   committed = editKey();
   edited = true;   // the autosaves may write from now on
@@ -862,11 +863,13 @@ function layerView() {
   } : null;
   const tints = new Map();
   for (const l of t.list) if (l.colour && l.tint > 0 && isVisible(t, l.id)) tints.set(l.id, { rgb: hexRgb(l.colour), k: l.tint });
+  // Each label at its layer's centre of mass plus the offset the player
+  // dragged it to -- unless labels are switched off as a whole.
   const labels = [];
-  for (const l of t.list) {
+  for (const l of t.showLabels === false ? [] : t.list) {
     if (l.id === BACKGROUND || !(l.label > 0) || !isVisible(t, l.id)) continue;
     const c = stats.centres.get(l.id);
-    if (c) labels.push({ x: c[0], y: c[1], text: l.name, colour: l.colour, size: l.label });
+    if (c) labels.push({ id: l.id, x: c[0] + (l.labelDx || 0), y: c[1] + (l.labelDy || 0), text: l.name, colour: l.colour, size: l.label });
   }
   const strs = new Map();   // "layer|base css" -> blended css, so a belt costs a lookup
   const blend = (id, base) => {
@@ -930,6 +933,31 @@ function layerView() {
   return lv;
 }
 
+// --- layer labels in the Hand ------------------------------------------------
+//
+// A tap on a layer label picks it up (outlined); a drag from it then moves
+// it, as an offset in cells from its layer's centre of mass, which it keeps
+// as the layer's membership changes. Any other tap, leaving the Hand, or
+// switching labels or layers off puts it down. Hit-tested against the boxes
+// the last render drew (`labelHits`), since only drawing knows the text's
+// measured size; the topmost (last drawn) wins.
+let labelSel = null;     // the picked-up label's layer id, or null
+let labelHits = [];
+
+function layerLabelHit(sx, sy) {
+  if (!layersOn()) return null;
+  for (let i = labelHits.length - 1; i >= 0; i--) {
+    const h = labelHits[i];
+    if (sx >= h.x0 && sx <= h.x1 && sy >= h.y0 && sy <= h.y1) return h.id;
+  }
+  return null;
+}
+
+function selectLayerLabel(id) {
+  labelSel = id;
+  redraw();
+}
+
 // What a layer view adds to a render: tints over the status colours (or in
 // their place), the visible lists, the hidden-cell mask and the labels.
 // One place, so the screen and a video frame cannot draw layers differently.
@@ -968,7 +996,7 @@ function syncLayerPanel(lv = layerView()) {
   layerPanel.update({
     rows: t.list.map(l => ({ id: l.id, name: l.name, colour: l.colour, visible: isVisible(t, l.id),
                              active: isActive(t, l.id), current: l.id === t.current, count: counts.get(l.id) || 0 })),
-    tint: ref?.tint ?? 0, label: ref?.label ?? 0,
+    tint: ref?.tint ?? 0, label: ref?.label ?? 0, labelsOn: t.showLabels !== false,
     selCount: sel ? sel.stamp.entries.length : 0,
     canEdit: t.current !== BACKGROUND,
   });
@@ -987,6 +1015,7 @@ function inspectLayerOf(row) {
 function layersChanged(edit) {
   if (!board) return;
   if (edit) board.layersRev++;
+  if (labelSel !== null && !layersOn()) labelSel = null;
   if (inspectRow >= 0 && seeAtRow(inspectRow) < 0) inspect(-1);
   shell.setInspectValue(handValueOf(inspectRow));
   syncHistory();
@@ -1045,6 +1074,13 @@ const layerActions = {
   onColour: (id, hex) => { const l = byId(board.layers, id); if (l && l.colour !== hex) { l.colour = hex; layersChanged(true); } },
   onTint: (v) => { setForActive(board.layers, "tint", v); redraw(); },
   onLabel: (v) => { setForActive(board.layers, "label", v); redraw(); },
+  // A long press on the Label slider's name: every layer label off or on,
+  // each keeping its own size. View, like visibility.
+  onLabelsToggle: () => {
+    board.layers.showLabels = board.layers.showLabels === false;
+    if (board.layers.showLabels === false) selectLayerLabel(null);
+    layersChanged(false);
+  },
 };
 
 // View > gate status colours: each machine's body coloured by what it is
@@ -1458,7 +1494,12 @@ function onTap(sx, sy) {
   const x = Math.floor(wx), y = Math.floor(wy);
   const mode = shell.state.mode;
   if (mode === "hand") {
-    // A label wins the tap: it draws over the board.
+    // A layer label draws over everything, so it wins the tap: it is picked
+    // up, to be dragged. With one picked up, any other tap only puts it down.
+    const li = layerLabelHit(sx, sy);
+    if (li !== null) { selectLayerLabel(li); return; }
+    if (labelSel !== null) { selectLayerLabel(null); return; }
+    // A note wins the tap: it draws over the board.
     const ni = noteHit(sx, sy);
     if (ni >= 0) { editNote(ni); return; }
     // A tap on bare board closes the window, as on the desktop. A hidden
@@ -2197,6 +2238,8 @@ const dragHooks = {
   // (sx, sy): where the press was. Called with no point after a pinch drops
   // back to one finger, which never starts a selection drag of its own.
   wants(sx, sy) {
+    // The Hand's picked-up layer label, dragged from anywhere on it.
+    if (shell.state.mode === "hand") return sx !== undefined && labelSel !== null && layerLabelHit(sx, sy) === labelSel;
     if (vec.picking) return sx !== undefined;
     if (labelHeld()) return sx !== undefined && (gripHit(sx, sy) >= 0 || noteHit(sx, sy) >= 0);
     if (run || place) return true;
@@ -2206,6 +2249,11 @@ const dragHooks = {
   },
   begin(sx, sy) {
     const world0 = cam.screenToWorld(sx, sy);
+    if (shell.state.mode === "hand") {
+      const l = labelSel !== null && byId(board.layers, labelSel);
+      if (l) grab = { layerLabel: l, off0: [l.labelDx || 0, l.labelDy || 0], world0 };
+      return;
+    }
     if (labelHeld()) {
       // The grip first: grabbing the corner must never read as grabbing the box.
       const g = gripHit(sx, sy);
@@ -2236,6 +2284,15 @@ const dragHooks = {
       return;
     }
     const dx = wx - grab.world0[0], dy = wy - grab.world0[1];
+    if (grab.layerLabel) {
+      // The offset from the centre of mass, by the finger's motion: the
+      // label keeps its grab point rather than jumping under the finger.
+      const r = (v) => Math.round(v * 1000) / 1000;
+      grab.layerLabel.labelDx = r(grab.off0[0] + dx);
+      grab.layerLabel.labelDy = r(grab.off0[1] + dy);
+      redraw();
+      return;
+    }
     if (grab.note) {
       // A label moves with the finger, kept to a thousandth of a cell as the
       // desktop saves it.
@@ -2280,6 +2337,8 @@ const dragHooks = {
     syncBar();
   },
   end() {
+    // A moved layer label is one undo step, when the drag ends.
+    if (grab?.layerLabel) board.layersRev++;
     // A held box the finger never dragged out selects nothing.
     if (grab?.box && grab.held) boxRect = null;
     if (grab?.box && boxRect) {
@@ -2500,6 +2559,7 @@ async function init() {
       // Leaving the Hand puts the Status window away; leaving the belt tool
       // abandons a run, as switching tools does on the desktop.
       if (s.mode !== "hand" && inspectRow >= 0) inspect(-1);
+      if (s.mode !== "hand" && labelSel !== null) selectLayerLabel(null);
       if (run && !(s.mode === "build" && beltHeld())) { run = null; grab = null; }
       if (place && !placer()) { place = null; grab = null; }
       // Leaving Build closes a picker, keeping the vector as it stands.

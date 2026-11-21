@@ -239,7 +239,7 @@ export function render(ctx, board, cam, dpr, opts = {}) {
     ctx.setLineDash([]);
   }
   if (view.indexLabels?.length) drawIndexLabels(ctx, view.indexLabels, cam, dpr);
-  if (view.layerLabels?.length) drawLayerLabels(ctx, view.layerLabels, cam, dpr);
+  if (view.layerLabels?.length) drawLayerLabels(ctx, view.layerLabels, cam, dpr, view.layerLabelHits, view.layerLabelSel);
 
   if (view.labels && z >= LOD.marks) {
     drawLabels(ctx, board.T, structs, cam, dpr, on, view.dim?.rows);
@@ -805,7 +805,10 @@ function layerLines(ctx, text) {
   }
   return lines;
 }
-function drawLayerLabels(ctx, labels, cam, dpr) {
+// `hits`, if given, collects each drawn label's box in CSS px ({ id, x0, y0,
+// x1, y1 }) for main.js to hit-test a tap against; `sel` is the id of the
+// label the Hand has picked up, outlined.
+function drawLayerLabels(ctx, labels, cam, dpr, hits = null, sel = null) {
   ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
   ctx.textAlign = "center";
   ctx.textBaseline = "middle";
@@ -822,6 +825,14 @@ function drawLayerLabels(ctx, labels, cam, dpr) {
     if (sx + bw / 2 < 0 || sx - bw / 2 > cam.w || sy + bh / 2 < 0 || sy - bh / 2 > cam.h) continue;
     ctx.fillStyle = "rgba(0,0,0,0.82)";
     ctx.fillRect(sx - bw / 2, sy - bh / 2, bw, bh);
+    hits?.push({ id: l.id, x0: sx - bw / 2, y0: sy - bh / 2, x1: sx + bw / 2, y1: sy + bh / 2 });
+    if (l.id === sel) {
+      ctx.strokeStyle = COL.select;
+      ctx.lineWidth = 2;
+      ctx.setLineDash([6, 4]);
+      ctx.strokeRect(sx - bw / 2 - 3, sy - bh / 2 - 3, bw + 6, bh + 6);
+      ctx.setLineDash([]);
+    }
     ctx.fillStyle = l.colour;
     lines.forEach((t, i) => ctx.fillText(t, sx, sy + (i - (lines.length - 1) / 2) * lh));
   }

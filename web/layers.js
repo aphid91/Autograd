@@ -31,11 +31,15 @@ function background() {
   return { id: BACKGROUND, name: "Background", colour: null, visible: true, active: true, tint: 0, label: 0 };
 }
 
+// `showLabels`: the layer labels' master switch (a long press on the Label
+// slider's name), separate from each layer's own size so turning labels off
+// and on again keeps every size.
 export function defaultLayers() {
-  return { list: [background()], current: BACKGROUND, next: 1 };
+  return { list: [background()], current: BACKGROUND, next: 1, showLabels: true };
 }
 
 const isHex = (c) => typeof c === "string" && /^#[0-9a-f]{6}$/i.test(c);
+const finite = (v) => (Number.isFinite(Number(v)) ? Math.round(Number(v) * 1000) / 1000 : 0);
 const clamp01 = (v) => Math.min(1, Math.max(0, Number(v) || 0));
 
 // The table from a save's JSON (or anything else): whatever is malformed is
@@ -67,17 +71,21 @@ export function parseLayers(text) {
       active: l.active !== false,
       tint: clamp01(l.tint),
       label: Math.min(LABEL_MAX, Math.max(0, Number(l.label) || 0)),
+      // Where the player dragged the label to, as an offset in cells from the
+      // centre of mass, so it follows the layer as its members change.
+      labelDx: finite(l.labelDx), labelDy: finite(l.labelDy),
     });
   }
   const maxId = Math.max(...t.list.map(l => l.id));
   t.next = Math.max(Number.isInteger(raw.next) ? raw.next : 1, maxId + 1);
   t.current = byId(t, raw.current) ? raw.current : BACKGROUND;
+  t.showLabels = raw.showLabels !== false;
   forceCurrent(t);
   return t;
 }
 
 export function serialiseLayers(t) {
-  return JSON.stringify({ list: t.list, current: t.current, next: t.next });
+  return JSON.stringify({ list: t.list, current: t.current, next: t.next, showLabels: t.showLabels !== false });
 }
 
 export const byId = (t, id) => t.list.find(l => l.id === id) || null;
@@ -89,7 +97,7 @@ export function adoptOrphans(t, ids) {
   for (const id of ids) {
     if (!Number.isInteger(id) || id <= 0 || byId(t, id)) continue;
     t.list.push({ id, name: `Layer ${id}`, colour: PALETTE[(id - 1) % PALETTE.length],
-                  visible: true, active: true, tint: 0, label: 0 });
+                  visible: true, active: true, tint: 0, label: 0, labelDx: 0, labelDy: 0 });
     t.next = Math.max(t.next, id + 1);
   }
 }
@@ -103,7 +111,7 @@ export function addLayer(t) {
   while (names.has(`Layer ${n}`)) n++;
   const id = t.next++;
   t.list.push({ id, name: `Layer ${n}`, colour: PALETTE[(t.list.length - 1) % PALETTE.length],
-                visible: true, active: true, tint: 0, label: 0 });
+                visible: true, active: true, tint: 0, label: 0, labelDx: 0, labelDy: 0 });
   return id;
 }
 

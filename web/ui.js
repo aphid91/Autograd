@@ -788,27 +788,33 @@ export class Shell {
   // The Hand: while Status is open on a Source or a belt, the bar offers
   // its number -- the emit value, or the seed (tap the lit one to unseed).
   renderHand(row) {
-    // The layer first: "Layer: name", and Make current unless it already is.
+    // The layer first: its colour and name, and under them a small Make
+    // current button (an icon only) unless it already is current.
     const il = this.state.inspectLayer;
     if (il) {
       const chip = document.createElement("div");
       chip.className = "laychip";
+      const top = document.createElement("div");
+      top.className = "laychip-top";
       const sw = document.createElement("span");
       sw.className = "ly-swatch";
       if (il.colour) sw.style.background = il.colour; else sw.dataset.none = "true";
       const name = document.createElement("span");
+      name.className = "laychip-name";
       name.textContent = il.name;
-      const lbl = document.createElement("span");
-      lbl.className = "rowlabel";
-      lbl.textContent = "Layer";
-      chip.append(lbl, sw, name);
-      row.append(chip);
+      top.append(sw, name);
+      chip.append(top);
       if (!il.current) {
-        row.append(this.swatch({
-          art: icon("layers"), name: "Make current", cls: "actsw act-laycur",
-          onTap: () => this.cb.onMakeLayerCurrent?.(),
-        }));
+        const b = document.createElement("button");
+        b.type = "button";
+        b.className = "laycur";
+        b.innerHTML = icon("layers");
+        b.setAttribute("aria-label", "Make current");
+        b.title = "Make this layer current";
+        b.addEventListener("click", () => this.cb.onMakeLayerCurrent?.());
+        chip.append(b);
       }
+      row.append(chip);
     }
     const iv = this.state.inspectValue;
     if (!iv) return;

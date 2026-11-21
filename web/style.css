@@ -897,17 +897,37 @@ html, body {
 }
 .ly-slider input { width: 100%; margin: 0; accent-color: var(--accent); }
 .ly-sval { text-align: right; font-variant-numeric: tabular-nums; }
+.ly-sname { -webkit-user-select: none; user-select: none; -webkit-touch-callout: none; touch-action: manipulation; }
+/* Layer labels switched off (a long press on "Label"): the slider dimmed. */
+.ly-slider[data-off="true"] input, .ly-slider[data-off="true"] .ly-sval { opacity: 0.3; }
+.ly-slider[data-off="true"] .ly-sname { text-decoration: line-through; }
 
-/* The Hand's bar: the inspected entity's layer, and Make current. */
+/* The Hand's bar: the inspected entity's layer -- colour and name -- with
+   a small Make current button under them. */
 .laychip {
-  display: flex; align-items: center; gap: calc(5 * var(--u));
+  display: flex; flex-direction: column; align-items: center;
+  gap: calc(5 * var(--u));
   flex: 0 0 auto;
-  color: var(--ink);
-  font-size: calc(11 * var(--u));
   max-width: calc(110 * var(--u));
 }
-.laychip .ly-swatch { flex: none; }
-.act-laycur { width: auto; }
-.act-laycur .sw-name { max-width: none; }
-.laychip span:last-child { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.laychip-top {
+  display: flex; align-items: center; gap: calc(5 * var(--u));
+  max-width: 100%;
+  color: var(--ink);
+  font-size: calc(11 * var(--u));
+}
+.laychip-top .ly-swatch { flex: none; }
+.laychip-name { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.laycur {
+  appearance: none;
+  width: calc(32 * var(--u)); height: calc(32 * var(--u));
+  padding: calc(7 * var(--u));
+  border-radius: 50%;
+  background: var(--chrome-2);
+  color: var(--ink);
+  border: calc(2 * var(--u)) solid var(--edge);
+  display: flex; align-items: center; justify-content: center;
+  touch-action: manipulation;
+}
+.laycur svg { width: 100%; height: 100%; fill: none; stroke: currentColor; stroke-width: 2; stroke-linecap: round; stroke-linejoin: round; }
 .ly-act span { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
