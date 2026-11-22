@@ -62,6 +62,12 @@ export class Sim {
     // so a forecast knows when it is stale.
     this.version = 0;
     this.rec = null;                // the forecast's event log, while one runs
+    // audio.js's Recorder while audio is on, else null: then the tick's whole
+    // audio cost is this null check (step() and structurePhase()).
+    this.audio = null;
+    // pixel.js's Screen while View > pixel overlay is on, else null: a
+    // Pixel's fire records its colour there. Web-only; no desktop analogue.
+    this.screen = null;
     this.fc = null;                 // the last forecast
     this.sync();
   }
@@ -267,6 +273,7 @@ export class Sim {
     this.rebuild();
     this.flush();
     this.seed();
+    this.screen?.clear();      // an edit, a Reset: the screen starts blank
     return true;
   }
 
@@ -368,6 +375,7 @@ export class Sim {
       const o = this.orientOf(row), [ox, oy] = this.originOf(row);
       const gate = {
         row, td, sim: td.sim,
+        pixel: td.class === "Pixel",
         strict: td.sim.fire_rule === this.T.sim.FIRE_ALL,
         outFaces: o.outputs.map(([lx, ly, face], i) => ({ x: ox + lx, y: oy + ly, face, ch: td.sim.out_ch[i] })),
         inFaces: o.inputs.map(([lx, ly, face], i) => ({ x: ox + lx, y: oy + ly, face, ch: td.sim.in_ch[i] })),
@@ -602,17 +610,21 @@ export class Sim {
   step() {
     this.sync();
     this.version++;
-    this.structurePhase();
+    // Not while forecasting: that step is rolled back, and is not heard.
+    const A = this.rec ? null : this.audio;
+    if (A) A.pre(this);
+    this.structurePhase(A, this.rec ? null : this.screen);
     for (const seg of this.order) this.tickSegment(seg, this.tick);
     this.deliverDirect();
     this.tick++;
+    if (A) A.post(this);
   }
 
   // The prefilter (GateSim._candidate_rows) and the per-gate firing rule.
   // The prefilter tests only necessary conditions that are pure row state --
   // the rule satisfiable by occupancy, a free output zone -- so it can admit
   // a gate that then does nothing but never rejects one that would fire.
-  structurePhase() {
+  structurePhase(A = null, P = null) {
     for (const g of this.gates) {
       const row = g.row, s = g.sim;
       let fed = 0;
@@ -624,12 +636,15 @@ export class Sim {
         for (let c = 0; c < s.n_out && !free; c++) if (!this.outHeld(row, c)) free = true;
         if (!free) continue;
       }
-      if (this.fire(g)) this.stats.fired++;
+      if (this.fire(g, P)) {
+        this.stats.fired++;
+        if (A) A.fires[g.agroup] += g.again ?? 1;   // a far gate (space.js) counts for less
+      }
     }
   }
 
   // _fire_admitted, for one gate the prefilter let through.
-  fire(g) {
+  fire(g, P = null) {
     const row = g.row, s = g.sim;
     if (!this.inputsReady(g)) return false;
     const drains = g.drains;
@@ -651,6 +666,7 @@ export class Sim {
     const values = [];
     for (let c = 0; c < s.n_in; c++) values.push(this.inHeld(row, c) ? this.inValue(row, c) : null);
     const results = evalOps(this.T, s.ops, values, 0);
+    if (P && g.pixel) P.fire(row, values);
     const consumed = this.consumed(g, values).filter(c => this.inHeld(row, c));
     for (const c of consumed) this.clearIn(row, c);
     const produced = [];
@@ -762,6 +778,49 @@ export class Sim {
     return this.fc;
   }
 
+  // --- copies, for baking audio --------------------------------------------------
+  //
+  // A copy that ticks on without touching this one: its own entity table
+  // (gate channels) and its own runs (rings, counters); everything derived
+  // from the board -- the gate table, the edges, the cell maps -- is shared,
+  // since a copy never rebuilds (its board's revision is frozen with it).
+  // The grid is shared too: an edit to the live board invalidates a bake,
+  // and the bake checks for one between chunks.
+  clone() {
+    const c = Object.create(Sim.prototype);
+    Object.assign(c, this);
+    const b = Object.create(Object.getPrototypeOf(this.board));
+    Object.assign(b, this.board);
+    b.entities = this.board.entities.slice();
+    c.board = b;
+    c.segments = new Map();
+    for (const [sid, seg] of this.segments) {
+      c.segments.set(sid, { ...seg, enter: seg.enter.slice(), payload: seg.payload.slice() });
+    }
+    c.order = this.order.map(seg => c.segments.get(seg.sid));
+    c.stats = { ...this.stats };
+    c.audio = null; c.rec = null; c.fc = null; c.screen = null;
+    return c;
+  }
+
+  // Put this sim back into a state copied from it by clone(), with no edit
+  // since. What a bake's Reset uses: a rebuild renumbers the runs, and the
+  // numbering decides the belt phase's order, so only the same state is
+  // guaranteed to replay the same ticks.
+  restoreFrom(snap) {
+    this.board.entities.set(snap.board.entities);
+    for (const seg of this.order) {
+      const s = snap.segments.get(seg.sid);
+      seg.head = s.head; seg.tail = s.tail; seg.anchor = s.anchor;
+      seg.enter.set(s.enter); seg.payload.set(s.payload);
+    }
+    this.tick = snap.tick;
+    Object.assign(this.stats, snap.stats);
+    this.version++;
+    this.fc = null;
+    this.screen?.clear();
+  }
+
   // --- reading it back ------------------------------------------------------------
 
   liveItems() {
@@ -786,11 +845,13 @@ export class Sim {
 // ticks happen at any frame rate. `alpha` is the leftover fraction, which
 // the renderer feeds to the closed form so items glide between ticks.
 
-export const RATE_PRESETS = [1, 5, 10, 30];
+export const RATE_PRESETS = [1, 5, 30, 240];
 export const RATE_MIN = 0.1;
-export const RATE_MAX = 240;
+export const RATE_MAX = 10000;
 // A frame that arrives after a long stall (a backgrounded tab) runs at most
-// this many ticks and drops the rest, rather than freezing to catch up.
+// this many ticks -- or a quarter second's worth at the current rate, if that
+// is more -- and drops the rest, rather than freezing to catch up. A flat 240
+// would cap a fast rate at 240 ticks a frame whatever the rate asked for.
 const MAX_CATCHUP = 240;
 
 export class Clock {
@@ -812,9 +873,10 @@ export class Clock {
     if (this.paused) return 0;
     this.frac += Math.max(0, dt) * this.rate;
     let due = Math.floor(this.frac);
-    if (due > MAX_CATCHUP) {
-      this.dropped += due - MAX_CATCHUP;
-      due = MAX_CATCHUP;
+    const cap = Math.max(MAX_CATCHUP, Math.ceil(this.rate / 4));
+    if (due > cap) {
+      this.dropped += due - cap;
+      due = cap;
       this.frac = 0;
     } else {
       this.frac -= due;

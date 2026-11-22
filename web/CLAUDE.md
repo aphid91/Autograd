@@ -10,7 +10,7 @@ CLAUDE.md for what the game *is*; most of its engineering notes are about
 the schedulers and the GPU, which do not apply here.
 
 Current state: **the phone shell, the belt planner, machine placement,
-per-instance settings, select / cut / copy / paste, and the simulation.** It
+per-instance settings, select / cut / copy / paste, layers, and the simulation.** It
 loads a save, pans (one finger) and zooms (pinch, or the wheel), lays belt
 runs (auto-tunnelling under obstacles), places machines and raw belts, edits
 a Source's emit value or a belt's seed, selects, moves, turns, deletes,
@@ -26,10 +26,15 @@ covers it).
 bash web/build.sh && python3 -m http.server -d _site 8000
 ```
 
-`build.sh` copies the app and every root `.npz` into `_site/`, writing
-`saves/index.json` for the save picker. On push to `Web`,
+`build.sh` copies the app and every `.npz` in **`web/saves/`** into
+`_site/`, writing `saves/index.json` for the save picker. On push to `Web`,
 `.github/workflows/pages.yml` does the same and deploys to GitHub Pages.
-`default.npz` is loaded at startup if it exists.
+`Default.npz` is loaded at startup if it exists. The bundled boards are
+**CPU experiments** (the root's `cpu.npz`), **RAM experiments** (the root's
+`quicksave.npz`), **GameOfLife_SLOW** and **Default**; the `.npz` files at
+the repo root are not shipped -- they are the desktop's and the tests'
+fixtures (`check_web_sim.py`, the web tests and the desktop's profiling
+tools load them by name), so they stay where they are.
 
 ## Installing it, and offline
 
@@ -69,23 +74,27 @@ scale 1.15.
     down, **long press** (right-click on a mouse) opens the picker for that
     slot, and the `+` swatch appends. Slots persist in localStorage.
     Tapping an existing entity **selects** it, whatever the hand holds, and
-    the bar becomes the selection's: Box, Delete, Cut, Copy, then the stamp
+    the bar becomes the selection's: Delete, Cut, Copy, then the stamp
     history, most recent first. See "Selecting" below.
   - **Hand**: tapping the board inspects: the Status folder fills in (the
     panel is **not** opened for you -- a tap is often only to reach the
     number swatches), and a tap on bare board clears it. While Status shows a Source or
     a belt, the bar offers the number swatches (0, 1, −1, 2, 4, 8) for its
     emit value or seed; on a belt, tapping the lit number unseeds it. A
-    Source also gets a **text box** after the swatches for any other value
-    (see "Placing machines and raw belts").
+    **text box** after the swatches takes any other value, for a Source or
+    a belt's seed (see "Placing machines and raw belts"); typing the seed a
+    belt already has changes nothing, so it never unseeds.
 - **Sim** (right): Reset (the desktop's ctrl+R: tick 0, every item gone,
   seeds back on, the factory untouched) and Play/Pause. Space toggles
   play. It **starts paused**, and loading a save pauses it again. **Long
   press Play/Pause** (right-click on a mouse) for the rate panel, just above
-  the Sim section: presets of 1, 5, 10 and 30 ticks a second, and Custom,
-  which opens a text box (0.1 to 240). It stays open until the next long
-  press or its × button, and shows the tick count. The rate persists with
-  the shell's localStorage; the panel's open state does not.
+  the Sim section: presets of 1, 5, 30 and 240 ticks a second, and Custom,
+  which opens a text box (0.1 to 10000). It stays open until the next long
+  press or its × button, and shows the tick count. The rate (30 by default)
+  and the panel's open state persist with the shell's localStorage. The
+  panel is **open on a first visit**, so it is found; the first time it is
+  ever closed, a hint over the Sim section says "long press play/pause for
+  tick controls" for a couple of seconds (`simHinted`, kept, so once).
 - **Edit**: Undo, Redo and Checkpoint (ctrl+Z, ctrl+shift+Z / ctrl+Y on a
   keyboard). See "Undo" below. Turning lives on the **thumb pads** in the
   board's corners, which show whenever there is something to turn: a held
@@ -112,11 +121,17 @@ Three things worth knowing:
   the desktop's panel/orchestrator split.
 
 The **Tweakpane** panel sits in the board's top-right corner, collapsed by
-default. It holds the saves, View toggles (grid, ports, source values, seed
+default. It holds the saves, View toggles (grid -- off by default, ports, source values, seed
 tint -- the green/red wash on seeded belts, ghosts included -- labels, pan
 momentum, items, belts (placed belts and underground ends; a planned run's
-ghost still draws), sources (hidden, not removed), **gate status colours**
-and **belt status colours**), Debug, and
+ghost still draws), gates (every machine, Sources included -- for a brief
+look at the belts underneath; still there and still tappable, and items
+held inside a machine still draw: View > items hides those), sources
+(hidden, not removed), **gate status colours** and **belt status
+colours** (both on by default, belts with "stalled but moving: green"), a **status
+colours** folder of pickers for both, and an **fps counter** -- frames and
+ticks per second actually reached, over half-second windows, top-left of
+the board under the sound button), Debug, and
 the Status folder. Tweakpane is **vendored** (`vendor/`, MIT) rather than
 pulled from a CDN, which keeps the no-build, works-offline property. Status
 writes the same row fields the desktop's Status window does, plus the
@@ -125,11 +140,19 @@ seed's `.z` bits, so a save edited here reads correctly there.
 ### Undo
 
 [history.js](history.js) keeps **states, not edits**: each entry is a whole
-`Board.snapshot()` (grid, entity table, row allocator -- about 5 MB on a
-512×512 board), so restoring cannot half-apply anything and no edit needs an
-inverse. It keeps `UNDO_DEPTH` (3) steps behind the current state, one
-constant.
+`Board.snapshot()` (grid, entity table, row allocator), so restoring
+cannot half-apply anything and no edit needs an inverse. It keeps
+`UNDO_DEPTH` (15) steps behind the current state, one constant.
 
+- **A snapshot is sparse.** A dense copy was about 5 MB on a 512×512 board
+  (the 4 MB grid is nearly all zeros, and the entity table is kept at its
+  doubled capacity), which was why the depth was 3: 16 of them is 80 MB on
+  a phone. The grid is stored as the occupied cells' indices and their four
+  words, and the entity table up to its last non-zero value (compared as
+  bits, so a trailing `-0` survives). About 1.2 MB on `cpu.npz`, `Ram2.npz`
+  and `noram.npz`, and 2-4 ms to take or restore. `Board.toNpz(snap)`
+  expands one to write it. `tests/npz.test.mjs` restores one word for word
+  and saves it byte for byte as the board it was taken from.
 - **The checkpoint** is one more state, just before the oldest: undo from
   the oldest step restores it, and redo walks forward through the history
   again from there. It is set when a board loads and whenever Checkpoint is
@@ -162,6 +185,13 @@ ports and values stay, ghosts keep their own colours):
   and the lane that control selects is not starved, nor is a Sink with any
   lane fed, and a Source (no inputs) never starves.
 - **green, running**: neither.
+
+All six status colours (these three and the belts' three below) are the
+player's: View > **status colours** has a picker for each -- Tweakpane's
+saturation/value square and hue strip -- and **Reset colours**. They persist
+with the panel's preferences, as hex (`STATUS_COLOUR_DEFAULTS` in
+panel.js); a stored key this build does not know, or a value that is not a
+`#rrggbb`, is ignored.
 
 **Belt status colours** do the same for belts, per run (segment), in
 `beltStatus()`: **red** empty; **yellow** stalled -- the head item is at the
@@ -220,7 +250,141 @@ and written back untouched, not drawn.
   restarting the simulation, and a drag or an open editor is held back as
   a change in progress until it ends (otherwise every frame of a drag was
   a step).
-- Not yet: labels do not travel with a selection, copy or paste.
+- **Labels join a selection** (see "Selecting"): a box picks up every
+  label it touches, and they move, turn, delete, cut, copy and paste with
+  the rest, and bake into stamp slots.
+
+### Layers
+
+AutoCAD-LT-style layers: named groups that **partition** the entities, all
+on the one shared grid. [layers.js](layers.js) is the model (pure, tested in
+`tests/layers.test.mjs`), [layerpanel.js](layerpanel.js) the panel, and
+main.js's "layers" section applies them. View > **layers** shows the panel
+(top left, under the sound button); while it is off, layers change
+nothing -- everything draws and can be touched -- but new entities still go
+on the current layer.
+
+- **The tag is in the entity row, slot `F_LAYER` (27)**: the last slot
+  spare at the desktop's stride (24..25 a belt's seed, 26 the desktop's
+  sleep flag). Not exported in `types.json` (the desktop is not changed for
+  this), so `Board` checks at load that nothing else claims it. In the row
+  it rides snapshots, undo and saves for free, and a zeroed row -- anything
+  placed by the desktop or an old save -- is on 0, **Background**.
+- **The table** (names, colours, flags, sliders, current) is a JSON string
+  under the save's `layers` key, like `annotations`; the desktop ignores it.
+  Malformed entries are repaired, not refused. Ids are handles, never
+  reused. A row naming an id the table lacks gets a "Layer n" entry rather
+  than being folded into Background.
+- **Current** is always visible and active; making a layer current turns
+  both on. **Hidden implies inactive** (the stored `active` survives, so
+  showing a layer again restores it). Background cannot be renamed or
+  deleted and takes no tint or label.
+- **Inactive means untouchable**: every cell lookup an interaction makes
+  goes through `pickAt()` -- tap-select, box, long press (the run is traced
+  whole and only its active cells lift; a hold on a locked belt arms a box),
+  vectored selection's match, a run starting on a belt, force build (which
+  never deletes a locked entity). The Hand inspects through `seeAt()`:
+  hidden entities are not there, inactive ones inspect **read only** (no
+  number swatches; Status edits are refused). Hidden entities still occupy
+  their cells and still simulate.
+- **Which layer a new entity gets**: a builder tool (belts, machines, raw
+  belts, a baked stamp, the planner's undergrounds) places on the current
+  layer (`Board.tagLayer`). A selection keeps each entity's layer through
+  lift, move, turn and put-down (`capture()` records it, `placeEntries()`
+  honours `entry.layer`). A **cut**'s first placement is a move and keeps
+  them (`place.keepLayers`); every other paste -- a copy, a repeat paste,
+  vector copies -- is a copy and goes on the current layer. **Adopt**
+  rewrites the lifted entries' layer; it lands when the selection goes down.
+- **Undo**: `board.layersRev` is part of the history key, bumped for
+  membership, names and colours (deleting a layer retags its rows to
+  Background without a derive, so none of this restarts the simulation).
+  Visibility, current and the sliders are view: not steps, and a restore
+  keeps the view as it stands.
+- **Drawing** (`layerView()` in main.js) is rebuilt only when the board, the
+  table or its view changes: the visible lists (only while something is
+  hidden), a hidden-cell mask that culls items (one byte read per item),
+  each layer's member count and centre of mass, and the tints. A tint
+  blends the layer's colour over what the entity would otherwise wear --
+  its own colour **or a status colour** -- by the layer's own amount, so at
+  1 the layer wins and below it both read. Lifted selections and ghosts are
+  not tinted.
+- **The tint slider sets every active layer** (not Background); each layer
+  keeps its value after. It shows the current layer's value (with
+  Background current, the first active layer's).
+- **The label slider sets the current layer only**, and is disabled with
+  Background current, which never has a label. The label is the layer's
+  name at its centre of mass, its height in world cells (zooming like the
+  board's own labels, 0 to 6, 0 off), in its colour over a black box, drawn
+  **last of all** -- over the Source values too. Background is counted in
+  `layerStats()` but never given a centre of mass.
+- **A long name wraps** (`wrapLabel()`): into about `sqrt(width / (4 ×
+  line height))` lines, so the block comes out roughly four times as wide
+  as tall, then the narrowest width that keeps that many lines, so they are
+  even rather than one long line and a tail. Words are never split, and
+  short names stay one line. Wrapping is the same at every size, so the
+  renderer measures once at 100 px and caches the lines per name.
+  **`//` forces the breaks** (`LABEL_BREAK`; a single slash is ordinary
+  text, so `in/out` survives): the lines are used exactly as typed, each
+  trimmed and empty ones dropped, with no automatic wrapping on top. The
+  panel and the Hand chip show the name as typed, `//` and all.
+- **Long press a layer's name to isolate it**: it becomes current and every
+  other layer, Background included, inactive. Long press it again while it
+  is the only active layer and every **visible** layer is active again (a
+  hidden one keeps its own flag). View, not an undo step. Right-click on a
+  mouse; the hold swallows the click its release makes.
+- **Double tap a layer's name to select all of it**: the first tap makes it
+  current as usual, the second (within 350 ms) lifts every entity on it
+  into the selection -- adding, as selecting always does. Selecting is a
+  state of Build, so the shell switches there, dropping a run, placement or
+  paste in progress. The timing is kept on the panel (`lastTap`), not the
+  button: the first tap makes the layer current, which rebuilds its row, so
+  the second tap lands on a new element. Background's 5,145 entities on
+  `cpu.npz` lift in about 16 ms.
+- **Inactive layers are washed out**: their cells get a `saturation`
+  composite with grey (colour drained) and then a dark wash, in one batched
+  pass after the items, so body, glyph, ports and items all fade; Source
+  values and item numbers over them, drawn later in screen space, fade to
+  30%. Not in video frames: what can be touched is an editing matter, like
+  the selection.
+- **The toggles**: an eye for visible, a **star** for active -- filled and
+  amber when active, a dim outline when not -- since fill against outline
+  reads at a glance where an open lock against a closed one did not. The
+  current layer's pair show on (and cannot be turned off); a hidden
+  layer's star is faint and disabled.
+- **The Hand's bar** shows the inspected entity's layer -- its colour box
+  and name (shortened to about 110 px) -- with a small icon-only **Make
+  current** button under them, unless it already is current. No "Layer"
+  word: the colour box says what it is.
+- **Long press the word "Label"** (beside its slider) to switch every
+  layer label off or on (`showLabels` on the table, saved with it). Off,
+  the word is struck through and the slider dimmed and disabled; each
+  layer keeps its own size, so on again brings them all back as they were.
+  View, not an undo step, like visibility.
+- **In the Hand, a tap on a layer label picks it up** (a dashed outline) and
+  a drag from it moves it: an offset in cells from the layer's centre of
+  mass (`labelDx`/`labelDy`, saved with the table), so the label keeps its
+  place relative to the layer as members come and go. A drag follows the
+  finger's motion, never pans, and is one undo step when it ends. Layer
+  labels draw over everything, so they win a tap before notes and
+  entities; with one picked up, any other tap only puts it down. Leaving
+  the Hand, switching labels off or turning View > layers off also puts it
+  down. Hit-tested against the boxes the last render drew
+  (`labelHits`, filled by `drawLayerLabels()`), since only drawing knows a
+  label's measured size; the topmost wins.
+- **The grip** in the panel's bottom-right corner resizes it: across sets
+  the width (the name column takes it all, so names show more or less;
+  the count, eye and star keep their size, and Rename / Delete / Adopt and
+  the sliders stretch, their labels ellipsizing when narrow), down sets
+  how tall the list may grow before it scrolls. It follows the finger's
+  motion from the press, the list from its **real** height rather than its
+  limit (so on a short list dragging up shrinks it at once). At least 180
+  px wide and one row tall, clamped to the board; kept in localStorage
+  (`gates.web.layers.size.v1`), not in the save, since it is about the
+  screen rather than the board. The grip captures the pointer, so a drag
+  from it never pans the board.
+- The panel redraws only when its model changes, and never under a finger:
+  the sliders are built once, and a colour is reported on `change` (the
+  picker closing), since rebuilding a row mid-pick would close the picker.
 
 ### The Dev folder
 
@@ -233,11 +397,18 @@ a ghost or a run's tip. Scales multiply the shipped value, so 1 is always
 panel's preferences; a stored key this build does not know is ignored.
 
 Below a divider, two sub-folders of **zoom thresholds**: the zoom (CSS px
-per cell) below which belts turn to solid squares, and from which the grid,
+per cell) below which belts turn to solid squares (0 by default: never), and from which the grid,
 glyphs and Source values, ports, port edges and belt chevrons draw; and the
 **text fades**, in px of text height (what legibility depends on) -- item
 numbers fading in between two values, and a label's text appearing from
 one. `render.js`'s `LOD` reads them live through getters.
+
+**Override zoom** (first in the zoom thresholds; 0 is off): above 0, the
+thresholds decide as if the zoom were that value, whatever the real zoom
+-- for a far-out view with full detail, or a close one without. The real
+zoom also sets sizes, so it is not swapped out; each threshold is rescaled
+instead (`t * z / override`, against the zoom of the render in progress),
+which gives exactly the same yes or no. It applies to video frames too.
 
 **Force build** makes the builder tools win: a blocked machine or raw belt
 deletes whatever is in its way and is placed, and a belt run deletes what
@@ -410,6 +581,7 @@ tables, the file parser, `a*x+b`), tested in `tests/indexer.test.mjs`.
 - **Values…** opens a sheet: the table -- **Random** (a shuffle of
   0..n-1, from a seed so the preview is what Apply writes; Re-roll), 
   **Ascending** (0, 1, 2…), **Doubling** (1, 2, 4…, clamped at 2²⁴),
+  **Alternating** (0, 1, 0, 1…),
   **Hack…** (below), or **File…** (numbers separated by commas or whitespace, repeated to fill
   the index; `D` is the default: 0 for a Source, no seed for a belt; any
   other token rejects the file with its line) -- then **a** and **b**
@@ -511,6 +683,48 @@ the footprint about its middle.
 Underground ends draw **narrowing toward the buried side** (the front of an
 entrance, the back of an exit), on the board and on the swatch.
 
+### Pixels
+
+**Pixel** ([pixel.js](pixel.js)) is a **web-only machine** that replaces
+Sink: `installPixel(T)` swaps it into the loaded `types.json` under **Sink's
+type id**, so every Sink in a save *is* a Pixel here, with no conversion
+pass (same 2x2 footprint, same look, same row layout). It is the one
+machine defined outside `core/entity.py`, by choice: the desktop is
+reference material and still reads the id as a Sink. Old toolbar slots and
+stamps naming "sink" resolve through `T.aliases` (`typeByName()`).
+
+- **Four inputs, all needed to fire, no outputs.** Facing +X with cell 0
+  bottom-left: **H** on cell 0's west face, **S** on the west face of the
+  cell above it, **V** on cell 0's south face -- three contiguous perimeter
+  spaces, V alone on its face -- and **Z** on the north face of the far
+  corner. Chiral, so F mirrors it. The placed ports for all eight
+  orientations come from `placePorts()`, a port of the desktop's
+  flip-then-rotate, which `tests/pixel.test.mjs` checks by rebuilding every
+  exported machine's ports from its authored ones.
+- **A fire sets its pixel**: hue H in turns (wrapping), saturation S and
+  value V clamped to 0..1, NaN as 0. **Z is the size**: 0 or less draws
+  nothing; above 0, `round(Z)` clamped to 1..View > pixel max size, as half
+  the side in cells -- Z = 1 covers exactly the machine (2x2), Z = 2 a 4x4,
+  centred on the machine's centre, which is always a grid corner, so every
+  square sits on the grid.
+- **View > pixel overlay** (0..1) is the screen's opacity, and 0 is off:
+  the sim then has no `Screen` and a fire records nothing (the Pixel still
+  consumes its inputs). Switching it on starts blank; so do every edit,
+  Reset (including a bake's), load and undo -- the sim clears it on any
+  rebuild. Not saved.
+- **The most recent fire draws on top** where squares overlap: the Screen
+  is a Map that re-inserts a row on each fire, so iteration order is fire
+  order.
+- Drawn over the board and its items; while it is on, the planning ghosts
+  move above it so what is being placed stays visible.
+- **Not heard in a forecast**, like audio: `forecast()` runs a real step,
+  so the hook is skipped while `rec` is set. A bake's clone has no screen.
+- Its fires click in audio group 1. Items going in vanish at its edge, as
+  they did into a Sink (it has no `LINKS`).
+- `tools/check_web_sim.py` and the tests that compare with the desktop load
+  `types.json` without `installPixel()`, so they still compare Sink with
+  Sink.
+
 ### How machines draw
 
 As the desktop draws them, because a design reads by it: the body, the
@@ -572,14 +786,15 @@ outlined in cyan. Deselecting places it back wherever the selection now is.
 | tap empty board | deselect everything that fits |
 | one-finger drag from a selected entity | move the whole selection |
 | one-finger drag elsewhere | pan |
-| Box, then a drag (from anywhere) | a rectangle: everything it touches is **added**, then Box disarms |
 | Index, then Values… | number the selected Sources and belts and write them values (see "Indexing") |
-| Reverse | every selected belt and underground faces the other way, in place; machines untouched (see below) |
+| Reverse | every selected belt and underground faces the other way, in place; Swap and Reciprocal turn half round, Merge and Route swap for each other (see below) |
 | Vector, drag the offset, Confirm | add every repeat of the selection along the vector, until it breaks (see "Vectors") |
 | Turn buttons | turn / mirror the selection as one stamp |
 | Delete | discard the selection |
 | long press a belt or underground | select its whole run; if the whole run is already selected, deselect it |
-| long press anywhere else, then drag | a box from the press point, as Box does: everything it touches is **added**. The box corner shows the moment the hold registers; lifting without dragging selects nothing |
+| long press anywhere else, then drag | a box from the press point: everything it touches is **added**, labels included. The box corner shows the moment the hold registers; lifting without dragging selects nothing |
+| tap a selected label | put that label back |
+| one-finger drag from a selected label | move the whole selection |
 | Cut | the selection becomes a stamp, and pasting starts with the ghost **exactly where the selection was** |
 | Copy | the selection becomes a stamp and goes back down; if all of it fit, pasting starts with the ghost over the originals |
 | a stamp swatch | paste it (tap it again to stop) |
@@ -589,10 +804,10 @@ outlined in cyan. Deselecting places it back wherever the selection now is.
   (moved onto something, say) stays selected, tinted red where it clashes.
   So a deselect-all can leave a few behind, and Copy then does not start
   pasting, leaving the player to deal with them.
-- **The Box only adds.** It appears only once something is selected, so a
-  box select is: tap one thing that belongs in it, then Box and drag. It
-  first toggled (dropping what was selected in the rectangle), which made
-  growing a selection by overlapping boxes undo itself.
+- **A box only adds.** It first toggled (dropping what was selected in the
+  rectangle), which made growing a selection by overlapping boxes undo
+  itself. There used to be a Box button on the selection bar as well; it
+  was removed because the long press below was the only way it got used.
 - **The pose is a continuous centre point**, like a placement ghost, so four
   turns come back exactly where they started. It is re-centred on the
   selection's box whenever the membership changes.
@@ -616,9 +831,9 @@ outlined in cyan. Deselecting places it back wherever the selection now is.
   with nothing planned, and while selecting; elsewhere it is an ordinary
   press.
 - **A long press anywhere but a belt arms a box** at the press, so a box
-  select needs no Box button and no first entity. `onLongPress` answers
+  select needs no first entity. `onLongPress` answers
   `"drag"` and `camera.js` hands the finger's moves and lift to the drag
-  hooks, the same path the Box button's drag takes. The cost is that a
+  hooks. The cost is that a
   still hold off a belt no longer ends as a tap (it used to start a run or
   a placement there); it does nothing. A hold on a **selected** entity is
   the exception and stays a press, so a slow drag from it still moves the
@@ -635,9 +850,55 @@ outlined in cyan. Deselecting places it back wherever the selection now is.
   (the desktop's empty-hand R on a pair: the exit is downstream of the
   entrance by position, so swapping the role alone would leave it upstream
   of its own entrance). A pair inside the selection reverses together and
-  stays paired. Machines are left alone, so a whole subtree can be
-  reversed in one go and its machines turned by hand. It changes the
-  lifted entries; the selection going down is the edit, one undo step.
+  stays paired. It changes the lifted entries; the selection going down is
+  the edit, one undo step.
+- **Reverse inverts the machines that have an inverse**
+  (`reversedGate()` in stamp.js). Swap and Reciprocal turn half round, and
+  Merge and Route each become the other, turned half round. A half turn
+  keeps the box, and so the origin, where it was, and puts every input
+  port exactly where an output was. The point is a tree of these: send
+  signals out through it, then copy it and Reverse the copy to undo every
+  swap and route. That only works if the control polarity lines up too, and
+  it does: Merge takes lane `a` when `c > 0`, and the turned Route sends a
+  positive control's value back out of that same cell. A half turn
+  commutes with the mirror, so a flipped machine keeps its flip. Every
+  other machine is left alone.
+
+  `tests/stamp.test.mjs` runs values through each gate, joins each output
+  port to the reversed gate's input on the same cell and face, and asserts
+  every value comes back out of the port it went in by. It covers every
+  orientation and both control signs. It is mutation-tested: no turn, a
+  turn plus a mirror, and Merge/Route kept as themselves all fail. The
+  turn-plus-mirror case **passed** at first, because the test looked up
+  the reversed gate's orientation with the original flip and not its own.
+- **Labels travel with the selection.** A box lifts every label whose box
+  it touches off `board.notes` into the stamp's `notes`
+  (`core/stamp.py`'s `Stamp.annotations`, rects in the stamp's frame), drawn
+  dimmed with the lifted outline; hidden labels (View > labels off) are not
+  picked up, as they take no taps. A label always fits, so it goes back
+  whenever the whole selection does (`dropAll()`), or alone on a tap. Turns
+  and mirrors move a label's **centre** with the cells and never its box or
+  text, so it stays upright, readable and over what it labels. Copy, Cut and
+  the paste ghost carry them; a paste places them wherever it lands
+  (nothing blocks a label), and a label-only paste is a label edit, so it
+  does not restart the simulation. The stamp's box is the **entities'**,
+  so a label hanging outside them does not move the paste ghost; a stamp of
+  labels alone takes their box on the cell lattice. Reverse, Index and the
+  selection vector ignore labels.
+
+  `tests/stamp.test.mjs` puts each label on a marker belt and asserts it is
+  still centred on that belt, at its own size, after random sequences of
+  turns and mirrors (mutation-tested: turning the wrong way, a no-op mirror
+  and swapping w/h all fail). The desktop is **not** the oracle here:
+  `core/stamp.py`'s `rotated()` and `mirrored()` turn a label inside the
+  box (`rotate_in_box()`) *and then* shift it again in `normalise()`, so on
+  a 3×1 run a label on the last belt comes back on the wrong end after a
+  clockwise turn or a mirror (the counter-clockwise turn is only right
+  there because the run is one cell tall). The two apps do not share
+  stamps, so nothing crosses over, but the desktop's is a bug.
+- Rounding: a label's rect is rounded to a millionth by the transforms, not
+  to the thousandth a dragged label uses -- at a thousandth a box of odd
+  thousandths moved half a thousandth a turn.
 - **Underground pairs.** Lifting one end of a pair releases the other
   (`Engine.unpair_under()`). Both ends lifted stay paired to each other.
   Placing back pairs the stamp's own ends first, then each unpaired end
@@ -790,8 +1051,13 @@ adds `dt * rate` and spends the whole ticks; the remainder is `alpha`,
 which the renderer feeds to the closed form so items glide between ticks.
 Banking seconds and dividing (the desktop's way) left float residue that
 turned a whole tick into 0.9999 of one; the unit test caught it. A frame's
-dt is clamped to 0.25 s and the backlog to 240 ticks, so a backgrounded tab
-never freezes to catch up. **Rendering loops only while playing**; paused,
+dt is clamped to 0.25 s and the backlog to 240 ticks or a quarter second's
+worth at the rate, whichever is more, so a backgrounded tab never freezes to
+catch up -- a flat 240 would have capped 10000 tps at 240 ticks a frame.
+`paint()` also stops stepping after `STEP_BUDGET_MS` (12 ms) of a frame and
+drops the rest, so a rate the board cannot sustain runs as fast as it can
+rather than starving frames into a growing backlog; the fps counter's tps is
+the rate actually reached. **Rendering loops only while playing**; paused,
 the board is still redrawn on demand.
 
 ### How items draw
@@ -889,6 +1155,528 @@ results are discarded), or a belt's run (its id, length, whether it is fed
 and drains, and the items on it, head first). Rewritten every frame; the
 panel touches the DOM only when the text changes.
 
+## Audio
+
+The panel's **Audio** folder makes sound from the ticks: a drone per moving
+belt run and a click per gate fire. **On by default, and remembered across
+sessions** (`gates.web.sound.v1` in localStorage, written only by the
+player's own tap). A browser starts audio only from a gesture, so a launch
+with sound on shows the button on and starts it on the **first tap or key
+anywhere** (`armSound()`: pointerup, touchend, keydown -- the events that
+count as activation on a touch screen; a tap on the sound button itself is
+left to its own click, which turns sound off). It is switched by the
+**sound button** in the board's top-left corner -- a speaker, crossed out
+while off -- not from the panel; the Audio folder holds the meter and the
+dials. The dials travel **with
+the save** (below) and are also kept in the panel's preferences as the
+last ones in front of the player; the switch is never in a save.
+
+**Off costs nothing.** `audio.js` and the worklet are imported only when
+the switch is ticked, and the tick's only trace is `Sim.audio`, null: one
+check in `step()`, passed on to `structurePhase()`. Measured on `cpu.npz`
+(best of 8 runs in node): 67 µs a tick before, 63 µs after with audio off,
+73 µs with it on -- the recorder is the whole on-cost.
+
+Three files, split by thread:
+
+- [audio-params.js](audio-params.js) -- the dials (`AUDIO_DEFAULTS`,
+  `AUDIO_SPEC`) and the gate groups. Tiny and loaded always, so the panel
+  can show the dials without any audio code.
+- [audio.js](audio.js) -- main thread. `Recorder` is `Sim.audio`: per tick
+  it writes one bit per **candidate run** (a run no longer than the cutoff)
+  and a fire count per **group** into flat typed arrays, and `paint()`
+  posts the frame's ticks to the worklet (`flush()`, buffers transferred),
+  or `stop()` while paused. `startAudio()` builds the graph.
+- [audio-dsp.js](audio-dsp.js) -- `GatesSynth`, the synthesiser, as a plain
+  class; [audio-worklet.js](audio-worklet.js) is its AudioWorklet wrapper.
+  Plain so `tests/audio.test.mjs` renders it under node.
+
+What sounds:
+
+- **A belt run is active on a tick** if it pushed or popped, or its newest
+  item moved (the belt status colours' "moving", with "stalled but moving:
+  green"). Two `positionOf()` calls per candidate per tick. Its drone has
+  pitch **min-length Hz × min length / length** (the sim's length, buried
+  underground tiles included): the dial is the pitch of the shortest run
+  that sounds, so raising min length transposes everything up and the
+  shortest audible run stays at the dial's pitch, 10 tiles is still an
+  octave above 20, and every run is a subharmonic of that pitch. (The key
+  is still `beltMaxHz`, so saves keep it; at min length 1 nothing moved.) Runs outside **min length** to **max
+  length** get no voice (the recorder leaves them out of the candidates).
+  Attack and release dials gate it per tick: short, a run moving every
+  other tick buzzes at half the tick rate; long, it smooths to a drone.
+  The dials are a **10-tile run's** times: **sluggishness** s (-2..2, 0 by
+  default) scales them by (length / 10)^s, so at 1 a 20-tile run is twice
+  as slow and a 5-tile one twice as quick. Per voice (`envFor()`), set on
+  allocation and on any dial change, so a sounding voice follows it.
+  **Follow tick rate** scales the pitch by (rate / reference)^track; 0
+  (the default) keeps it fixed.
+- **A gate fire is a click**: an impulse into a two-pole resonator (tone,
+  decay), per group -- **0: Swap, Route, Merge; 1: everything else**;
+  Sources are silent (`audioGroupOf()`). Only the per-tick **count** per
+  group crosses threads, so fires cost the same on any board. Clicks
+  closer together than a click lasts overlap into a buzz at the tick rate,
+  by design: raise the rate and the ticking becomes a pitch.
+- **Normalisation is against the board, not the moment**: a drone is scaled
+  by 1 / N^p with N the candidate runs, a group's clicks by 1 / N^p with N
+  that group's gates. N changes only on an edit, so more activity is always
+  louder; p = 0.5 puts "everything active" near full scale for
+  uncorrelated voices. A tanh soft clip is the safety net (switchable). The
+  meter shows the peak before it, in dB, and counts clipped samples.
+
+**Time.** The sim ticks in bursts, a frame's worth at once; the synth plays
+them back evenly at the rate they were run at, **latency** behind (60 ms).
+Playback starts once that much is queued, and its speed follows the queue's
+depth (smoothed, 0.25× to 1.25×): if the sim cannot reach its rate (the
+frame budget drops ticks), playback slows and pitches sag rather than
+gapping. A queue over 3 latencies deep is **skipped** to the target, not
+raced through. Run dry -- paused, or stalled -- every voice releases and
+playback waits to refill. A tick takes effect at its start (an early
+version applied each tick after its own duration, at a placeholder rate of
+1 tps, and so played nothing at all).
+
+**Voices.** A voice belongs to an active run, never to a candidate as such:
+13 candidates of which 4 are active take 4 voices. Past the **voice limit**,
+a run turning on is **refused** (no stealing, which would click) and counted;
+when a voice frees -- its run off and its release finished -- the first
+refused run still on takes it. A releasing voice still holds its slot, so
+at high tick rates with a long release the count runs near the limit while
+few runs are active at any one instant: the meter shows both
+(`voices n / limit`, `runs active k of N`). The pool is
+`VOICE_LIMIT_MAX` (1024). A reconfig (any edit: the run ids are rebuilt)
+orphans the old voices, which release out at their old pitch.
+
+**The forecast is not heard.** `forecast()` runs a real `step()` and rolls
+it back; `step()` skips the recorder while `rec` is set, or every drawn tick
+would be heard twice. Pinned by the recorder test, which also asserts the
+recorded run is tick-for-tick identical to an unrecorded one.
+
+**The scale** ([scale.js](scale.js); Audio > **Customize scale…**). A
+scale is a **wavelength** function f(n), normalised so the min-length run
+keeps the dial's pitch: `Hz(n) = (min-length Hz) × f(m) / f(n)`, m the min
+length. f(n) = n is the original law (the Standard preset), and
+`tests/scale.test.mjs` pins that it gives exactly the old pitch.
+
+- **The sheet sits at the top of the screen** (`.sheet-top`), for room,
+  and scrolls if the screen is short. Top to bottom: a short scrolling
+  list of the presets with their formulas, ending in **Table…**; the
+  formula box; copies of the **min-length Hz** (logarithmic, 50-8000,
+  snapped to 10) and **min length** dials, so the pitch can be retuned
+  without leaving the sheet (they and the panel's are the same dials);
+  then **Notes** or **Lengths** below.
+- **Notes** lists the lengths from the min length with Hz, the nearest
+  note and cents. **Lengths** is a histogram of every run that may sound
+  -- inside the min and max length and, with an audio selection, touching
+  it -- one bar per length, coloured by the note it plays (hue = pitch
+  class, so a scale's shape shows), heights on a **square-root** scale (one
+  length usually dwarfs the rest, and a lone run would be a pixel tall).
+  A tap or drag on it reads out that length's count, Hz and note. The runs
+  come from `eligibleRuns()` in audio-params.js, which the recorder now
+  uses too, so the plot and what sounds cannot disagree.
+- **Presets are formulas** (Standard, Semitones, Major, Minor, Harmonic
+  minor, Pentatonic, Minor pentatonic, Blues, Whole tone, Dorian): picking
+  one fills the formula box, so a preset is a starting point to edit.
+  **Table…** loads a file; with one loaded and a formula playing, it
+  switches back to that table instead, and tapped while the table plays it
+  loads a new one. The
+  scale ones are `2 ** (major(n - m) / 12)` and so on: longer runs walk
+  down the scale from the min length, which is the root.
+- **The formula language** is parsed, never `eval`ed, since a formula
+  rides in save files: numbers, `n`, `m`, `pi`, `e`, `+ - * / % ** ^ ( )`
+  (`%` never negative, `**` right-associative, `-2 ** 2` is -4), and
+  `floor ceil round abs sqrt exp log log2 log10 sin cos tan sign fract min
+  max pow mod clamp`, plus one function per scale (`major minor harmonic
+  pent minpent blues whole dorian`) giving degree k's semitones, continuing
+  by octaves both ways. Errors name what went wrong.
+- **A table file** ("Table…"): numbers separated by spaces, commas or
+  lines; the i-th is f(i) from n = 1, and past the end the last holds.
+- **It applies as it changes.** Every edit that parses goes straight to
+  the dials (`setScale()`): the synth re-pitches sounding voices on its next
+  tick. A half-typed formula shows red and the last good one keeps
+  playing. The preview lists the lengths from the min length, with Hz and
+  the nearest note and cents.
+- **The synth compiles it** (`scaleTable()` in `applyParams()`, only when
+  the formula, table or min length changed), so live playback, a bake and
+  a video's soundtrack read the same dials the same way. Three dials:
+  `scaleMode` (`formula` / `lut`), `scaleExpr`, `scaleLut` (the numbers as
+  text); saved with the board and the panel's preferences like any dial,
+  and a bake under another scale goes stale. A length whose f is not a
+  positive number falls back to the standard pitch, and the preview says
+  how many did.
+
+**Tone** (a sub-folder): a gain per run length for **lengths 1 to 6** --
+the shortest runs are the highest pitches, and the usual thing to tame --
+with 7 and longer at 1. Per voice, not a filter, so it takes exactly those
+runs and nothing else (a filter would also take the upper harmonics of
+longer runs under a triangle or saw); it follows the dial on voices already
+sounding. **Pitch tilt** (0..2) multiplies that by (length / min length)^tilt:
+a min-length run is unchanged and each doubling of length is +6 dB per unit
+of tilt -- about what a small speaker (and an ear) loses per octave down,
+so near 1 a single run sounds about equally loud at every length and above
+1 the low runs dominate. Capped at +24 dB. Phone speakers barely play
+below 150-200 Hz at all, which the waveform dial helps with too: a saw
+gives a low run harmonics the speaker can reproduce. **Low cut** is a 2nd-order Butterworth high-pass on the whole mix
+against rumble (0 Hz is off), per sample, so a bake stays bit-identical.
+
+**Start tick and fade** (`startTick`, `fadeMs`): the synth is silent while
+the tick it plays is before the start tick, then fades in. It keeps
+following the runs while silent, so a drone already going at the start
+tick fades in rather than starting cold. Each batch carries its first
+tick's number (`tick0`) for this. Default 0 and 0: no change.
+
+**Set audio selection** (a button): with entities selected, only they
+sound -- a run if any of its cells is selected (underground ends count),
+a gate if any of its cells is -- and with nothing selected everything does
+again. The cells are taken where the selection sits at the press, and kept
+after deselecting; the meter adds "sound selection: n runs, m gates".
+Unselected gates click in the silent group, as a Source does, so it costs
+nothing per tick, and **normalisation counts only the selection**, so an
+isolated part fills the mix. A change of sound selection makes a bake stale,
+and a video's soundtrack uses it.
+
+**Set audio region** (the next button) is the other way to choose: a
+**place**, not a set of entities. The button arms it ("drag a box…"); the
+next one-finger drag on the board, in Build or the Hand, draws a box (a
+still hold then a drag starts it at the finger, not a selection), and
+every run and gate touching the box sounds -- whatever is built, moved or
+deleted there afterwards, since the recorder re-asks on every rebuild. It
+shows as a dashed cyan outline (an editing mark, not in videos). A tap
+while armed, or a box touching no entity, goes back to everything. Edits
+never reset it, only choosing again (either kind -- they replace each
+other) or loading a board. Its `cells` is an object with `has(y*W+x)`
+rather than a Set: that is the only call the recorder, `eligibleRuns()`, a
+bake and a video make of a selection, so none of them knows which kind
+they have. `tests/region.test.mjs` checks a region picks exactly the runs
+touching its box on `cpu.npz`, and that a run built inside it afterwards
+becomes a candidate.
+
+**Space: camera-aware audio, and soft edges** ([space.js](space.js);
+Audio > **space**). The region is no longer a cell filter but a **space**: a
+box, and every run and gate weighted by its distance from it. Inside
+(anything touching the box) is full volume and unfiltered; out to the
+**soft edge** -- a fraction of the box's longer side, so a camera box feels
+the same at any zoom -- the volume falls along a half cosine to 0, and the
+**distance low-pass** (a one-pole per voice) closes from 18 kHz by up to 7
+octaves at the fringe's edge. Beyond it nothing is heard. **Soft edge 0 is
+a hard edge** -- touching or nothing, exactly the region as it was -- and
+both dials default to 0.
+
+- **Camera-aware** (a switch) makes the box the screen -- the whole board
+  view, scaled about its centre by **screen scale** (0.5: a box half the
+  screen's size). It takes over from a drawn region while on. An entity
+  selection still narrows what can sound, and the box weighs it.
+- **Panning never re-voices.** The candidates (length window and entity
+  selection) are fixed; distance is a per-candidate gain and cutoff sent
+  as their own message (`Recorder.setSpace()` -> the synth's `space`),
+  only when the box moves by a hundredth of a cell or a dial changes
+  (`spaceKey()`). A reconfigure would orphan every voice. On `cpu.npz`
+  panning took the heard runs from 110 to 245 of a fixed 613.
+- **Out of earshot takes no voice**: a run at gain 0 is not voiced even
+  while active (and not counted as refused), so a big board seen through a
+  small screen does not fill the voice limit with silence; moving it into
+  earshot voices it at once.
+- **Gains glide** (40 ms) per voice, and the drones normalise by the
+  weights' **sum** rather than the count -- glided too, since it moves with
+  the camera -- so a screen's worth fills the mix as an isolated part does.
+- **Gates click by their weight**: a fire adds its gate's gain to its
+  group's count, and groups normalise by the gains' sums. They get the
+  falloff but not the low-pass, since a group's clicks share one
+  resonator.
+- **Shown** as the box dashed and, with a soft edge, the fringe's limit
+  dotted with round corners (distance is Euclidean). The region's always
+  shows; the camera's only while the Audio folder is open in an expanded
+  pane -- the same rule the video frame now follows (it ignored a minimised
+  pane before). A sub-folder folding inside Audio or Video bubbles a fold
+  event up; those are ignored by target.
+- **Bakes and videos**: a bake uses the space at the press; a video's
+  soundtrack with camera-aware on hears the **video's** frame, which moves
+  with the end camera (`videoSpaceAt()`: tick -> frame -> crop box, scaled).
+  A bake does not follow a pan made after it.
+- Without a space every path is unchanged to the bit (the existing audio
+  tests, bit-identical bakes included, pass untouched);
+  `tests/space.test.mjs` pins the curves, a hard edge being exactly
+  "touching the box" on `cpu.npz`, the soft fringe, and the synth: no
+  voice at gain 0, re-voiced on a pan without a reconfigure, and the
+  low-pass cutting a saw's high-frequency energy tenfold.
+
+**Any change to the board resets** an entity selection, and since selecting is itself an
+edit here (the selection is lifted off), "a change" means a change of
+**content**: `Board.contentHash()` -- every occupied cell's type, facing,
+footprint offset and flags, a Source's value and a belt's seed value, but
+**not row ids** (putting a selection back where it was can take different
+rows) and not gate channels (rewritten every tick). The reference is the
+first stable board after the press, so deselecting in place keeps it and
+moving the selection, any other edit, an undo or a load resets it (labels
+are not content). `Recorder.setSelection()` syncs the sim and reconfigures
+at once rather than at the next tick -- configuring against a sim that had
+not yet seen the lift read rows the lift had freed. Tested: the hash
+survives a lift and put-back, ticking and a label, and moves with a moved
+machine or a Source's value; the recorder takes exactly the touched runs
+and gates.
+
+**A slow tick rate must not kill the worklet.** At 5 tps one tick lasts
+200 ms, longer than the skip threshold (3 × 60 ms latency): starting
+playback took the only queued tick, and the skip test, on the depth
+measured *before* that, `skip()`'d an empty queue -- a throw, and an
+AudioWorkletProcessor that throws is silent for good, so sound came back
+only by switching it off and on. Now the start threshold is at least 1.5
+ticks (`max(latency, 1.5 / rate)`), the depth is re-measured after the
+start, `skip()` returns on an empty queue, and the worklet catches any
+throw, stops the synth (it restarts on the next ticks) and posts
+`{type: "error"}`, which main.js logs. Pinned by a test streaming 1000 →
+5 → 10 → 2 → 1000 tps that asserts no 100 ms window goes silent.
+
+**The queue's lag cap scales with the tick.** It drops the oldest ticks
+past 1 s queued, which at 1 tps is one tick -- less than the 1.5 ticks
+playback waits for, so ticks were dropped and the drone moved every other
+tick (or, fed perfectly evenly, never started). The cap is now at least
+`(SKIP_AT + 1) * 1.5` ticks; at 1 tps the audio runs about 1.5 s behind
+the picture, the price of never running dry between ticks. Pinned by a
+test that every tick plays at 0.5, 1 and 2 tps.
+
+**Hold on underrun** (off by default): when the queue runs dry, the voices
+hold where they are instead of releasing, and playback picks up the moment
+ticks arrive, with no refill wait. A hold gives up after `HOLD_MAX_S`
+(0.5 s); a pause is still a stop. It is the realtime remedy for stutter at
+busy moments; baking is the thorough one.
+
+### Baking
+
+**Bake audio…** (Audio folder) opens a sheet: seconds (default 30, at most
+300) and ticks per second (default the current rate), **Bake**, **Cancel
+bake**, **Play / Pause** and **Download WAV** (16-bit mono). Play / Pause
+plays the baked buffer on its own -- the simulation untouched -- from where
+it was paused, from the start once it has played through; on the sound's
+context, or one made in the tap when sound is off. Closing the dialog, a
+new bake or Play on the board stops it. [audio-bake.js](audio-bake.js)
+renders the stretch ahead of time with no frame budget and no deadline:
+the same recorder and the same synth, the synth **offline** (no latency, no
+speed control, no skipping), fed every tick before it renders their
+samples. About 0.6 s for 4 s at 240 tps on desktop; most of the cost is
+ticks, so 10000 tps is far slower to bake than 240.
+
+- **It starts with a Reset and keeps that state** (`Sim.clone()`), and
+  while the bake is live **Reset restores it** (`Sim.restoreFrom()`)
+  instead of re-deriving. A rebuild renumbers the runs, alternating scan
+  order, and the numbering decides the belt phase's order, so only the
+  same state is sure to replay the same ticks. With no bake, or after an
+  edit, Reset is the desktop's as before (`check_web_sim.py` is unaffected).
+- **It runs on a clone**, in 25 ms chunks with a yield between, so the live
+  board is untouched and the page stays live. A clone copies the entity
+  table and each run's ring and counters; everything derived (gate table,
+  edges, cell maps, the grid) is shared, since a clone never rebuilds. An
+  edit or a new board cancels the bake.
+- **Warm-up**: the synth runs from about half a second (attack + release)
+  before the start tick, so the bake starts with the voices a realtime run
+  would have.
+- **Playback**: while the live sim is in the baked stretch, at the bake's
+  rate, with the same dials (`bakeKey()`: everything but latency and hold),
+  the buffer plays straight to the destination -- no queue, so only the
+  output's own latency -- and **the audio is the clock**: each frame steps
+  the sim to the tick being heard (context time less `outputLatency`), with
+  a 100 ms step budget, so a busy frame drops frames rather than drifting.
+  Leaving the stretch, pausing, or the bake going stale hands back to
+  realtime (a small skip, accepted). The meter's last line says which bake
+  exists and why it is stale.
+- **A bake is the same to the bit however it is chunked**, which took three
+  fixes in the synth, all inaudible but each a real dependence on where a
+  render call ended: offline, tick k starts at sample `round(k * sr /
+  rate)` from a sample count rather than an accumulated float; finished
+  voices are freed only on a tick boundary, **after** the span is rendered
+  (a refused run given the freed slot mid-loop was rendered over the whole
+  span, starting before its time); and a dead click is flushed to zero per
+  sample rather than at span ends. Found by baking twice and comparing.
+
+### Audio settings in the save
+
+Every save carries the dials and the Bake dialog's seconds and rate under
+its own `audio` key: a JSON string in a 0-d array, the same shape as
+`annotations` (`audioRecord()` / `parseAudio()` in audio-params.js). The
+desktop ignores a key it does not know, so it still loads these files; it
+does not write the key back, and is deliberately left that way.
+
+- **Loading a save with settings applies them** over the dials and shows
+  "audio settings loaded from this save" in the meter for a few seconds.
+  **A save without them** (the bundled ones, anything older) leaves the dials
+  as they are. Either way `board.audio` then becomes the dials in front of
+  the player, so the next save writes them.
+- **A dial change is a change for the autosaves**, like a label edit
+  (`board.audioRev` is part of the save key, and it sets `edited`), but it
+  does not restart the simulation and is not an undo step: a slider drag
+  is dozens of changes. Reset audio dials is one more such change.
+- **Applying a save's dials is not a change.** Tweakpane's `refresh()` fires
+  `change` (it re-snaps the value to the step), so `Panel.applyAudio()`
+  holds `applyingAudio` while it refreshes and the panel does not report
+  it; without that, merely loading a save counted as an edit and woke the
+  autosaves.
+- **Cleaned on read** (`cleanDials()`): only known dials of the right type,
+  clamped to the panel's ranges; a bad entry costs that dial, a corrupt
+  blob costs the settings, never the board.
+- The baked audio itself is not saved: memory only, and tens of MB.
+
+Two practical notes: the `AudioContext` is created and resumed **inside the
+tap** (main.js `setAudio()`), before the dynamic import, since iOS will not
+start one made after an await; `navigator.audioSession.type = "playback"`
+is set where the browser has it, or the iPhone's silent switch mutes it.
+The sound button **blurs itself** after a tap: otherwise the next Space
+(play) toggled audio off again.
+
+`tests/audio.test.mjs`: the octave rule and rate tracking by zero
+crossings; silence when idle; the buzz's period is the tick's; the start
+threshold and run-dry release; the skip; the voice limit (refusal and
+reuse); stop; the groups; the recorder on `cpu.npz`; the start tick and
+fade; hold on underrun; sample-exact ticks offline; the WAV header; and a
+real bake -- the live sim untouched, two bakes identical, and
+`restoreFrom()` replaying the same ticks; the length window (and that
+changing it reconfigures); the per-length gains, live; and the low cut. Mutation-tested:
+recording the forecast, never reusing a freed voice, and a wrong pitch law
+each fail it.
+
+## Video
+
+The panel's **Video** folder renders a stretch of the simulation **offline**
+into an MP4: after Fluoddity's Recording tab (`aphid91/fluoddity-web`,
+`src/recorder/`), with **mediabunny** (MPL-2.0, vendored unmodified as
+`vendor/mediabunny-1.55.1.min.mjs` with its licence, and imported only when
+a recording starts). [video-params.js](video-params.js) is the settings and
+the camera arithmetic, loaded always and tested in node;
+[video.js](video.js) is the recorder, loaded on demand.
+
+- **Settings**: width and height (128-3840, even -- H.264 4:2:0 needs it;
+  the first default is the board's size on screen in device pixels),
+  duration (1-120 s), **ticks / s** of video, and mediabunny's five named
+  quality levels. 60 fps, fixed. The summary line reads "frames · size ·
+  ticks/frame", then progress. Persisted with the panel; the end camera is
+  per session.
+- **Offline, on a copy.** It starts **from the current tick**, on a clone
+  of the sim (as a bake does), and draws each frame into its own canvas
+  with `render()`, so the frame budget and the live board's playback never
+  touch it. The live sim is paused meanwhile, and an edit or a new board
+  stops the render. Frame `f` is the state at tick `t0 + f * tps / 60` --
+  fractional ticks drawn at that alpha, so a slow tick rate still moves
+  smoothly -- stamped `f / 60`, a **computed** time, so a frame that takes a
+  second to draw still lasts 1/60 s. `await video.add()` is the
+  backpressure (Fluoddity's note): dropping it queues frames until the tab
+  dies.
+- **What is drawn**: the board as View draws it -- grid, status colours,
+  the pixel overlay (the copy gets its own Screen, starting blank), labels,
+  **layers** (hidden ones left out, items included, tints and layer labels)
+  -- and never the selection, ghosts or other editing marks
+  (`drawVideoFrame()` in main.js; `gateStatus()`/`beltStatus()` take the sim
+  to read for this). The layers are the view taken at Record
+  (`recLayers`), applied through the same `layerOpts()` the screen uses, so
+  the two cannot draw them differently; the copy shares the live board's
+  grid, table and lists (an edit stops the recording), so that view is
+  exact for every frame. Changing a layer's visibility or sliders mid-render
+  does not reach the video.
+- **Sound**: with Audio's switch on, the same ticks are baked
+  (`bakeAudio(..., t0)`: a bake may now start mid-run, at the video's own
+  first tick, so the soundtrack starts and ends with the picture; the start
+  tick still silences what comes before it) and fed to an audio track a
+  second at a time beside the frames. AAC, or Opus where AAC cannot be
+  encoded (Linux Chromium); H.264, then VP9, then AV1 for the picture, each
+  asked of the browser rather than assumed.
+- **The camera**: the frame is the largest box of the video's aspect that
+  fits the view (`cropBox()`), shown on the board while the folder is open;
+  **Select end camera state** captures the view as it is, drawn dashed, and
+  **Unset end camera** drops it. The move runs from the view at Record to
+  the end state over **start lerp .. end lerp** (fractions of the video,
+  still outside), its speed a trapezoid: **fade in** and **fade out** are
+  the ramps as fractions of that window (0/0 constant speed, 0.5/0.5 a
+  smooth S; scaled down if they exceed 1). Centre linear, size geometric,
+  so a zoom feels even.
+- **The file name** is the board's name and a short timestamp, e.g.
+  `CPU experiments 11-20 12_07_33.mp4` (underscores, not dots), so several
+  takes of one scene do not collide.
+- **Saving**, as Fluoddity: the file picker is raised **before any other
+  await** in the click (it needs the gesture), and a chosen file is
+  **streamed** into (`fastStart: false`, flat memory; `finalize()` closes
+  it -- closing again throws); no picker (Firefox, Safari, iPhone) or a
+  failed one **buffers** in memory and downloads at the end; Cancel in the
+  picker records nothing. **Cancel recording** keeps what was encoded: a
+  partial video is still a video.
+
+**The dry run**: with an end camera set, pressing play flies the view along
+the path a recording started now would take, to tune the start view and
+the fades without rendering. The view at the press is the start, and the
+**tick on screen** picks the frame (frame f is tick `t0 + f * tps / 60`, as
+in video.js), so the camera matches the content at any play rate -- at the
+video's own ticks/s it runs in real time. The view is set so the crop box
+*is* that frame, and holds the end view once the path is done. The video
+and camera dials apply live. **Any disturbance restores the view** from the
+press: pause, a pan or zoom of any kind, an edit (undo included), Reset, a
+load (which then frames the new board), unsetting the end camera, starting
+a recording. A manual move is detected by the camera no longer being where
+the dry run last put it (`driveDryRun()`), which catches drag, pinch,
+wheel, the pan glide and Fit board without touching camera.js. Checked in
+the browser: a second into a 2 s path at the video's rate the zoom is the
+geometric midpoint, a pause or a pan puts back the exact start view, and a
+full run holds the end view.
+
+Checked in headless Chromium: 2 s at 480×270 with sound and an end camera
+gave 120 frames of H.264 at exactly 2.00 s and an Opus track (mean
+-15 dB), the first frame the whole board and the last the zoomed end
+camera, the live sim still at its tick; cancelling a 1080p recording at
+frame 182 gave a valid 3.03 s file. `tests/video.test.mjs` covers the move
+(still outside the window, monotone, continuous, linear without fades,
+symmetric), the crop box, the lerp, the settings, and a bake starting
+mid-run.
+
+## Presentation mode
+
+`…/#b=<name>` opens a **presentation**: `presentations/<name>.json` and the
+board it names (`<name>.npz` beside it), as a show rather than an editor.
+[present.js](present.js) is the page; main.js hands it a small interface
+(`presentApi`) and three hooks (taps, the frame, Space). The editor makes
+them: the panel's **Presentation** folder, and **Export presentation
+(.zip)**, which zips the pair. Unzip it into `web/presentations/` and push;
+`build.sh` copies the pairs into the site. A change of hash reloads.
+
+- **The JSON**: `rate` and up to four other `rates`; `startCamera` and
+  `endCamera` as world boxes `{cx, cy, hw, hh}` (`viewBox()`), fitted to
+  whatever screen opens it (`fitBox()`); `schedule` -- ticks, and the
+  video's lerp start/end and fade in/out; `views`, one or more, the first
+  the default. A view is the panel's View, status colours and Dev dials
+  (`Panel.captureView()` / `applyView()`) plus each layer's visible, active,
+  tint and label size and the labels' master switch (`captureViewState()`
+  / `applyViewState()` in main.js; layers are matched by id).
+- **Export** takes the board as it stands -- a selection put down first;
+  audio settings and labels ride in the save -- the view in front of the
+  player as "default", the captured detail view if set, and the folder's
+  draft: name, start rate and four rate boxes (blank or 0 unused), the
+  cameras (no start camera: the whole board) and the schedule. The draft
+  persists with the panel's preferences.
+- **The page** shows the board, the sound button, Reset and Play/Pause
+  (bottom middle), an **i** button cycling the views (hidden with only
+  one), and the **speed** panel (bottom left, above the button row so five
+  rates never reach the centred buttons), the starting rate lit -- no
+  panel at all without other rates. Everything else is hidden by
+  `body.presenting`. It writes **nothing** to the browser's storage:
+  `freezePersist()` runs before the shell and the panel are built, and
+  every store (panel prefs, the shell's, the layer panel size, saves and
+  autosaves) checks `persistEnabled()`; no resume, no autosave timers.
+- **Tap to begin**: the board loads dimmed under a cover that takes the
+  whole gesture, tap or drag, so the drag that dismisses it neither pans nor
+  ends the schedule; its lift also starts the sound. Then the sim plays and
+  a toast says "drag to pan, pinch to zoom".
+- **The camera schedule** places the camera from the **tick on screen**
+  (`sim.tick + alpha` over the schedule's ticks, through `pathBox()`), so a
+  pause holds it and Reset puts it back at the start pose. It ends **for
+  good** (until a reload) the moment the camera is not where it last put it
+  -- a drag, pinch, wheel or glide, detected as the dry run does -- or the
+  rate is changed. 0 ticks, or no end camera: no schedule.
+- **A tap on a machine** (visible, not a belt or underground) pauses if
+  playing and opens a large panel with its name (the mini example board is
+  a later phase). Any tap or drag on the panel only dismisses it, and plays
+  on if it was playing. Long press, selection drags and editing keys are
+  all off.
+
+`tests/present.test.mjs` covers the hash, the record, the speed panel and
+the schedule. Driven in Chromium as a Pixel 7: export, unzip, open; the
+cover's drag leaves the camera; the schedule zooms with the ticks and Reset
+returns it; i cycles; a machine tap pauses and the dismiss resumes; a pan
+and a rate change each end the schedule; localStorage byte-identical after.
+
 ## Saving
 
 The panel's **Board** folder saves the board **to this browser** under a
@@ -914,9 +1702,11 @@ replaces the board in front of you. Saving over an existing name asks first.
   than silently left out of the file.
 - The simulation's items are **not** saved, as on the desktop: a loaded
   board starts paused at tick 0 with its seeds on.
-- **Two saves keep themselves**, listed with the rest: **auto save**, every
-  30 s (`AUTOSAVE_MS`) when the board changed since the last one, and
-  **exitsave**, whenever the app is hidden -- closed, switched away from,
+- **Four saves keep themselves**, listed with the rest. Three timed tiers
+  (`AUTOSAVES`): **auto save** every 30 s, **autosave5** every 5 min and
+  **autosave15** every 15 min. Each writes when the board has changed since
+  that tier last wrote, so the slow two are older copies to fall back on.
+  The fourth is **exitsave**, whenever the app is hidden -- closed, switched away from,
   the screen locked. A phone gives no other warning of a close, and nothing
   asynchronous can be relied on to finish in that moment, so the save's
   bytes are **prepared ahead of time** (compressed after every committed
@@ -926,10 +1716,18 @@ replaces the board in front of you. Saving over an existing name asks first.
 - **Both write the history's current state** -- the last stable board,
   `Board.toNpz(snapshot)` -- so a selection half-lifted off the board is
   saved where it was picked up, not missing.
+- **Nothing is written until the board has been edited this session**: no
+  tier and no exitsave (`edited`, set by `recordStep()`; loading a board
+  does not count). Opening the app used to clobber the saves it was opened
+  to choose between: the resumed board overwrote an older autosave before
+  the player got round to loading it. A session that only looks, or only
+  loads, leaves every save as it found it. The cost is that loading a
+  board and closing without an edit resumes the previous one next time.
 - **Opening the app loads the exitsave, unless the auto save is newer**,
   and either opens under the name of the board it holds (kept in its index
   entry), so saving it again does not write over the autosave. With
-  neither, the bundled default loads as before.
+  neither, the bundled default loads as before. The 5- and 15-minute tiers
+  are never resumed; they are loaded by hand.
 
 `tests/npz.test.mjs` writes `cpu.npz` and `ram.npz` back out after an edit,
 reads them here, and loads them through the desktop's `persistence.load()`,
@@ -973,8 +1771,20 @@ asserting every array matches and exactly the edited value differs.
 | `ui.js` | the shell's state and DOM: modes, sim and turn buttons, thumb pads, swatches, long press, picker |
 | `tools.js` | the tool catalog (from `types.json`) and the swatch drawings |
 | `icons.js` | line icons as path data (mostly Lucide, ISC) |
-| `panel.js` | the Tweakpane panel: bundled and browser saves, export, View, Debug, Status (with the live channel readout) |
-| `vendor/` | Tweakpane 4.0.5, vendored |
+| `panel.js` | the Tweakpane panel: bundled and browser saves, export, View, Audio, Debug, Status (with the live channel readout) |
+| `audio-params.js` | the Audio dials and the gate groups; loaded always |
+| `audio.js` | audio, main thread: the per-tick recorder and starting the graph; loaded on demand |
+| `audio-dsp.js`, `audio-worklet.js` | the synthesiser, and its AudioWorklet wrapper |
+| `space.js` | spatial audio: distance to the region or screen box, the falloff and low-pass curves, per-run and per-gate weights |
+| `scale.js` | belt scales: the formula language, presets, tables, the wavelength table the synth reads |
+| `audio-bake.js` | baking: a stretch of ticks rendered offline, and the WAV writer; loaded on demand |
+| `pixel.js` | the Pixel machine (web-only, in Sink's id), its screen, and the overlay's drawing |
+| `present.js` | presentation mode: the `#b=` route, its controls, the camera schedule, the info panel |
+| `persist.js` | the one switch that stops every localStorage write (presentation mode) |
+| `presentations/` | presentation pairs, `<name>.json` + `<name>.npz`, copied into the site |
+| `video-params.js` | video export: the settings and the camera move; loaded always |
+| `video.js` | video export: the offline recorder (mediabunny); loaded on demand |
+| `vendor/` | Tweakpane 4.0.5 (MIT) and mediabunny 1.55.1 (MPL-2.0, with its licence), vendored |
 | `npz.js` | `.npz` reader and writer: zip directory + native `DecompressionStream` / `CompressionStream` + `.npy` headers |
 | `saves.js` | browser saves: whole `.npz` files in localStorage, and their index |
 | `board.js` | the save's arrays, validation, derived render lists, `entityAt`/`describe`, placing, erasing, capturing, and the two setting writers |
@@ -995,6 +1805,8 @@ asserting every array matches and exactly the edited value differs.
 | `assembler.js` | the full-screen Hack editor |
 | `toast.js` | a brief message that fades by itself |
 | `vector.js` | vectors: offsets, turns, the claims overlay, laying copies, following a chain |
+| `layers.js` | layers: the table, its rules (current, visible, active), parsing, stats (counts, centres, hidden cells) |
+| `layerpanel.js` | the layer panel's DOM: rows, +, Rename / Delete / Adopt, the tint and label sliders |
 | `tests/` | `node --test` suites for the pure modules |
 | `types.json` | generated — do not edit |
 | `build.sh` | assembles `_site/`, and stamps `sw.js` with its file list and version |
@@ -1017,7 +1829,7 @@ node --test web/tests/*.test.mjs
 
 Pure-JS tests (the planner, the placer, the stamp transforms, the run
 tracer, the closed form against the naive oracle, the opcodes, the clock,
-the `.npz` writer) run in Node, with no npm and no browser. The whole tick against the
+the `.npz` writer, audio settings in a save) run in Node, with no npm and no browser. The whole tick against the
 desktop's is a separate, slower check (about 25 s for every save):
 
 ```bash

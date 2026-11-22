@@ -6,6 +6,8 @@
 // so listing the saves never decodes one. Every access is guarded: storage
 // can be absent, full, or throw in a private window.
 
+import { persistEnabled } from "./persist.js";
+
 const INDEX_KEY = "gates.web.saves.v1";
 const ITEM_KEY = (name) => `gates.web.save.v1:${name}`;
 
@@ -39,6 +41,7 @@ function fromBase64(text) {
 // `meta` is kept in the index beside it (the autosaves record which board
 // they are of).
 export function putSave(name, bytes, meta = {}) {
+  if (!persistEnabled()) return;
   const index = readIndex().filter(e => e.name !== name);
   index.push({ ...meta, name, savedAt: Date.now(), bytes: bytes.length });
   try {
@@ -60,6 +63,7 @@ export function getSave(name) {
 }
 
 export function deleteSave(name) {
+  if (!persistEnabled()) return;
   try {
     localStorage.removeItem(ITEM_KEY(name));
     localStorage.setItem(INDEX_KEY, JSON.stringify(readIndex().filter(e => e.name !== name)));

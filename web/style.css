@@ -92,6 +92,37 @@ html, body {
   touch-action: none;
 }
 
+/* The sound button, in the board's top-left corner (the top-right is the
+   Tweakpane's, full width on a phone), and View > fps counter under it. */
+#sound-btn {
+  position: absolute;
+  top: calc(6 * var(--u));
+  left: calc(6 * var(--u));
+  width: calc(36 * var(--u));
+  height: calc(36 * var(--u));
+  padding: calc(7 * var(--u));
+  border-radius: 50%;
+  border: var(--border) solid var(--edge);
+  background: rgba(0, 0, 0, 0.55);
+  color: var(--ink-dim);
+  touch-action: manipulation;
+}
+#sound-btn[aria-pressed="true"] { color: var(--accent); border-color: var(--accent); }
+#sound-btn svg { width: 100%; height: 100%; fill: none; stroke: currentColor; stroke-width: 2; stroke-linecap: round; stroke-linejoin: round; }
+#fps {
+  position: absolute;
+  top: calc(48 * var(--u));
+  left: calc(6 * var(--u));
+  padding: 2px 6px;
+  border-radius: 4px;
+  background: rgba(0, 0, 0, 0.55);
+  color: #cfd3da;
+  font: 12px/1.3 ui-monospace, SFMono-Regular, Menlo, monospace;
+  white-space: nowrap;
+  pointer-events: none;
+}
+#fps[hidden] { display: none; }
+
 /* Tweakpane, floated in the board's top-right corner. */
 #pane-host {
   position: absolute;
@@ -445,7 +476,7 @@ html, body {
   font-size: calc(11 * var(--u));
 }
 /* The index sheet: the table choices, a and b, a preview, Apply. */
-.idx-tables { display: grid; grid-template-columns: repeat(auto-fill, minmax(calc(76 * var(--u)), 1fr)); gap: calc(6 * var(--u)); }
+.idx-tables { display: grid; grid-template-columns: repeat(3, 1fr); gap: calc(6 * var(--u)); }
 .idx-hack {
   flex: 1; min-width: 0; height: calc(34 * var(--u)); box-sizing: border-box; padding: 0 calc(8 * var(--u));
   background: var(--chrome-2); color: var(--ink); border: var(--border) solid var(--edge);
@@ -469,6 +500,61 @@ html, body {
 }
 .idx-preview[data-error="true"] { color: var(--danger); }
 .idx-apply { color: var(--accent); border-color: var(--accent); }
+/* The scale sheet, at the top of the screen for room: a short scrolling
+   list of presets (and Table…), the formula, the two pitch dials, then the
+   notes table or the lengths histogram. */
+.sheet-top { align-items: flex-start; }
+.sheet-top .sheet {
+  max-height: calc(100dvh - 12px);
+  overflow-y: auto;
+  border: var(--border) solid var(--edge);
+  border-top: 0;
+  border-radius: 0 0 calc(10 * var(--u)) calc(10 * var(--u));
+  padding-top: calc(env(safe-area-inset-top, 0px) + 12 * var(--u));
+  padding-bottom: calc(12 * var(--u));
+}
+.scale-list {
+  display: flex; flex-direction: column; gap: 2px;
+  max-height: calc(4 * 30 * var(--u) + 6px);
+  overflow-y: auto; overscroll-behavior: contain;
+  background: var(--chrome-2);
+  border: var(--border) solid var(--edge); border-radius: var(--r);
+  padding: 2px;
+  flex: none;
+}
+.scale-list .pick { height: calc(30 * var(--u)); flex: none; border-color: transparent; }
+.scale-list .pick[data-selected="true"] { border-color: var(--accent); color: var(--accent); }
+.scale-list .pick .scale-f {
+  margin-left: auto; color: var(--ink-dim);
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: calc(9.5 * var(--u));
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0;
+}
+.scale-expr { flex: none; }
+.scale-dial {
+  display: grid; grid-template-columns: calc(84 * var(--u)) minmax(0, 1fr) calc(52 * var(--u));
+  align-items: center; gap: calc(8 * var(--u));
+  font-size: calc(11 * var(--u)); color: var(--ink-dim);
+}
+.scale-dial input { width: 100%; margin: 0; accent-color: var(--accent); }
+.scale-dial output { text-align: right; color: var(--ink); font-variant-numeric: tabular-nums; }
+.scale-view { display: flex; gap: calc(6 * var(--u)); flex: none; }
+.scale-view .pick { flex: 1; height: calc(30 * var(--u)); justify-content: center; }
+.scale-view .pick[data-selected="true"] { border-color: var(--accent); color: var(--accent); }
+.scale-hist { display: flex; flex-direction: column; gap: calc(4 * var(--u)); }
+.scale-hist[hidden] { display: none; }
+.scale-hist canvas {
+  width: 100%; height: calc(150 * var(--u));
+  background: var(--chrome-2); border-radius: var(--r);
+  touch-action: none;
+}
+.scale-hist-info { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: calc(10.5 * var(--u)); color: var(--ink); min-height: 1.4em; }
+.scale-help summary { cursor: pointer; color: var(--ink-dim); }
+.scale-help > div { margin-top: calc(4 * var(--u)); }
+#scale-expr { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+#scale-expr[aria-invalid="true"] { border-color: var(--danger); }
+.scale-help { font-size: calc(10 * var(--u)); color: var(--ink-dim); line-height: 1.4; }
+.scale-help code { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; color: var(--ink); }
+.sheet-btn:disabled { opacity: 0.4; }
 /* The label editor. */
 #note-text {
   width: 100%; box-sizing: border-box; resize: vertical; min-height: calc(64 * var(--u));
@@ -615,6 +701,28 @@ html, body {
   z-index: 8;
 }
 .simpanel[data-open="true"] { display: flex; }
+
+/* The one-time hint shown when the rate panel is first closed. */
+.sim-hint {
+  position: absolute;
+  bottom: calc(100% + var(--pad) * var(--u));
+  left: 50%;
+  transform: translateX(-50%);
+  width: max-content;
+  max-width: calc(100vw - 2 * var(--pad) * var(--u));
+  padding: calc(5 * var(--u)) calc(8 * var(--u));
+  background: var(--chrome);
+  border: var(--border) solid var(--accent);
+  border-radius: var(--r);
+  color: var(--ink);
+  font-size: calc(var(--label-fs) * 1.15 * var(--u));
+  text-align: center;
+  pointer-events: none;
+  opacity: 0;
+  transition: opacity 0.3s;
+  z-index: 8;
+}
+.sim-hint[data-open="true"] { opacity: 1; }
 .simpanel-head {
   display: flex;
   align-items: center;
@@ -800,3 +908,297 @@ html, body {
   opacity: 0; pointer-events: none; transition: opacity 0.2s, transform 0.2s;
 }
 .toast[data-show="true"] { opacity: 1; transform: translate(-50%, 0); }
+
+/* ----------------------------------------------------------------------
+   THE LAYER PANEL (layerpanel.js): floated in the board's top-left corner
+   while View > layers is on. Compact rows, so dozens of layers scroll in a
+   short list rather than taking the board.
+   ---------------------------------------------------------------------- */
+/* Just under the sound button (and under the fps counter, when that shows).
+   An expanded Tweakpane draws over it (z-index 5). */
+.layerpanel {
+  --ly-top: calc(48 * var(--u));
+  position: absolute;
+  top: var(--ly-top);
+  left: calc(6 * var(--u));
+  width: min(calc(190 * var(--u)), calc(100% - 12 * var(--u)));
+  max-height: calc(100% - 6 * var(--u) - var(--ly-top));
+  display: flex;
+  flex-direction: column;
+  box-sizing: border-box;
+  background: rgba(22, 24, 29, 0.94);
+  border: var(--border) solid var(--edge);
+  border-radius: var(--r);
+  z-index: 4;
+  font-size: calc(11 * var(--u));
+  color: var(--ink);
+  touch-action: manipulation;
+}
+.layerpanel[data-open="false"] { display: none; }
+#fps:not([hidden]) ~ .layerpanel { --ly-top: calc(72 * var(--u)); }
+.layerpanel[data-folded="true"] .ly-body { display: none; }
+/* The resize grip: a right angle in the bottom-right corner, as a label's
+   (notes) grip, with a finger-sized target around it. */
+.ly-grip {
+  position: absolute;
+  right: 0; bottom: 0;
+  width: calc(26 * var(--u)); height: calc(26 * var(--u));
+  touch-action: none;
+  cursor: nwse-resize;
+}
+.ly-grip::after {
+  content: "";
+  position: absolute;
+  right: calc(4 * var(--u)); bottom: calc(4 * var(--u));
+  width: calc(9 * var(--u)); height: calc(9 * var(--u));
+  border-right: 2px solid var(--ink-dim);
+  border-bottom: 2px solid var(--ink-dim);
+  border-bottom-right-radius: 2px;
+}
+.layerpanel[data-resizing="true"] .ly-grip::after { border-color: var(--accent); }
+.layerpanel[data-folded="true"] .ly-grip { display: none; }
+/* Room under the sliders so the grip does not sit on the Label one. */
+.layerpanel .ly-body { padding-bottom: calc(14 * var(--u)); }
+.layerpanel button { font: inherit; color: inherit; touch-action: manipulation; }
+.layerpanel svg {
+  fill: none; stroke: currentColor; stroke-width: 2;
+  stroke-linecap: round; stroke-linejoin: round;
+}
+.ly-head {
+  appearance: none; background: none; border: 0;
+  display: flex; align-items: center; gap: calc(6 * var(--u));
+  padding: calc(5 * var(--u)) calc(7 * var(--u));
+  font-size: calc(var(--label-fs) * var(--u)) !important;
+  letter-spacing: var(--label-spacing);
+  text-transform: uppercase;
+  color: var(--ink-dim) !important;
+  text-align: left;
+}
+.ly-head svg { width: calc(14 * var(--u)); height: calc(14 * var(--u)); }
+.ly-fold { margin-left: auto; }
+.ly-fold::after { content: "\25B4"; }
+.layerpanel[data-folded="true"] .ly-fold::after { content: "\25BE"; }
+.ly-body {
+  display: flex; flex-direction: column; gap: calc(5 * var(--u));
+  padding: 0 calc(5 * var(--u)) calc(6 * var(--u));
+  min-height: 0;
+}
+.ly-list {
+  display: flex; flex-direction: column; gap: calc(2 * var(--u));
+  max-height: calc(28 * 7 * var(--u));
+  overflow-y: auto;
+  overscroll-behavior: contain;
+}
+.ly-row {
+  display: grid;
+  grid-template-columns: calc(16 * var(--u)) minmax(0, 1fr) auto calc(24 * var(--u)) calc(24 * var(--u));
+  align-items: center;
+  gap: calc(4 * var(--u));
+  min-height: calc(26 * var(--u));
+  padding: 0 calc(3 * var(--u));
+  border-radius: calc(4 * var(--u));
+  border: var(--border) solid transparent;
+}
+.ly-row[data-current="true"] { background: var(--sel-bg); border-color: var(--sel-edge); }
+.ly-row[data-hidden="true"] .ly-name, .ly-row[data-hidden="true"] .ly-count { color: var(--ink-dim); }
+.ly-swatch {
+  position: relative;
+  width: calc(14 * var(--u)); height: calc(14 * var(--u));
+  border-radius: calc(3 * var(--u));
+  border: var(--border) solid rgba(255, 255, 255, 0.25);
+  box-sizing: border-box;
+}
+.ly-swatch[data-none="true"] { border-style: dashed; border-color: var(--edge); }
+/* The native colour input, invisible over the swatch: a tap opens the
+   platform's picker. */
+.ly-swatch input {
+  position: absolute; inset: -4px;
+  width: calc(100% + 8px); height: calc(100% + 8px);
+  opacity: 0; padding: 0; border: 0; cursor: pointer;
+}
+.ly-name {
+  -webkit-user-select: none; user-select: none; -webkit-touch-callout: none;
+  appearance: none; background: none; border: 0; padding: calc(4 * var(--u)) 0;
+  text-align: left; min-width: 0;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.ly-row[data-current="true"] .ly-name { color: var(--sel-ink); font-weight: 600; }
+.ly-count { color: var(--ink-dim); font-variant-numeric: tabular-nums; font-size: calc(10 * var(--u)); }
+.ly-tog {
+  appearance: none; background: none; border: 0; padding: calc(3 * var(--u));
+  width: calc(24 * var(--u)); height: calc(24 * var(--u));
+  display: flex; align-items: center; justify-content: center;
+  color: var(--ink);
+}
+.ly-tog[data-on="false"] { color: var(--ink-dim); }
+/* Off and disabled (a hidden layer's star) reads fainter still; on and
+   disabled (the current layer, always visible and active) stays bright. */
+.ly-tog:disabled[data-on="false"] { opacity: 0.35; }
+/* The star: filled and bright when active, a dim outline when not. */
+.ly-star[data-on="true"] { color: var(--accent); }
+.ly-star[data-on="true"] svg path { fill: currentColor; }
+.ly-tog svg { width: 100%; height: 100%; }
+.ly-add {
+  appearance: none; background: none;
+  border: var(--border) dashed var(--edge); border-radius: calc(4 * var(--u));
+  height: calc(24 * var(--u));
+  display: flex; align-items: center; justify-content: center;
+  color: var(--ink-dim);
+}
+.ly-add svg { width: calc(14 * var(--u)); height: calc(14 * var(--u)); }
+.ly-acts { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: calc(4 * var(--u)); }
+.ly-act {
+  aspect-ratio: auto !important;
+  gap: calc(4 * var(--u));
+  padding: calc(5 * var(--u)) calc(2 * var(--u)) !important;
+  font-size: calc(10 * var(--u)) !important;
+}
+.ly-act svg { width: calc(12 * var(--u)); height: calc(12 * var(--u)); flex: none; }
+.ly-act[data-disabled="true"] { opacity: 0.35; }
+.ly-slider {
+  display: grid;
+  grid-template-columns: calc(34 * var(--u)) minmax(0, 1fr) calc(26 * var(--u));
+  align-items: center; gap: calc(4 * var(--u));
+  color: var(--ink-dim);
+  font-size: calc(10 * var(--u));
+}
+.ly-slider input { width: 100%; margin: 0; accent-color: var(--accent); }
+.ly-sval { text-align: right; font-variant-numeric: tabular-nums; }
+.ly-sname { -webkit-user-select: none; user-select: none; -webkit-touch-callout: none; touch-action: manipulation; }
+/* Layer labels switched off (a long press on "Label"): the slider dimmed. */
+.ly-slider[data-off="true"] input, .ly-slider[data-off="true"] .ly-sval { opacity: 0.3; }
+.ly-slider[data-off="true"] .ly-sname { text-decoration: line-through; }
+.ly-slider[data-na="true"] input, .ly-slider[data-na="true"] .ly-sval { opacity: 0.3; }
+
+/* The Hand's bar: the inspected entity's layer -- colour and name -- with
+   a small Make current button under them. */
+.laychip {
+  display: flex; flex-direction: column; align-items: center;
+  gap: calc(5 * var(--u));
+  flex: 0 0 auto;
+  max-width: calc(110 * var(--u));
+}
+.laychip-top {
+  display: flex; align-items: center; gap: calc(5 * var(--u));
+  max-width: 100%;
+  color: var(--ink);
+  font-size: calc(11 * var(--u));
+}
+.laychip-top .ly-swatch { flex: none; }
+.laychip-name { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.laycur {
+  appearance: none;
+  width: calc(32 * var(--u)); height: calc(32 * var(--u));
+  padding: calc(7 * var(--u));
+  border-radius: 50%;
+  background: var(--chrome-2);
+  color: var(--ink);
+  border: calc(2 * var(--u)) solid var(--edge);
+  display: flex; align-items: center; justify-content: center;
+  touch-action: manipulation;
+}
+.laycur svg { width: 100%; height: 100%; fill: none; stroke: currentColor; stroke-width: 2; stroke-linecap: round; stroke-linejoin: round; }
+.ly-act span { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+/* --- presentation mode (present.js): `#b=<name>` ------------------------- */
+/* Only the board, the sound button and the presentation's own controls. */
+.presenting #controls, .presenting #bar, .presenting #pane-host, .presenting .thumbpad,
+.presenting #fps, .presenting .layerpanel { display: none !important; }
+.pr-ui { position: absolute; inset: 0; pointer-events: none; }
+.pr-btn {
+  pointer-events: auto;
+  width: calc(36 * var(--u));
+  height: calc(36 * var(--u));
+  padding: calc(8 * var(--u));
+  border-radius: 50%;
+  border: var(--border) solid var(--edge);
+  background: rgba(0, 0, 0, 0.55);
+  color: var(--ink-dim);
+  touch-action: manipulation;
+}
+.pr-btn svg { width: 100%; height: 100%; fill: none; stroke: currentColor; stroke-width: 2; stroke-linecap: round; stroke-linejoin: round; }
+.pr-btn svg .fill { fill: currentColor; stroke: none; }
+.pr-btn:active { color: var(--ink); }
+.pr-sim {
+  position: absolute;
+  bottom: calc(10 * var(--u));
+  left: 50%;
+  transform: translateX(-50%);
+  display: flex;
+  gap: calc(12 * var(--u));
+}
+.pr-i {
+  position: absolute;
+  right: calc(10 * var(--u));
+  bottom: calc(10 * var(--u));
+  padding: 0;
+  font: italic 700 calc(17 * var(--u)) / 1 Georgia, "Times New Roman", serif;
+  color: var(--ink);
+}
+.pr-i[hidden] { display: none; }
+/* Above the button row, so up to five rates never reach the centred buttons
+   on a phone. */
+.pr-speed {
+  pointer-events: auto;
+  position: absolute;
+  left: calc(10 * var(--u));
+  bottom: calc(56 * var(--u));
+  padding: calc(4 * var(--u)) calc(6 * var(--u));
+  border-radius: calc(8 * var(--u));
+  border: var(--border) solid var(--edge);
+  background: rgba(0, 0, 0, 0.55);
+}
+.pr-speed-label { font-size: calc(8 * var(--u)); color: var(--ink-dim); text-transform: uppercase; letter-spacing: 0.08em; margin-bottom: calc(3 * var(--u)); }
+.pr-speed-row { display: flex; gap: calc(4 * var(--u)); }
+.pr-rate {
+  min-width: calc(30 * var(--u));
+  height: calc(26 * var(--u));
+  border-radius: calc(5 * var(--u));
+  border: var(--border) solid var(--edge);
+  background: transparent;
+  color: var(--ink-dim);
+  font: 600 calc(11 * var(--u)) / 1 system-ui, sans-serif;
+  touch-action: manipulation;
+}
+.pr-rate[data-selected="true"] { color: var(--accent-ink); background: var(--accent); border-color: var(--accent); }
+.pr-cover, .pr-catch {
+  position: fixed;
+  inset: 0;
+  z-index: 50;
+  touch-action: none;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+.pr-cover { background: rgba(0, 0, 0, 0.6); }
+.pr-cover-msg { color: var(--ink); font: 600 calc(20 * var(--u)) / 1.3 system-ui, sans-serif; letter-spacing: 0.04em; padding: 0 24px; text-align: center; }
+.pr-error { font-size: calc(13 * var(--u)); font-weight: 400; color: var(--danger); }
+.pr-catch { background: rgba(0, 0, 0, 0.35); }
+.pr-info {
+  width: min(86vw, 520px);
+  min-height: min(56vh, 420px);
+  border-radius: calc(12 * var(--u));
+  border: var(--border) solid var(--edge);
+  background: var(--chrome);
+  display: flex;
+  align-items: flex-start;
+  justify-content: center;
+  padding: calc(18 * var(--u));
+}
+.pr-info-title { color: var(--ink); font: 700 calc(22 * var(--u)) / 1.2 system-ui, sans-serif; }
+.pr-toast {
+  position: fixed;
+  left: 50%;
+  top: 22%;
+  transform: translateX(-50%);
+  z-index: 40;
+  padding: 8px 14px;
+  border-radius: 8px;
+  background: rgba(0, 0, 0, 0.75);
+  color: var(--ink);
+  font: 14px/1.3 system-ui, sans-serif;
+  pointer-events: none;
+  opacity: 0;
+  transition: opacity 0.4s;
+}
+.pr-toast[data-show="true"] { opacity: 1; }

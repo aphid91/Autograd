@@ -43,6 +43,10 @@ const COL = {
   itemHalo: "rgba(15,18,23,0.85)",
 };
 
+// The colours a layer tint blends from (main.js), where nothing else has
+// recoloured the entity.
+export const BASE_COLOURS = { belt: COL.belt, under: COL.under };
+
 // world.frag's ITEM_RADIUS / ITEM_RING.
 const ITEM = { r: 0.22, ring: 0.055 };
 // An item's number, as a fraction of a cell, and the zoom band it fades in
@@ -51,13 +55,21 @@ const ITEM_TEXT = { size: 0.3, glyph: 0.336 };   // its fade band: TUNE.itemText
 
 // Below this zoom (CSS px per cell) detail is not drawn at all.
 // Live from the Dev folder's zoom thresholds (tune.js).
+//
+// Dev > override zoom, above 0, decides the detail as if the zoom were that
+// value, at any real zoom. Every threshold is compared against the real zoom
+// `z` (which also sets sizes, so it cannot simply be swapped), so the
+// override rescales each threshold instead: z >= t * z / o exactly when
+// o >= t. `lodZ` is the zoom of the render in progress, set by render().
+let lodZ = 1;
+const lod = (t) => (TUNE.lodZoom > 0 ? t * lodZ / TUNE.lodZoom : t);
 const LOD = {
-  get beltSolid() { return TUNE.lodBeltSolid; },
-  get gridLines() { return TUNE.lodGrid; },
-  get chevrons() { return TUNE.lodChevrons; },
-  get ports() { return TUNE.lodPorts; },
-  get marks() { return TUNE.lodMarks; },
-  get portEdge() { return TUNE.lodPortEdge; },
+  get beltSolid() { return lod(TUNE.lodBeltSolid); },
+  get gridLines() { return lod(TUNE.lodGrid); },
+  get chevrons() { return lod(TUNE.lodChevrons); },
+  get ports() { return lod(TUNE.lodPorts); },
+  get marks() { return lod(TUNE.lodMarks); },
+  get portEdge() { return lod(TUNE.lodPortEdge); },
 };
 
 // A Source's number, in CSS px: 1.75x the first cut, bounded by the body's
@@ -73,8 +85,10 @@ function emitSize(s, z) {
 const emitShown = (s, z, labels) => s.emit !== null && labels && z >= LOD.marks;
 
 import { structGlyph } from "./glyphs.js";
+import { wrapLabel } from "./layers.js";
 import { TUNE } from "./tune.js";
 import { itemPoints } from "./flow.js";
+import { drawPixels } from "./pixel.js";
 import { css as noteCss, isText, sizeOf, wrap, PAD, LINE } from "./notes.js";
 
 const css = (c) => `rgb(${(c[0] * 255) | 0},${(c[1] * 255) | 0},${(c[2] * 255) | 0})`;
@@ -93,6 +107,7 @@ export const DEFAULT_VIEW = { grid: true, ports: true, labels: true, seedTint: t
 export function render(ctx, board, cam, dpr, opts = {}) {
   const view = { ...DEFAULT_VIEW, ...opts };
   const z = cam.zoom;
+  lodZ = z;
   ctx.setTransform(1, 0, 0, 1, 0, 0);
   ctx.fillStyle = COL.void;
   ctx.fillRect(0, 0, ctx.canvas.width, ctx.canvas.height);
@@ -101,6 +116,7 @@ export function render(ctx, board, cam, dpr, opts = {}) {
   // World transform: x right, y up, one unit per cell.
   ctx.setTransform(dpr * z, 0, 0, -dpr * z,
                    dpr * (cam.w / 2 - cam.cx * z), dpr * (cam.h / 2 + cam.cy * z));
+  const world = ctx.getTransform();
   const px = 1 / z;   // one CSS pixel, in world units
   const v = cam.visible(1);
   const on = (x, y, w = 1, h = 1) => x + w >= v.x0 && x <= v.x1 && y + h >= v.y0 && y <= v.y1;
@@ -135,26 +151,78 @@ export function render(ctx, board, cam, dpr, opts = {}) {
   const hide = view.hide?.length ? new Set(view.hide.map(([x, y]) => `${x},${y}`)) : null;
   // View > belts off hides placed belts and underground ends (ghosts of a
   // run being planned still draw).
+  // `lists`: the board's own lists with hidden layers' entities left out
+  // (main.js filters them once per change, not per frame).
+  const L = view.lists || board;
   if (view.belts !== false) {
-    drawBelts(ctx, hide ? board.belts.filter(b => !hide.has(`${b.x},${b.y}`)) : board.belts, z, on, S, view.seedTint, view.beltTint || null);
-    drawUnders(ctx, board.unders, z, on, S, view.beltTint || null);
+    drawBelts(ctx, hide ? L.belts.filter(b => !hide.has(`${b.x},${b.y}`)) : L.belts, z, on, S, view.seedTint, view.beltTint || null);
+    drawUnders(ctx, L.unders, z, on, S, view.underTint || view.beltTint || null);
   }
   // View > sources off: Sources are not drawn (there are hundreds on a
   // computer, and they hide the machines worth looking at). Still there.
-  const structs = view.sources === false ? board.structs.filter(s => board.T.types[s.type].name !== "source") : board.structs;
+  // View > gates off hides every machine, Sources included -- for a look at
+  // the belts underneath. Still there, and still tappable.
+  const structs = view.gates === false ? []
+    : view.sources === false ? L.structs.filter(s => board.T.types[s.type].name !== "source") : L.structs;
   drawStructs(ctx, board.T, structs, z, px, on, S, view.ports, view.labels, view.gateTint || null);
 
   ctx.strokeStyle = COL.border;
   ctx.lineWidth = 2 * px;
   ctx.strokeRect(0, 0, board.width, board.height);
 
+  // The planning ghosts go under the items -- or, while the pixel overlay
+  // is on, over it, so what is being placed stays visible on the screen.
   const ghosts = (view.ghosts || [view.ghost]).filter(Boolean);
-  for (const g of ghosts) drawGhost(ctx, board.T, g, z, px, on, S, view.ports, view.labels, view.seedTint);
+  const drawGhosts = () => { for (const g of ghosts) drawGhost(ctx, board.T, g, z, px, on, S, view.ports, view.labels, view.seedTint); };
+  if (!view.pixels) drawGhosts();
 
   // Items last among the board's contents: cargo on a cell, over any tint,
   // so a red wash never changes the colour that says an item's sign.
   let cargo = null;
-  if (view.sim && view.items !== false) cargo = drawItems(ctx, view.sim, view.alpha || 0, z, on, S);
+  if (view.sim && view.items !== false) cargo = drawItems(ctx, view.sim, view.alpha || 0, z, on, S, view.hiddenCells, board.width, view.dim?.cells);
+
+  // Layers: what an inactive layer holds is washed out -- colour drained,
+  // then darkened -- body, glyph, ports and items alike, so what can be
+  // touched stands out. Over the items, under the editing marks.
+  if (view.dim) drawDim(ctx, view.dim.rects, on, world);
+
+  // The pixel overlay (pixel.js): over the board and its items.
+  if (view.pixels) {
+    drawPixels(ctx, board, view.pixels.screen, view.pixels.alpha, view.pixels.max, on);
+    drawGhosts();
+  }
+
+  // The video frame (Video folder open): the crop box now, solid, and the
+  // end camera's, dashed. Screen-pixel lines, over everything on the board.
+  if (view.frameBoxes) {
+    ctx.lineWidth = 2 * px;
+    for (const b of view.frameBoxes) {
+      ctx.setLineDash(b.dashed ? [8 * px, 6 * px] : []);
+      ctx.strokeStyle = b.dashed ? "rgba(255,200,80,0.9)" : "rgba(255,255,255,0.85)";
+      ctx.strokeRect(b.cx - b.hw, b.cy - b.hh, 2 * b.hw, 2 * b.hh);
+    }
+    ctx.setLineDash([]);
+  }
+
+  // The audio's box (Audio > Set audio region, or camera-aware audio): the
+  // box itself dashed -- fainter for the camera's, which is the screen --
+  // and, with a soft edge, the fringe's outer limit, rounded since distance
+  // is Euclidean. Screen-pixel lines. An editing mark: never in a video.
+  if (view.soundSpace) {
+    const { rect: r, fringe: D, camera } = view.soundSpace;
+    ctx.lineWidth = (camera ? 1.5 : 2) * px;
+    ctx.setLineDash([6 * px, 4 * px]);
+    ctx.strokeStyle = camera ? "rgba(95,211,230,0.55)" : "rgba(95,211,230,0.9)";
+    ctx.strokeRect(r.x, r.y, r.w, r.h);
+    if (D > 0) {
+      ctx.setLineDash([2 * px, 5 * px]);
+      ctx.strokeStyle = "rgba(95,211,230,0.35)";
+      ctx.beginPath();
+      ctx.roundRect(r.x - D, r.y - D, r.w + 2 * D, r.h + 2 * D, D);
+      ctx.stroke();
+    }
+    ctx.setLineDash([]);
+  }
 
   // The vector picker's highlights, over the ghosts they move.
   if (view.vector) drawVectorMarks(ctx, view.vector, px);
@@ -171,14 +239,36 @@ export function render(ctx, board, cam, dpr, opts = {}) {
 
   if (cargo) drawItemLabels(ctx, cargo, cam, dpr);
   if (view.notes !== false && board.notes?.length) drawNotes(ctx, board.notes, cam, dpr, view.noteSel ?? -1, !!view.noteGrips);
+  // Labels lifted into a selection, or about to be pasted: ghosted, and a
+  // selected one outlined as a lifted entity is.
+  for (const g of view.ghostNotes || []) {
+    ctx.save();
+    ctx.globalAlpha = TUNE.ghostAlpha;
+    drawNotes(ctx, g.notes, cam, dpr, -1);
+    ctx.restore();
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    ctx.strokeStyle = g.lifted ? COL.lifted : COL.select;
+    ctx.lineWidth = 2;
+    if (!g.lifted) ctx.setLineDash([6, 4]);
+    for (const n of g.notes) {
+      const [x, y, w, h] = n.rect;
+      const [sx0, sy0] = cam.worldToScreen(x, y);
+      const [sx1, sy1] = cam.worldToScreen(x + w, y - h);
+      ctx.strokeRect(sx0 - 2, sy0 - 2, sx1 - sx0 + 4, sy1 - sy0 + 4);
+    }
+    ctx.setLineDash([]);
+  }
   if (view.indexLabels?.length) drawIndexLabels(ctx, view.indexLabels, cam, dpr);
 
   if (view.labels && z >= LOD.marks) {
-    drawLabels(ctx, board.T, structs, cam, dpr, on);
+    drawLabels(ctx, board.T, structs, cam, dpr, on, view.dim?.rows);
     ctx.globalAlpha = 0.7;
     for (const g of ghosts) if (g.structs?.length) drawLabels(ctx, board.T, g.structs, cam, dpr, on);
     ctx.globalAlpha = 1;
   }
+  // Layer labels last of all, over the Source values too: they name whole
+  // modules, and a value showing through one makes both unreadable.
+  if (view.layerLabels?.length) drawLayerLabels(ctx, view.layerLabels, cam, dpr, view.layerLabelHits, view.layerLabelSel);
 }
 
 // `tint`: View > belt status colours -- (x, y) -> a colour, or null for the
@@ -503,19 +593,47 @@ function port(path, x, y, f, inward) {
 
 // Text is drawn in screen space: under the world transform it would be
 // mirrored by the y flip.
-function drawLabels(ctx, T, structs, cam, dpr, on) {
+// `dimRows`: inactive layers' machines, whose values fade with their washout.
+function drawLabels(ctx, T, structs, cam, dpr, on, dimRows = null) {
   ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
   ctx.textAlign = "center";
   ctx.textBaseline = "middle";
   ctx.fillStyle = COL.label;
-  const z = cam.zoom;
+  const z = cam.zoom, a0 = ctx.globalAlpha;
   for (const s of structs) {
     if (!on(s.x, s.y, s.w, s.h) || !emitShown(s, z, true)) continue;
     const size = emitSize(s, z);
     ctx.font = `600 ${size.toFixed(1)}px system-ui, sans-serif`;
     const [sx, sy] = cam.worldToScreen(s.x + s.w / 2, s.y + s.h / 2);
+    ctx.globalAlpha = dimRows?.has(s.row) ? a0 * DIM_TEXT : a0;
     ctx.fillText(fmtNumber(s.emit), sx, sy);
   }
+  ctx.globalAlpha = a0;
+}
+
+// The inactive washout: the cells' colour drained ("saturation" with a grey
+// takes the hue and chroma out of what is beneath) and then darkened toward
+// the board's background. One path, culled to the view; under the world
+// transform, which `world` restores since text passes leave screen space.
+const DIM = { desat: 0.9, dark: "rgba(24,24,29,0.6)" };
+const DIM_TEXT = 0.3;   // what text over a washed-out cell keeps of its alpha
+function drawDim(ctx, rects, on, world) {
+  ctx.save();
+  ctx.setTransform(world);
+  ctx.beginPath();
+  let any = false;
+  for (const r of rects) if (on(r[0], r[1], r[2], r[3])) { ctx.rect(r[0], r[1], r[2], r[3]); any = true; }
+  if (any) {
+    ctx.globalCompositeOperation = "saturation";
+    ctx.globalAlpha = DIM.desat;
+    ctx.fillStyle = "#808080";
+    ctx.fill();
+    ctx.globalCompositeOperation = "source-over";
+    ctx.globalAlpha = 1;
+    ctx.fillStyle = DIM.dark;
+    ctx.fill();
+  }
+  ctx.restore();
 }
 
 // Labels (notes.js), as the desktop's annotation layer draws them: a faint
@@ -618,21 +736,25 @@ function drawVectorMarks(ctx, marks, px) {
 // forecast. Here they only become discs. A result waiting in an output zone
 // is an ordinary disc on the out-edge, half on the machine and half on the
 // belt. Items draw after the machines, so over their control overlays.
-function drawItems(ctx, sim, alpha, z, on, S) {
+// `hidden`: a cell mask of hidden layers' entities, or null -- an item over
+// one is not drawn (one byte read per item, and only while a layer is hidden).
+function drawItems(ctx, sim, alpha, z, on, S, hidden = null, W = 0, dimCells = null) {
   const text = textOpacity(z);
   const { pts } = itemPoints(sim, alpha, {
     visible: (x0, y0, x1, y1) => on(x0, y0, x1 - x0, y1 - y0),
     reach: 0.5 + ITEM.r,
   });
-  const pos = [], neg = [], labels = [];
+  const pos = [], neg = [], labels = [], dimLabels = [];
   for (let i = 0; i < pts.length; i += 3) {
     const x = pts[i], y = pts[i + 1], value = pts[i + 2];
     if (!on(x - 0.5, y - 0.5)) continue;
+    const k = Math.floor(y) * W + Math.floor(x);
+    if (hidden && hidden[k]) continue;
     (value > 0 ? pos : neg).push(x, y);
-    if (text > 0) labels.push(x, y, value);
+    if (text > 0) (dimCells && dimCells[k] ? dimLabels : labels).push(x, y, value);
   }
   discs(ctx, pos, neg);
-  return labels.length ? { labels, alpha: text } : null;
+  return labels.length || dimLabels.length ? { labels, dimLabels, alpha: text } : null;
 }
 
 // Discs: the ring's colour as a full disc, then the dark interior over it.
@@ -666,6 +788,7 @@ function textOpacity(z) {
 // with a dark halo so a digit spilling past the rim still reads.
 function drawItemLabels(ctx, cargo, cam, dpr) {
   const { labels, alpha } = cargo;
+  if (cargo.dimLabels?.length) drawItemLabels(ctx, { labels: cargo.dimLabels, alpha: alpha * DIM_TEXT }, cam, dpr);
   ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
   ctx.textAlign = "center";
   ctx.textBaseline = "middle";
@@ -682,4 +805,57 @@ function drawItemLabels(ctx, cargo, cam, dpr) {
     ctx.fillText(t, sx, sy);
   }
   ctx.globalAlpha = 1;
+}
+
+// Layer labels (layers.js): each layer's name at the centre of mass of its
+// entities, sized in world cells like the board's own labels, in the
+// layer's colour over a black box so it reads over anything. A long name
+// wraps into a few balanced lines (wrapLabel()); the wrap does not depend on
+// size, so it is worked out once per name at a reference size and cached.
+// Screen space, over everything. Below a few pixels of text a label is not
+// drawn at all.
+const LAYER_FONT = (px) => `700 ${px.toFixed(1)}px system-ui, sans-serif`;
+const LAYER_LINE = 1.2;          // line height, in text heights
+const wrapCache = new Map();     // name -> lines
+function layerLines(ctx, text) {
+  let lines = wrapCache.get(text);
+  if (!lines) {
+    ctx.font = LAYER_FONT(100);
+    lines = wrapLabel(text, (t) => ctx.measureText(t).width / 100, LAYER_LINE);
+    if (wrapCache.size > 500) wrapCache.clear();
+    wrapCache.set(text, lines);
+  }
+  return lines;
+}
+// `hits`, if given, collects each drawn label's box in CSS px ({ id, x0, y0,
+// x1, y1 }) for main.js to hit-test a tap against; `sel` is the id of the
+// label the Hand has picked up, outlined.
+function drawLayerLabels(ctx, labels, cam, dpr, hits = null, sel = null) {
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  ctx.textAlign = "center";
+  ctx.textBaseline = "middle";
+  for (const l of labels) {
+    const px = l.size * cam.zoom;
+    if (px < 4) continue;
+    const lines = layerLines(ctx, l.text);
+    const [sx, sy] = cam.worldToScreen(l.x, l.y);
+    ctx.font = LAYER_FONT(px);
+    const w = Math.max(...lines.map(t => ctx.measureText(t).width));
+    const lh = px * LAYER_LINE;
+    const padX = px * 0.35, padY = px * 0.2;
+    const bw = w + 2 * padX, bh = lh * lines.length + 2 * padY;
+    if (sx + bw / 2 < 0 || sx - bw / 2 > cam.w || sy + bh / 2 < 0 || sy - bh / 2 > cam.h) continue;
+    ctx.fillStyle = "rgba(0,0,0,0.82)";
+    ctx.fillRect(sx - bw / 2, sy - bh / 2, bw, bh);
+    hits?.push({ id: l.id, x0: sx - bw / 2, y0: sy - bh / 2, x1: sx + bw / 2, y1: sy + bh / 2 });
+    if (l.id === sel) {
+      ctx.strokeStyle = COL.select;
+      ctx.lineWidth = 2;
+      ctx.setLineDash([6, 4]);
+      ctx.strokeRect(sx - bw / 2 - 3, sy - bh / 2 - 3, bw + 6, bh + 6);
+      ctx.setLineDash([]);
+    }
+    ctx.fillStyle = l.colour;
+    lines.forEach((t, i) => ctx.fillText(t, sx, sy + (i - (lines.length - 1) / 2) * lh));
+  }
 }

@@ -9,27 +9,39 @@
 
 import { Board } from "./board.js";
 import { Camera, attachGestures } from "./camera.js";
-import { render } from "./render.js";
+import { render, BASE_COLOURS } from "./render.js";
+import { LayerPanel } from "./layerpanel.js";
+import { SCALE_PRESETS, SCALE_NAMES, compileScale, parseLut, scaleTable, scaleHz, noteName } from "./scale.js";
+import { BACKGROUND, byId, addLayer, removeLayer, renameLayer, setCurrent, isVisible, isActive,
+         setForActive, layerStats, mix, parseCss, rgbCss, isolate } from "./layers.js";
 import { Shell } from "./ui.js";
-import { Panel } from "./panel.js";
+import { Panel, STATUS_COLOUR_DEFAULTS } from "./panel.js";
 import { ROUTE_NAMES, ROUTE_H_FIRST, ROUTE_V_FIRST, chooseRoute, planRun, routeWorks, turnTip } from "./planner.js";
 import { originFor } from "./placer.js";
 import { VALUE_CHOICES, hasValue, toolValue } from "./tools.js";
-import { makeStamp, mirrored, rotated, stampCells, subset } from "./stamp.js";
+import { makeStamp, mirrored, noteTouches, reversedGate, rotated, shiftNote, stampCells, subset } from "./stamp.js";
 import { emitMask, emitsWith, stampGhost } from "./ghost.js";
 import { traceRun } from "./segtrace.js";
 import { TUNE, setTune } from "./tune.js";
-import { Sim, Clock } from "./sim.js";
+import { Sim, Clock, RATE_MIN, RATE_MAX } from "./sim.js";
 import { History } from "./history.js";
+import { icon } from "./icons.js";
 import { DEFAULT, naturalOrder, tableValues, finalValues } from "./indexer.js";
 import { openAssembler, isAssemblerOpen } from "./assembler.js";
 import { toast } from "./toast.js";
-import { entrySize } from "./stamp.js";
-import { noteAt, gripAt, newRect, MIN_W, MIN_H } from "./notes.js";
+import { entrySize, typeByName } from "./stamp.js";
+import { installPixel, Screen } from "./pixel.js";
+import { cropBox, evenDim, frameBox, frameCount, viewBox } from "./video-params.js";
+import { presentationName, startPresentation, presentationRecord, safeName } from "./present.js";
+import { freezePersist } from "./persist.js";
+import { writeZip } from "./npz.js";
+import { spaceWeights, spaceKey, fringeOf } from "./space.js";
+import { noteAt, gripAt, isText, newRect, MIN_W, MIN_H } from "./notes.js";
 import { Claims, followChain, offsets, layCopies, isZero, rotateVec, flipVec, moreCount, lessCount } from "./vector.js";
 import { deleteSave, getSave, listSaves, putSave } from "./saves.js";
+import { bakeKey, audioRecord, eligibleRuns, BAKE_DEFAULT_SECONDS, BAKE_MAX_SECONDS } from "./audio-params.js";
 
-const DEFAULT_SAVE = "default.npz";
+const DEFAULT_SAVE = "Default.npz";
 
 const canvas = document.getElementById("board");
 const ctx = canvas.getContext("2d", { alpha: false });
@@ -41,7 +53,9 @@ let board = null;
 let dpr = 1;
 let shell = null;
 let panel = null;
+let layerPanel = null;
 let view = {};
+let statusColours = { ...STATUS_COLOUR_DEFAULTS };   // View > status colours
 let inspectRow = -1;   // a row, not a description: re-read it every time
 // The simulation of the loaded board, and the clock that paces it. A new
 // Sim per board, as a fresh desktop session per load: segment ids come from
@@ -114,6 +128,11 @@ let vec = { on: false, picking: null, v: [0, 0], count: 2, anchor: null, sv: [0,
 const pickV = () => (vec.picking === "select" ? vec.sv : vec.v);
 function setPickV(v) { if (vec.picking === "select") vec.sv = v; else vec.v = v; }
 
+// Presentation mode (present.js): `#b=<name>` in the URL. Decided once, at
+// load; a change of hash reloads the page.
+const presenting = presentationName();
+let presenter = null;
+
 // A handle for the console and for headless tests. Not an API.
 const debug = window.gates = {
   cam, redraw, renderMs: 0,
@@ -127,12 +146,839 @@ const debug = window.gates = {
   get place() { return place; },
   get sel() { return sel; },
   selEntries: () => (sel ? selAbs() : []),
+  lift: (rows) => { lift(rows); redraw(); },
+  dropAll: () => { dropAll(); redraw(); },
+  get soundSel() { return soundSel; },
+  get audio() { return audio; },
+  get presenter() { return presenter; },
+  captureViewState: () => captureViewState(),
   placement: () => currentPlacement(),
   plan: () => currentPlan(),
 };
 
+// --- the pixel overlay --------------------------------------------------------
+//
+// View > pixel overlay above 0 hands the sim the Screen, and each Pixel's
+// fire records its colour on it (pixel.js); at 0 the sim has none and a
+// fire records nothing. Switching on starts blank, as does every edit and
+// Reset (the sim clears it on a rebuild).
+const screen = new Screen();
+function syncScreen() {
+  if (!sim) return;
+  const on = view.pixelAlpha > 0;
+  if (on && sim.screen !== screen) { screen.clear(); sim.screen = screen; }
+  else if (!on && sim.screen) { sim.screen = null; screen.clear(); }
+}
+
+// --- audio -------------------------------------------------------------------
+//
+// Off by default and loaded on demand: with it off, audio.js and the worklet
+// are never fetched and the tick's only cost is Sim.audio's null check.
+let audio = null;          // the running engine (audio.js startAudio), or null
+let audioStarting = false;
+let audioCtx = null;       // its context, from the tap that switched it on
+let soundWanted = false;   // the sound button's state (top-left of the board)
+// The player's choice, kept across sessions; on until they turn it off.
+const SOUND_KEY = "gates.web.sound.v1";
+function soundStored() {
+  try { return localStorage.getItem(SOUND_KEY) !== "off"; } catch { return true; }
+}
+function storeSound(on) {
+  try { localStorage.setItem(SOUND_KEY, on ? "on" : "off"); } catch { /* not kept */ }
+}
+// A browser starts audio only from a gesture, so a launch with sound on
+// shows the button on and starts it on the first tap or key anywhere --
+// pointerup / touchend / keydown, the events that count as activation on
+// a touch screen. A context made before then would only be suspended.
+// Until it runs, each gesture tries again (a resume can be refused).
+function armSound() {
+  const evs = ["pointerup", "touchend", "keydown"];
+  const go = (e) => {
+    if (!soundWanted) return done();
+    if (e.target?.closest?.("#sound-btn")) return;   // the button's own click decides
+    if (!audio && !audioStarting) setAudio(true);
+    else audioCtx?.resume?.();
+    if (audioCtx?.state === "running") done();
+  };
+  const done = () => { for (const ev of evs) document.removeEventListener(ev, go, true); };
+  for (const ev of evs) document.addEventListener(ev, go, true);
+}
+// The sound button: a speaker, crossed out while sound is off.
+function setSoundBtn(on) {
+  const b = document.getElementById("sound-btn");
+  if (!b) return;
+  b.innerHTML = icon(on ? "soundOn" : "soundOff");
+  b.setAttribute("aria-pressed", String(on));
+  b.title = on ? "Sound on (tap for off)" : "Sound off (tap for on)";
+}
+function setAudio(on) {
+  soundWanted = on;
+  setSoundBtn(on);
+  if (!on) {
+    bakedPlay = null;
+    if (audio) { audio.close(); audio = null; }
+    audioCtx = null;
+    panel.setAudioMeter("off");
+    return;
+  }
+  if (audio || audioStarting) return;
+  const Ctx = window.AudioContext || window.webkitAudioContext;
+  if (!Ctx || !window.AudioWorkletNode) { soundWanted = false; setSoundBtn(false); panel.setAudioMeter("no Web Audio here"); return; }
+  // Made and resumed here, inside the tap: iOS will not start a context
+  // created after an await.
+  const ctx = audioCtx = new Ctx({ latencyHint: "interactive" });
+  ctx.resume();
+  audioStarting = true;
+  panel.setAudioMeter("starting…");
+  import("./audio.js")
+    .then(m => m.startAudio(ctx, { ...panel.audio }, sim, (mm) => {
+      if (!audio) return;
+      if (mm.type === "error") { console.warn("audio:", mm.message); return; }   // the worklet recovered; say so in the console
+      panel.setAudioMeter(meterText(mm));
+    }))
+    .then(a => {
+      audioStarting = false;
+      if (!soundWanted) { a.close(); return; }   // switched off while starting
+      audio = a;
+      a.rec.setSelection(soundSel?.cells ?? null);
+      a.rec.setSpace(currentSpace());
+      redraw();
+    })
+    .catch(e => {
+      audioStarting = false;
+      ctx.close().catch(() => {});
+      soundWanted = false;
+      setSoundBtn(false);
+      panel.setAudioMeter(`failed: ${e.message}`);
+    });
+}
+function meterText(m) {
+  const db = m.peak > 0 ? (20 * Math.log10(m.peak)).toFixed(1) : "-inf";
+  return `voices ${m.voices} / ${m.limit}` + (m.refused ? `  (${m.refused} refused)` : "") + "\n" +
+    `runs active ${m.active} of ${m.candidates}\n` +
+    `peak ${m.peak.toFixed(2)} (${db} dB)` + (m.clipped ? `  clipped ${m.clipped}` : "") + "\n" +
+    `lag ${Math.round(m.lagMs)} ms · speed ${m.speed.toFixed(2)}` +
+    (bakedPlay ? "  (baked)" : "") + "\n" + bakeStatus() +
+    (audioNote && performance.now() < audioNote.until ? `\n${audioNote.text}` : "") +
+    (audio?.rec.selInfo ? `\n${panel.audio.camAudio ? "in earshot of the screen" : soundSel?.region ? "in earshot of the region" : "sound selection"}: ` +
+      `${audio.rec.selInfo.runs} runs, ${audio.rec.selInfo.gates} gates` : "");
+}
+
+// --- audio settings in the save ------------------------------------------------
+//
+// Every save carries the dials and the bake dialog's seconds and rate
+// (board.audio; audio-params.js has the format). Loading a save that has
+// them applies them; one without leaves the dials as they are. Either way
+// board.audio is then the dials in front of the player, so the next save
+// writes them. A dial change is a change for the autosaves, like a label
+// edit, but it does not restart the simulation and is not an undo step.
+let bakeOpts = null;        // { seconds, rate } last used in the Bake dialog
+let audioNote = null;       // { text, until }: a line for the meter
+function loadAudioSettings() {
+  const saved = board.audio;
+  if (saved) {
+    panel.applyAudio(saved.dials);
+    if (saved.bake) bakeOpts = saved.bake;
+    if (audio) audio.setParams({ ...panel.audio });
+    audioNote = { text: "audio settings loaded from this save", until: performance.now() + 6000 };
+    if (!audio) panel.setAudioMeter(`off\n${audioNote.text}`);
+  } else if (!audio) panel.setAudioMeter("off");
+  board.audio = audioRecord(panel.audio, bakeOpts);
+}
+// The dials (or the bake options) moved: the board's record follows, and
+// the autosaves will write it.
+function touchAudio() {
+  if (!board) return;
+  board.audio = audioRecord(panel.audio, bakeOpts);
+  board.audioRev++;
+  edited = true;
+  prepareSave();
+}
+
+// --- video export ---------------------------------------------------------------
+//
+// Video (panel) renders a stretch of the simulation offline into an MP4
+// (video.js, after Fluoddity's recorder). It starts from the current tick,
+// on a copy of the sim, so the live board is not touched -- it is paused
+// while the render runs, and any edit stops it, keeping what was encoded.
+// With sound on, the same ticks are baked into its audio track.
+//
+// The camera moves from where it is when Record is pressed to the end state
+// captured by "Select end camera state" (if any), over the lerp window.
+let endCam = null;          // { cx, cy, zoom, w, h }, or null: a still camera
+let videoOpen = false;      // the Video folder is open: show the frame on the board
+let recording = null;       // { cancel } while a video renders
+const camState = () => ({ cx: cam.cx, cy: cam.cy, zoom: cam.zoom, w: cam.w, h: cam.h });
+
+// What the video frame covers, for the preview: the crop box now, and the
+// end camera's (dashed), in the video's aspect.
+function videoBoxes() {
+  if (!videoOpen || !panel.paneOpen) return null;
+  const v = panel.video, aspect = v.width / v.height;
+  const boxes = [{ ...cropBox(camState(), aspect), dashed: false }];
+  if (endCam) boxes.push({ ...cropBox(endCam, aspect), dashed: true });
+  return boxes;
+}
+
+// One video frame: the board as View draws it, never the editing marks.
+// Layers too, as the board shows them: the view taken when Record was
+// pressed (`recLayers`), since the copy shares the live board's grid, table
+// and lists and an edit stops the recording anyway.
+let recLayers = null;
+function drawVideoFrame(ctx, s, vcam, alpha) {
+  render(ctx, s.board, vcam, 1, {
+    ...view, sim: s, alpha, ghosts: [],
+    ...layerOpts(recLayers, view.gateStatus ? gateStatus(s) : null, view.beltStatus ? beltStatus(s) : null, true),
+    pixels: s.screen ? { screen: s.screen, alpha: view.pixelAlpha, max: view.pixelMax } : null,
+  });
+}
+
+// Camera-aware audio in a video hears the VIDEO's frame, which moves with
+// the end camera: tick t is frame (t - t0) * 60 / tps (as video.js draws
+// it), and the frame's crop box, scaled by the screen scale dial, is the
+// box. Null when camera-aware audio is off (the static space is used).
+function videoSpaceAt(settings, startCam, endCam, t0) {
+  const p = panel.audio;
+  if (!p.camAudio) return null;
+  const frames = frameCount(settings), fringe = p.spaceFringe, lp = p.spaceLp, k = p.camScale;
+  return (tick) => {
+    const f = Math.min(frames - 1, Math.max(0, (tick - t0) * 60 / settings.tps));
+    const b = frameBox(startCam, endCam, settings, f, frames);
+    return { rect: { x: b.cx - b.hw * k, y: b.cy - b.hh * k, w: 2 * b.hw * k, h: 2 * b.hh * k }, fringe, lp };
+  };
+}
+
+// Fluoddity's saveFile.ts: the picker must be raised before any other await
+// in the click, or it loses the gesture. Three outcomes: a file to stream
+// into, no picker here (buffer and download), or the player said no.
+async function chooseVideoFile(name) {
+  if (typeof window.showSaveFilePicker !== "function") return { kind: "unavailable" };
+  try {
+    const handle = await window.showSaveFilePicker({ suggestedName: name, types: [{ description: "MP4 video", accept: { "video/mp4": [".mp4"] } }] });
+    return { kind: "file", writable: await handle.createWritable() };
+  } catch (e) {
+    return e?.name === "AbortError" ? { kind: "cancelled" } : { kind: "unavailable" };
+  }
+}
+
+async function recordVideoNow() {
+  if (recording) { recording.cancel = true; return; }
+  if (!sim || !board) return;
+  const settings = { ...panel.video };
+  // A short timestamp in the name, so takes of one scene do not collide:
+  // "CPU experiments 11-20 12_07_33.mp4" (underscores: no dots in a name).
+  const base = (panel.local.name || "gates").replace(/[^\w .-]+/g, "_").trim() || "gates";
+  const d = new Date(), two = (n) => String(n).padStart(2, "0");
+  const fileName = `${base} ${two(d.getMonth() + 1)}-${two(d.getDate())} ${two(d.getHours())}_${two(d.getMinutes())}_${two(d.getSeconds())}.mp4`;
+  endDryRun();       // a recording starts from the view play took over from
+  const choice = await chooseVideoFile(fileName);       // first await: keeps the gesture
+  if (choice.kind === "cancelled") return;
+  const own = { cancel: false };
+  recording = own;
+  panel.setVideoRecording(true);
+  shell.setPaused(true);
+  clock.paused = true;
+  const copy = sim.clone();
+  if (view.pixelAlpha > 0) copy.screen = new Screen();
+  const startCam = camState(), rev = board.revision, live = sim;
+  recLayers = layerView();
+  const withSound = !!audio;
+  panel.setVideoProgress("starting…");
+  try {
+    const [{ recordVideo }, bakeMod] = await Promise.all([import("./video.js"), withSound ? import("./audio-bake.js") : null]);
+    const res = await recordVideo({
+      sim: copy, settings, startCam, endCam, draw: drawVideoFrame,
+      audio: withSound ? { params: { ...panel.audio }, bake: bakeMod.bakeAudio, selection: soundSel?.cells ?? null,
+                           space: currentSpace(), spaceAt: videoSpaceAt(settings, startCam, endCam, copy.tick) } : null,
+      writable: choice.kind === "file" ? choice.writable : null,
+      onProgress: (p) => panel.setVideoProgress(p.phase === "audio"
+        ? `baking audio ${Math.round(p.fraction * 100)}%`
+        : `frame ${p.frame} of ${p.frames} (${Math.round(p.fraction * 100)}%)`),
+      shouldStop: () => own.cancel || sim !== live || board.revision !== rev,
+    });
+    if (res.kind === "buffered") {
+      const a = document.createElement("a");
+      a.href = URL.createObjectURL(res.blob);
+      a.download = fileName;
+      a.click();
+      setTimeout(() => URL.revokeObjectURL(a.href), 10000);
+    }
+    panel.setVideoProgress(res.kind === "empty" ? "nothing recorded"
+      : `saved ${res.frames} frames${res.frames < frameCount(settings) ? " (stopped early)" : ""}`);
+  } catch (e) {
+    console.error(e);
+    panel.setVideoProgress(`failed: ${e.message}`);
+  } finally {
+    recording = null;
+    recLayers = null;
+    panel.setVideoRecording(false);
+  }
+}
+
+// --- the sound selection ------------------------------------------------------------
+//
+// Audio > Set audio selection: with entities selected, only they sound (a
+// run if any of its cells is selected, a gate if any of its cells is); with
+// nothing selected, everything does again. The cells are taken where the
+// selection sits at the press, and kept after deselecting.
+//
+// It is reset by any change to the board -- and selecting is itself an edit
+// here (the selection is lifted off the board), so "a change" is a change of
+// CONTENT: Board.contentHash(), which ignores row ids and per-tick channel
+// values. The reference is the first stable board after the press (nothing
+// lifted), so deselecting in place keeps it and moving the selection, any
+// other edit, an undo or a load resets it. Normalisation then counts only
+// what is selected (audio.js), so an isolated part fills the mix.
+//
+// Audio > Set audio region instead takes a BOX of the board: the next
+// one-finger drag draws it, and every run and gate touching it sounds --
+// whatever is built there, as it changes, since the recorder re-asks the
+// region on every rebuild. Its `cells` is not a Set but an object with
+// has(y*W+x), the one call everything reading a selection makes (the
+// recorder, eligibleRuns(), a bake, a video), so nothing downstream knows
+// which kind it has. A region is not reset by edits, only by choosing again,
+// a tap while armed, a box touching nothing, or a new board. The two kinds
+// replace each other.
+let soundSel = null;      // { cells: Set<y*W+x> | { has }, ref: hash | null, rev, id, region?: {x,y,w,h} }
+let regionArmed = false;  // Set audio region pressed: the next drag draws the box
+let soundSelN = 0;
+const soundSelId = () => soundSel?.id ?? 0;
+function setSoundSelection() {
+  if (!sel || !sel.stamp.entries.length) { clearSoundSel(); return; }
+  const [ox, oy] = selOrigin(), W = board.width;
+  const cells = new Set(stampCells(T, sel.stamp, ox, oy).map(([x, y]) => y * W + x));
+  soundSel = { cells, ref: null, rev: -1, id: ++soundSelN };
+  audio?.rec.setSelection(cells);
+  panel.setAudioSelection(true);
+  panel.setAudioRegion(null);
+}
+
+// The space the audio hears (space.js), or null: with camera-aware audio
+// on, the screen -- the whole board view, scaled about its centre by the
+// screen scale dial -- else the audio region, else none. The soft edge and
+// the distance low-pass apply to either.
+function currentSpace(camera = camState()) {
+  const p = panel.audio;
+  let rect = null;
+  if (p.camAudio) {
+    const hw = camera.w / 2 / camera.zoom * p.camScale, hh = camera.h / 2 / camera.zoom * p.camScale;
+    rect = { x: camera.cx - hw, y: camera.cy - hh, w: 2 * hw, h: 2 * hh };
+  } else if (soundSel?.region) rect = soundSel.region;
+  return rect ? { rect, fringe: p.spaceFringe, lp: p.spaceLp } : null;
+}
+// Each frame: the recorder hears where the camera is now. It sends weights
+// only when the box (to a hundredth of a cell) or a dial actually moved.
+function syncSpace() { if (audio) audio.rec.setSpace(currentSpace()); }
+
+// The audio's box on the board: the core dashed, the fringe's outer edge
+// fainter and rounded (distance is Euclidean, so the fade's limit has round
+// corners). The region always shows; the camera's box only while the Audio
+// folder is open in an expanded pane, as the video frame does -- it is the
+// screen, and would otherwise frame every view.
+function spaceMarks() {
+  const sp = currentSpace();
+  if (!sp) return null;
+  if (panel.audio.camAudio && !panel.audioVisible) return null;
+  return { rect: sp.rect, fringe: fringeOf(sp), camera: !!panel.audio.camAudio };
+}
+
+// Arm (or disarm) the region box: the next one-finger drag on the board
+// draws it; a tap instead cancels, and clears any audio selection.
+function armSoundRegion() {
+  regionArmed = !regionArmed;
+  panel.setAudioRegion(regionArmed ? "armed" : soundSel?.region ? "set" : null);
+  redraw();
+}
+
+// The box `r` (cells, {x, y, w, h}) as the sound selection -- or, if it
+// touches no entity, back to everything.
+function setSoundRegion(r) {
+  regionArmed = false;
+  let touched = false;
+  for (let y = r.y; y < r.y + r.h && !touched; y++) {
+    for (let x = r.x; x < r.x + r.w; x++) if (board.entityAt(x, y) >= 0) { touched = true; break; }
+  }
+  if (!touched) { clearSoundSel(); return; }
+  // Not a cell filter but a SPACE (space.js): with a soft edge, entities
+  // past the box are heard too, quieter. With a hard edge (the default)
+  // that is exactly "touching the box", as before.
+  soundSel = { cells: null, ref: null, rev: -1, id: ++soundSelN, region: { ...r } };
+  audio?.rec.setSelection(null);
+  panel.setAudioSelection(false);
+  panel.setAudioRegion("set");
+  redraw();
+}
+function clearSoundSel() {
+  regionArmed = false;
+  panel.setAudioRegion(null);
+  if (!soundSel) return;
+  soundSel = null;
+  audio?.rec.setSelection(null);
+  panel.setAudioSelection(false);
+  redraw();
+}
+// Each frame: once nothing is lifted, any change of content since the
+// reference resets it.
+function checkSoundSel() {
+  // A region is about a place, not its contents: edits never reset it.
+  if (!soundSel || soundSel.region || sel || !board || board.revision === soundSel.rev) return;
+  soundSel.rev = board.revision;
+  const h = board.contentHash();
+  if (soundSel.ref === null) soundSel.ref = h;
+  else if (h !== soundSel.ref) clearSoundSel();
+}
+
+// --- the camera's dry run -----------------------------------------------------------
+//
+// With an end camera set, pressing play flies the view along the path a
+// recording started now would take: the view at the press is the start, and
+// the tick on screen decides the frame (frame f is tick t0 + f * tps / 60,
+// as in video.js), so the camera always matches the content, at any play
+// rate. The view is set so the crop box IS that frame. It holds the end
+// view once the path is done. The video and camera dials apply live, so the
+// fades can be tuned while watching.
+//
+// Any disturbance -- pause, a pan or zoom of any kind, an edit (undo
+// included), Reset, a load, unsetting the end camera, starting a real
+// recording -- puts the view back where it was when play was pressed. A
+// manual camera move is detected by the camera no longer being where the
+// dry run last put it, which catches drag, pinch, wheel, the pan glide and
+// Fit board alike without touching camera.js.
+let dry = null;   // { start, t0, sim, rev, set }: set = the view last applied
+function startDryRun() {
+  if (!endCam || !sim || recording) { dry = null; return; }
+  dry = { start: camState(), t0: sim.tick, sim, rev: board.revision, set: null };
+}
+function endDryRun() {
+  if (!dry) return;
+  const st = dry.start;
+  dry = null;
+  cam.cx = st.cx; cam.cy = st.cy; cam.zoom = st.zoom;
+  redraw();
+}
+function driveDryRun() {
+  if (!dry) return;
+  const moved = dry.set && (cam.cx !== dry.set.cx || cam.cy !== dry.set.cy || cam.zoom !== dry.set.zoom);
+  if (moved || !endCam || clock.paused || sim !== dry.sim || board.revision !== dry.rev) { endDryRun(); return; }
+  const v = panel.video, frames = frameCount(v);
+  const f = Math.min(frames - 1, Math.max(0, (sim.tick + clock.alpha - dry.t0) * 60 / v.tps));
+  const box = frameBox(dry.start, endCam, v, f, frames);
+  // The view whose crop box is `box`: the crop is the largest box of the
+  // video's aspect in the view, so its half-width is min(w/2, h/2 * aspect) / zoom.
+  const aspect = v.width / v.height;
+  cam.cx = box.cx; cam.cy = box.cy;
+  cam.zoom = Math.min(cam.w / 2, (cam.h / 2) * aspect) / box.hw;
+  dry.set = { cx: cam.cx, cy: cam.cy, zoom: cam.zoom };
+}
+
+// --- baked audio ------------------------------------------------------------------
+//
+// A stretch of ticks rendered ahead of time (audio-bake.js), played back
+// from a buffer while the live sim is on exactly that stretch. It starts
+// with a Reset and keeps that tick-0 state (`snap`): while the bake is
+// valid, Reset restores it rather than rebuilding, since a rebuild renumbers
+// the runs and the numbering decides the belt phase's order -- only the
+// same state is sure to replay the same ticks.
+//
+// While it plays, the audio is the clock: each frame steps the sim to the
+// tick being heard, with a bigger step budget, so frames drop rather than
+// the board drifting from the sound.
+let bake = null;           // { snap, sim, revision, rebuilds, rate, key, t0, end, samples, sampleRate, buf }
+let bakedPlay = null;      // { t0Time }: context time at which tick bake.t0 is heard
+let baking = null;         // { cancel } while a bake runs
+const BAKED_BUDGET_MS = 100;
+
+// Same board, same run numbering, same sim: Reset can return to the bake's start.
+const bakeLive = () => !!(bake && sim === bake.sim && board.revision === bake.revision &&
+                          sim.stats.rebuilds === bake.rebuilds);
+function bakeStale() {
+  if (!bake) return null;
+  if (!bakeLive()) return "the board changed";
+  if (bake.key !== bakeKey(panel.audio)) return "the dials changed";
+  if (bake.sel !== soundSelId()) return "the sound selection changed";
+  if (clock.rate !== bake.rate) return `the rate is not ${bake.rate}`;
+  return null;
+}
+// The live sim is inside the baked stretch and the bake still says what it would play.
+const bakePlayable = () => !!(audio && bake && !bakeStale() && sim.tick < bake.end);
+function bakeStatus() {
+  if (baking) return "bake: baking…";
+  if (!bake) return "bake: none";
+  const why = bakeStale(), secs = ((bake.end - bake.t0) / bake.rate).toFixed(1);
+  return `bake: ${secs} s @ ${bake.rate} tps, ticks ${bake.t0}–${bake.end}` + (why ? ` -- stale: ${why}` : "");
+}
+
+function startBakedPlay() {
+  audio.rec.stop();
+  audio.rec.detach();                // nothing to record: the buffer is the sound
+  if (!bake.buf) bake.buf = audio.buffer(bake.samples, bake.sampleRate);
+  const ac = audio.ctx, lead = 0.03;
+  const at = sim.tick + clock.alpha;
+  // Tick `at` starts sounding `lead` from now (out of the speakers a
+  // further outputLatency on, which the clock below takes off again).
+  const t0Time = ac.currentTime + lead - (at - bake.t0) / bake.rate;
+  audio.playBaked(bake.buf, Math.max(ac.currentTime + lead, t0Time), Math.max(0, (at - bake.t0) / bake.rate));
+  bakedPlay = { t0Time };
+}
+function stopBakedPlay() {
+  if (!bakedPlay) return;
+  bakedPlay = null;
+  if (audio) { audio.stopBaked(); audio.rec.attach(sim); }
+}
+// The fractional tick being heard now.
+function bakedTick() {
+  const ac = audio.ctx, out = ac.outputLatency || ac.baseLatency || 0;
+  return bake.t0 + (ac.currentTime - out - bakedPlay.t0Time) * bake.rate;
+}
+
+// The Bake dialog's Play / Pause: the baked buffer on its own, from where it
+// was paused (from the start once it has played through), with the
+// simulation left alone. On the sound's context if sound is on, else on one
+// made in this tap. Stopped by closing the dialog, a new bake, or Play on
+// the board.
+let preview = null;       // { src, ctx, t0, from } while playing
+let previewAt = 0;        // seconds into the bake to resume from
+let previewCtx = null;    // our own context, when sound is off
+function stopPreview(keepPlace = true) {
+  if (!preview) { if (!keepPlace) previewAt = 0; return; }
+  const p = preview;
+  preview = null;
+  previewAt = keepPlace ? p.from + (p.ctx.currentTime - p.t0) : 0;
+  p.src.onended = null;
+  try { p.src.stop(); } catch { /* ended */ }
+  p.src.disconnect();
+  syncPreviewBtn();
+}
+function syncPreviewBtn() {
+  const b = document.getElementById("bake-play");
+  if (b) { b.textContent = preview ? "Pause" : "Play"; b.disabled = !bake || !!baking; }
+}
+function togglePreview() {
+  if (preview) { stopPreview(); return; }
+  if (!bake) return;
+  let ctx = audio?.ctx;
+  if (!ctx) {
+    const Ctx = window.AudioContext || window.webkitAudioContext;
+    if (!Ctx) return;
+    ctx = previewCtx ||= new Ctx();
+  }
+  ctx.resume();
+  const buf = ctx.createBuffer(1, bake.samples.length, bake.sampleRate);
+  buf.copyToChannel(bake.samples, 0);
+  if (previewAt >= buf.duration - 0.01) previewAt = 0;
+  const src = ctx.createBufferSource();
+  src.buffer = buf;
+  src.connect(ctx.destination);
+  src.start(0, previewAt);
+  src.onended = () => { if (preview?.src === src) { preview = null; previewAt = 0; syncPreviewBtn(); } };
+  preview = { src, ctx, t0: ctx.currentTime, from: previewAt };
+  syncPreviewBtn();
+}
+
+// --- the belt scale -----------------------------------------------------------------
+//
+// Audio > Customize scale… (scale.js): presets, a formula for the wavelength
+// f(n), or a table file. Every change that parses is applied at once -- the
+// dials change and the synth re-pitches its voices on its next tick, so the
+// scale can be tuned while the board plays. A formula that does not parse
+// (half typed) is shown in red and the last good one keeps playing. It is
+// a dial change like any other: saved with the board and in the panel's
+// preferences, and a bake made under another scale goes stale.
+
+function setScale(changes) {
+  const p = panel.audio;
+  if (Object.keys(changes).every(k => p[k] === changes[k])) return;
+  panel.applyAudio(changes);
+  if (audio) audio.setParams({ ...panel.audio });
+  touchAudio();
+}
+
+// The min-length Hz slider is logarithmic: 50..8000 Hz is too wide a range
+// for a linear one to tune the low end. Snapped to the panel dial's step.
+const HZ_LO = 50, HZ_HI = 8000;
+const hzOf = (pos) => Math.min(HZ_HI, Math.max(HZ_LO, Math.round(HZ_LO * (HZ_HI / HZ_LO) ** (pos / 1000) / 10) * 10));
+const posOf = (hz) => Math.round(1000 * Math.log(Math.max(HZ_LO, hz) / HZ_LO) / Math.log(HZ_HI / HZ_LO));
+
+let scaleView = "notes";   // the dialog's lower half: "notes" or "lengths"
+
+function openScaleDialog() {
+  const m = document.getElementById("scalemenu");
+  const list = m.querySelector("#scale-presets"), expr = m.querySelector("#scale-expr");
+  const preview = m.querySelector("#scale-preview"), help = m.querySelector("#scale-help");
+  const fileInput = m.querySelector("#scale-file-input");
+  const hz = m.querySelector("#scale-hz"), hzVal = m.querySelector("#scale-hz-val");
+  const minL = m.querySelector("#scale-min"), minVal = m.querySelector("#scale-min-val");
+  const histBox = m.querySelector("#scale-hist"), canvas = m.querySelector("#scale-hist-canvas");
+  const histInfo = m.querySelector("#scale-hist-info");
+  const viewNotes = m.querySelector("#scale-view-notes"), viewLengths = m.querySelector("#scale-view-lengths");
+  let lutName = m.dataset.lutName || "";
+  let formulaError = null;
+  let hist = null;   // { lo, hi, counts, f, total } for the histogram's taps
+
+  const show = () => {
+    const p = panel.audio;
+    for (const b of list.children) {
+      b.dataset.selected = String(b.dataset.kind === "lut" ? p.scaleMode === "lut"
+        : p.scaleMode === "formula" && b.dataset.expr === p.scaleExpr.trim());
+    }
+    expr.setAttribute("aria-invalid", String(!!formulaError));
+    if (document.activeElement !== hz) hz.value = String(posOf(p.beltMaxHz));
+    if (document.activeElement !== minL) minL.value = String(p.beltMinLen);
+    hzVal.textContent = `${p.beltMaxHz}`;
+    minVal.textContent = `${p.beltMinLen}`;
+    viewNotes.dataset.selected = String(scaleView === "notes");
+    viewLengths.dataset.selected = String(scaleView === "lengths");
+    const { f, bad, error: tableError } = scaleTable(p);
+    // Messages first, in either view.
+    const lines = [];
+    if (formulaError) lines.push(`✗ ${formulaError} -- still playing the last good scale.`);
+    if (p.scaleMode === "lut") lines.push(`Playing a table${lutName ? ` (${lutName})` : ""}: ${parseLutCount(p.scaleLut)} numbers, f(1) onwards.`);
+    if (tableError && !formulaError) lines.push(`✗ ${tableError}`);
+    if (bad) lines.push(`${bad} length${bad === 1 ? "" : "s"} gave no positive wavelength; those play the standard pitch.`);
+    if (scaleView === "notes") {
+      histBox.hidden = true;
+      preview.hidden = false;
+      if (lines.length) lines.push("");
+      const lo = Math.max(1, p.beltMinLen), hiL = Math.min(p.beltCutoff, lo + 23);
+      for (let n = lo; n <= hiL; n++) {
+        const h = Math.min(scaleHz(f, n, p.beltMaxHz, p.beltMinLen), 24000);
+        lines.push(`${String(n).padStart(4)}  ${h.toFixed(h < 100 ? 2 : 1).padStart(8)} Hz  ${noteName(h)}`);
+      }
+      if (hiL < p.beltCutoff) lines.push(`  …to length ${p.beltCutoff} (the max length dial)`);
+      preview.textContent = lines.join("\n");
+      preview.dataset.error = String(!!(formulaError || tableError));
+    } else {
+      preview.hidden = !lines.length;
+      preview.textContent = lines.join("\n");
+      preview.dataset.error = String(!!(formulaError || tableError));
+      histBox.hidden = false;
+      drawHist(f);
+    }
+  };
+
+  // The lengths of every run that may sound -- within the min and max length
+  // dials and, with a sound selection, touching it (eligibleRuns(), the
+  // recorder's own rule) -- one bar per length, coloured by the note it
+  // plays (hue = pitch class), so a scale's shape shows in the bars.
+  const drawHist = (f) => {
+    const p = panel.audio;
+    if (sim) sim.sync();
+    let runs = sim ? eligibleRuns(sim, p.beltMinLen, p.beltCutoff, soundSel?.cells ?? null) : [];
+    // With a space, the runs it leaves audible at all (a hard edge: those
+    // touching the box).
+    const sp = currentSpace();
+    if (sim && sp) { const w = spaceWeights(sim, runs, [], sp); runs = runs.filter((_, i) => w.gain[i] > 0); }
+    const lo = Math.max(1, p.beltMinLen);
+    const hi = Math.max(lo, Math.min(p.beltCutoff, runs.reduce((a, s) => Math.max(a, s.length), lo)));
+    const counts = new Int32Array(hi - lo + 1);
+    for (const s of runs) counts[s.length - lo]++;
+    hist = { lo, hi, counts, f, total: runs.length };
+    const dpr = window.devicePixelRatio || 1, r = canvas.getBoundingClientRect();
+    canvas.width = Math.max(1, Math.round(r.width * dpr));
+    canvas.height = Math.max(1, Math.round(r.height * dpr));
+    const c = canvas.getContext("2d");
+    c.setTransform(dpr, 0, 0, dpr, 0, 0);
+    c.clearRect(0, 0, r.width, r.height);
+    const pad = { l: 8, r: 8, t: 16, b: 18 }, w = r.width - pad.l - pad.r, h = r.height - pad.t - pad.b;
+    const max = Math.max(1, ...counts), bw = w / counts.length;
+    for (let i = 0; i < counts.length; i++) {
+      if (!counts[i]) continue;
+      const hzN = scaleHz(f, lo + i, p.beltMaxHz, p.beltMinLen);
+      const pc = ((12 * Math.log2(hzN / 440) % 12) + 12) % 12;
+      c.fillStyle = `hsl(${Math.round(pc * 30)}, 70%, 60%)`;
+      // Square-root heights: one length usually dwarfs the rest, and on a
+      // linear axis a lone run at another length is a pixel tall.
+      const bh = Math.max(2, h * Math.sqrt(counts[i] / max));
+      c.fillRect(pad.l + i * bw + (bw > 3 ? 0.5 : 0), pad.t + h - bh, Math.max(1, bw - (bw > 3 ? 1 : 0)), bh);
+    }
+    c.fillStyle = "#767c8a";
+    c.font = "10px system-ui, sans-serif";
+    c.textBaseline = "top";
+    c.textAlign = "left"; c.fillText(String(lo), pad.l, pad.t + h + 4);
+    c.textAlign = "right"; c.fillText(String(hi), pad.l + w, pad.t + h + 4);
+    c.textAlign = "left"; c.textBaseline = "alphabetic"; c.fillText(`${max} run${max === 1 ? "" : "s"} (√ scale)`, pad.l, 11);
+    c.textAlign = "right"; c.fillText("length", pad.l + w, 11);
+    if (!histInfo.dataset.pinned) {
+      histInfo.textContent = `${runs.length} run${runs.length === 1 ? "" : "s"} may sound` +
+        (panel.audio.camAudio ? " (on screen)" : soundSel?.region ? " (the audio region)" : soundSel ? " (the audio selection)" : "") + " -- tap a bar for its pitch";
+    }
+  };
+  const histAt = (e) => {
+    if (!hist) return;
+    const r = canvas.getBoundingClientRect(), w = r.width - 16;
+    const i = Math.max(0, Math.min(hist.counts.length - 1, Math.floor((e.clientX - r.left - 8) / (w / hist.counts.length))));
+    const n = hist.lo + i, p = panel.audio, h = scaleHz(hist.f, n, p.beltMaxHz, p.beltMinLen);
+    histInfo.dataset.pinned = "1";
+    histInfo.textContent = `length ${n}: ${hist.counts[i]} run${hist.counts[i] === 1 ? "" : "s"} · ${h.toFixed(1)} Hz ${noteName(h)}`;
+  };
+  canvas.onpointerdown = (e) => { canvas.setPointerCapture(e.pointerId); histAt(e); };
+  canvas.onpointermove = (e) => { if (e.buttons || e.pointerType === "mouse") histAt(e); };
+
+  const row = (name, detail, onTap, data) => {
+    const b = document.createElement("button");
+    b.type = "button"; b.className = "pick";
+    b.innerHTML = `<span></span><span class="scale-f"></span>`;
+    b.firstChild.textContent = name; b.lastChild.textContent = detail;
+    Object.assign(b.dataset, data);
+    b.onclick = onTap;
+    return b;
+  };
+  list.replaceChildren(
+    ...SCALE_PRESETS.map(([name, formula]) => row(name, formula, () => {
+      expr.value = formula; formulaError = null;
+      setScale({ scaleMode: "formula", scaleExpr: formula }); show();
+    }, { expr: formula })),
+    // Table…: with a table already loaded and a formula playing, back to the
+    // table; otherwise (none yet, or it is the one playing) a file to load.
+    row("Table…", lutName || (panel.audio.scaleLut ? `${parseLutCount(panel.audio.scaleLut)} numbers` : "a file of f(1), f(2)…"), () => {
+      const p = panel.audio;
+      if (p.scaleLut && p.scaleMode !== "lut") { formulaError = null; setScale({ scaleMode: "lut" }); show(); }
+      else fileInput.click();
+    }, { kind: "lut" }));
+  expr.value = panel.audio.scaleExpr;
+  expr.oninput = () => {
+    const text = expr.value;
+    try { compileScale(text); formulaError = null; } catch (e) { formulaError = e.message; show(); return; }
+    setScale({ scaleMode: "formula", scaleExpr: text.trim() });
+    show();
+  };
+  fileInput.onchange = async () => {
+    const file = fileInput.files[0];
+    fileInput.value = "";
+    if (!file) return;
+    try {
+      const nums = parseLut(await file.text());
+      lutName = m.dataset.lutName = file.name;
+      list.lastChild.lastChild.textContent = file.name;
+      formulaError = null;
+      setScale({ scaleMode: "lut", scaleLut: nums.join(" ") });
+    } catch (e) { formulaError = `${file.name}: ${e.message}`; }
+    show();
+  };
+  hz.oninput = () => { setScale({ beltMaxHz: hzOf(Number(hz.value)) }); show(); };
+  minL.oninput = () => { setScale({ beltMinLen: Number(minL.value) }); show(); };
+  viewNotes.onclick = () => { scaleView = "notes"; show(); };
+  viewLengths.onclick = () => { scaleView = "lengths"; delete histInfo.dataset.pinned; show(); };
+  help.innerHTML = "Wavelength of a run of length <code>n</code>; <code>m</code> is the min length, " +
+    "which keeps the min-length Hz dial. <code>+ - * / % ** ( )</code>, " +
+    `<code>${SCALE_NAMES.funcs.join(" ")}</code>, <code>pi e</code>. ` +
+    "Scale functions give the semitones of degree k. A table file: f(1), f(2)… separated by spaces, commas or lines.";
+  const close = () => { m.dataset.open = "false"; expr.blur(); };
+  m.querySelector("#scale-close").onclick = close;
+  let down = false;
+  m.onpointerdown = (e) => { down = e.target === m; };
+  m.onclick = (e) => { if (e.target === m && down) close(); down = false; };
+  delete histInfo.dataset.pinned;
+  m.dataset.open = "true";
+  show();   // after opening: the histogram measures its canvas
+}
+
+const parseLutCount = (text) => { try { return parseLut(text).length; } catch { return 0; } };
+
+function openBakeDialog() {
+  const m = document.getElementById("bakemenu");
+  const secs = m.querySelector("#bake-seconds"), rate = m.querySelector("#bake-rate");
+  const status = m.querySelector("#bake-status"), go = m.querySelector("#bake-go");
+  const cancel = m.querySelector("#bake-cancel"), wav = m.querySelector("#bake-wav");
+  secs.value = String(bakeOpts?.seconds ?? (Number(secs.value) || BAKE_DEFAULT_SECONDS));
+  rate.value = String(bakeOpts?.rate ?? clock.rate);
+  const show = (text) => {
+    status.textContent = text ?? (`Starts with a Reset. Audio from tick ${panel.audio.startTick}` +
+      (panel.audio.fadeMs ? `, fading in over ${panel.audio.fadeMs} ms` : "") + ".\n" + bakeStatus());
+    go.disabled = !!baking; cancel.disabled = !baking; wav.disabled = !bake || !!baking;
+    syncPreviewBtn();
+  };
+  const close = () => { stopPreview(); m.dataset.open = "false"; };
+  m.querySelector("#bake-play").onclick = () => togglePreview();
+  m.querySelector("#bake-close").onclick = close;
+  let down = false;
+  m.onpointerdown = (e) => { down = e.target === m; };
+  m.onclick = (e) => { if (e.target === m && down) close(); down = false; };
+  cancel.onclick = () => { if (baking) baking.cancel = true; };
+  wav.onclick = () => bake && downloadWav();
+  go.onclick = () => {
+    const sv = Number(secs.value), rv = Number(rate.value);
+    if (!(sv > 0 && sv <= BAKE_MAX_SECONDS)) { show(`Duration must be between 0 and ${BAKE_MAX_SECONDS} s.`); return; }
+    if (!(rv >= RATE_MIN && rv <= RATE_MAX)) { show(`Tick rate must be ${RATE_MIN} to ${RATE_MAX}.`); return; }
+    if (bakeOpts?.seconds !== sv || bakeOpts?.rate !== rv) { bakeOpts = { seconds: sv, rate: rv }; touchAudio(); }
+    // Playing it back needs sound on; this tap is the gesture that may start it.
+    if (!audio && !audioStarting) { setAudio(true); storeSound(true); }
+    runBake(sv, rv, show);
+  };
+  show();
+  m.dataset.open = "true";
+}
+
+async function runBake(seconds, rate, show) {
+  if (!sim || baking) return;
+  shell.setPaused(true);
+  clock.paused = true;
+  stopBakedPlay();
+  stopPreview(false);
+  bake = null;
+  sim.reset();
+  clock.reset();
+  redraw();
+  const snap = sim.clone();
+  const own = { cancel: false };
+  baking = own;
+  const startSim = sim, revision = board.revision, rebuilds = sim.stats.rebuilds;
+  const params = { ...panel.audio }, key = bakeKey(params), sel = soundSelId();
+  const t = performance.now();
+  const { bakeAudio } = await import("./audio-bake.js");
+  let res = null;
+  try {
+    res = await bakeAudio({
+      start: snap, params, rate, seconds, sampleRate: audioCtx?.sampleRate || 48000, selection: soundSel?.cells ?? null,
+      space: currentSpace(),
+      onProgress: (f, tick, end) => show(`Baking… ${Math.round(f * 100)}%  (tick ${tick} of ${end})`),
+      shouldStop: () => own.cancel || sim !== startSim || board.revision !== revision,
+    });
+  } catch (e) {
+    show(`Bake failed: ${e.message}`);
+  }
+  baking = null;
+  if (!res) { show(res === null ? "Bake cancelled (or the board changed)." : undefined); return; }
+  bake = { snap, sim: startSim, revision, rebuilds, rate, key, sel, ...res, buf: null };
+  shell.setRate(rate);     // play it at the rate it was baked at
+  show(`Baked ${seconds} s at ${rate} tps in ${((performance.now() - t) / 1000).toFixed(1)} s. Press play.\n` + bakeStatus());
+  redraw();
+}
+
+function downloadWav() {
+  import("./audio-bake.js").then(({ wavBytes }) => {
+    const blob = new Blob([wavBytes(bake.samples, bake.sampleRate)], { type: "audio/wav" });
+    const a = document.createElement("a");
+    a.href = URL.createObjectURL(blob);
+    a.download = `${(panel.local.name || "gates").replace(/[^\w.-]+/g, "_")}-${bake.rate}tps-t${bake.t0}.wav`;
+    a.click();
+    setTimeout(() => URL.revokeObjectURL(a.href), 10000);
+  });
+}
+
 let queued = false;
 let lastNow = null;    // the previous playing frame's time, or null
+// Stepping stops after this many ms of a frame and drops the rest of the
+// ticks due, so a rate the board cannot sustain slows the sim instead of
+// starving the frame (and every later frame, as the backlog grows).
+const STEP_BUDGET_MS = 12;
+
+// View > fps counter: frames and ticks counted over a half-second window.
+const fpsEl = document.getElementById("fps");
+const fpsWin = { t0: null, frames: 0, ticks: 0 };
+function countFrame(now, ticks) {
+  if (!view.fps) { fpsEl.hidden = true; fpsWin.t0 = null; return; }
+  fpsEl.hidden = false;
+  // Paused, frames are drawn only on demand, so a rate would mean nothing.
+  if (!sim || clock.paused) { fpsEl.textContent = "paused"; fpsWin.t0 = null; return; }
+  if (fpsWin.t0 === null) { Object.assign(fpsWin, { t0: now, frames: 0, ticks: 0 }); return; }
+  fpsWin.frames++; fpsWin.ticks += ticks;
+  const dt = now - fpsWin.t0;
+  if (dt >= 500) {
+    fpsEl.textContent = `${Math.round(fpsWin.frames * 1000 / dt)} fps · ${Math.round(fpsWin.ticks * 1000 / dt)} tps`;
+    Object.assign(fpsWin, { t0: now, frames: 0, ticks: 0 });
+  }
+}
 function redraw() {
   if (queued) return;
   queued = true;
@@ -141,22 +987,48 @@ function redraw() {
 
 function paint(now) {
   queued = false;
+  let ran = 0;
   if (sim) {
     // An edit since the last frame re-derives the runs and starts fresh --
     // here rather than at each edit site, so no edit path can forget it.
     sim.sync();
-    if (!clock.paused) {
+    if (!clock.paused && bakePlayable()) {
+      // Baked: step to the tick being heard. The buffer runs on its own
+      // clock, so falling behind costs frames, never sync.
+      if (!bakedPlay) startBakedPlay();
+      const target = Math.min(bakedTick(), bake.end);
+      const t0 = performance.now();
+      while (sim.tick < Math.floor(target) && performance.now() - t0 < BAKED_BUDGET_MS) { sim.step(); ran++; }
+      clock.frac = Math.min(1, Math.max(0, target - sim.tick));
+    } else if (!clock.paused) {
+      if (bakedPlay) stopBakedPlay();   // out of the baked stretch: realtime from here
       // A stalled frame (a backgrounded tab) is clamped, and the clock caps
       // the backlog too, so coming back never freezes to catch up.
       const dt = lastNow === null ? 0 : Math.min(0.25, (now - lastNow) / 1000);
       const n = clock.advance(dt);
-      for (let i = 0; i < n; i++) sim.step();
+      const t0 = performance.now();
+      for (; ran < n; ran++) {
+        if (ran > 0 && performance.now() - t0 > STEP_BUDGET_MS) { clock.dropped += n - ran; break; }
+        sim.step();
+      }
     }
     shell.setTick(sim.tick);
     if (inspectRow >= 0) panel.setLive(liveText(inspectRow));
   }
+  driveDryRun();
+  presenter?.frame();
+  checkSoundSel();
+  // Ship this frame's ticks to the audio thread; paused, let it fall silent.
+  if (audio) {
+    if (clock.paused) stopBakedPlay();
+    if (bakedPlay) { /* the buffer is playing */ }
+    else if (sim && !clock.paused) audio.rec.flush(clock.rate);
+    else audio.rec.stop();
+  }
   lastNow = sim && !clock.paused ? now : null;
+  countFrame(now, ran);
   recordStep();
+  syncSpace();
   const t0 = performance.now();
   const info = board ? board.describe(inspectRow) : null;
   const ghosts = [
@@ -168,10 +1040,18 @@ function paint(now) {
   ];
   // The belt a run starts on draws only as the run's ghost, at its new facing.
   const hide = run ? runCopies().copies.filter(c => c.over).map(c => c.start) : null;
+  const lv = layerView();
+  const gTint = view.gateStatus ? gateStatus() : null;
+  const bTint = view.beltStatus ? beltStatus() : null;
   render(ctx, board, cam, dpr, { ...view, selected: info, ghosts, sim, alpha: clock.alpha, hide, vector: vectorMarks(),
                                 indexLabels: indexLabels(), noteSel: noteEdit, noteGrips: labelHeld(),
-                                gateTint: view.gateStatus ? gateStatus() : null,
-                                beltTint: view.beltStatus ? beltStatus() : null });
+                                ghostNotes: ghostNotes(),
+                                pixels: sim?.screen ? { screen, alpha: view.pixelAlpha, max: view.pixelMax } : null,
+                                frameBoxes: videoBoxes(),
+                                soundSpace: spaceMarks(),
+                                ...layerOpts(lv, gTint, bTint),
+                                layerLabelHits: labelHits = [], layerLabelSel: labelSel });
+  syncLayerPanel(lv);
   debug.renderMs = performance.now() - t0;
   if (sim && !clock.paused) redraw();
 }
@@ -183,15 +1063,16 @@ function paint(now) {
 // (clearing the way, then building) are one step.
 // The board's edit key: entities and labels both. A label edit is an undo
 // step but not a board edit -- it must not restart the simulation.
-const editKey = () => `${board.revision}/${board.notesRev}`;
+const editKey = () => `${board.revision}/${board.notesRev}/${board.layersRev}`;
 
 function recordStep() {
   if (!board || sel || editKey() === committed) return;
   // A label being dragged or typed into is a change in progress too: one
   // step when the drag ends or the editor closes, not one per frame.
-  if (grab?.note || noteEdit >= 0) return;
+  if (grab?.note || grab?.layerLabel || noteEdit >= 0) return;
   history.commit(board.snapshot());
   committed = editKey();
+  edited = true;   // the autosaves may write from now on
   syncHistory();
   prepareSave();
 }
@@ -246,6 +1127,278 @@ function checkpoint() {
   syncHistory();
 }
 
+// --- layers -------------------------------------------------------------------
+//
+// layers.js is the model; the table lives on the board (board.layers) so it
+// rides in snapshots and saves, and each entity's tag in its row. While
+// View > layers is off, layers change nothing: everything is drawn and
+// everything can be touched (new entities still go on the current layer).
+//
+// Every interaction that finds an entity under a cell goes through
+// pickAt() -- an inactive layer's entities are not there to select, run
+// over, force-build through or match -- and the Hand's inspect through
+// seeAt(), which also skips hidden layers but lets an inactive entity be
+// inspected, read only, so its layer can be made current.
+
+const layersOn = () => !!board && view.layers === true;
+
+function pickable(row) {
+  return row >= 0 && (!layersOn() || isActive(board.layers, board.layerOf(row)));
+}
+function pickAt(x, y) { const r = board.entityAt(x, y); return pickable(r) ? r : -1; }
+function seeAt(x, y) {
+  const r = board.entityAt(x, y);
+  return r >= 0 && (!layersOn() || isVisible(board.layers, board.layerOf(r))) ? r : -1;
+}
+
+// What the layers mean for drawing, rebuilt only when the board, the table
+// or its view changed -- not per frame: the visible lists (only while
+// something is hidden), the hidden-cell mask for items, each layer's label
+// at its centre of mass, and the tints. A tint blends the layer's colour
+// over whatever the entity would otherwise wear (its own colour, or a
+// status colour), by that layer's own amount.
+let lvCache = null;
+function layerView() {
+  if (!layersOn()) return null;
+  const t = board.layers;
+  const key = `${board.revision}/${board.layersRev}/${JSON.stringify(t)}`;
+  if (lvCache?.board === board && lvCache.key === key) return lvCache.lv;
+  const stats = layerStats(board, t);
+  const vis = (row) => isVisible(t, board.layerOf(row));
+  const lists = stats.hidden ? {
+    belts: board.belts.filter(b => vis(b.row)),
+    unders: board.unders.filter(u => vis(u.row)),
+    structs: board.structs.filter(st => vis(st.row)),
+  } : null;
+  const tints = new Map();
+  for (const l of t.list) if (l.colour && l.tint > 0 && isVisible(t, l.id)) tints.set(l.id, { rgb: hexRgb(l.colour), k: l.tint });
+  // Each label at its layer's centre of mass plus the offset the player
+  // dragged it to -- unless labels are switched off as a whole.
+  const labels = [];
+  for (const l of t.showLabels === false ? [] : t.list) {
+    if (l.id === BACKGROUND || !(l.label > 0) || !isVisible(t, l.id)) continue;
+    const c = stats.centres.get(l.id);
+    if (c) labels.push({ id: l.id, x: c[0] + (l.labelDx || 0), y: c[1] + (l.labelDy || 0), text: l.name, colour: l.colour, size: l.label });
+  }
+  const strs = new Map();   // "layer|base css" -> blended css, so a belt costs a lookup
+  const blend = (id, base) => {
+    const k = `${id}|${base}`;
+    let c = strs.get(k);
+    if (!c) {
+      const tt = tints.get(id);
+      c = rgbCss(mix(parseCss(base) || [0.46, 0.47, 0.52], tt.rgb, tt.k));
+      strs.set(k, c);
+    }
+    return c;
+  };
+  // Visible but inactive: what cannot be touched, washed out so it reads as
+  // such. Cell rects for the one batched pass, plus the rows and cells the
+  // renderer's screen-space text (Source values, item numbers) fades by.
+  let dim = null;
+  if (t.list.some(l => isVisible(t, l.id) && !isActive(t, l.id))) {
+    const W = board.width, cells = new Uint8Array(W * board.height), rows = new Set(), rects = [];
+    const dimmed = (row) => { const id = board.layerOf(row); return isVisible(t, id) && !isActive(t, id); };
+    const add = (row, x, y, w, h) => {
+      if (!dimmed(row)) return;
+      rows.add(row);
+      rects.push([x, y, w, h]);
+      for (let dy = 0; dy < h; dy++) cells.fill(1, (y + dy) * W + x, (y + dy) * W + x + w);
+    };
+    for (const b of board.belts) add(b.row, b.x, b.y, 1, 1);
+    for (const u of board.unders) add(u.row, u.x, u.y, 1, 1);
+    for (const st of board.structs) add(st.row, st.x, st.y, st.w, st.h);
+    dim = { rects, rows, cells };
+  }
+  let plainGate = null;     // the machines' map with no status colours, built once
+  const lv = {
+    lists, labels, stats, dim, hidden: stats.hidden,
+    // `status`: View > gate status colours' row -> rgb map, or null.
+    gateTint(status) {
+      if (!tints.size) return status;
+      if (!status && plainGate) return plainGate;
+      const out = new Map(status || []);
+      for (const st of board.structs) {
+        const tt = tints.get(board.layerOf(st.row));
+        if (!tt) continue;
+        const base = status?.get(st.row) || T.types[st.type].colour || [0.5, 0.5, 0.5];
+        out.set(st.row, mix(base, tt.rgb, tt.k));
+      }
+      if (!status) plainGate = out;
+      return out;
+    },
+    // `status`: View > belt status colours' (x, y) -> css, or null.
+    // `base`: the belt's (or underground end's) own colour.
+    beltTint(status, base) {
+      if (!tints.size) return status;
+      const W = board.width;
+      return (x, y) => {
+        const s0 = status?.(x, y) || null;
+        const id = board.layerOf(board.cellId(board.grid[(y * W + x) * 4]));
+        return tints.has(id) ? blend(id, s0 || base) : s0;
+      };
+    },
+  };
+  lvCache = { board, key, lv };
+  return lv;
+}
+
+// --- layer labels in the Hand ------------------------------------------------
+//
+// A tap on a layer label picks it up (outlined); a drag from it then moves
+// it, as an offset in cells from its layer's centre of mass, which it keeps
+// as the layer's membership changes. Any other tap, leaving the Hand, or
+// switching labels or layers off puts it down. Hit-tested against the boxes
+// the last render drew (`labelHits`), since only drawing knows the text's
+// measured size; the topmost (last drawn) wins.
+let labelSel = null;     // the picked-up label's layer id, or null
+let labelHits = [];
+
+function layerLabelHit(sx, sy) {
+  if (!layersOn()) return null;
+  for (let i = labelHits.length - 1; i >= 0; i--) {
+    const h = labelHits[i];
+    if (sx >= h.x0 && sx <= h.x1 && sy >= h.y0 && sy <= h.y1) return h.id;
+  }
+  return null;
+}
+
+function selectLayerLabel(id) {
+  labelSel = id;
+  redraw();
+}
+
+// What a layer view adds to a render: tints over the status colours (or in
+// their place), the visible lists, the hidden-cell mask and the labels.
+// One place, so the screen and a video frame cannot draw layers differently.
+// `forVideo`: the inactive washout is left out -- what can be touched is an
+// editing matter, like the selection and the ghosts.
+function layerOpts(lv, gTint, bTint, forVideo = false) {
+  return {
+    dim: !forVideo && lv?.dim || null,
+    gateTint: lv ? lv.gateTint(gTint) : gTint,
+    beltTint: lv ? lv.beltTint(bTint, BASE_COLOURS.belt) : bTint,
+    underTint: lv ? lv.beltTint(bTint, BASE_COLOURS.under) : null,
+    lists: lv?.lists || null, hiddenCells: lv?.hidden || null,
+    layerLabels: lv?.labels || null,
+  };
+}
+
+// The panel's model, pushed every frame (the panel redraws only on change).
+// Counts include what is lifted in the selection, so Adopt shows at once.
+function syncLayerPanel(lv = layerView()) {
+  if (!layerPanel) return;
+  layerPanel.show(layersOn());
+  shell.setInspectLayer(inspectLayerOf(inspectRow));
+  if (!lv) return;
+  const t = board.layers;
+  const counts = new Map(lv.stats.counts);
+  if (sel) {
+    for (const e of sel.stamp.entries) {
+      const id = byId(t, e.layer) ? e.layer : BACKGROUND;
+      counts.set(id, (counts.get(id) || 0) + 1);
+    }
+  }
+  // The sliders show the current layer's values -- or, with Background
+  // current, the first active layer's, since that is what they would move.
+  const cur = byId(t, t.current);
+  const ref = cur && cur.id !== BACKGROUND ? cur : t.list.find(l => l.id !== BACKGROUND && isActive(t, l.id));
+  layerPanel.update({
+    rows: t.list.map(l => ({ id: l.id, name: l.name, colour: l.colour, visible: isVisible(t, l.id),
+                             active: isActive(t, l.id), current: l.id === t.current, count: counts.get(l.id) || 0 })),
+    tint: ref?.tint ?? 0, labelsOn: t.showLabels !== false,
+    // The label slider shows and sets the current layer only.
+    label: cur && cur.id !== BACKGROUND ? cur.label : 0, labelEditable: !!cur && cur.id !== BACKGROUND,
+    selCount: sel ? sel.stamp.entries.length : 0,
+    canEdit: t.current !== BACKGROUND,
+  });
+}
+
+// The Hand bar's layer chip for a row, or null.
+function inspectLayerOf(row) {
+  if (!layersOn() || !board.describe(row)) return null;
+  const t = board.layers;
+  const l = byId(t, board.layerOf(row)) || t.list[0];
+  return { name: l.name, colour: l.colour, current: l.id === t.current };
+}
+
+// After any layer change. `edit`: an undo step (membership, names,
+// colours) rather than view (visibility, current, sliders).
+function layersChanged(edit) {
+  if (!board) return;
+  if (edit) board.layersRev++;
+  if (labelSel !== null && !layersOn()) labelSel = null;
+  if (inspectRow >= 0 && seeAtRow(inspectRow) < 0) inspect(-1);
+  shell.setInspectValue(handValueOf(inspectRow));
+  syncHistory();
+  redraw();
+}
+const seeAtRow = (row) => (!layersOn() || isVisible(board.layers, board.layerOf(row)) ? row : -1);
+
+const layerActions = {
+  onSelect: (id) => { setCurrent(board.layers, id); layersChanged(false); },
+  onIsolate: (id) => { if (isolate(board.layers, id)) layersChanged(false); },
+  // Double tap: every entity on the layer joins the selection (the first
+  // tap already made it current, so all of it is active and visible).
+  // Selecting is a state of Build, so the shell goes there; a run, a
+  // placement or a paste in progress is dropped first, as a tap on an
+  // entity would not reach them otherwise.
+  onSelectAll: (id) => {
+    setCurrent(board.layers, id);
+    if (shell.state.mode !== "build") shell.setMode("build");
+    if (run) cancelRun();
+    if (shell.activeStamp) exitPaste();
+    else if (place) endPlace();
+    const E = T.entity, rows = [];
+    for (let r = 1; r < board.rows; r++) if (board.field(r, E.F_ALIVE) && board.layerOf(r) === id) rows.push(r);
+    lift(rows);
+    layersChanged(false);
+  },
+  onAdd: () => { addLayer(board.layers); layersChanged(true); },
+  onRename: () => {
+    const t = board.layers, l = byId(t, t.current);
+    if (!l || l.id === BACKGROUND) return;
+    const name = prompt("Rename layer", l.name);
+    if (name !== null && renameLayer(t, l.id, name)) layersChanged(true);
+  },
+  // Deleting a layer moves its entities -- on the board and lifted -- to
+  // Background, after asking.
+  onDelete: () => {
+    const t = board.layers, l = byId(t, t.current);
+    if (!l || l.id === BACKGROUND) return;
+    const n = (layerView()?.stats.counts.get(l.id) || 0) + (sel ? sel.stamp.entries.filter(e => e.layer === l.id).length : 0);
+    const what = n ? ` Its ${n} ${n === 1 ? "entity moves" : "entities move"} to Background.` : "";
+    if (!confirm(`Delete layer "${l.name}"?${what}`)) return;
+    board.retag(l.id, BACKGROUND);
+    if (sel) for (const e of sel.stamp.entries) if (e.layer === l.id) e.layer = BACKGROUND;
+    removeLayer(t, l.id);
+    layersChanged(true);
+  },
+  // The selection's entities join the current layer. They are lifted, so
+  // the change lands -- one undo step -- when the selection goes down.
+  onAdopt: () => {
+    if (!sel) return;
+    for (const e of sel.stamp.entries) e.layer = board.layers.current;
+    layersChanged(false);
+  },
+  onVisible: (id, v) => { const l = byId(board.layers, id); if (l) l.visible = v; layersChanged(false); },
+  onActive: (id, v) => { const l = byId(board.layers, id); if (l) l.active = v; layersChanged(false); },
+  onColour: (id, hex) => { const l = byId(board.layers, id); if (l && l.colour !== hex) { l.colour = hex; layersChanged(true); } },
+  onTint: (v) => { setForActive(board.layers, "tint", v); redraw(); },
+  // The label slider is the current layer's alone (Background has none);
+  // the tint slider still sets every active layer.
+  onLabel: (v) => {
+    const l = byId(board.layers, board.layers.current);
+    if (l && l.id !== BACKGROUND) { l.label = v; redraw(); }
+  },
+  // A long press on the Label slider's name: every layer label off or on,
+  // each keeping its own size. View, like visibility.
+  onLabelsToggle: () => {
+    board.layers.showLabels = board.layers.showLabels === false;
+    if (board.layers.showLabels === false) selectLayerLabel(null);
+    layersChanged(false);
+  },
+};
+
 // View > gate status colours: each machine's body coloured by what it is
 // doing in the state on screen. BLOCKED (yellow) when an output with
 // somewhere to go is holding a result it could not hand on -- that wins,
@@ -253,14 +1406,17 @@ function checkpoint() {
 // does not have what its own firing rule needs (a Merge needs its control
 // and the lane that selects, a Sink any one lane; a Source never starves);
 // RUNNING (green) otherwise. Dangling outputs discard and never block.
-const STATUS_COL = { blocked: [0.86, 0.72, 0.18], starved: [0.78, 0.26, 0.24], running: [0.27, 0.66, 0.33] };
-function gateStatus() {
+// The colours are the player's (View > status colours, panel.js).
+const hexRgb = (h) => [1, 3, 5].map(i => parseInt(h.slice(i, i + 2), 16) / 255);
+// `s` is the sim to read (the live one, or a video's copy).
+function gateStatus(s = sim) {
   const out = new Map();
-  if (!sim) return out;
-  sim.sync();
-  for (const g of sim.gates) {
-    const blocked = g.drains.some(c => sim.outHeld(g.row, c));
-    const starved = g.sim.n_in > 0 && !sim.inputsReady(g);
+  if (!s) return out;
+  s.sync();
+  const STATUS_COL = { blocked: hexRgb(statusColours.gateBlocked), starved: hexRgb(statusColours.gateStarved), running: hexRgb(statusColours.gateRunning) };
+  for (const g of s.gates) {
+    const blocked = g.drains.some(c => s.outHeld(g.row, c));
+    const starved = g.sim.n_in > 0 && !s.inputsReady(g);
     out.set(g.row, blocked ? STATUS_COL.blocked : starved ? STATUS_COL.starved : STATUS_COL.running);
   }
   return out;
@@ -271,16 +1427,16 @@ function gateStatus() {
 // leave on the coming tick (the forecast has no pop), so items are stuck on
 // it (and, by default, nothing on it is moving either -- see below); GREEN
 // otherwise (carrying, and moving). Returns (x, y) -> colour.
-const BELT_STATUS_COL = { empty: "rgb(176,72,66)", stalled: "rgb(214,180,58)", moving: "rgb(80,160,92)" };
-function beltStatus() {
-  if (!sim) return null;
-  sim.sync();
-  const F = sim.forecast();
+function beltStatus(s = sim) {
+  if (!s) return null;
+  const BELT_STATUS_COL = { empty: statusColours.beltEmpty, stalled: statusColours.beltStalled, moving: statusColours.beltMoving };
+  s.sync();
+  const F = s.forecast();
   const bySid = new Map();
-  for (const seg of sim.segments.values()) {
+  for (const seg of s.segments.values()) {
     let st = "moving";
     if (seg.head === seg.tail) st = "empty";
-    else if (sim.positionOf(seg, seg.head, sim.tick) >= seg.length * sim.UNIT && !F.pops.has(seg)) {
+    else if (s.positionOf(seg, seg.head, s.tick) >= seg.length * s.UNIT && !F.pops.has(seg)) {
       st = "stalled";
       // View > "stalled but moving: green": a stalled run whose items are
       // still moving -- one is pushed on this tick, or the newest is still
@@ -288,14 +1444,14 @@ function beltStatus() {
       // they all have) -- is not static, and reads green. O(1) per run.
       if (view.beltActive !== false) {
         const k = seg.tail - 1;
-        const moving = sim.positionOf(seg, k, sim.tick, 1) > sim.positionOf(seg, k, sim.tick, 0);
+        const moving = s.positionOf(seg, k, s.tick, 1) > s.positionOf(seg, k, s.tick, 0);
         if (moving || F.pushes.has(seg)) st = "moving";
       }
     }
     bySid.set(seg.sid, BELT_STATUS_COL[st]);
   }
-  const W = board.width;
-  return (x, y) => bySid.get(sim.segAt[y * W + x]) || null;
+  const W = s.board.width;
+  return (x, y) => bySid.get(s.segAt[y * W + x]) || null;
 }
 
 // What the Status pane's live readout says about a row: a gate's channels,
@@ -343,6 +1499,11 @@ function resize() {
   canvas.width = Math.round(r.width * dpr);
   canvas.height = Math.round(r.height * dpr);
   cam.resize(r.width, r.height);
+  // A first video size: the board's own size on screen, in device pixels --
+  // here, once the canvas has a real size (before, it is the default 300x150).
+  if (panel && (!panel.video.width || !panel.video.height) && r.width > 0 && r.height > 0) {
+    panel.setVideoSize(evenDim(canvas.width), evenDim(canvas.height));
+  }
   redraw();
 }
 
@@ -377,6 +1538,7 @@ function inspect(row) {
 function syncInspect() {
   panel.showStatus(board ? board.describe(inspectRow) : null);
   shell.setInspectValue(handValueOf(inspectRow));
+  shell.setInspectLayer(inspectLayerOf(inspectRow));
   redraw();
 }
 
@@ -384,7 +1546,8 @@ function syncInspect() {
 // a belt's seed (null when unseeded), or nothing for anything else.
 function handValueOf(row) {
   const info = board?.describe(row);
-  if (!info) return null;
+  // An inactive layer's entities can be inspected but not edited.
+  if (!info || !pickable(row)) return null;
   if (info.emit !== null) return { kind: "emit", values: VALUE_CHOICES, current: info.emit };
   if (info.seedOn !== null) return { kind: "seed", values: VALUE_CHOICES, current: info.seedOn ? info.seedValue : null };
   return null;
@@ -392,7 +1555,7 @@ function handValueOf(row) {
 
 function setInspectValue(v) {
   const info = board?.describe(inspectRow);
-  if (!info) return;
+  if (!info || !pickable(inspectRow)) return;
   // Setting the value already held is not a change: an edit restarts the
   // simulation, and re-tapping the lit swatch should not.
   if (info.emit !== null) { if (Math.fround(v) !== info.emit) board.setEmit(inspectRow, v); }
@@ -608,10 +1771,11 @@ function indexApply(o) {
 
 function openSelectPicker() {
   if (!sel) return;
+  // A selection of labels alone has no entity to anchor on: its box's corner.
   const first = selAbs()[0];
   vec.picking = "select";
   vec.sv = [0, 0];
-  vec.anchor = [first.dx, first.dy];
+  vec.anchor = first ? [first.dx, first.dy] : selOrigin();
   grab = null;
   syncVector();
 }
@@ -621,6 +1785,7 @@ function confirmSelectVector() {
   closePicker(true);
   if (!sel || isZero(v)) return;
   const pattern = selAbs();
+  if (!pattern.length) return;   // labels are not followed: no pattern to match
   const rows = [];
   for (const off of followChain(v, (o) => {
     const found = pattern.map(e => matchRow(e, e.dx + o[0], e.dy + o[1]));
@@ -634,7 +1799,7 @@ function confirmSelectVector() {
 // The board row matching entry `e` with its origin at (x, y): same type,
 // facing, flip and underground role -- or -1. Settings are not compared.
 function matchRow(e, x, y) {
-  const row = board.entityAt(x, y);
+  const row = pickAt(x, y);
   if (row < 0) return -1;
   const E = T.entity;
   if ((board.field(row, E.F_ORIGIN_X) | 0) !== x || (board.field(row, E.F_ORIGIN_Y) | 0) !== y) return -1;
@@ -650,15 +1815,32 @@ function matchRow(e, x, y) {
 
 function onTap(sx, sy) {
   if (!board) return;
+  // Presenting: a tap on a machine shows what it is; nothing else answers.
+  if (presenting) {
+    const [wx, wy] = cam.screenToWorld(sx, sy);
+    const info = board.describe(seeAt(Math.floor(wx), Math.floor(wy)));
+    if (info && info.td.kind === "structure") presenter?.tap(info.td.class || info.td.name);
+    return;
+  }
+  // Set audio region armed: a tap instead of a drag cancels it, and the
+  // audio goes back to everything.
+  if (regionArmed) { clearSoundSel(); return; }
   const [wx, wy] = cam.screenToWorld(sx, sy);
   const x = Math.floor(wx), y = Math.floor(wy);
   const mode = shell.state.mode;
   if (mode === "hand") {
-    // A label wins the tap: it draws over the board.
+    // A layer label draws over everything, so it wins the tap: it is picked
+    // up, to be dragged. With one picked up, any other tap only puts it down.
+    const li = layerLabelHit(sx, sy);
+    if (li !== null) { selectLayerLabel(li); return; }
+    if (labelSel !== null) { selectLayerLabel(null); return; }
+    // A note wins the tap: it draws over the board.
     const ni = noteHit(sx, sy);
     if (ni >= 0) { editNote(ni); return; }
-    // A tap on bare board closes the window, as on the desktop.
-    inspect(board.entityAt(x, y));
+    // A tap on bare board closes the window, as on the desktop. A hidden
+    // layer's entities are not there to tap; an inactive one's can be
+    // inspected (read only), which is how its layer is made current.
+    inspect(seeAt(x, y));
     return;
   }
   if (mode !== "build") return;
@@ -706,10 +1888,11 @@ function onTap(sx, sy) {
     } else commitRun();
     return;
   }
-  if (sel) { selectTap(x, y); return; }
+  if (sel) { selectTap(x, y, wx, wy); return; }
   // Idle: a tap on an entity selects it, whatever the hand holds; a tap on
-  // empty board is the held tool's.
-  const row = board.entityAt(x, y);
+  // empty board is the held tool's. An inactive layer's entity is not
+  // there to select.
+  const row = pickAt(x, y);
   // With the belt planner held, a tap on a placed belt starts a run FROM it:
   // that belt is turned to follow the run on Build. Machines and underground
   // ends still select; a long press still selects a belt's whole run.
@@ -802,7 +1985,7 @@ function busFor(route) {
     const start = [run.start[0] + k * v0[0], run.start[1] + k * v0[1]];
     const end = [run.end[0] + k * vec.v[0], run.end[1] + k * vec.v[1]];
     if (!inBoard(start) || !inBoard(end)) continue;
-    const row = board.entityAt(start[0], start[1]);
+    const row = pickAt(start[0], start[1]);
     const over = k === 0 ? (run.over && overStart(start[0], start[1]) ? run.over : 0)
                          : row >= 0 && isBeltRow(row) ? row : 0;
     const free = (x, y) => (over && x === start[0] && y === start[1]) || claims.free(x, y);
@@ -898,7 +2081,8 @@ function commitRun() {
 // machine takes the machine, as erasing does on the desktop).
 function clearCells(cells) {
   const rows = new Set();
-  for (const c of cells) { const r = board.entityAt(c.x, c.y); if (r >= 0) rows.add(r); }
+  // Force build never deletes what an inactive layer holds.
+  for (const c of cells) { const r = pickAt(c.x, c.y); if (r >= 0) rows.add(r); }
   if (!rows.size) return;
   if (rows.has(inspectRow)) inspect(-1);
   board.eraseRows([...rows]);
@@ -929,7 +2113,7 @@ function placer() {
 }
 
 function typeIdOf(name) {
-  return Number(Object.keys(T.types).find(k => T.types[k].name === name));
+  return typeByName(T, name)?.id ?? NaN;
 }
 
 // The tool at the ghost's position: what would be built, and where it is
@@ -981,7 +2165,8 @@ function placementAt(tool, origin) {
     const st = tool.stamp;
     const at = st.entries.map(e => [origin[0] + e.dx, origin[1] + e.dy]);
     const ghost = stampGhost(board, st.entries, at);
-    return { tool, kind: "stamp", origin, w: st.w, h: st.h, entries: st.entries, at, ghost, blocked: ghost.blocked };
+    const notes = (st.notes || []).map(n => shiftNote(n, origin[0], origin[1]));
+    return { tool, kind: "stamp", origin, w: st.w, h: st.h, entries: st.entries, at, ghost, blocked: ghost.blocked, notes };
   }
   const dir = tool.dir | 0, flip = !!tool.flip;
   if (tool.kind === "rawbelt") {
@@ -1030,6 +2215,8 @@ function placeOnce() {
   const pls = placements();
   let any = false;
   pls.forEach((pl, k) => { if (placeOne(pl, k === 0)) any = true; });
+  // Only the cut's first placement is the move; pasting it again copies.
+  if (any && place) place.keepLayers = false;
   if (any) board.derive();
   redraw();
   return any;
@@ -1040,11 +2227,21 @@ function placeOnce() {
 // machine or raw belt only -- never for a copy, and never for a stamp,
 // which already places whatever fits.
 function placeOne(pl, original) {
-  if (pl.kind === "stamp") return board.placeEntries(pl.entries, pl.at, { derive: false }).size > 0;
+  if (pl.kind === "stamp") {
+    // A cut being put down is a move: its entities keep their layers. Any
+    // other paste makes copies, which go on the current layer.
+    const keep = original && place?.keepLayers;
+    const entries = keep ? pl.entries : pl.entries.map(e => ({ ...e, layer: undefined }));
+    // Labels always fit. A label edit is not a board edit (it must not
+    // restart the simulation), so only placed entities count for the derive.
+    if (pl.notes.length) { board.notes.push(...pl.notes.map(n => ({ ...n, rect: n.rect.slice() }))); board.notesRev++; }
+    return board.placeEntries(entries, pl.at, { derive: false }).size > 0;
+  }
   const blocked = placementCells(pl).filter(([x, y]) => !board.isFree(x, y));
   if (blocked.length) {
     if (!original || !TUNE.forceBuild) return false;
     clearCells(blocked.map(([x, y]) => ({ x, y })));
+    if (placementCells(pl).some(([x, y]) => !board.isFree(x, y))) return false;   // an inactive layer is in the way
   }
   const [x, y] = pl.origin;
   if (pl.kind === "rawbelt") board.spawnBelt(x, y, pl.dir, pl.value);
@@ -1078,6 +2275,12 @@ function onGhost(sx, sy) {
 //   drag from a selected one  move the whole selection
 //   drag with Box armed       a rectangle that adds what it touches
 //   Turn buttons              turn / mirror the selection as one stamp
+//
+// Labels join it too: a box picks up every (visible) label it touches, and
+// they are lifted off board.notes into the stamp's `notes`, so they move,
+// turn, delete, cut, copy and paste with the rest (stamp.js keeps them
+// upright). A label always fits, so it goes back down whenever the whole
+// selection does; a tap on a selected label puts that one back.
 
 const selOrigin = () => originFor(sel.stamp.w, sel.stamp.h, sel.px, sel.py);
 
@@ -1087,16 +2290,26 @@ function selAbs() {
   return sel.stamp.entries.map(e => ({ ...e, dx: ox + e.dx, dy: oy + e.dy }));
 }
 
-// Replace the selection with these absolute entries. The pose is re-centred
-// on their box, so a turn after a membership change pivots on what is
-// actually selected.
-function setSel(abs) {
-  if (!abs.length) sel = null;
+// The selection's labels with absolute rects.
+function selNotes() {
+  if (!sel) return [];
+  const [ox, oy] = selOrigin();
+  return (sel.stamp.notes || []).map(n => shiftNote(n, ox, oy));
+}
+
+// The selected label at world point (wx, wy), or -1.
+const selNoteAt = (wx, wy) => (sel && notesOn() ? noteAt(selNotes(), wx, wy) : -1);
+
+// Replace the selection with these absolute entries and labels (by default
+// the labels it already holds). The pose is re-centred on their box, so a
+// turn after a membership change pivots on what is actually selected.
+function setSel(abs, notes = selNotes()) {
+  if (!abs.length && !notes.length) sel = null;
   else {
-    const { stamp, origin } = makeStamp(T, abs);
+    const { stamp, origin } = makeStamp(T, abs, notes);
     sel = { stamp, px: origin[0] + stamp.w / 2, py: origin[1] + stamp.h / 2 };
   }
-  shell.setSelection(sel ? sel.stamp.entries.length : 0);
+  shell.setSelection(sel ? sel.stamp.entries.length + sel.stamp.notes.length : 0);
   // Nothing left selected: the selection's picker has nothing to repeat,
   // and there is nothing left to index.
   if (!sel && vec.picking === "select") closePicker(false);
@@ -1113,14 +2326,37 @@ function selIndexAt(x, y) {
   return hit ? hit[2] : -1;
 }
 
-function lift(rows) {
+// Lift entity rows, and labels (the board.notes records themselves), into
+// the selection.
+function lift(rows, notes = []) {
   rows = [...new Set(rows)].filter(r => r > 0);
-  if (!rows.length) return;
+  notes = [...new Set(notes)].filter(n => board.notes.includes(n));
+  if (!rows.length && !notes.length) return;
   const abs = sel ? selAbs() : [];
-  const caught = board.capture(rows).map(e => ({ ...e, partner: e.partner === null ? null : e.partner + abs.length }));
-  board.eraseRows(rows);
-  if (rows.includes(inspectRow)) inspect(-1);
-  setSel([...abs, ...caught]);
+  const held = selNotes();
+  let caught = [];
+  if (rows.length) {
+    caught = board.capture(rows).map(e => ({ ...e, partner: e.partner === null ? null : e.partner + abs.length }));
+    board.eraseRows(rows);
+    if (rows.includes(inspectRow)) inspect(-1);
+  }
+  if (notes.length) {
+    for (const n of notes) board.notes.splice(board.notes.indexOf(n), 1);
+    noteEdit = -1;   // indices moved; no editor is open during a selection anyway
+    board.notesRev++;
+  }
+  setSel([...abs, ...caught], [...held, ...notes]);
+}
+
+// Put the selection's labels `which` (indices into selNotes()) back on the
+// board where the selection now has them. A label always fits.
+function dropNotes(which) {
+  if (!sel || !which.length) return;
+  const all = selNotes();
+  const want = new Set(which);
+  for (const k of which) board.notes.push(all[k]);
+  board.notesRev++;
+  setSel(selAbs(), all.filter((_, k) => !want.has(k)));
 }
 
 // Place the selected entries `which` (indices) back on the board where the
@@ -1136,27 +2372,49 @@ function drop(which) {
   setSel(subset(abs, i => !placedOrig.has(i)));
 }
 
-function dropAll() { if (sel) drop(sel.stamp.entries.map((_, i) => i)); }
+// Everything that fits goes down, and every label.
+function dropAll() {
+  if (!sel) return;
+  dropNotes(sel.stamp.notes.map((_, k) => k));
+  if (sel) drop(sel.stamp.entries.map((_, i) => i));
+}
 
-function selectTap(x, y) {
+function selectTap(x, y, wx, wy) {
+  // A selected label draws over the rest, so it wins the tap: it goes back.
+  const k = selNoteAt(wx, wy);
+  if (k >= 0) { dropNotes([k]); return; }
   const i = selIndexAt(x, y);
   if (i >= 0) { drop([i]); return; }
-  const row = board.entityAt(x, y);
+  const row = pickAt(x, y);
   if (row >= 0) lift([row]);
   else dropAll();
 }
 
-// Add every board entity the box touches to the selection. It only adds:
-// what is already selected stays selected.
+// Add every board entity the box touches to the selection, and every label
+// whose box it touches (if labels are showing: hidden ones take no taps,
+// so they take no boxes either). It only adds: what is already selected
+// stays selected.
 function boxAdd(r) {
   const rows = new Set();
   for (let y = r.y; y < r.y + r.h; y++) {
     for (let x = r.x; x < r.x + r.w; x++) {
-      const row = board.entityAt(x, y);
+      const row = pickAt(x, y);
       if (row >= 0) rows.add(row);
     }
   }
-  lift([...rows]);
+  const notes = notesOn() ? board.notes.filter(n => isText(n) && noteTouches(n, r)) : [];
+  lift([...rows], notes);
+}
+
+// Labels off the board that still draw: the selection's (outlined, as a
+// lifted entity is) and those a paste would place, ghosted.
+function ghostNotes() {
+  if (!board || !notesOn()) return null;
+  const out = [];
+  const held = selNotes();
+  if (held.length) out.push({ notes: held, lifted: true });
+  for (const pl of placements()) if (pl.kind === "stamp" && pl.notes.length) out.push({ notes: pl.notes, lifted: false });
+  return out.length ? out : null;
 }
 
 function selGhost() {
@@ -1181,8 +2439,11 @@ function selectTurn(cw) {
 // read from the selection as it was, all at once, before any is changed --
 // through the same emit mask the run tracer uses, since the selection is
 // lifted off the board. An underground end swaps entrance for exit AND
-// reverses, as the desktop's empty-hand R does to a placed pair. Machines
-// are not touched. The change lands when the selection goes down.
+// reverses, as the desktop's empty-hand R does to a placed pair. The machines
+// with a natural inverse turn into it (reversedGate(): Swap and Reciprocal
+// half-turn, Merge and Route trade places and half-turn), so a copied tree of
+// them, reversed, undoes what the original did; other machines are not
+// touched. The change lands when the selection goes down.
 function selectReverse() {
   if (!sel) return;
   const abs = selAbs();
@@ -1200,7 +2461,7 @@ function selectReverse() {
   sel.stamp.entries = sel.stamp.entries.map((e, i) => {
     if (e.type === "belt") return { ...e, dir: dirs[i] };
     if (e.type === "under") return { ...e, dir: dirs[i], exit: !e.exit };
-    return e;
+    return reversedGate(e);
   });
   redraw();
 }
@@ -1218,10 +2479,10 @@ function selectFlip() {
 // cancel; a copy's ghost sits over the originals.
 function selectCommand(c) {
   if (!sel) return;
-  if (c === "delete") { setSel([]); return; }
+  if (c === "delete") { setSel([], []); return; }
   const pose = [sel.px, sel.py];
   const id = shell.addStamp(sel.stamp);
-  if (c === "cut") { setSel([]); enterPaste(id, pose); return; }
+  if (c === "cut") { setSel([], []); enterPaste(id, pose); if (place) place.keepLayers = true; return; }
   // Copy: the selection goes back down. If all of it fit, there is nothing
   // left selected and the copy is ready to paste; anything that could not go
   // back stays selected for the player to deal with.
@@ -1234,7 +2495,7 @@ function selectCommand(c) {
 // given, puts the ghost up straight away at that centre point.
 function enterPaste(id, pose = null) {
   dropAll();
-  if (sel) setSel([]);
+  if (sel) setSel([], []);
   place = pose ? { px: pose[0], py: pose[1] } : null;
   shell.setPasting(id);
   syncBar();
@@ -1248,6 +2509,10 @@ function enterPaste(id, pose = null) {
 // them instead. The run is traced over the board AND the selection
 // together, so a run that is partly lifted is still one run.
 function onLongPress(sx, sy) {
+  if (presenting) return false;
+  // Set audio region armed: a hold starts the box at the finger, in either
+  // mode, rather than a selection.
+  if (board && regionArmed) { dragHooks.begin(sx, sy); return "drag"; }
   if (!board || shell.state.mode !== "build" || vec.picking) return false;
   if (run || place || shell.activeStamp) return false;
   const [x, y] = cellUnder(sx, sy);
@@ -1266,11 +2531,13 @@ function onLongPress(sx, sy) {
     return board.beltNode(cx, cy);
   };
   const emits = emitsWith(board, emitMask(board, abs, at));
-  const cells = traceRun(node, (cx, cy, d) => board.incoming(cx, cy, d, emits), x, y);
+  // A hold on an inactive layer's belt is a hold on nothing: it arms a box.
+  const lockedHere = board.entityAt(x, y) >= 0 && pickAt(x, y) < 0 && selIndexAt(x, y) < 0;
+  const cells = lockedHere ? [] : traceRun(node, (cx, cy, d) => board.incoming(cx, cy, d, emits), x, y);
   if (!cells.length) {
     // A hold on a selected entity stays a press: a slow drag from it still
     // moves the selection, as it always did.
-    if (sel && selIndexAt(x, y) >= 0) return false;
+    if (sel && (selIndexAt(x, y) >= 0 || selNoteAt(...cam.screenToWorld(sx, sy)) >= 0)) return false;
     // Anywhere else but a belt, the hold arms a box selection at the press,
     // drawn at once so the hold reads as having taken. The finger now drags
     // the box out; lifting it without moving does nothing.
@@ -1280,7 +2547,8 @@ function onLongPress(sx, sy) {
     redraw();
     return "drag";
   }
-  const rows = cells.filter(c => c.row !== undefined).map(c => c.row);
+  // The run is traced whole, but only its active cells are lifted.
+  const rows = cells.filter(c => c.row !== undefined && pickable(c.row)).map(c => c.row);
   if (rows.length) lift(rows);
   else drop(cells.map(c => c.sel));
   return true;
@@ -1309,16 +2577,26 @@ const dragHooks = {
   // (sx, sy): where the press was. Called with no point after a pinch drops
   // back to one finger, which never starts a selection drag of its own.
   wants(sx, sy) {
+    if (presenting) return false;
+    // Set audio region armed: any one-finger drag draws the box.
+    if (regionArmed) return sx !== undefined;
+    // The Hand's picked-up layer label, dragged from anywhere on it.
+    if (shell.state.mode === "hand") return sx !== undefined && labelSel !== null && layerLabelHit(sx, sy) === labelSel;
     if (vec.picking) return sx !== undefined;
     if (labelHeld()) return sx !== undefined && (gripHit(sx, sy) >= 0 || noteHit(sx, sy) >= 0);
     if (run || place) return true;
     if (!shell.selecting) return false;
     if (sx === undefined) return false;
-    if (shell.state.boxArmed) return true;
-    return selIndexAt(...cellUnder(sx, sy)) >= 0;
+    return selIndexAt(...cellUnder(sx, sy)) >= 0 || selNoteAt(...cam.screenToWorld(sx, sy)) >= 0;
   },
   begin(sx, sy) {
     const world0 = cam.screenToWorld(sx, sy);
+    if (regionArmed) { grab = { region: true, box: world0 }; boxRect = rectOf(world0, world0); redraw(); return; }
+    if (shell.state.mode === "hand") {
+      const l = labelSel !== null && byId(board.layers, labelSel);
+      if (l) grab = { layerLabel: l, off0: [l.labelDx || 0, l.labelDy || 0], world0 };
+      return;
+    }
     if (labelHeld()) {
       // The grip first: grabbing the corner must never read as grabbing the box.
       const g = gripHit(sx, sy);
@@ -1337,7 +2615,6 @@ const dragHooks = {
     // read as confusing in practice: Cancel and re-tap is the way to move it.
     if (run) grab = { cell0: run.end.slice(), world0 };
     else if (place) grab = { p0: [place.px, place.py], world0 };
-    else if (shell.state.boxArmed) { grab = { box: world0 }; boxRect = rectOf(world0, world0); }
     else if (sel) grab = { sel: true, p0: [sel.px, sel.py], world0 };
   },
   move(sx, sy) {
@@ -1350,6 +2627,15 @@ const dragHooks = {
       return;
     }
     const dx = wx - grab.world0[0], dy = wy - grab.world0[1];
+    if (grab.layerLabel) {
+      // The offset from the centre of mass, by the finger's motion: the
+      // label keeps its grab point rather than jumping under the finger.
+      const r = (v) => Math.round(v * 1000) / 1000;
+      grab.layerLabel.labelDx = r(grab.off0[0] + dx);
+      grab.layerLabel.labelDy = r(grab.off0[1] + dy);
+      redraw();
+      return;
+    }
     if (grab.note) {
       // A label moves with the finger, kept to a thousandth of a cell as the
       // desktop saves it.
@@ -1394,15 +2680,21 @@ const dragHooks = {
     syncBar();
   },
   end() {
+    if (grab?.region) {
+      const r = boxRect;
+      boxRect = null;
+      grab = null;
+      if (r) setSoundRegion(r); else clearSoundSel();
+      return;
+    }
+    // A moved layer label is one undo step, when the drag ends.
+    if (grab?.layerLabel) board.layersRev++;
     // A held box the finger never dragged out selects nothing.
     if (grab?.box && grab.held) boxRect = null;
     if (grab?.box && boxRect) {
       const r = boxRect;
       boxRect = null;
       boxAdd(r);
-      // Box is one-shot: after its rectangle, back to plain selecting.
-      shell.state.boxArmed = false;
-      shell.changed();
     }
     grab = null;
     redraw();
@@ -1420,9 +2712,15 @@ function rectOf(a, b) {
 
 async function show(name, bytes) {
   try {
+    endDryRun();      // before the new board's framing, which then stands
+    clearSoundSel();  // a new board: everything sounds again
     board = await Board.fromNpz(T, bytes);
     panel.setBoardName(name.replace(/\.npz$/i, ""));
+    loadAudioSettings();
     sim = new Sim(T, board);
+    syncScreen();
+    stopBakedPlay();
+    if (audio) audio.rec.attach(sim);
     clock.reset();
     shell.setPaused(true);   // a freshly loaded board waits to be started
     run = null;
@@ -1450,8 +2748,10 @@ async function show(name, bytes) {
 
 // --- autosave and the save on close -------------------------------------------
 //
-// Two browser saves the app keeps by itself, listed with the others:
-//   "auto save"  every AUTOSAVE_MS, when the board changed since the last one
+// Browser saves the app keeps by itself, listed with the others:
+//   "auto save"  every 30 s, when the board changed since that slot's last
+//   "autosave5"  every 5 min, likewise -- an older copy to fall back on
+//   "autosave15" every 15 min, likewise
 //   "exitsave"   whenever the app is hidden -- closed, switched away from,
 //                the screen locked. On a phone that is the only warning a
 //                close gives, and nothing asynchronous can be relied on to
@@ -1461,15 +2761,26 @@ async function show(name, bytes) {
 // Both write the history's current state -- the last stable board -- so a
 // selection half-lifted off the board is saved where it was picked up. On
 // opening, the exitsave is loaded, unless the auto save is newer; each
-// remembers the name of the board it holds.
-const AUTOSAVE_MS = 30000;
+// remembers the name of the board it holds. The two slower tiers are
+// backups loaded by hand; resuming never picks them.
+//
+// NOTHING is written -- no tier, no exitsave -- until the player has edited
+// the board this session. Opening the app must not clobber the saves it was
+// opened to choose between: an old autosave could otherwise be overwritten
+// by whatever the app resumed before the player got round to loading it.
+// Loading a board is not an edit.
 const AUTO_NAME = "auto save", EXIT_NAME = "exitsave";
+const AUTOSAVES = [
+  { name: AUTO_NAME, ms: 30 * 1000 },
+  { name: "autosave5", ms: 5 * 60 * 1000 },
+  { name: "autosave15", ms: 15 * 60 * 1000 },
+];
+let edited = false;       // has the player changed the board this session?
 let boardName = "";
 let loadGen = 0;          // which load the prepared bytes belong to
 let ready = null;         // { key, bytes }: the current state, compressed
 let preparing = false;
-let autosavedKey = null;
-const saveKey = () => `${loadGen}:${committed}`;
+const saveKey = () => `${loadGen}:${committed}:${board?.audioRev ?? 0}`;
 
 async function prepareSave() {
   if (!board || preparing) return;
@@ -1487,7 +2798,7 @@ async function prepareSave() {
 }
 
 function writeAuto(name) {
-  if (!ready) return false;
+  if (!ready || !edited) return false;
   try {
     putSave(name, ready.bytes, { board: ready.name });
     return true;
@@ -1497,10 +2808,11 @@ function writeAuto(name) {
   }
 }
 
-function autosave() {
-  if (!ready || ready.key === autosavedKey) return;
-  if (writeAuto(AUTO_NAME)) {
-    autosavedKey = ready.key;
+// One tier's tick: write if the board moved on since this tier last wrote.
+function autosave(tier) {
+  if (!ready || ready.key === tier.key) return;
+  if (writeAuto(tier.name)) {
+    tier.key = ready.key;
     panel.setLocalSaves(listSaves());
   }
 }
@@ -1580,8 +2892,124 @@ async function loadBundled(name) {
   await show(name, await res.arrayBuffer());
 }
 
+function resetSim() {
+  endDryRun();
+  if (sim) {
+    stopBakedPlay();
+    if (bakeLive()) sim.restoreFrom(bake.snap); else sim.reset();
+    clock.reset();
+    if (audio) audio.rec.stop();
+  }
+  redraw();
+}
+
+// --- view state: everything a presentation's "i" button switches between --
+//
+// The panel's View, status colours and Dev dials, plus each layer's view
+// (visible, active, tint, label size) and the labels' master switch.
+function captureViewState(name = "default") {
+  const t = board.layers;
+  return {
+    name, ...panel.captureView(),
+    layers: t.list.map(l => ({ id: l.id, visible: l.visible, active: l.active, tint: l.tint, label: l.label })),
+    showLabels: t.showLabels !== false,
+  };
+}
+function applyViewState(v) {
+  panel.applyView(v);
+  if (board && Array.isArray(v.layers)) {
+    const t = board.layers;
+    for (const s of v.layers) {
+      const l = byId(t, s.id);
+      if (!l) continue;
+      if (typeof s.visible === "boolean") l.visible = s.visible;
+      if (typeof s.active === "boolean") l.active = s.active;
+      if (l.id !== BACKGROUND && Number.isFinite(s.tint)) l.tint = s.tint;
+      if (l.id !== BACKGROUND && Number.isFinite(s.label)) l.label = s.label;
+    }
+    if (typeof v.showLabels === "boolean") t.showLabels = v.showLabels;
+    // The current layer is always visible and active; a view hiding it moves
+    // "current" to the first layer it leaves showing.
+    const cur = byId(t, t.current);
+    if (cur && (!cur.visible || !cur.active)) {
+      const ok = t.list.find(l => l.visible && l.active);
+      if (ok) t.current = ok.id; else { cur.visible = true; cur.active = true; }
+    }
+  }
+  layersChanged(false);
+}
+
+// --- the editor's Presentation folder ---------------------------------------
+
+async function presentAction(kind) {
+  if (!board) return;
+  const box = () => viewBox(cam);
+  if (kind === "start") panel.setPresent({ startCamera: box() });
+  else if (kind === "end") panel.setPresent({ endCamera: box() });
+  else if (kind === "clearEnd") panel.setPresent({ endCamera: null });
+  else if (kind === "detail") panel.setPresent({ detail: captureViewState("detail") });
+  else if (kind === "clearDetail") panel.setPresent({ detail: null });
+  else if (kind === "export") await exportPresentation();
+  redraw();
+}
+
+// The board as it stands (audio settings and labels ride in the save), the
+// view in front of the player as "default", the captured detail view, and
+// the draft's rates and camera schedule, zipped as <name>.json + <name>.npz.
+async function exportPresentation() {
+  const d = panel.present;
+  const name = safeName(d.name) || "presentation";
+  dropAll();
+  const lifted = sel ? sel.stamp.entries.length : 0;
+  if (lifted && !confirm(`${lifted} selected ${lifted === 1 ? "entity does" : "entities do"} not fit back on the board and will not be in the presentation. Export anyway?`)) return;
+  const b = board.bounds;
+  const fit = b ? { cx: (b.minX + b.maxX) / 2, cy: (b.minY + b.maxY) / 2,
+                    hw: Math.max(1, b.maxX - b.minX) * 0.575, hh: Math.max(1, b.maxY - b.minY) * 0.575 }
+                : viewBox(cam);
+  const views = [captureViewState("default")];
+  if (d.detail) views.push({ ...d.detail, name: "detail" });
+  const rec = presentationRecord(name, {
+    ...d, rates: [d.rate1, d.rate2, d.rate3, d.rate4],
+    startCamera: d.startCamera || fit,
+  }, views);
+  try {
+    const npz = new Uint8Array(await board.toNpz());
+    const json = new TextEncoder().encode(JSON.stringify(rec, null, 1));
+    const zip = await writeZip({ [`${name}.json`]: json, [`${name}.npz`]: npz });
+    const url = URL.createObjectURL(new Blob([zip], { type: "application/zip" }));
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = `${name}.zip`;
+    document.body.append(a);
+    a.click();
+    a.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 10000);
+    panel.updatePresentText(`exported ${name}.zip: unzip into web/presentations/, open #b=${name}`);
+  } catch (err) {
+    alert(`Could not export: ${err.message}`);
+  }
+}
+
+// The presentation page's handle on the app: everything present.js needs,
+// and nothing else.
+const presentApi = {
+  cam,
+  loadBoard: (name, bytes) => show(name, bytes),
+  applyView: (v) => applyViewState(v),
+  setRate: (r) => shell.setRate(Math.min(RATE_MAX, Math.max(RATE_MIN, r))),
+  rate: () => clock.rate,
+  setPlaying: (on) => shell.setPaused(!on),
+  isPlaying: () => !clock.paused,
+  reset: () => resetSim(),
+  tick: () => (sim ? sim.tick + clock.alpha : 0),
+  redraw: () => redraw(),
+};
+
 async function init() {
-  T = await (await fetch("types.json")).json();
+  // Presenting writes nothing to the browser's storage: frozen before the
+  // shell and the panel read (and would otherwise rewrite) their stores.
+  if (presenting) { freezePersist(); document.body.classList.add("presenting"); }
+  T = installPixel(await (await fetch("types.json")).json());
 
   let lastMode = null;
   shell = new Shell(T, {
@@ -1597,6 +3025,7 @@ async function init() {
       // Leaving the Hand puts the Status window away; leaving the belt tool
       // abandons a run, as switching tools does on the desktop.
       if (s.mode !== "hand" && inspectRow >= 0) inspect(-1);
+      if (s.mode !== "hand" && labelSel !== null) selectLayerLabel(null);
       if (run && !(s.mode === "build" && beltHeld())) { run = null; grab = null; }
       if (place && !placer()) { place = null; grab = null; }
       // Leaving Build closes a picker, keeping the vector as it stands.
@@ -1626,8 +3055,14 @@ async function init() {
     // Tapping the stamp being pasted puts it away; any other starts pasting it.
     onPasteStamp: (id) => { if (shell.state.pasteStamp === id) exitPaste(); else enterPaste(id); },
     // ctrl+R: tick 0, every item gone, seeds back on; the factory stays.
-    onReset: () => { if (sim) { sim.reset(); clock.reset(); } redraw(); },
-    onPause: (paused) => { clock.paused = paused; redraw(); },
+    // With a live bake, back to the bake's own tick-0 state, so playing
+    // replays exactly what was baked.
+    onReset: () => resetSim(),
+    onPause: (paused) => {
+      clock.paused = paused;
+      if (paused) endDryRun(); else { startDryRun(); stopPreview(); }
+      redraw();
+    },
     onRate: (rate) => { clock.setRate(rate); redraw(); },
     onBuildTap: () => {
       if (vec.picking === "build") closePicker(true);
@@ -1642,6 +3077,11 @@ async function init() {
     onSelectVector: () => { if (vec.picking === "select") closePicker(false); else if (!vec.picking) openSelectPicker(); },
     onIndexPreview: (o) => indexPreview(o),
     onIndexApply: (o) => indexApply(o),
+    onMakeLayerCurrent: () => {
+      if (inspectRow < 0) return;
+      setCurrent(board.layers, board.layerOf(inspectRow));
+      layersChanged(false);
+    },
     onUndo: () => undo(),
     onRedo: () => redo(),
     onCheckpoint: () => checkpoint(),
@@ -1654,24 +3094,49 @@ async function init() {
     onLoadSave: (name) => loadBundled(name).catch(e => alert(e.message)),
     onOpenFile: () => fileInput.click(),
     onFit: () => { if (board) cam.frame(board.bounds); redraw(); },
-    onView: (v) => { view = v; redraw(); },
+    onView: (v) => { view = v; syncScreen(); layersChanged(false); },
+    onColours: (c) => { statusColours = c; redraw(); },
+    onAudioEnable: (on) => setAudio(on),
+    onBake: () => openBakeDialog(),
+    onScale: () => openScaleDialog(),
+    onAudioRegion: () => armSoundRegion(),
+    onAudioSelection: () => { setSoundSelection(); redraw(); },
+    onVideoRecord: () => recordVideoNow(),
+    onVideoEndCamera: (set) => { endDryRun(); endCam = set ? camState() : null; panel.setVideoEndCamera(!!endCam); redraw(); },
+    onVideoOpen: (open) => { videoOpen = open; redraw(); },
+    onPaneFold: () => redraw(),
+    onVideo: () => redraw(),
+    onAudio: (p) => { if (audio) audio.setParams(p); touchAudio(); redraw(); },
+    onAudioOpen: () => redraw(),
     onTune: (t) => { setTune(t); redraw(); },
     onClearStamps: () => shell.clearStamps(),
     onCloseStatus: () => inspect(-1),
-    onEmit: (row, v) => { board.setEmit(row, v); shell.setInspectValue(handValueOf(row)); redraw(); },
-    onSeed: (row, on, v) => { board.setSeed(row, on, v); shell.setInspectValue(handValueOf(row)); redraw(); },
+    // An inactive layer's entity is read only: the edit is refused and the
+    // pane shows the value it still holds.
+    onEmit: (row, v) => { if (!pickable(row)) { syncInspect(); return; } board.setEmit(row, v); shell.setInspectValue(handValueOf(row)); redraw(); },
+    onSeed: (row, on, v) => { if (!pickable(row)) { syncInspect(); return; } board.setSeed(row, on, v); shell.setInspectValue(handValueOf(row)); redraw(); },
     onSaveLocal: (name) => saveLocal(name),
     onLoadLocal: (name) => loadLocal(name),
     onExportLocal: (name) => exportLocal(name),
     onDeleteLocal: (name) => deleteLocal(name),
     onAssembler: () => openAsm(),
+    onPresent: (kind) => presentAction(kind),
   });
   panel.setLocalSaves(listSaves());
   view = { ...panel.view };
+  syncScreen();
+
+  statusColours = { ...panel.colours };
+  layerPanel = new LayerPanel(document.getElementById("stage"), layerActions);
   setTune(panel.dev);
 
   resize();
   new ResizeObserver(resize).observe(canvas);
+  const soundBtn = document.getElementById("sound-btn");
+  soundWanted = soundStored();
+  setSoundBtn(soundWanted);
+  if (soundWanted) { panel.setAudioMeter("starts on your first tap"); armSound(); }
+  soundBtn.addEventListener("click", () => { setAudio(!soundWanted); storeSound(soundWanted); soundBtn.blur(); });
   attachGestures(canvas, cam, redraw, { onTap, onLongPress, drag: dragHooks, momentum: () => view.momentum !== false });
 
   fileInput.addEventListener("change", async () => {
@@ -1685,11 +3150,21 @@ async function init() {
   document.addEventListener("keydown", (e) => {
     if (isAssemblerOpen()) return;
     if (e.target instanceof HTMLInputElement || e.target instanceof HTMLTextAreaElement) return;
+    if (presenting) {
+      if (e.code === "Space") { e.preventDefault(); presenter?.togglePlay(); }
+      return;
+    }
     if (e.code === "Space") { e.preventDefault(); document.getElementById("btn-play").click(); }
     // ctrl+Z / ctrl+shift+Z (or ctrl+Y) for a keyboard.
     if ((e.ctrlKey || e.metaKey) && e.code === "KeyZ") { e.preventDefault(); if (e.shiftKey) redo(); else undo(); }
     if ((e.ctrlKey || e.metaKey) && e.code === "KeyY") { e.preventDefault(); redo(); }
   });
+
+  if (presenting) {
+    window.addEventListener("hashchange", () => location.reload());
+    presenter = await startPresentation(presenting, presentApi);
+    return;
+  }
 
   // The bundled saves are listed by web/build.sh. Served from the bare web/
   // folder there is no list, and Open still works.
@@ -1705,7 +3180,7 @@ async function init() {
   if (resume) await loadLocal(resume.name);
   else if (first) await loadBundled(first).catch(e => alert(e.message));
 
-  setInterval(autosave, AUTOSAVE_MS);
+  for (const tier of AUTOSAVES) setInterval(() => autosave(tier), tier.ms);
   document.addEventListener("visibilitychange", () => { if (document.visibilityState === "hidden") exitSave(); });
   window.addEventListener("pagehide", exitSave);
 }

@@ -20,6 +20,8 @@
 <div id="shell">
   <div id="stage">
     <canvas id="board"></canvas>
+    <button type="button" id="sound-btn" aria-label="Sound" aria-pressed="false"></button>
+    <div id="fps" hidden></div>
     <div id="pane-host"></div>
     <div class="thumbpad" id="thumb-left" data-show="false"></div>
     <div class="thumbpad" id="thumb-right" data-show="false"></div>
@@ -43,6 +45,50 @@
     </div>
     <div id="picker-list"></div>
     <button type="button" class="b sheet-btn danger" id="picker-remove">Remove slot</button>
+  </div>
+</div>
+
+<div id="bakemenu" class="sheetwrap" data-open="false" role="dialog" aria-modal="true" aria-labelledby="bake-title">
+  <div class="sheet">
+    <div class="sheet-head">
+      <span id="bake-title">Bake audio</span>
+      <button type="button" class="b sheet-btn" id="bake-close">Close</button>
+    </div>
+    <div class="idx-row">
+      <label class="idx-ab">seconds <input id="bake-seconds" type="text" inputmode="decimal" autocomplete="off"></label>
+      <label class="idx-ab">ticks/s <input id="bake-rate" type="text" inputmode="decimal" autocomplete="off"></label>
+    </div>
+    <div id="bake-status" class="idx-preview"></div>
+    <div class="idx-row">
+      <button type="button" class="b sheet-btn idx-apply" id="bake-go">Bake</button>
+      <button type="button" class="b sheet-btn" id="bake-play">Play</button>
+      <button type="button" class="b sheet-btn" id="bake-cancel">Cancel bake</button>
+      <button type="button" class="b sheet-btn" id="bake-wav">Download WAV</button>
+    </div>
+  </div>
+</div>
+
+<div id="scalemenu" class="sheetwrap sheet-top" data-open="false" role="dialog" aria-modal="true" aria-labelledby="scale-title">
+  <div class="sheet">
+    <div class="sheet-head">
+      <span id="scale-title">Belt scale</span>
+      <button type="button" class="b sheet-btn" id="scale-close">Close</button>
+    </div>
+    <div id="scale-presets" class="scale-list" role="listbox" aria-label="Scale presets"></div>
+    <input id="scale-file-input" type="file" accept=".txt,.csv,text/plain" hidden>
+    <label class="idx-ab scale-expr">f(n) = <input id="scale-expr" type="text" autocomplete="off" autocapitalize="off" spellcheck="false"></label>
+    <div class="scale-dial"><span>min-length Hz</span><input id="scale-hz" type="range" min="0" max="1000" step="1"><output id="scale-hz-val"></output></div>
+    <div class="scale-dial"><span>min length</span><input id="scale-min" type="range" min="1" max="512" step="1"><output id="scale-min-val"></output></div>
+    <div class="scale-view">
+      <button type="button" class="pick" id="scale-view-notes">Notes</button>
+      <button type="button" class="pick" id="scale-view-lengths">Lengths</button>
+    </div>
+    <div id="scale-preview" class="idx-preview"></div>
+    <div id="scale-hist" class="scale-hist" hidden>
+      <canvas id="scale-hist-canvas"></canvas>
+      <div id="scale-hist-info" class="scale-hist-info"></div>
+    </div>
+    <details class="scale-help"><summary>Formula help</summary><div id="scale-help"></div></details>
   </div>
 </div>
 

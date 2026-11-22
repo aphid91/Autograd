@@ -12,6 +12,7 @@ test("natural order is left to right, rows from the bottom up", () => {
 test("ascending and doubling", () => {
   assert.deepEqual(tableValues("ascending", 4), [0, 1, 2, 3]);
   assert.deepEqual(tableValues("doubling", 4), [1, 2, 4, 8]);
+  assert.deepEqual(tableValues("alternating", 5), [0, 1, 0, 1, 0]);
   assert.equal(tableValues("doubling", 30)[29], 2 ** 24, "clamped at the value limit");
 });
 

@@ -7,6 +7,8 @@
 
 import { readNpz, writeNpz } from "./npz.js";
 import { parseNotes } from "./notes.js";
+import { F_LAYER, BACKGROUND, parseLayers, serialiseLayers, adoptOrphans, byId } from "./layers.js";
+import { parseAudio } from "./audio-params.js";
 
 export const FORMAT_VERSION = 1;
 
@@ -32,6 +34,22 @@ export class Board {
     // restart the simulation, but it is an undo step.
     this.notes = parseNotes(arrays.annotations?.data);
     this.notesRev = 0;
+    // Layers (layers.js): the table from the save, and each row's tag in
+    // slot F_LAYER. Their own revision, like the labels': regrouping
+    // entities is an undo step but not a board edit, so it does not restart
+    // the simulation. `layersRev` moves only for what undo should record
+    // (membership, names, colours); visibility and the sliders are view.
+    if (T.entity.STRIDE <= F_LAYER || Object.entries(T.entity).some(([k, v]) => k !== "STRIDE" && v === F_LAYER)) {
+      throw new Error(`entity slot ${F_LAYER} is not free for the layer tag`);
+    }
+    this.layers = parseLayers(arrays.layers?.data);
+    adoptOrphans(this.layers, this.rowLayers());
+    this.layersRev = 0;
+    // The save's audio settings (audio-params.js), or null if it has none.
+    // main.js keeps this the dials in front of the player, so every save
+    // writes them; not part of a snapshot, so undo never touches them.
+    this.audio = parseAudio(arrays.audio?.data);
+    this.audioRev = 0;
     this.derive();
   }
 
@@ -67,19 +85,46 @@ export class Board {
   async toNpz(snap = null) {
     const E = this.T.entity;
     const src = snap || this;
-    const grid = src.grid.slice();
+    const grid = snap ? expandGrid(snap, this.grid.length) : this.grid.slice();
     for (let i = 3; i < grid.length; i += 4) grid[i] = 0;
     const notes = snap ? snap.notes : JSON.stringify(this.notes);
     return writeNpz({
       version: { descr: "<i4", shape: [1], data: new Int32Array([FORMAT_VERSION]) },
       size: { descr: "<i4", shape: [2], data: new Int32Array([this.width, this.height]) },
       grid: { descr: "<i4", shape: [this.height, this.width, 4], data: grid },
-      entities: { descr: "<f4", shape: [src.rows, E.STRIDE], data: src.entities },
+      entities: { descr: "<f4", shape: [src.rows, E.STRIDE], data: snap ? expandEntities(snap, E.STRIDE) : src.entities },
       annotations: { descr: "<U", shape: [], data: notes },
+      // The live table, even when writing a snapshot: its view flags are
+      // not undo state, and a layer named only by a snapshot's rows comes
+      // back as an orphan rather than being lost.
+      layers: { descr: "<U", shape: [], data: serialiseLayers(this.layers) },
       next_row: { descr: "<i4", shape: [1], data: new Int32Array([src.nextRow]) },
       free_rows: { descr: "<i4", shape: [src.freeRows.length], data: new Int32Array(src.freeRows) },
       live_count: { descr: "<i4", shape: [1], data: new Int32Array([src.liveCount]) },
+      ...(this.audio ? { audio: { descr: "<U", shape: [], data: JSON.stringify(this.audio) } } : {}),
     });
+  }
+
+  // What the board IS, as a hash: every occupied cell's position, type,
+  // facing, footprint offset and flags, and a Source's value and a belt's
+  // seed value. Not the row ids -- putting a selection back where it was can
+  // take different rows, and that is no change -- and not gate channels,
+  // which the simulation rewrites every tick. The audio selection resets
+  // when this moves (main.js).
+  contentHash() {
+    const g = this.grid, E = this.T.entity, C = this.T.cell;
+    const f32 = new Float32Array(1), u32 = new Uint32Array(f32.buffer);
+    let h = 2166136261 >>> 0;
+    const mix = (v) => { h = Math.imul(h ^ (v | 0), 16777619) >>> 0; };
+    for (let i = 0; i < g.length; i += 4) {
+      const x = g[i];
+      if (!x) continue;
+      mix(i); mix(x & ((1 << C.ID_SHIFT) - 1)); mix(g[i + 1]); mix(g[i + 2] & ~C.GHOST_MASK);
+      const row = this.cellId(x);
+      if (this.T.types[(x >> C.TYPE_SHIFT) & C.TYPE_MASK]?.name === "source") { f32[0] = this.field(row, E.F_EMIT); mix(u32[0]); }
+      if (g[i + 2] & C.SEED_BIT) { f32[0] = this.field(row, E.F_SEED_VALUE); mix(u32[0]); }
+    }
+    return h;
   }
 
   // --- raw access -------------------------------------------------------
@@ -156,13 +201,33 @@ export class Board {
 
   // --- undo -------------------------------------------------------------
   // The whole editable state, copied: the grid, the entity table and the
-  // row allocator. Everything else on a Board is derived from these. About
-  // 5 MB on a 512x512 board, which is why history.js keeps only a few.
+  // row allocator. Everything else on a Board is derived from these. The
+  // grid is kept SPARSE -- the occupied cells' indices and their four words
+  // -- since a 512x512 grid is 4 MB and nearly all of it zero; a dense copy
+  // made each snapshot about 6 MB, and 16 of them (history.js) too much for
+  // a phone. Sparse, and with the entity table's zero tail trimmed,
+  // cpu.npz's is about 0.6 MB.
   snapshot() {
+    const g = this.grid, n = g.length >> 2;
+    let count = 0;
+    for (let c = 0; c < n; c++) {
+      const i = c << 2;
+      if (g[i] | g[i + 1] | g[i + 2] | g[i + 3]) count++;
+    }
+    const cells = new Int32Array(count), words = new Int32Array(count * 4);
+    for (let c = 0, k = 0; c < n; c++) {
+      const i = c << 2;
+      if (g[i] | g[i + 1] | g[i + 2] | g[i + 3]) {
+        cells[k] = c;
+        words.set(g.subarray(i, i + 4), k * 4);
+        k++;
+      }
+    }
     return {
-      grid: this.grid.slice(), entities: this.entities.slice(), rows: this.rows,
+      cells, words, entities: this.entities.slice(0, usedLength(this.entities)), rows: this.rows,
       nextRow: this.nextRow, freeRows: this.freeRows.slice(), liveCount: this.liveCount,
       notes: JSON.stringify(this.notes),
+      layers: serialiseLayers(this.layers),
     };
   }
 
@@ -170,8 +235,10 @@ export class Board {
   // later redo) and re-derive -- an edit like any other.
   restore(s) {
     const S = this.T.entity.STRIDE;
-    this.grid.set(s.grid);
-    this.entities = s.entities.slice();
+    this.grid.fill(0);
+    scatterGrid(s, this.grid);
+    this.entities = new Float32Array(s.rows * S);
+    this.entities.set(s.entities);
     this.rows = s.rows;
     this.arrays.entities = { ...this.arrays.entities, shape: [this.rows, S], data: this.entities };
     this.nextRow = s.nextRow;
@@ -179,11 +246,23 @@ export class Board {
     this.liveCount = s.liveCount;
     this.notes = JSON.parse(s.notes);
     this.notesRev++;
+    // The snapshot's layers -- membership, names, colours -- but the view
+    // as it stands: undo is not meant to re-hide a layer the player showed.
+    const was = this.layers;
+    this.layers = parseLayers(s.layers);
+    for (const l of this.layers.list) {
+      const w = byId(was, l.id);
+      if (w) Object.assign(l, { visible: w.visible, active: w.active, tint: w.tint, label: w.label });
+    }
+    if (byId(this.layers, was.current)) this.layers.current = was.current;
+    this.layers.showLabels = was.showLabels;
+    adoptOrphans(this.layers, this.rowLayers());
+    this.layersRev++;
     this.derive();
   }
 
   // A 1x1 entity (belt or underground end). Returns its row.
-  spawn1(type, x, y, dir, { isExit = false } = {}) {
+  spawn1(type, x, y, dir, { isExit = false, layer } = {}) {
     const E = this.T.entity, C = this.T.cell, S = E.STRIDE;
     const row = this.claimRow();
     this.entities.fill(0, row * S, (row + 1) * S);
@@ -195,6 +274,7 @@ export class Board {
     this.setField(row, E.F_W, 1);
     this.setField(row, E.F_H, 1);
     if (type === C.TYPE_UNDER) this.setField(row, E.F_UNDER_IS_EXIT, isExit ? 1 : 0);
+    this.tagLayer(row, layer);
     this.liveCount++;
     const i = (y * this.width + x) * 4;
     this.grid[i] = (dir << C.DIR_SHIFT) | (type << C.TYPE_SHIFT) | (row << C.ID_SHIFT);
@@ -206,9 +286,9 @@ export class Board {
 
   // A raw belt with an optional seed. `seed` null means no seed; a number
   // turns it on with that value, mirrored into .z as setSeed() does.
-  spawnBelt(x, y, dir, seed = null) {
+  spawnBelt(x, y, dir, seed = null, layer) {
     const E = this.T.entity, C = this.T.cell;
-    const row = this.spawn1(C.TYPE_BELT, x, y, dir);
+    const row = this.spawn1(C.TYPE_BELT, x, y, dir, { layer });
     if (seed !== null) {
       this.setField(row, E.F_SEED_ON, 1);
       this.setField(row, E.F_SEED_VALUE, seed);
@@ -239,7 +319,7 @@ export class Board {
   // Each cell's .y holds its offset within the PLACED footprint, which is
   // what Gameboard._stamp_footprint() writes and what the desktop renderer
   // un-places to find a port.
-  spawnStructure(type, origin, dir, flip, { emit = null, derive = true } = {}) {
+  spawnStructure(type, origin, dir, flip, { emit = null, derive = true, layer } = {}) {
     const E = this.T.entity, C = this.T.cell, S = E.STRIDE;
     const { o, blocked } = this.footprint(type, origin, dir, flip);
     if (blocked.length) return -1;
@@ -255,6 +335,7 @@ export class Board {
     this.setField(row, E.F_H, o.h);
     this.setField(row, E.F_FLIPPED, flip ? 1 : 0);
     if (this.T.types[type].name === "source") this.setField(row, E.F_EMIT, emit ?? 0);
+    this.tagLayer(row, layer);
     this.liveCount++;
     const wordX = (dir << C.DIR_SHIFT) | (type << C.TYPE_SHIFT) | (row << C.ID_SHIFT);
     const wordZ = flip ? C.FLIP_BIT : 0;
@@ -294,6 +375,33 @@ export class Board {
     this.setField(other, E.F_UNDER_PARTNER, 0);
     const x = this.field(other, E.F_ORIGIN_X) | 0, y = this.field(other, E.F_ORIGIN_Y) | 0;
     this.grid[(y * this.width + x) * 4 + 2] &= ~C.UNDER_PAIRED_BIT;
+  }
+
+  // Every layer id the rows name.
+  rowLayers() {
+    const ids = new Set();
+    for (let r = 1; r < this.rows; r++) if (this.field(r, this.T.entity.F_ALIVE)) ids.add(this.field(r, F_LAYER) | 0);
+    return ids;
+  }
+
+  layerOf(row) { return this.field(row, F_LAYER) | 0; }
+
+  // The layer a new entity goes on: `layer` if given (a selection going back
+  // down keeps its own), else the current layer -- what a builder tool
+  // places on.
+  tagLayer(row, layer) {
+    const id = Number.isInteger(layer) && byId(this.layers, layer) ? layer : this.layers.current;
+    this.setField(row, F_LAYER, id);
+  }
+
+  // Move every entity on layer `from` to `to` (deleting a layer: its
+  // entities go to Background). Not a board edit: no derive.
+  retag(from, to = BACKGROUND) {
+    let n = 0;
+    for (let r = 1; r < this.rows; r++) {
+      if (this.field(r, this.T.entity.F_ALIVE) && (this.field(r, F_LAYER) | 0) === from) { this.setField(r, F_LAYER, to); n++; }
+    }
+    return n;
   }
 
   alive(row) { return row > 0 && row < this.rows && !!this.field(row, this.T.entity.F_ALIVE); }
@@ -336,6 +444,7 @@ export class Board {
         partner: partner && index.has(partner) ? index.get(partner) : null,
         emit: td.name === "source" ? this.field(r, E.F_EMIT) : null,
         seed: td.kind === "belt" && this.field(r, E.F_SEED_ON) ? this.field(r, E.F_SEED_VALUE) : null,
+        layer: this.field(r, F_LAYER) | 0,
       };
     });
   }
@@ -374,9 +483,11 @@ export class Board {
       if (this.entryBlocked(e, x, y).length) return;
       const t = this.typeId(e.type);
       let row;
-      if (t === C.TYPE_BELT) row = this.spawnBelt(x, y, e.dir, e.seed ?? null);
-      else if (t === C.TYPE_UNDER) row = this.spawn1(t, x, y, e.dir, { isExit: e.exit });
-      else row = this.spawnStructure(t, [x, y], e.dir, e.flip, { emit: e.emit, derive: false });
+      // An entry's own layer if it has one (a selection going back down);
+      // none (a copy being pasted) puts it on the current layer.
+      if (t === C.TYPE_BELT) row = this.spawnBelt(x, y, e.dir, e.seed ?? null, e.layer);
+      else if (t === C.TYPE_UNDER) row = this.spawn1(t, x, y, e.dir, { isExit: e.exit, layer: e.layer });
+      else row = this.spawnStructure(t, [x, y], e.dir, e.flip, { emit: e.emit, derive: false, layer: e.layer });
       rows.set(i, row);
     });
     const E = this.T.entity;
@@ -584,4 +695,33 @@ export class Board {
     }
     return -1;
   }
+}
+
+// The entity table grows by doubling, so its tail is mostly zero rows: a
+// snapshot keeps it only up to the last non-zero value.
+// Compared as bits, so a -0 is kept.
+function usedLength(a) {
+  const bits = new Uint32Array(a.buffer, a.byteOffset, a.length);
+  let n = a.length;
+  while (n > 0 && bits[n - 1] === 0) n--;
+  return n;
+}
+
+function expandEntities(s, stride) {
+  const out = new Float32Array(s.rows * stride);
+  out.set(s.entities);
+  return out;
+}
+
+// A snapshot's sparse grid (Board.snapshot()) written into `grid`, which
+// must already be zero.
+function scatterGrid(s, grid) {
+  const { cells, words } = s;
+  for (let k = 0; k < cells.length; k++) grid.set(words.subarray(k * 4, k * 4 + 4), cells[k] * 4);
+}
+
+function expandGrid(s, length) {
+  const grid = new Int32Array(length);
+  scatterGrid(s, grid);
+  return grid;
 }
