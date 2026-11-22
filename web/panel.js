@@ -9,6 +9,7 @@ import { Pane } from "./vendor/tweakpane-4.0.5.min.js";
 import { TUNE_DEFAULTS, TUNE_SPEC } from "./tune.js";
 import { AUDIO_DEFAULTS, AUDIO_SPEC } from "./audio-params.js";
 import { VIDEO_SPEC, CAMERA_SPEC, VIDEO_FPS, cleanVideo, frameCount } from "./video-params.js";
+import { persistEnabled } from "./persist.js";
 
 const PANE_KEY = "gates.web.pane.v1";
 const DIR_NAMES = ["+X east", "+Y north", "-X west", "-Y south"];
@@ -30,6 +31,7 @@ function loadPrefs() {
   try { return JSON.parse(localStorage.getItem(PANE_KEY) || "null") || {}; } catch { return {}; }
 }
 function savePrefs(p) {
+  if (!persistEnabled()) return;
   try { localStorage.setItem(PANE_KEY, JSON.stringify(p)); } catch { /* not persisted */ }
 }
 
@@ -77,23 +79,26 @@ export class Panel {
 
     this.view = { grid: false, ports: true, labels: true, seedTint: true, notes: true, momentum: true, items: true, belts: true, gates: true, gateStatus: true, sources: true, beltStatus: true, beltActive: true, fps: false, pixelAlpha: 0, pixelMax: 8, layers: false, ...this.prefs.view };
     const view = this.pane.addFolder({ title: "View", expanded: false });
+    this.viewBindings = [];
     for (const [key, label] of [["grid", "grid lines"], ["ports", "ports"], ["labels", "source values"], ["seedTint", "seed tint"], ["notes", "labels (notes)"], ["momentum", "pan momentum"], ["items", "items"], ["belts", "belts"], ["gates", "gates"], ["gateStatus", "gate status colours"], ["beltStatus", "belt status colours"], ["beltActive", "stalled but moving: green"], ["sources", "sources"], ["fps", "fps counter"], ["layers", "layers"]]) {
-      view.addBinding(this.view, key, { label }).on("change", () => {
+      this.viewBindings.push(view.addBinding(this.view, key, { label }).on("change", () => {
+        if (this.applyingView) return;
         this.prefs.view = { ...this.view };
         savePrefs(this.prefs);
         cb.onView({ ...this.view });
-      });
+      }));
     }
     // The pixel overlay (pixel.js): how opaque the Pixels' screen is (0 is
     // off, and a Pixel's fire then records nothing), and the largest square
     // a Pixel's Z may ask for, in cells each side of its centre.
     for (const [key, label, opts] of [["pixelAlpha", "pixel overlay", { min: 0, max: 1, step: 0.01 }],
                                       ["pixelMax", "pixel max size", { min: 1, max: 64, step: 1 }]]) {
-      view.addBinding(this.view, key, { label, ...opts }).on("change", () => {
+      this.viewBindings.push(view.addBinding(this.view, key, { label, ...opts }).on("change", () => {
+        if (this.applyingView) return;
         this.prefs.view = { ...this.view };
         savePrefs(this.prefs);
         cb.onView({ ...this.view });
-      });
+      }));
     }
 
     // The status colours, each with a picker. Persisted with the panel.
@@ -102,11 +107,12 @@ export class Panel {
     this.colours = { ...STATUS_COLOUR_DEFAULTS, ...stored };
     const colours = view.addFolder({ title: "status colours", expanded: false });
     const pushColours = () => {
+      if (this.applyingView) return;
       this.prefs.colours = { ...this.colours };
       savePrefs(this.prefs);
       cb.onColours({ ...this.colours });
     };
-    const colourBindings = STATUS_COLOUR_LABELS.map(([key, label]) =>
+    const colourBindings = this.colourBindings = STATUS_COLOUR_LABELS.map(([key, label]) =>
       colours.addBinding(this.colours, key, { label, view: "color" }).on("change", pushColours));
     colours.addButton({ title: "Reset colours" }).on("click", () => {
       Object.assign(this.colours, STATUS_COLOUR_DEFAULTS);
@@ -194,11 +200,12 @@ export class Panel {
     this.dev = { ...TUNE_DEFAULTS, ...(this.prefs.dev || {}) };
     const dev = this.pane.addFolder({ title: "Dev", expanded: false });
     const pushDev = () => {
+      if (this.applyingView) return;
       this.prefs.dev = { ...this.dev };
       savePrefs(this.prefs);
       cb.onTune({ ...this.dev });
     };
-    const devBindings = [];
+    const devBindings = this.devBindings = [];
     // A "---" entry is a divider with a heading.
     let group = dev;
     for (const [key, label, opts] of TUNE_SPEC) {
@@ -217,6 +224,36 @@ export class Panel {
 
     const dbg = this.pane.addFolder({ title: "Debug", expanded: false });
     dbg.addButton({ title: "Clear stamps" }).on("click", () => cb.onClearStamps());
+  }
+
+  // --- view settings as one value -----------------------------------------------
+  //
+  // What a presentation's views hold: every View toggle and dial (the pixel
+  // overlay included), the status colours and the Dev dials. Captured as
+  // plain data; applied in one go, the bindings refreshed under a guard
+  // (Tweakpane's refresh() fires change) and each callback told once.
+  // Unknown keys are dropped and missing ones left as they are, so a view
+  // written by an older or newer build applies what it can.
+  captureView() {
+    return { view: { ...this.view }, colours: { ...this.colours }, dev: { ...this.dev } };
+  }
+
+  applyView(s) {
+    const take = (into, from) => {
+      if (!from || typeof from !== "object") return;
+      for (const [k, v] of Object.entries(from)) if (k in into && typeof v === typeof into[k]) into[k] = v;
+    };
+    take(this.view, s.view);
+    take(this.colours, s.colours);
+    take(this.dev, s.dev);
+    this.applyingView = true;
+    try { for (const b of [...this.viewBindings, ...this.colourBindings, ...this.devBindings]) b.refresh(); }
+    finally { this.applyingView = false; }
+    this.prefs.view = { ...this.view }; this.prefs.colours = { ...this.colours }; this.prefs.dev = { ...this.dev };
+    savePrefs(this.prefs);   // a no-op in presentation mode (persist.js)
+    this.cb.onView({ ...this.view });
+    this.cb.onColours({ ...this.colours });
+    this.cb.onTune({ ...this.dev });
   }
 
   // A save's dials (already cleaned: audio-params.js cleanDials) over the

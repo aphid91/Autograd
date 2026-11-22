@@ -13,6 +13,7 @@ import { CW, CCW, canFlip, catalog, isKnown, labelFor, sameTool, stampArt, toolA
 import { copyStamp, mirrored, rotated } from "./stamp.js";
 import { TABLES, TABLE_NAMES, parseTable } from "./indexer.js";
 import { PALETTE, SIZE_NAMES, css as noteCss } from "./notes.js";
+import { persistEnabled } from "./persist.js";
 
 const STORE_KEY = "gates.web.shell.v1";
 const LONG_PRESS_MS = 500;   // as sand mode
@@ -52,6 +53,7 @@ function loadStored() {
   try { return JSON.parse(localStorage.getItem(STORE_KEY) || "null"); } catch { return null; }
 }
 function store(data) {
+  if (!persistEnabled()) return;
   try { localStorage.setItem(STORE_KEY, JSON.stringify(data)); } catch { /* not persisted */ }
 }
 

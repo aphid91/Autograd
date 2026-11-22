@@ -15,6 +15,7 @@
 
 import { icon } from "./icons.js";
 import { LABEL_MAX } from "./layers.js";
+import { persistEnabled } from "./persist.js";
 
 const HOLD_MS = 500, HOLD_SLOP = 10;   // a long press, as the shell's
 const DOUBLE_TAP_MS = 350;
@@ -24,6 +25,7 @@ function loadSize() {
   try { const v = JSON.parse(localStorage.getItem(SIZE_KEY) || "null"); return v && typeof v === "object" ? v : null; } catch { return null; }
 }
 function saveSize(v) {
+  if (!persistEnabled()) return;
   try { localStorage.setItem(SIZE_KEY, JSON.stringify({ w: v.w, listH: v.listH })); } catch { /* not kept */ }
 }
 

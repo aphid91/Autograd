@@ -177,11 +177,16 @@ export function buildNpy({ descr, shape, data }) {
 
 // Write { name: {descr, shape, data} } as a deflated .npz. Returns bytes.
 export async function writeNpz(arrays) {
+  return writeZip(Object.fromEntries(Object.entries(arrays).map(([key, arr]) => [`${key}.npy`, buildNpy(arr)])));
+}
+
+// A zip of named files ({ name: Uint8Array }), each deflated. What an .npz
+// is, and what a presentation export (a board and its JSON) is too.
+export async function writeZip(files) {
   const parts = [], central = [];
   let offset = 0;
-  for (const [key, arr] of Object.entries(arrays)) {
-    const name = te.encode(`${key}.npy`);
-    const raw = buildNpy(arr);
+  for (const [fileName, raw] of Object.entries(files)) {
+    const name = te.encode(fileName);
     const comp = await deflate(raw);
     const crc = crc32(raw);
     const local = new Uint8Array(30 + name.length);

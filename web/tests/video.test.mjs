@@ -89,3 +89,18 @@ test("a bake can start mid-run on the video's own first tick", { skip: !existsSy
   assert.equal(r.samples.subarray(0, silentUntil - 1).reduce((m, x) => Math.max(m, Math.abs(x)), 0), 0);
   assert.equal(sim.tick, 37, "the live sim is untouched");
 });
+
+test("the shared camera path: a still without an end, clamped, and a box fitted to any screen", async () => {
+  const { pathBox, fitBox, viewBox } = await import("../video-params.js");
+  const s = { lerpStart: 0, lerpEnd: 1, fadeIn: 0, fadeOut: 0 };
+  const a = { cx: 0, cy: 0, hw: 10, hh: 5 }, b = { cx: 10, cy: 0, hw: 40, hh: 20 };
+  assert.deepEqual(pathBox(a, null, s, 0.5), a);
+  assert.deepEqual(pathBox(a, b, s, -1), pathBox(a, b, s, 0));
+  assert.deepEqual(pathBox(a, b, s, 2), b);
+  assert.equal(pathBox(a, b, s, 0.5).hw, 20, "size geometric: halfway between 10 and 40 is 20");
+  // A 20x10 box fitted to a tall screen: the width decides; all of it shows.
+  const f = fitBox(a, 400, 800);
+  assert.equal(f.zoom, 20);
+  const back = viewBox({ cx: f.cx, cy: f.cy, zoom: f.zoom, w: 400, h: 800 });
+  assert.ok(back.hw >= a.hw - 1e-9 && back.hh >= a.hh - 1e-9);
+});

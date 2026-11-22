@@ -96,11 +96,30 @@ export function lerpBox(a, b, k) {
   return { cx: a.cx + (b.cx - a.cx) * k, cy: a.cy + (b.cy - a.cy) * k, hw: g(a.hw, b.hw), hh: g(a.hh, b.hh) };
 }
 
+// Where along a move from box `a` to box `b` (or a still, with no `b`) the
+// camera is at fraction u of its whole stretch, under the lerp window and
+// fades in `s` ({ lerpStart, lerpEnd, fadeIn, fadeOut }). One path for a
+// video, its dry run and a presentation's camera schedule.
+export function pathBox(a, b, s, u) {
+  return b ? lerpBox(a, b, moveProgress(Math.min(1, Math.max(0, u)), s)) : a;
+}
+
+// The whole view a camera state shows, as a box: what a presentation stores
+// as a pose, so it can be fitted to any screen.
+export const viewBox = (cam) => ({ cx: cam.cx, cy: cam.cy, hw: cam.w / 2 / cam.zoom, hh: cam.h / 2 / cam.zoom });
+
+// The camera (centre and zoom) that FITS box `b` into a w x h view: all of
+// it shows, centred, with room to spare along one axis when the aspects
+// differ.
+export function fitBox(b, w, h) {
+  return { cx: b.cx, cy: b.cy, zoom: Math.min(w / (2 * b.hw), h / (2 * b.hh)) };
+}
+
 // The crop box for video frame f of `frames`, with no end camera a still.
 export function frameBox(startCam, endCam, s, f, frames) {
   const aspect = s.width / s.height;
   const a = cropBox(startCam, aspect);
   if (!endCam) return a;
   const u = frames > 1 ? f / (frames - 1) : 1;
-  return lerpBox(a, cropBox(endCam, aspect), moveProgress(u, s));
+  return pathBox(a, cropBox(endCam, aspect), s, u);
 }
