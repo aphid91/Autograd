@@ -986,3 +986,106 @@ html, body {
 }
 .laycur svg { width: 100%; height: 100%; fill: none; stroke: currentColor; stroke-width: 2; stroke-linecap: round; stroke-linejoin: round; }
 .ly-act span { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+/* --- presentation mode (present.js): `#b=<name>` ------------------------- */
+/* Only the board, the sound button and the presentation's own controls. */
+.presenting #controls, .presenting #bar, .presenting #pane-host, .presenting .thumbpad,
+.presenting #fps, .presenting .layerpanel { display: none !important; }
+.pr-ui { position: absolute; inset: 0; pointer-events: none; }
+.pr-btn {
+  pointer-events: auto;
+  width: calc(36 * var(--u));
+  height: calc(36 * var(--u));
+  padding: calc(8 * var(--u));
+  border-radius: 50%;
+  border: var(--border) solid var(--edge);
+  background: rgba(0, 0, 0, 0.55);
+  color: var(--ink-dim);
+  touch-action: manipulation;
+}
+.pr-btn svg { width: 100%; height: 100%; fill: none; stroke: currentColor; stroke-width: 2; stroke-linecap: round; stroke-linejoin: round; }
+.pr-btn svg .fill { fill: currentColor; stroke: none; }
+.pr-btn:active { color: var(--ink); }
+.pr-sim {
+  position: absolute;
+  bottom: calc(10 * var(--u));
+  left: 50%;
+  transform: translateX(-50%);
+  display: flex;
+  gap: calc(12 * var(--u));
+}
+.pr-i {
+  position: absolute;
+  right: calc(10 * var(--u));
+  bottom: calc(10 * var(--u));
+  padding: 0;
+  font: italic 700 calc(17 * var(--u)) / 1 Georgia, "Times New Roman", serif;
+  color: var(--ink);
+}
+.pr-i[hidden] { display: none; }
+/* Above the button row, so up to five rates never reach the centred buttons
+   on a phone. */
+.pr-speed {
+  pointer-events: auto;
+  position: absolute;
+  left: calc(10 * var(--u));
+  bottom: calc(56 * var(--u));
+  padding: calc(4 * var(--u)) calc(6 * var(--u));
+  border-radius: calc(8 * var(--u));
+  border: var(--border) solid var(--edge);
+  background: rgba(0, 0, 0, 0.55);
+}
+.pr-speed-label { font-size: calc(8 * var(--u)); color: var(--ink-dim); text-transform: uppercase; letter-spacing: 0.08em; margin-bottom: calc(3 * var(--u)); }
+.pr-speed-row { display: flex; gap: calc(4 * var(--u)); }
+.pr-rate {
+  min-width: calc(30 * var(--u));
+  height: calc(26 * var(--u));
+  border-radius: calc(5 * var(--u));
+  border: var(--border) solid var(--edge);
+  background: transparent;
+  color: var(--ink-dim);
+  font: 600 calc(11 * var(--u)) / 1 system-ui, sans-serif;
+  touch-action: manipulation;
+}
+.pr-rate[data-selected="true"] { color: var(--accent-ink); background: var(--accent); border-color: var(--accent); }
+.pr-cover, .pr-catch {
+  position: fixed;
+  inset: 0;
+  z-index: 50;
+  touch-action: none;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+.pr-cover { background: rgba(0, 0, 0, 0.6); }
+.pr-cover-msg { color: var(--ink); font: 600 calc(20 * var(--u)) / 1.3 system-ui, sans-serif; letter-spacing: 0.04em; padding: 0 24px; text-align: center; }
+.pr-error { font-size: calc(13 * var(--u)); font-weight: 400; color: var(--danger); }
+.pr-catch { background: rgba(0, 0, 0, 0.35); }
+.pr-info {
+  width: min(86vw, 520px);
+  min-height: min(56vh, 420px);
+  border-radius: calc(12 * var(--u));
+  border: var(--border) solid var(--edge);
+  background: var(--chrome);
+  display: flex;
+  align-items: flex-start;
+  justify-content: center;
+  padding: calc(18 * var(--u));
+}
+.pr-info-title { color: var(--ink); font: 700 calc(22 * var(--u)) / 1.2 system-ui, sans-serif; }
+.pr-toast {
+  position: fixed;
+  left: 50%;
+  top: 22%;
+  transform: translateX(-50%);
+  z-index: 40;
+  padding: 8px 14px;
+  border-radius: 8px;
+  background: rgba(0, 0, 0, 0.75);
+  color: var(--ink);
+  font: 14px/1.3 system-ui, sans-serif;
+  pointer-events: none;
+  opacity: 0;
+  transition: opacity 0.4s;
+}
+.pr-toast[data-show="true"] { opacity: 1; }

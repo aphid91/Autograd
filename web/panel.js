@@ -35,6 +35,25 @@ function savePrefs(p) {
   try { localStorage.setItem(PANE_KEY, JSON.stringify(p)); } catch { /* not persisted */ }
 }
 
+// The presentation draft as the panel stores it: text boxes for the rates
+// (blank or 0: unused), the schedule's dials, and the captured cameras and
+// detail view (plain data, or null).
+export const PRESENT_DEFAULTS = {
+  name: "presentation", rate: "30", rate1: "", rate2: "", rate3: "", rate4: "",
+  ticks: 0, lerpStart: 0, lerpEnd: 1, fadeIn: 0.25, fadeOut: 0.25,
+  startCamera: null, endCamera: null, detail: null,
+};
+function cleanPresent(p) {
+  const out = { ...PRESENT_DEFAULTS };
+  if (!p || typeof p !== "object") return out;
+  for (const k of Object.keys(PRESENT_DEFAULTS)) {
+    const def = PRESENT_DEFAULTS[k], v = p[k];
+    if (def === null) { if (v && typeof v === "object") out[k] = v; }
+    else if (typeof v === typeof def && (typeof v !== "number" || Number.isFinite(v))) out[k] = v;
+  }
+  return out;
+}
+
 export class Panel {
   constructor(host, cb) {
     this.cb = cb;
@@ -195,6 +214,30 @@ export class Panel {
     this.recordBtn.on("click", () => cb.onVideoRecord());
     this.updateVideoText();
 
+    // Presentation: what a `#b=<name>` page shows (present.js). The draft --
+    // the dials and the captured cameras and detail view -- persists with the
+    // panel; Export bundles it with the board as it stands (main.js).
+    this.present = cleanPresent(this.prefs.present);
+    const pres = this.pane.addFolder({ title: "Presentation", expanded: false });
+    const pushPresent = () => { this.prefs.present = { ...this.present }; savePrefs(this.prefs); this.updatePresentText(); };
+    this.presentBindings = [];
+    const pb = (folder, key, opts) => this.presentBindings.push(folder.addBinding(this.present, key, opts).on("change", pushPresent));
+    pb(pres, "name", { label: "name" });
+    pb(pres, "rate", { label: "start rate" });
+    for (let i = 1; i <= 4; i++) pb(pres, `rate${i}`, { label: `rate ${i}` });
+    const pcam = pres.addFolder({ title: "camera", expanded: false });
+    pcam.addButton({ title: "Set start camera" }).on("click", () => cb.onPresent("start"));
+    pcam.addButton({ title: "Set end camera" }).on("click", () => cb.onPresent("end"));
+    pcam.addButton({ title: "Clear end camera" }).on("click", () => cb.onPresent("clearEnd"));
+    pb(pcam, "ticks", { label: "ticks", min: 0, max: 1000000, step: 1 });
+    for (const [key, label, opts] of CAMERA_SPEC) pb(pcam, key, { label, ...opts });
+    pres.addButton({ title: "Set detail view" }).on("click", () => cb.onPresent("detail"));
+    pres.addButton({ title: "Clear detail view" }).on("click", () => cb.onPresent("clearDetail"));
+    this.presentText = { text: "" };
+    pres.addBinding(this.presentText, "text", { label: "", readonly: true, multiline: true, rows: 3, interval: 250 });
+    pres.addButton({ title: "Export presentation (.zip)" }).on("click", () => cb.onPresent("export"));
+    this.updatePresentText();
+
     // Dev: the tuned-by-eye numbers and the force-build switch. Persisted
     // with the rest of the panel's preferences.
     this.dev = { ...TUNE_DEFAULTS, ...(this.prefs.dev || {}) };
@@ -282,6 +325,20 @@ export class Panel {
     const v = this.video, tpf = v.tps / VIDEO_FPS;
     this.videoText.text = `${frameCount(v)} frames · ${v.width}×${v.height} · ` +
       `${tpf >= 10 ? Math.round(tpf) : +tpf.toFixed(2)} ticks/frame` + (this.videoStatus ? `\n${this.videoStatus}` : "");
+  }
+  // The presentation draft changed from main.js (a camera or view captured).
+  setPresent(patch) {
+    Object.assign(this.present, patch);
+    this.prefs.present = { ...this.present };
+    savePrefs(this.prefs);
+    for (const b of this.presentBindings) b.refresh();
+    this.updatePresentText();
+  }
+  updatePresentText(extra = "") {
+    const p = this.present;
+    const box = (b) => (b ? `${b.cx.toFixed(1)},${b.cy.toFixed(1)} ±${b.hw.toFixed(1)}` : "–");
+    this.presentText.text = `start ${p.startCamera ? box(p.startCamera) : "fit board"} · end ${box(p.endCamera)}\n` +
+      `detail view: ${p.detail ? "set" : "–"}` + (extra ? `\n${extra}` : "");
   }
   setVideoProgress(text) { this.videoStatus = text; this.updateVideoText(); }
   setVideoRecording(on) { this.recordBtn.title = on ? "Cancel recording" : "Begin recording"; }

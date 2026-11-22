@@ -17,6 +17,10 @@ cp "$ROOT"/web/saves/*.npz "$OUT/saves/"
 (cd "$OUT/saves" && ls *.npz) \
   | python3 -c 'import json, sys; print(json.dumps([l.strip() for l in sys.stdin]))' \
   > "$OUT/saves/index.json"
+# Presentations (`#b=<name>`): each a <name>.json + <name>.npz pair, as the
+# editor's Presentation > Export zips them, unzipped into web/presentations/.
+mkdir -p "$OUT/presentations"
+find "$ROOT/web/presentations" -maxdepth 1 \( -name '*.json' -o -name '*.npz' \) -exec cp {} "$OUT/presentations/" \; 2>/dev/null || true
 # The service worker's precache list and version: every file in the site,
 # and a hash of all their contents (see web/sw.js).
 python3 - "$OUT" <<'PY'

@@ -1583,6 +1583,61 @@ frame 182 gave a valid 3.03 s file. `tests/video.test.mjs` covers the move
 symmetric), the crop box, the lerp, the settings, and a bake starting
 mid-run.
 
+## Presentation mode
+
+`…/#b=<name>` opens a **presentation**: `presentations/<name>.json` and the
+board it names (`<name>.npz` beside it), as a show rather than an editor.
+[present.js](present.js) is the page; main.js hands it a small interface
+(`presentApi`) and three hooks (taps, the frame, Space). The editor makes
+them: the panel's **Presentation** folder, and **Export presentation
+(.zip)**, which zips the pair. Unzip it into `web/presentations/` and push;
+`build.sh` copies the pairs into the site. A change of hash reloads.
+
+- **The JSON**: `rate` and up to four other `rates`; `startCamera` and
+  `endCamera` as world boxes `{cx, cy, hw, hh}` (`viewBox()`), fitted to
+  whatever screen opens it (`fitBox()`); `schedule` -- ticks, and the
+  video's lerp start/end and fade in/out; `views`, one or more, the first
+  the default. A view is the panel's View, status colours and Dev dials
+  (`Panel.captureView()` / `applyView()`) plus each layer's visible, active,
+  tint and label size and the labels' master switch (`captureViewState()`
+  / `applyViewState()` in main.js; layers are matched by id).
+- **Export** takes the board as it stands -- a selection put down first;
+  audio settings and labels ride in the save -- the view in front of the
+  player as "default", the captured detail view if set, and the folder's
+  draft: name, start rate and four rate boxes (blank or 0 unused), the
+  cameras (no start camera: the whole board) and the schedule. The draft
+  persists with the panel's preferences.
+- **The page** shows the board, the sound button, Reset and Play/Pause
+  (bottom middle), an **i** button cycling the views (hidden with only
+  one), and the **speed** panel (bottom left, above the button row so five
+  rates never reach the centred buttons), the starting rate lit -- no
+  panel at all without other rates. Everything else is hidden by
+  `body.presenting`. It writes **nothing** to the browser's storage:
+  `freezePersist()` runs before the shell and the panel are built, and
+  every store (panel prefs, the shell's, the layer panel size, saves and
+  autosaves) checks `persistEnabled()`; no resume, no autosave timers.
+- **Tap to begin**: the board loads dimmed under a cover that takes the
+  whole gesture, tap or drag, so the drag that dismisses it neither pans nor
+  ends the schedule; its lift also starts the sound. Then the sim plays and
+  a toast says "drag to pan, pinch to zoom".
+- **The camera schedule** places the camera from the **tick on screen**
+  (`sim.tick + alpha` over the schedule's ticks, through `pathBox()`), so a
+  pause holds it and Reset puts it back at the start pose. It ends **for
+  good** (until a reload) the moment the camera is not where it last put it
+  -- a drag, pinch, wheel or glide, detected as the dry run does -- or the
+  rate is changed. 0 ticks, or no end camera: no schedule.
+- **A tap on a machine** (visible, not a belt or underground) pauses if
+  playing and opens a large panel with its name (the mini example board is
+  a later phase). Any tap or drag on the panel only dismisses it, and plays
+  on if it was playing. Long press, selection drags and editing keys are
+  all off.
+
+`tests/present.test.mjs` covers the hash, the record, the speed panel and
+the schedule. Driven in Chromium as a Pixel 7: export, unzip, open; the
+cover's drag leaves the camera; the schedule zooms with the ticks and Reset
+returns it; i cycles; a machine tap pauses and the dismiss resumes; a pan
+and a rate change each end the schedule; localStorage byte-identical after.
+
 ## Saving
 
 The panel's **Board** folder saves the board **to this browser** under a
@@ -1685,6 +1740,9 @@ asserting every array matches and exactly the edited value differs.
 | `scale.js` | belt scales: the formula language, presets, tables, the wavelength table the synth reads |
 | `audio-bake.js` | baking: a stretch of ticks rendered offline, and the WAV writer; loaded on demand |
 | `pixel.js` | the Pixel machine (web-only, in Sink's id), its screen, and the overlay's drawing |
+| `present.js` | presentation mode: the `#b=` route, its controls, the camera schedule, the info panel |
+| `persist.js` | the one switch that stops every localStorage write (presentation mode) |
+| `presentations/` | presentation pairs, `<name>.json` + `<name>.npz`, copied into the site |
 | `video-params.js` | video export: the settings and the camera move; loaded always |
 | `video.js` | video export: the offline recorder (mediabunny); loaded on demand |
 | `vendor/` | Tweakpane 4.0.5 (MIT) and mediabunny 1.55.1 (MPL-2.0, with its licence), vendored |

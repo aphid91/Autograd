@@ -29,7 +29,10 @@ import { icon } from "./icons.js";
 import { DEFAULT, naturalOrder, tableValues, finalValues } from "./indexer.js";
 import { entrySize, typeByName } from "./stamp.js";
 import { installPixel, Screen } from "./pixel.js";
-import { cropBox, evenDim, frameBox, frameCount } from "./video-params.js";
+import { cropBox, evenDim, frameBox, frameCount, viewBox } from "./video-params.js";
+import { presentationName, startPresentation, presentationRecord, safeName } from "./present.js";
+import { freezePersist } from "./persist.js";
+import { writeZip } from "./npz.js";
 import { spaceWeights, spaceKey, fringeOf } from "./space.js";
 import { noteAt, gripAt, isText, newRect, MIN_W, MIN_H } from "./notes.js";
 import { Claims, followChain, offsets, layCopies, isZero, rotateVec, flipVec, moreCount, lessCount } from "./vector.js";
@@ -123,6 +126,11 @@ let vec = { on: false, picking: null, v: [0, 0], count: 2, anchor: null, sv: [0,
 const pickV = () => (vec.picking === "select" ? vec.sv : vec.v);
 function setPickV(v) { if (vec.picking === "select") vec.sv = v; else vec.v = v; }
 
+// Presentation mode (present.js): `#b=<name>` in the URL. Decided once, at
+// load; a change of hash reloads the page.
+const presenting = presentationName();
+let presenter = null;
+
 // A handle for the console and for headless tests. Not an API.
 const debug = window.gates = {
   cam, redraw, renderMs: 0,
@@ -140,6 +148,8 @@ const debug = window.gates = {
   dropAll: () => { dropAll(); redraw(); },
   get soundSel() { return soundSel; },
   get audio() { return audio; },
+  get presenter() { return presenter; },
+  captureViewState: () => captureViewState(),
   placement: () => currentPlacement(),
   plan: () => currentPlan(),
 };
@@ -1004,6 +1014,7 @@ function paint(now) {
     if (inspectRow >= 0) panel.setLive(liveText(inspectRow));
   }
   driveDryRun();
+  presenter?.frame();
   checkSoundSel();
   // Ship this frame's ticks to the audio thread; paused, let it fall silent.
   if (audio) {
@@ -1793,6 +1804,13 @@ function matchRow(e, x, y) {
 
 function onTap(sx, sy) {
   if (!board) return;
+  // Presenting: a tap on a machine shows what it is; nothing else answers.
+  if (presenting) {
+    const [wx, wy] = cam.screenToWorld(sx, sy);
+    const info = board.describe(seeAt(Math.floor(wx), Math.floor(wy)));
+    if (info && info.td.kind === "structure") presenter?.tap(info.td.class || info.td.name);
+    return;
+  }
   // Set audio region armed: a tap instead of a drag cancels it, and the
   // audio goes back to everything.
   if (regionArmed) { clearSoundSel(); return; }
@@ -2480,6 +2498,7 @@ function enterPaste(id, pose = null) {
 // them instead. The run is traced over the board AND the selection
 // together, so a run that is partly lifted is still one run.
 function onLongPress(sx, sy) {
+  if (presenting) return false;
   // Set audio region armed: a hold starts the box at the finger, in either
   // mode, rather than a selection.
   if (board && regionArmed) { dragHooks.begin(sx, sy); return "drag"; }
@@ -2547,6 +2566,7 @@ const dragHooks = {
   // (sx, sy): where the press was. Called with no point after a pinch drops
   // back to one finger, which never starts a selection drag of its own.
   wants(sx, sy) {
+    if (presenting) return false;
     // Set audio region armed: any one-finger drag draws the box.
     if (regionArmed) return sx !== undefined;
     // The Hand's picked-up layer label, dragged from anywhere on it.
@@ -2861,7 +2881,123 @@ async function loadBundled(name) {
   await show(name, await res.arrayBuffer());
 }
 
+function resetSim() {
+  endDryRun();
+  if (sim) {
+    stopBakedPlay();
+    if (bakeLive()) sim.restoreFrom(bake.snap); else sim.reset();
+    clock.reset();
+    if (audio) audio.rec.stop();
+  }
+  redraw();
+}
+
+// --- view state: everything a presentation's "i" button switches between --
+//
+// The panel's View, status colours and Dev dials, plus each layer's view
+// (visible, active, tint, label size) and the labels' master switch.
+function captureViewState(name = "default") {
+  const t = board.layers;
+  return {
+    name, ...panel.captureView(),
+    layers: t.list.map(l => ({ id: l.id, visible: l.visible, active: l.active, tint: l.tint, label: l.label })),
+    showLabels: t.showLabels !== false,
+  };
+}
+function applyViewState(v) {
+  panel.applyView(v);
+  if (board && Array.isArray(v.layers)) {
+    const t = board.layers;
+    for (const s of v.layers) {
+      const l = byId(t, s.id);
+      if (!l) continue;
+      if (typeof s.visible === "boolean") l.visible = s.visible;
+      if (typeof s.active === "boolean") l.active = s.active;
+      if (l.id !== BACKGROUND && Number.isFinite(s.tint)) l.tint = s.tint;
+      if (l.id !== BACKGROUND && Number.isFinite(s.label)) l.label = s.label;
+    }
+    if (typeof v.showLabels === "boolean") t.showLabels = v.showLabels;
+    // The current layer is always visible and active; a view hiding it moves
+    // "current" to the first layer it leaves showing.
+    const cur = byId(t, t.current);
+    if (cur && (!cur.visible || !cur.active)) {
+      const ok = t.list.find(l => l.visible && l.active);
+      if (ok) t.current = ok.id; else { cur.visible = true; cur.active = true; }
+    }
+  }
+  layersChanged(false);
+}
+
+// --- the editor's Presentation folder ---------------------------------------
+
+async function presentAction(kind) {
+  if (!board) return;
+  const box = () => viewBox(cam);
+  if (kind === "start") panel.setPresent({ startCamera: box() });
+  else if (kind === "end") panel.setPresent({ endCamera: box() });
+  else if (kind === "clearEnd") panel.setPresent({ endCamera: null });
+  else if (kind === "detail") panel.setPresent({ detail: captureViewState("detail") });
+  else if (kind === "clearDetail") panel.setPresent({ detail: null });
+  else if (kind === "export") await exportPresentation();
+  redraw();
+}
+
+// The board as it stands (audio settings and labels ride in the save), the
+// view in front of the player as "default", the captured detail view, and
+// the draft's rates and camera schedule, zipped as <name>.json + <name>.npz.
+async function exportPresentation() {
+  const d = panel.present;
+  const name = safeName(d.name) || "presentation";
+  dropAll();
+  const lifted = sel ? sel.stamp.entries.length : 0;
+  if (lifted && !confirm(`${lifted} selected ${lifted === 1 ? "entity does" : "entities do"} not fit back on the board and will not be in the presentation. Export anyway?`)) return;
+  const b = board.bounds;
+  const fit = b ? { cx: (b.minX + b.maxX) / 2, cy: (b.minY + b.maxY) / 2,
+                    hw: Math.max(1, b.maxX - b.minX) * 0.575, hh: Math.max(1, b.maxY - b.minY) * 0.575 }
+                : viewBox(cam);
+  const views = [captureViewState("default")];
+  if (d.detail) views.push({ ...d.detail, name: "detail" });
+  const rec = presentationRecord(name, {
+    ...d, rates: [d.rate1, d.rate2, d.rate3, d.rate4],
+    startCamera: d.startCamera || fit,
+  }, views);
+  try {
+    const npz = new Uint8Array(await board.toNpz());
+    const json = new TextEncoder().encode(JSON.stringify(rec, null, 1));
+    const zip = await writeZip({ [`${name}.json`]: json, [`${name}.npz`]: npz });
+    const url = URL.createObjectURL(new Blob([zip], { type: "application/zip" }));
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = `${name}.zip`;
+    document.body.append(a);
+    a.click();
+    a.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 10000);
+    panel.updatePresentText(`exported ${name}.zip: unzip into web/presentations/, open #b=${name}`);
+  } catch (err) {
+    alert(`Could not export: ${err.message}`);
+  }
+}
+
+// The presentation page's handle on the app: everything present.js needs,
+// and nothing else.
+const presentApi = {
+  cam,
+  loadBoard: (name, bytes) => show(name, bytes),
+  applyView: (v) => applyViewState(v),
+  setRate: (r) => shell.setRate(Math.min(RATE_MAX, Math.max(RATE_MIN, r))),
+  rate: () => clock.rate,
+  setPlaying: (on) => shell.setPaused(!on),
+  isPlaying: () => !clock.paused,
+  reset: () => resetSim(),
+  tick: () => (sim ? sim.tick + clock.alpha : 0),
+  redraw: () => redraw(),
+};
+
 async function init() {
+  // Presenting writes nothing to the browser's storage: frozen before the
+  // shell and the panel read (and would otherwise rewrite) their stores.
+  if (presenting) { freezePersist(); document.body.classList.add("presenting"); }
   T = installPixel(await (await fetch("types.json")).json());
 
   let lastMode = null;
@@ -2910,16 +3046,7 @@ async function init() {
     // ctrl+R: tick 0, every item gone, seeds back on; the factory stays.
     // With a live bake, back to the bake's own tick-0 state, so playing
     // replays exactly what was baked.
-    onReset: () => {
-      endDryRun();
-      if (sim) {
-        stopBakedPlay();
-        if (bakeLive()) sim.restoreFrom(bake.snap); else sim.reset();
-        clock.reset();
-        if (audio) audio.rec.stop();
-      }
-      redraw();
-    },
+    onReset: () => resetSim(),
     onPause: (paused) => {
       clock.paused = paused;
       if (paused) endDryRun(); else { startDryRun(); stopPreview(); }
@@ -2981,6 +3108,7 @@ async function init() {
     onLoadLocal: (name) => loadLocal(name),
     onExportLocal: (name) => exportLocal(name),
     onDeleteLocal: (name) => deleteLocal(name),
+    onPresent: (kind) => presentAction(kind),
   });
   panel.setLocalSaves(listSaves());
   view = { ...panel.view };
@@ -3009,11 +3137,21 @@ async function init() {
   // the icon cannot disagree with the state.
   document.addEventListener("keydown", (e) => {
     if (e.target instanceof HTMLInputElement) return;
+    if (presenting) {
+      if (e.code === "Space") { e.preventDefault(); presenter?.togglePlay(); }
+      return;
+    }
     if (e.code === "Space") { e.preventDefault(); document.getElementById("btn-play").click(); }
     // ctrl+Z / ctrl+shift+Z (or ctrl+Y) for a keyboard.
     if ((e.ctrlKey || e.metaKey) && e.code === "KeyZ") { e.preventDefault(); if (e.shiftKey) redo(); else undo(); }
     if ((e.ctrlKey || e.metaKey) && e.code === "KeyY") { e.preventDefault(); redo(); }
   });
+
+  if (presenting) {
+    window.addEventListener("hashchange", () => location.reload());
+    presenter = await startPresentation(presenting, presentApi);
+    return;
+  }
 
   // The bundled saves are listed by web/build.sh. Served from the bare web/
   // folder there is no list, and Open still works.
