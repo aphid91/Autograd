@@ -409,14 +409,53 @@ tables, the file parser, `a*x+b`), tested in `tests/indexer.test.mjs`.
   Other selected entities are not numbered and keep their settings.
 - **Values…** opens a sheet: the table -- **Random** (a shuffle of
   0..n-1, from a seed so the preview is what Apply writes; Re-roll), 
-  **Ascending** (0, 1, 2…), **Doubling** (1, 2, 4…, clamped at 2²⁴), or
-  **File…** (numbers separated by commas or whitespace, repeated to fill
+  **Ascending** (0, 1, 2…), **Doubling** (1, 2, 4…, clamped at 2²⁴),
+  **Hack…** (below), or **File…** (numbers separated by commas or whitespace, repeated to fill
   the index; `D` is the default: 0 for a Source, no seed for a belt; any
   other token rejects the file with its line) -- then **a** and **b**
   (1 and 0), so the value is `a*x + b`, float32, clamped; a default stays a
   default. A live preview lists the first dozen; **Apply to n** writes the
   values into the lifted entries and puts the selection down: one edit,
   one undo step.
+- **Position has three switches** on the bar while it is the order:
+  **Transpose** (up each column, columns left to right), **Reverse X**
+  and **Reverse Y**. Together they reach all eight ways a rectangle can be
+  read, so a block placed rotated or mirrored is still numbered in its own
+  reading order. Session-only (`shell.state.indexOrder`).
+- **Hack…** is the sixth table: a program saved in the Assembler (below),
+  assembled on the spot. Its words fill from #0 and the rest get 0; a
+  program longer than the index is cut short, said in the preview and in a
+  toast on Apply. a and b do not apply (they are disabled): the values are
+  machine code, written as **unsigned** integers (a C-instruction is
+  57344 or more). A program with errors is refused in the preview.
+
+### The assembler
+
+The panel's **Assembler** folder opens a full-screen Hack editor
+([assembler.js](assembler.js)) over the app; the simulation pauses while it
+is open and resumes on close if it was running. Its only link to the board
+is indexing's Hack… table. [hack.js](hack.js) is the pure assembler,
+tested in `tests/hack.test.mjs` (the book's Max.asm, word for word).
+
+- **Standard Hack**: `@n` (0..32767) or `@symbol`, `dest=comp;jump`,
+  `(LABEL)`, `//` comments, whitespace ignored. Predefined symbols (SP, LCL,
+  ARG, THIS, THAT, R0-R15, SCREEN, KBD) are one table, `PREDEFINED`, and
+  variables are allocated from `VAR_BASE` (16): change either there for a
+  platform with a different memory map. Two leniencies: dest letters in any
+  order, and the commutative comps either way round (`A+D`).
+- **`#define NAME replacement`**: plain-text replacement, in definition
+  order (a define's replacement is expanded by the ones before it), over the
+  whole file. `#define gg @` makes `gg100` read `@100`. No word boundaries,
+  on purpose.
+- **Highlighting is a textarea over a coloured copy** of its text, scrolled
+  in step. Every edit re-assembles: a bad line is tinted and its error is in
+  the status strip (tap to jump). The gutter shows each instruction's ROM
+  address. **Binary** lists the words, with a **decimal** toggle.
+- **Programs save to the browser** ([hackstore.js](hackstore.js), one
+  localStorage key), import and export as `.asm`. The working text is kept
+  as a draft on every keystroke, so closing loses nothing; New, Load and
+  Import over unsaved changes, Delete, and saving over a different program
+  all ask first.
 
 ### Placing machines and raw belts
 
@@ -951,6 +990,10 @@ asserting every array matches and exactly the edited value differs.
 | `history.js` | undo, redo and the checkpoint, over board snapshots |
 | `notes.js` | labels: the desktop's text-box records, hit-testing, wrapping, fitting a box to its text |
 | `indexer.js` | indexing: the orders, the value tables, the file parser, a·x+b |
+| `hack.js` | the Hack assembler and its `#define` preprocessor (pure) |
+| `hackstore.js` | saved Hack programs and the editor's draft, in localStorage |
+| `assembler.js` | the full-screen Hack editor |
+| `toast.js` | a brief message that fades by itself |
 | `vector.js` | vectors: offsets, turns, the claims overlay, laying copies, following a chain |
 | `tests/` | `node --test` suites for the pure modules |
 | `types.json` | generated — do not edit |

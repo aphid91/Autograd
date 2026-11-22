@@ -22,6 +22,8 @@ import { TUNE, setTune } from "./tune.js";
 import { Sim, Clock } from "./sim.js";
 import { History } from "./history.js";
 import { DEFAULT, naturalOrder, tableValues, finalValues } from "./indexer.js";
+import { openAssembler, isAssemblerOpen } from "./assembler.js";
+import { toast } from "./toast.js";
 import { entrySize } from "./stamp.js";
 import { noteAt, gripAt, newRect, MIN_W, MIN_H } from "./notes.js";
 import { Claims, followChain, offsets, layCopies, isZero, rotateVec, flipVec, moreCount, lessCount } from "./vector.js";
@@ -541,7 +543,7 @@ function indexed() {
   const abs = selAbs();
   const items = abs.map((e, i) => ({ i, e })).filter(({ e }) => e.type === "source" || e.type === "belt");
   if (shell.state.indexing === "natural") {
-    return naturalOrder(items.map(({ e }) => ({ x: e.dx, y: e.dy }))).map(k => items[k]);
+    return naturalOrder(items.map(({ e }) => ({ x: e.dx, y: e.dy })), shell.state.indexOrder).map(k => items[k]);
   }
   return items;
 }
@@ -554,24 +556,33 @@ function indexLabels() {
   });
 }
 
+// A Hack program's words are machine code, written as they are: no a*x+b.
+// `cut` is how many words did not fit.
 function indexValues(o) {
   const list = indexed();
   const table = tableValues(o.kind, list.length, { file: o.file, seed: o.seed, limit: T.sim.VALUE_LIMIT });
-  return { list, values: finalValues(table, o.a, o.b, T.sim.VALUE_LIMIT) };
+  if (o.kind === "hack") return { list, values: table, cut: Math.max(0, (o.file?.length || 0) - list.length) };
+  return { list, values: finalValues(table, o.a, o.b, T.sim.VALUE_LIMIT), cut: 0 };
 }
 
 function indexPreview(o) {
-  const { list, values } = indexValues(o);
+  const { list, values, cut } = indexValues(o);
   if (!list.length) return { n: 0, error: "Nothing indexed: select some Sources or belts." };
   const fmt = (v) => (v === DEFAULT ? "default" : String(parseFloat(v.toPrecision(6))));
   const lines = list.slice(0, 12).map(({ e }, n) => `#${n}  ${e.type === "source" ? "Source" : "belt  "}  ${fmt(values[n])}`);
   if (list.length > 12) lines.push(`… and ${list.length - 12} more`);
+  if (o.kind === "hack") {
+    const len = o.file.length;
+    lines.unshift(cut ? `"${o.hackName}": ${len} instructions, only the first ${list.length} fit -- the rest are cut`
+      : `"${o.hackName}": ${len} instructions${list.length > len ? `, then ${list.length - len} zeros` : ""}`, "");
+  }
   return { n: list.length, text: lines.join("\n") };
 }
 
 function indexApply(o) {
-  const { list, values } = indexValues(o);
+  const { list, values, cut } = indexValues(o);
   if (!list.length) return;
+  if (cut) toast(`The program did not fit: ${cut} instruction${cut === 1 ? "" : "s"} cut (${list.length} indexed, ${o.file.length} needed).`, 5000);
   list.forEach(({ i, e }, n) => {
     const entry = sel.stamp.entries[i];
     const v = values[n];
@@ -1653,6 +1664,7 @@ async function init() {
     onLoadLocal: (name) => loadLocal(name),
     onExportLocal: (name) => exportLocal(name),
     onDeleteLocal: (name) => deleteLocal(name),
+    onAssembler: () => openAsm(),
   });
   panel.setLocalSaves(listSaves());
   view = { ...panel.view };
@@ -1671,7 +1683,8 @@ async function init() {
   // Space toggles pause, as on the desktop -- through the shell's button so
   // the icon cannot disagree with the state.
   document.addEventListener("keydown", (e) => {
-    if (e.target instanceof HTMLInputElement) return;
+    if (isAssemblerOpen()) return;
+    if (e.target instanceof HTMLInputElement || e.target instanceof HTMLTextAreaElement) return;
     if (e.code === "Space") { e.preventDefault(); document.getElementById("btn-play").click(); }
     // ctrl+Z / ctrl+shift+Z (or ctrl+Y) for a keyboard.
     if ((e.ctrlKey || e.metaKey) && e.code === "KeyZ") { e.preventDefault(); if (e.shiftKey) redo(); else undo(); }
@@ -1695,6 +1708,15 @@ async function init() {
   setInterval(autosave, AUTOSAVE_MS);
   document.addEventListener("visibilitychange", () => { if (document.visibilityState === "hidden") exitSave(); });
   window.addEventListener("pagehide", exitSave);
+}
+
+// The assembler covers the app while it is open: the simulation is paused
+// (through the Play button, so its icon agrees) and resumes on close if it
+// was running.
+function openAsm() {
+  const wasPlaying = !clock.paused;
+  if (wasPlaying) document.getElementById("btn-play").click();
+  openAssembler({ onClose: () => { if (wasPlaying && clock.paused) document.getElementById("btn-play").click(); redraw(); } });
 }
 
 init();

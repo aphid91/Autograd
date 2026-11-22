@@ -12,6 +12,8 @@ import { RATE_MAX, RATE_MIN, RATE_PRESETS } from "./sim.js";
 import { CW, CCW, canFlip, catalog, isKnown, labelFor, sameTool, stampArt, toolArt, toolValue } from "./tools.js";
 import { copyStamp, mirrored, rotated } from "./stamp.js";
 import { TABLES, TABLE_NAMES, parseTable } from "./indexer.js";
+import { assemble } from "./hack.js";
+import { listPrograms, getProgram } from "./hackstore.js";
 import { PALETTE, SIZE_NAMES, css as noteCss } from "./notes.js";
 
 const STORE_KEY = "gates.web.shell.v1";
@@ -119,6 +121,9 @@ export class Shell {
       // "selection" (the order things were selected) or "natural" (left to
       // right, rows from the bottom up). main.js draws the numbers.
       indexing: null,
+      // The Position order's switches (indexer.js naturalOrder): read
+      // columns first, right to left, top to bottom. Kept for the session.
+      indexOrder: { transpose: false, revX: false, revY: false },
     };
 
     this.buildControls();
@@ -560,6 +565,14 @@ export class Shell {
       selected: s.indexing === "selection", onTap: () => { s.indexing = "selection"; this.changed(); } }));
     row.append(this.swatch({ art: icon("box"), name: "Position", cls: "actsw",
       selected: s.indexing === "natural", onTap: () => { s.indexing = "natural"; this.changed(); } }));
+    if (s.indexing === "natural") {
+      const o = s.indexOrder;
+      const toggle = (key, art, name) => row.append(this.swatch({ art: `<span class="swnum">${art}</span>`, name, cls: "actsw",
+        selected: o[key], onTap: () => { o[key] = !o[key]; this.changed(); } }));
+      toggle("transpose", "x⇄y", "Transpose");
+      toggle("revX", "←x", "Reverse X");
+      toggle("revY", "↓y", "Reverse Y");
+    }
     row.append(this.swatch({ art: icon("table"), name: "Values…", cls: "actsw",
       onTap: () => this.openIndexSheet() }));
   }
@@ -575,19 +588,41 @@ export class Shell {
   openIndexSheet() {
     const m = document.getElementById("indexsheet");
     if (!m) return;
-    const st = this.indexSheet || (this.indexSheet = { kind: "ascending", file: null, fileName: "", seed: 1 });
+    const st = this.indexSheet || (this.indexSheet = { kind: "ascending", file: null, fileName: "", seed: 1, hack: "" });
     const tables = m.querySelector("#index-tables"), extra = m.querySelector("#index-extra");
     const ain = m.querySelector("#index-a"), bin = m.querySelector("#index-b");
     const preview = m.querySelector("#index-preview"), apply = m.querySelector("#index-apply");
     const fileIn = document.getElementById("index-file");
     const num = (el, dflt) => { const v = Number(el.value.trim()); return el.value.trim() === "" ? dflt : v; };
-    const opts = () => ({ kind: st.kind, file: st.file, seed: st.seed, a: num(ain, 1), b: num(bin, 0) });
+    // A Hack program is re-read and re-assembled on every refresh, so an
+    // edit saved in the assembler shows here at once.
+    const hackWords = () => {
+      const text = st.hack ? getProgram(st.hack) : null;
+      if (text === null) return { error: st.hack ? `"${st.hack}" is not saved any more.` : "No saved Hack programs: write one in the panel's Assembler." };
+      const res = assemble(text);
+      if (res.errors.length) return { error: `"${st.hack}" has ${res.errors.length} error${res.errors.length === 1 ? "" : "s"} (line ${res.errors[0].line}: ${res.errors[0].msg}). Fix it in the Assembler.` };
+      return { words: res.words };
+    };
+    const opts = () => {
+      if (st.kind === "hack") {
+        const h = hackWords();
+        return { kind: "hack", file: h.words || null, hackError: h.error || null, hackName: st.hack, a: 1, b: 0 };
+      }
+      return { kind: st.kind, file: st.file, seed: st.seed, a: num(ain, 1), b: num(bin, 0) };
+    };
     const refresh = () => {
       tables.replaceChildren(...TABLES.map(k => {
         const b = document.createElement("button");
         b.type = "button"; b.className = "pick"; b.textContent = TABLE_NAMES[k];
         b.dataset.current = String(k === st.kind);
-        b.onclick = () => { if (k === "file") fileIn.click(); else { st.kind = k; refresh(); } };
+        b.onclick = () => {
+          if (k === "file") fileIn.click();
+          else {
+            if (k === "hack" && !listPrograms().some(p => p.name === st.hack)) st.hack = listPrograms()[0]?.name || "";
+            st.kind = k;
+            refresh();
+          }
+        };
         return b;
       }));
       extra.replaceChildren();
@@ -598,10 +633,29 @@ export class Shell {
         extra.append(r);
       } else if (st.kind === "file") {
         extra.textContent = `${st.fileName} — ${st.file.length} value${st.file.length === 1 ? "" : "s"}, repeated to fill`;
+      } else if (st.kind === "hack") {
+        const progs = listPrograms();
+        if (progs.length) {
+          const sel = document.createElement("select");
+          sel.className = "idx-hack";
+          sel.setAttribute("aria-label", "Hack program");
+          for (const p of progs) {
+            const o = document.createElement("option");
+            o.value = p.name; o.textContent = p.name; o.selected = p.name === st.hack;
+            sel.append(o);
+          }
+          sel.onchange = () => { st.hack = sel.value; refresh(); };
+          const note = document.createElement("span");
+          note.textContent = "machine code, 0 after the end";
+          extra.append(sel, note);
+        }
       }
+      // a and b do not apply to machine code.
+      ain.disabled = bin.disabled = st.kind === "hack";
       const o = opts();
       const bad = !Number.isFinite(o.a) || !Number.isFinite(o.b);
-      const res = bad ? { n: 0, error: "a and b must be numbers" } : this.cb.onIndexPreview?.(o) || { n: 0 };
+      const res = o.hackError ? { n: 0, error: o.hackError }
+        : bad ? { n: 0, error: "a and b must be numbers" } : this.cb.onIndexPreview?.(o) || { n: 0 };
       preview.dataset.error = String(!!res.error);
       preview.textContent = res.error || res.text || "";
       apply.disabled = !!res.error || !res.n;

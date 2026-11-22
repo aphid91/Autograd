@@ -36,3 +36,21 @@ test("a*x+b, defaults untouched, float32 and clamped", () => {
   assert.equal(finalValues([0.1], 1, 0)[0], Math.fround(0.1));
   assert.equal(finalValues([1e9], 1, 0)[0], 2 ** 24);
 });
+
+test("position order: transpose and the two reversals reach all eight readings", () => {
+  // A 2x2 block: indices 0..3 at (0,0) (1,0) (0,1) (1,1).
+  const it = [{ x: 0, y: 0 }, { x: 1, y: 0 }, { x: 0, y: 1 }, { x: 1, y: 1 }];
+  const seen = new Set();
+  for (const transpose of [false, true]) for (const revX of [false, true]) for (const revY of [false, true]) {
+    seen.add(naturalOrder(it, { transpose, revX, revY }).join(""));
+  }
+  assert.equal(seen.size, 8);
+  assert.deepEqual(naturalOrder(it, { transpose: true }), [0, 2, 1, 3], "up each column, columns left to right");
+  assert.deepEqual(naturalOrder(it, { revX: true }), [1, 0, 3, 2], "rows still bottom up, each right to left");
+  assert.deepEqual(naturalOrder(it, { revY: true }), [2, 3, 0, 1]);
+});
+
+test("a hack program fills from the start, pads with 0 and is cut when long", () => {
+  assert.deepEqual(tableValues("hack", 5, { file: [7, 64528] }), [7, 64528, 0, 0, 0]);
+  assert.deepEqual(tableValues("hack", 2, { file: [1, 2, 3] }), [1, 2]);
+});

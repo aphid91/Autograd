@@ -8,13 +8,29 @@
 // a Source, no seed for a belt. Defaults are not transformed by a and b.
 
 export const DEFAULT = null;
-export const TABLES = ["random", "ascending", "doubling", "file"];
-export const TABLE_NAMES = { random: "Random", ascending: "Ascending", doubling: "Doubling", file: "File…" };
+export const TABLES = ["random", "ascending", "doubling", "file", "hack"];
+export const TABLE_NAMES = { random: "Random", ascending: "Ascending", doubling: "Doubling", file: "File…", hack: "Hack…" };
 
 // NATURAL order: left to right along each row, rows from the bottom up
 // (world +Y is up). `items` are { x, y }; returns their indices in order.
-export function naturalOrder(items) {
-  return items.map((_, i) => i).sort((a, b) => items[a].y - items[b].y || items[a].x - items[b].x);
+//
+// Three switches reach the other seven orders a rectangle can be read in, so
+// a block laid out rotated or mirrored can still be numbered the way it is
+// meant to be read:
+//   transpose  columns first: bottom to top up each column, columns left to
+//              right (before the reversals below)
+//   revX       right to left instead of left to right
+//   revY       top to bottom instead of bottom to top
+export function naturalOrder(items, { transpose = false, revX = false, revY = false } = {}) {
+  const sx = revX ? -1 : 1, sy = revY ? -1 : 1;
+  const key = (i) => {
+    const x = items[i].x * sx, y = items[i].y * sy;
+    return transpose ? [x, y] : [y, x];
+  };
+  return items.map((_, i) => i).sort((a, b) => {
+    const ka = key(a), kb = key(b);
+    return ka[0] - kb[0] || ka[1] - kb[1];
+  });
 }
 
 // A small seeded generator, so the Random table the preview shows is the one
@@ -48,6 +64,9 @@ export function parseTable(text) {
 }
 
 // The table's first n entries. A file shorter than n repeats from its start.
+// A Hack program (`file` is its words) does not: it fills from the start and
+// the rest are 0, and a program longer than n is cut short -- the caller
+// reports that. Its values are machine code and are never put through a*x+b.
 // `limit` is the largest magnitude a value may have (the doubling table
 // reaches it at 2^24, VALUE_LIMIT).
 export function tableValues(kind, n, { file = null, seed = 1, limit = 2 ** 24 } = {}) {
@@ -61,6 +80,10 @@ export function tableValues(kind, n, { file = null, seed = 1, limit = 2 ** 24 } 
       [a[i], a[j]] = [a[j], a[i]];
     }
     return a;
+  }
+  if (kind === "hack") {
+    const words = file || [];
+    return Array.from({ length: n }, (_, i) => (i < words.length ? words[i] : 0));
   }
   if (kind === "file") {
     if (!file || !file.length) return Array(n).fill(DEFAULT);

@@ -89,6 +89,11 @@ export class Panel {
       pushDev();
     });
 
+    // The Hack assembler: a full-screen editor (assembler.js). Its programs
+    // reach the board only through indexing's Hack… table.
+    const asm = this.pane.addFolder({ title: "Assembler", expanded: false });
+    asm.addButton({ title: "Open Hack editor" }).on("click", () => cb.onAssembler?.());
+
     const dbg = this.pane.addFolder({ title: "Debug", expanded: false });
     dbg.addButton({ title: "Clear stamps" }).on("click", () => cb.onClearStamps());
   }

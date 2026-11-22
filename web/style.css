@@ -445,7 +445,13 @@ html, body {
   font-size: calc(11 * var(--u));
 }
 /* The index sheet: the table choices, a and b, a preview, Apply. */
-.idx-tables { display: grid; grid-template-columns: repeat(4, 1fr); gap: calc(6 * var(--u)); }
+.idx-tables { display: grid; grid-template-columns: repeat(auto-fill, minmax(calc(76 * var(--u)), 1fr)); gap: calc(6 * var(--u)); }
+.idx-hack {
+  flex: 1; min-width: 0; height: calc(34 * var(--u)); box-sizing: border-box; padding: 0 calc(8 * var(--u));
+  background: var(--chrome-2); color: var(--ink); border: var(--border) solid var(--edge);
+  border-radius: var(--r); font: inherit; font-size: 16px;
+}
+.idx-ab input:disabled { opacity: 0.4; }
 .idx-tables .pick { justify-content: center; height: calc(36 * var(--u)); }
 .idx-row { display: flex; gap: calc(8 * var(--u)); align-items: center; font-size: calc(11 * var(--u)); color: var(--ink-dim); }
 .idx-row:empty { display: none; }
@@ -687,3 +693,110 @@ html, body {
 .numcustom input:focus { outline: none; border-color: var(--accent); }
 .numcustom[data-selected="true"] input { background: var(--sel-bg); color: var(--sel-ink); border-color: var(--sel-edge); }
 .numcustom input[aria-invalid="true"] { border-color: var(--danger); }
+
+/* ----------------------------------------------------------------------
+   THE ASSEMBLER (assembler.js): a full-screen Hack editor over the app.
+   ---------------------------------------------------------------------- */
+.asm {
+  --u: calc(var(--ui) * 1px);
+  --asm-lh: 22px;
+  position: fixed;
+  inset: 0;
+  z-index: 30;
+  display: none;
+  flex-direction: column;
+  gap: calc(5 * var(--u));
+  box-sizing: border-box;
+  padding:
+    calc(env(safe-area-inset-top, 0px) + 6 * var(--u))
+    calc(env(safe-area-inset-right, 0px) + 6 * var(--u))
+    calc(env(safe-area-inset-bottom, 0px) + 6 * var(--u))
+    calc(env(safe-area-inset-left, 0px) + 6 * var(--u));
+  background: var(--bg);
+  color: var(--ink);
+}
+.asm[data-open="true"] { display: flex; }
+.asm-bar { display: flex; gap: calc(5 * var(--u)); align-items: center; flex: none; }
+.asm-btn { height: calc(32 * var(--u)); padding: 0 calc(10 * var(--u)); font-size: calc(11 * var(--u)); flex: none; }
+.asm-btn.danger { color: var(--danger); border-color: color-mix(in srgb, var(--danger) 45%, var(--edge)); }
+.asm-save[data-dirty="true"] { color: var(--accent); border-color: var(--accent); }
+.asm-spacer { flex: 1; }
+.asm-name, .asm-list {
+  flex: 1; min-width: 0; height: calc(32 * var(--u)); box-sizing: border-box;
+  padding: 0 calc(8 * var(--u)); background: var(--chrome-2); color: var(--ink);
+  border: var(--border) solid var(--edge); border-radius: var(--r); font: inherit;
+  font-size: 16px;   /* below 16px iOS zooms the page on focus */
+}
+.asm-check { display: flex; align-items: center; gap: calc(4 * var(--u)); font-size: calc(11 * var(--u)); color: var(--ink-dim); }
+.asm-body {
+  flex: 1; min-height: 0; display: flex; border: var(--border) solid var(--edge);
+  border-radius: var(--r); background: var(--chrome); overflow: hidden;
+}
+.asm-edit { flex: 1; min-width: 0; display: flex; }
+.asm-edit[hidden], .asm-bin[hidden] { display: none; }
+.asm-gutter, .asm-code, .asm-bin {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 15px;
+  line-height: var(--asm-lh);
+}
+.asm-gutter {
+  flex: none; overflow: hidden; background: var(--chrome-2);
+  border-right: var(--border) solid var(--edge); color: var(--ink-dim); user-select: none;
+}
+.asm-gutter-in { padding: 6px 0; }
+.asm-ln { height: var(--asm-lh); display: flex; gap: 6px; padding: 0 6px; justify-content: flex-end; }
+.asm-ln .asm-num { min-width: 2.2ch; text-align: right; }
+.asm-ln .asm-addr { min-width: 3ch; text-align: right; color: #5f8fb8; font-size: 11px; }
+.asm-ln.err { color: var(--danger); background: color-mix(in srgb, var(--danger) 18%, transparent); }
+.asm-code { flex: 1; min-width: 0; position: relative; overflow: hidden; }
+.asm-hl, .asm-text {
+  margin: 0; padding: 6px 8px; box-sizing: border-box; white-space: pre; tab-size: 2;
+  font: inherit; line-height: var(--asm-lh); letter-spacing: 0; border: 0;
+}
+.asm-hl { position: absolute; top: 0; left: 0; min-width: 100%; pointer-events: none; color: var(--ink); }
+.asm-line { height: var(--asm-lh); }
+.asm-line.err { background: color-mix(in srgb, var(--danger) 16%, transparent); text-decoration: underline wavy color-mix(in srgb, var(--danger) 70%, transparent); text-underline-offset: 4px; }
+.asm-text {
+  position: absolute; inset: 0; width: 100%; height: 100%; resize: none; outline: none;
+  background: transparent; color: transparent; caret-color: var(--accent); overflow: auto;
+  -webkit-text-fill-color: transparent;
+}
+.asm-text::selection { background: rgba(232, 163, 61, 0.3); }
+/* Token colours. */
+.asm .cm { color: #5d6472; font-style: italic; }
+.asm .pp { color: #c792ea; }
+.asm .mac { color: #ff9e64; }
+.asm .lb { color: #e8c35d; }
+.asm .at { color: #7aa2f7; font-weight: 700; }
+.asm .num { color: #b5e08a; }
+.asm .sym { color: #7dcfff; }
+.asm .dst { color: #7dcfff; }
+.asm .op { color: var(--ink-dim); }
+.asm .cmp { color: #e8e9ed; }
+.asm .jmp { color: #f7768e; }
+.asm-bin { flex: 1; overflow: auto; padding: 6px 0; }
+.asm-row { display: flex; gap: 12px; padding: 0 10px; white-space: pre; cursor: pointer; }
+.asm-row:hover { background: var(--chrome-2); }
+.asm-row .asm-addr { min-width: 5ch; text-align: right; color: #5f8fb8; }
+.asm-word { color: #b5e08a; min-width: 19ch; }
+.asm-word.c { color: #7dcfff; }
+.asm-src { color: var(--ink-dim); }
+.asm-bin-msg { padding: 10px; color: var(--ink-dim); }
+.asm-status {
+  flex: none; max-height: calc(90 * var(--u)); overflow-y: auto; font-size: calc(11 * var(--u));
+  color: var(--ink-dim); padding: 0 calc(2 * var(--u));
+}
+.asm-status[data-error="true"] { color: var(--danger); }
+.asm-err { cursor: pointer; }
+.asm-err:hover { text-decoration: underline; }
+
+/* A brief message (toast.js). */
+.toast {
+  position: fixed; left: 50%; bottom: calc(env(safe-area-inset-bottom, 0px) + 90px);
+  transform: translate(-50%, 8px); z-index: 40; max-width: min(420px, calc(100% - 32px));
+  padding: 9px 14px; border-radius: 8px; background: var(--chrome-2); color: var(--ink);
+  border: 1px solid var(--edge); box-shadow: 0 6px 20px rgba(0, 0, 0, 0.5);
+  font: 13px/1.35 var(--font); text-align: center;
+  opacity: 0; pointer-events: none; transition: opacity 0.2s, transform 0.2s;
+}
+.toast[data-show="true"] { opacity: 1; transform: translate(-50%, 0); }
