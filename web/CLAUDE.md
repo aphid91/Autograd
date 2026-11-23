@@ -607,7 +607,15 @@ The panel's **Assembler** folder opens a full-screen Hack editor
 ([assembler.js](assembler.js)) over the app; the simulation pauses while it
 is open and resumes on close if it was running. Its only link to the board
 is indexing's Hack… table. [hack.js](hack.js) is the pure assembler,
-tested in `tests/hack.test.mjs` (the book's Max.asm, word for word).
+tested in `tests/hack.test.mjs` (the book's Max.asm, word for word
+but for the comp bits).
+
+- **The comp bits are not the book's.** `COMP_A` holds the control bits of
+  this project's own ALU, which decodes c1..c6 differently: `1`, `-1`, `D`,
+  `A`, `!D`, `!A` and the four ±1 forms all differ (`D+1`/`D-1` and
+  `A+1`/`A-1` are each the book's codes swapped). The `a` bit and the bit
+  order are standard, so an M form is still its A form with `a=1`. A test
+  pins the whole table, since a transposed pair still assembles cleanly.
 
 - **Standard Hack**: `@n` (0..32767) or `@symbol`, `dest=comp;jump`,
   `(LABEL)`, `//` comments, whitespace ignored. Predefined symbols (SP, LCL,

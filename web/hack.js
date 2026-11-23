@@ -10,7 +10,8 @@
 //   lineOf   lineOf[i] is the source line of word i
 //   symbols  the final symbol table (predefined, labels, variables)
 //
-// The language, per the standard spec:
+// The language, per the standard spec -- except the comp bits, which are
+// this project's own ALU's (see COMP_A):
 //   @value     A-instruction: a decimal constant 0..32767, or a symbol
 //   dest=comp;jump   C-instruction; dest= and ;jump are each optional
 //   (LABEL)    names the address of the next instruction
@@ -38,11 +39,16 @@ export const VAR_BASE = 16;
 export const A_MAX = 32767;
 
 // comp -> "a c1..c6", for the A forms; the M forms are the same bits with a=1.
+// NOT the book's table: these are the control bits of this project's own ALU,
+// which decodes c1..c6 differently. 0, -D, -A and the two-register comps
+// happen to match the book; 1, -1, D, A, !D, !A and the four +-1 forms do
+// not (D+1/D-1 and A+1/A-1 are each the book's codes the other way round).
+// Bit order is unchanged: c1 lands in bit 11, right after a.
 const COMP_A = {
-  "0": "101010", "1": "111111", "-1": "111010",
-  "D": "001100", "A": "110000", "!D": "001101", "!A": "110001",
-  "-D": "001111", "-A": "110011", "D+1": "011111", "A+1": "110111",
-  "D-1": "001110", "A-1": "110010", "D+A": "000010", "D-A": "010011",
+  "0": "101010", "1": "111101", "-1": "111111",
+  "D": "001010", "A": "100010", "!D": "001011", "!A": "100011",
+  "-D": "001111", "-A": "110011", "D+1": "001110", "A+1": "110010",
+  "D-1": "011111", "A-1": "110111", "D+A": "000010", "D-A": "010011",
   "A-D": "000111", "D&A": "000000", "D|A": "010101",
 };
 export const COMP = {};

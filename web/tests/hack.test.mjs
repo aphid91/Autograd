@@ -4,13 +4,14 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { assemble, preprocess, toBinary, COMP, PREDEFINED } from "../hack.js";
 
+
 const bin = (src) => {
   const r = assemble(src);
   assert.deepEqual(r.errors, []);
   return r.words.map(toBinary);
 };
 
-test("Max.asm assembles to the book's Max.hack", () => {
+test("Max.asm assembles to the book's Max.hack, with this ALU's comp bits", () => {
   const src = `// Computes R2 = max(R0, R1)
    @R0
    D=M              // D = first number
@@ -32,10 +33,10 @@ test("Max.asm assembles to the book's Max.hack", () => {
    @INFINITE_LOOP
    0;JMP            // infinite loop`;
   assert.deepEqual(bin(src), [
-    "0000000000000000", "1111110000010000", "0000000000000001", "1111010011010000",
-    "0000000000001010", "1110001100000001", "0000000000000001", "1111110000010000",
-    "0000000000001100", "1110101010000111", "0000000000000000", "1111110000010000",
-    "0000000000000010", "1110001100001000", "0000000000001110", "1110101010000111",
+    "0000000000000000", "1111100010010000", "0000000000000001", "1111010011010000",
+    "0000000000001010", "1110001010000001", "0000000000000001", "1111100010010000",
+    "0000000000001100", "1110101010000111", "0000000000000000", "1111100010010000",
+    "0000000000000010", "1110001010001000", "0000000000001110", "1110101010000111",
   ]);
 });
 
@@ -46,17 +47,32 @@ test("the comp table has all 28 forms, plus the commuted ones", () => {
   assert.equal(COMP["A+D"], COMP["D+A"]);
   assert.equal(COMP["M|D"], COMP["D|M"]);
   assert.equal(COMP["D+M"], "1000010");
-  assert.equal(COMP["!M"], "1110001");
+  assert.equal(COMP["!M"], "1100011");
+});
+
+test("the comp bits are this project's ALU, not the book's", () => {
+  const want = {
+    "0": "101010", "1": "111101", "-1": "111111", "D": "001010", "A": "100010",
+    "!D": "001011", "!A": "100011", "-D": "001111", "-A": "110011",
+    "D+1": "001110", "A+1": "110010", "D-1": "011111", "A-1": "110111",
+    "D+A": "000010", "D-A": "010011", "A-D": "000111", "D&A": "000000", "D|A": "010101",
+  };
+  for (const [k, c] of Object.entries(want)) {
+    assert.equal(COMP[k], "0" + c, k);
+    if (k.includes("A")) assert.equal(COMP[k.replace("A", "M")], "1" + c, k.replace("A", "M"));
+  }
+  const codes = Object.values(want);
+  assert.equal(new Set(codes).size, codes.length, "two comps share a code");
 });
 
 test("words are unsigned: a C-instruction is 57344 or more", () => {
   const r = assemble("D=M\n@15\n0;JMP");
-  assert.deepEqual(r.words, [0b1111110000010000, 15, 0b1110101010000111]);
+  assert.deepEqual(r.words, [0b1111100010010000, 15, 0b1110101010000111]);
   assert.ok(r.words[0] >= 57344);
 });
 
 test("dest letters in any order, and every jump", () => {
-  assert.deepEqual(bin("MD=1\nDM=1\nAMD=0"), ["1110111111011000", "1110111111011000", "1110101010111000"]);
+  assert.deepEqual(bin("MD=1\nDM=1\nAMD=0"), ["1110111101011000", "1110111101011000", "1110101010111000"]);
   assert.equal(bin("0;JLE")[0].slice(13), "110");
 });
 
