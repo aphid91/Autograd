@@ -119,8 +119,8 @@ export class Screen {
 
 // Draw the screen in world space (the renderer's transform): each Pixel's
 // square centred on its footprint's centre, a grid corner, `alpha` opaque.
-// A character pixel draws its glyph in that square instead -- the font's
-// full cell (ascent + descent) as tall as the square, centred -- over a
+// A character pixel draws its glyph in that square instead -- cap height
+// to descender as tall as the square, centred (see drawGlyph) -- over a
 // black square when `textBg` is set, and over nothing otherwise. A space
 // draws only that background.
 export function drawPixels(ctx, board, screen, alpha, max, on, textBg = false) {
@@ -150,24 +150,32 @@ export function drawPixels(ctx, board, screen, alpha, max, on, textBg = false) {
 // The glyph font is set at a fixed size and scaled into place: canvas text
 // at a size of a few world units is quantised (or floored at a minimum
 // size) by some browsers, and the scale keeps it exact at any zoom.
+//
+// Placed by measured ink, not by the font's declared cell: the reference
+// box runs from the top of "M" (cap height) to the bottom of "g"
+// (descender), which is as tall as the square and centred on it. The
+// font-box metrics this used first differ between browsers and fonts --
+// some report a tall ascent, or none at all -- and on a phone that pushed
+// the glyph up out of its square. One reference box for every character,
+// so a baseline is shared and 'a', 'g' and 'T' sit as they would in text.
 const GLYPH_PX = 100;
 const GLYPH_FONT = `${GLYPH_PX}px ui-monospace, Menlo, Consolas, "DejaVu Sans Mono", monospace`;
-let glyphCell = null;   // { asc, desc } of GLYPH_FONT, measured once
+let glyphRef = null;   // { asc, desc } of the reference ink, at GLYPH_PX
 
 function drawGlyph(ctx, ch, css, cx, cy, side) {
   ctx.save();
   ctx.font = GLYPH_FONT;
-  if (!glyphCell) {
-    const m = ctx.measureText("M");
-    const asc = m.fontBoundingBoxAscent, desc = m.fontBoundingBoxDescent;
-    glyphCell = asc > 0 && desc >= 0 ? { asc, desc } : { asc: 0.8 * GLYPH_PX, desc: 0.2 * GLYPH_PX };
+  ctx.textAlign = "center";
+  ctx.textBaseline = "alphabetic";
+  if (!glyphRef) {
+    const asc = ctx.measureText("M").actualBoundingBoxAscent;
+    const desc = ctx.measureText("g").actualBoundingBoxDescent;
+    glyphRef = asc > 0 && desc >= 0 ? { asc, desc } : { asc: 0.72 * GLYPH_PX, desc: 0.22 * GLYPH_PX };
   }
-  const { asc, desc } = glyphCell, sc = side / (asc + desc);
+  const { asc, desc } = glyphRef, sc = side / (asc + desc);
   // The world transform has y up; text wants y down, so flip it locally.
   ctx.translate(cx, cy);
   ctx.scale(sc, -sc);
-  ctx.textAlign = "center";
-  ctx.textBaseline = "alphabetic";
   ctx.fillStyle = css;
   ctx.fillText(ch, 0, (asc - desc) / 2);
   ctx.restore();

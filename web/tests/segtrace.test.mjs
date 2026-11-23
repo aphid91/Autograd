@@ -3,6 +3,13 @@
 // The run a long press selects, against core/segments.py itself: for every
 // belt and underground cell of cpu.npz, the cells traceRun() finds through
 // it must be exactly the cells of the desktop segment that holds it.
+//
+// FLAKY under load, and not because of traceRun: the Python half imports the
+// desktop app, and core/tick_profile.py runs a timing-based self-check at
+// import. Alongside the other suites (node --test runs files in parallel)
+// that check occasionally misses its timing and the import throws, failing
+// this test about one full-suite run in six. Rerun this file alone:
+//   node --test web/tests/segtrace.test.mjs
 
 import { test } from "node:test";
 import assert from "node:assert/strict";

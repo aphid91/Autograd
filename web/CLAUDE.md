@@ -719,7 +719,10 @@ stamps naming "sink" resolve through `T.aliases` (`typeByName()`).
   fractional part the value -- except a fractional part of exactly 0 means
   *full* value, so 55 is a bright `7` and 55.5 a half-bright one (55.25 is
   a quarter, not three quarters). 33..126 draw their glyph in a monospace
-  font whose full cell (ascent + descent) is the square's height, centred;
+  font, scaled so the *measured ink* from the top of `M` to the bottom of
+  `g` is the square's height, centred -- not the font's declared cell,
+  whose metrics vary by browser and pushed glyphs up out of the square on
+  a phone;
   32 draws an empty square; every other code draws the ordinary square at
   that same fractional value. V of exactly 1 is still a plain full square.
   **View > pixel text on black** puts a black square behind a character
