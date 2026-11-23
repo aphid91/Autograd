@@ -52,7 +52,7 @@ test("the comp table has all 28 forms, plus the commuted ones", () => {
 
 test("the comp bits are this project's ALU, not the book's", () => {
   const want = {
-    "0": "101010", "1": "111101", "-1": "111111", "D": "001010", "A": "100010",
+    "0": "101010", "1": "101001", "-1": "111111", "D": "001010", "A": "100010",
     "!D": "001011", "!A": "100011", "-D": "001111", "-A": "110011",
     "D+1": "001110", "A+1": "110010", "D-1": "011111", "A-1": "110111",
     "D+A": "000010", "D-A": "010011", "A-D": "000111", "D&A": "000000", "D|A": "010101",
@@ -72,7 +72,7 @@ test("words are unsigned: a C-instruction is 57344 or more", () => {
 });
 
 test("dest letters in any order, and every jump", () => {
-  assert.deepEqual(bin("MD=1\nDM=1\nAMD=0"), ["1110111101011000", "1110111101011000", "1110101010111000"]);
+  assert.deepEqual(bin("MD=1\nDM=1\nAMD=0"), ["1110101001011000", "1110101001011000", "1110101010111000"]);
   assert.equal(bin("0;JLE")[0].slice(13), "110");
 });
 

@@ -45,7 +45,7 @@ export const A_MAX = 32767;
 // not (D+1/D-1 and A+1/A-1 are each the book's codes the other way round).
 // Bit order is unchanged: c1 lands in bit 11, right after a.
 const COMP_A = {
-  "0": "101010", "1": "111101", "-1": "111111",
+  "0": "101010", "1": "101001", "-1": "111111",
   "D": "001010", "A": "100010", "!D": "001011", "!A": "100011",
   "-D": "001111", "-A": "110011", "D+1": "001110", "A+1": "110010",
   "D-1": "011111", "A-1": "110111", "D+A": "000010", "D-A": "010011",
