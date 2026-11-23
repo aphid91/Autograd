@@ -216,6 +216,23 @@ export class Panel {
       pushAudio();
     });
 
+    // Presets (audiopresets.js): the dials under a name, kept in this
+    // browser and as .json files, to carry a sound from one save to
+    // another. The panel only requests; main.js reads and writes them.
+    const pre = audio.addFolder({ title: "presets", expanded: false });
+    this.presetFolder = pre;
+    this.preset = { name: "", saved: "" };
+    pre.addBinding(this.preset, "name", { label: "name" });
+    this.presetSaveBtn = pre.addButton({ title: "Save preset" });
+    this.presetSaveBtn.on("click", () => cb.onSavePreset?.(this.preset.name.trim()));
+    this.presetBinding = null;
+    this.presetActions = [
+      pre.addButton({ title: "Load preset" }).on("click", () => this.preset.saved && cb.onLoadPreset?.(this.preset.saved)),
+      pre.addButton({ title: "Export preset .json" }).on("click", () => this.preset.saved && cb.onExportPreset?.(this.preset.saved)),
+      pre.addButton({ title: "Delete preset" }).on("click", () => this.preset.saved && cb.onDeletePreset?.(this.preset.saved)),
+    ];
+    pre.addButton({ title: "Import preset .json…" }).on("click", () => cb.onImportPreset?.());
+
     // Video: render a stretch of the simulation offline into an MP4
     // (video.js; main.js runs it). After Fluoddity's Recording tab. The
     // settings persist with the panel; the end camera is per session.
@@ -432,6 +449,17 @@ export class Panel {
     const at = this.saveFolder.children.indexOf(this.localSaveBtn) + 1;
     this.localBinding = this.saveFolder.addBinding(this.local, "saved", { label: "saved", options, index: at });
     for (const b of this.localActions) b.disabled = !names.length;
+  }
+
+  // The saved audio presets, by name; `selected` is kept if it is still
+  // there. Picking alone does nothing (Load does), as with browser saves.
+  setAudioPresets(names, selected = this.preset.saved) {
+    if (this.presetBinding) this.presetBinding.dispose();
+    this.preset.saved = names.includes(selected) ? selected : (names[0] ?? "");
+    const options = names.length ? Object.fromEntries(names.map(n => [n, n])) : { "(none yet)": "" };
+    const at = this.presetFolder.children.indexOf(this.presetSaveBtn) + 1;
+    this.presetBinding = this.presetFolder.addBinding(this.preset, "saved", { label: "saved", options, index: at });
+    for (const b of this.presetActions) b.disabled = !names.length;
   }
 
   // Show `info` (from Board.describe) in the Status folder, or hide it.

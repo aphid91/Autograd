@@ -13,7 +13,7 @@ import { render, BASE_COLOURS } from "./render.js";
 import { LayerPanel } from "./layerpanel.js";
 import { SCALE_PRESETS, SCALE_NAMES, compileScale, parseLut, scaleTable, scaleHz, noteName } from "./scale.js";
 import { BACKGROUND, byId, addLayer, removeLayer, renameLayer, setCurrent, isVisible, isActive,
-         setForActive, layerStats, mix, parseCss, rgbCss, isolate } from "./layers.js";
+         setForActive, layerStats, mix, parseCss, rgbCss, isolate, tagLayers, resolveLayers } from "./layers.js";
 import { Shell } from "./ui.js";
 import { Panel, STATUS_COLOUR_DEFAULTS } from "./panel.js";
 import { ROUTE_NAMES, ROUTE_H_FIRST, ROUTE_V_FIRST, chooseRoute, planRun, routeWorks, turnTip } from "./planner.js";
@@ -33,7 +33,8 @@ import { entrySize, typeByName } from "./stamp.js";
 import { installPixel, Screen } from "./pixel.js";
 import { cropBox, evenDim, frameBox, frameCount, viewBox } from "./video-params.js";
 import { presentationName, startPresentation, presentationRecord, safeName } from "./present.js";
-import { freezePersist } from "./persist.js";
+import { freezePersist, persistEnabled } from "./persist.js";
+import { presetNames, readPresets, putPreset, deletePreset, presetFile, parsePresetFile } from "./audiopresets.js";
 import { writeZip } from "./npz.js";
 import { spaceWeights, spaceKey, fringeOf } from "./space.js";
 import { noteAt, gripAt, isText, newRect, MIN_W, MIN_H } from "./notes.js";
@@ -294,6 +295,79 @@ function touchAudio() {
   edited = true;
   prepareSave();
 }
+
+// Audio presets (audiopresets.js): the dials and bake options under a name,
+// in this browser or a .json file, to carry a sound between saves. Loading
+// one is a dial change like any other -- it lands in the board's own audio
+// record and wakes the autosaves -- and sets every dial, not just the ones
+// it differs in.
+const presetStore = () => (persistEnabled() ? localStorage : null);
+function refreshPresets(selected) {
+  const st = presetStore();
+  panel.setAudioPresets(st ? presetNames(st) : [], selected);
+}
+function applyPreset(record) {
+  panel.applyAudio(record.dials);
+  if (record.bake) bakeOpts = record.bake;
+  if (audio) audio.setParams({ ...panel.audio });
+  touchAudio();
+  redraw();
+}
+const presetActions = {
+  onSavePreset: (name) => {
+    const st = presetStore();
+    if (!st) return;
+    if (!name) { alert("Give the preset a name first."); return; }
+    if (name in readPresets(st) && !confirm(`Replace the preset "${name}"?`)) return;
+    try { refreshPresets(putPreset(st, name, panel.audio, bakeOpts)); toast(`Saved audio preset "${name}".`); }
+    catch (err) { alert(`Could not save the preset: ${err.message}`); }
+  },
+  onLoadPreset: (name) => {
+    const st = presetStore();
+    const r = st && readPresets(st)[name];
+    if (!r) { refreshPresets(); return; }
+    applyPreset(r);
+    toast(`Loaded audio preset "${name}".`);
+  },
+  onDeletePreset: (name) => {
+    const st = presetStore();
+    if (!st || !confirm(`Delete the audio preset "${name}"?`)) return;
+    deletePreset(st, name);
+    refreshPresets();
+  },
+  onExportPreset: (name) => {
+    const st = presetStore();
+    const r = st && readPresets(st)[name];
+    if (!r) return;
+    const a = document.createElement("a");
+    a.href = URL.createObjectURL(new Blob([presetFile(name, r)], { type: "application/json" }));
+    a.download = `${name.replace(/[^\w.-]+/g, "_")}.audio.json`;
+    a.click();
+    setTimeout(() => URL.revokeObjectURL(a.href), 10000);
+  },
+  // An imported preset is applied at once and kept in the list under its
+  // own name (asking before replacing one of that name).
+  onImportPreset: () => {
+    const input = document.createElement("input");
+    input.type = "file";
+    input.accept = ".json,application/json";
+    input.onchange = async () => {
+      const f = input.files?.[0];
+      if (!f) return;
+      let got;
+      try { got = parsePresetFile(await f.text(), f.name.replace(/(\.audio)?\.json$/i, "")); }
+      catch (err) { alert(`Could not import "${f.name}": ${err.message}`); return; }
+      applyPreset(got.record);
+      const st = presetStore();
+      if (st && (!(got.name in readPresets(st)) || confirm(`Replace the preset "${got.name}" with the imported one?`))) {
+        try { putPreset(st, got.name, got.record.dials, got.record.bake); } catch (err) { alert(`Could not keep the preset: ${err.message}`); }
+      }
+      refreshPresets(got.name);
+      toast(`Imported audio preset "${got.name}".`);
+    };
+    input.click();
+  },
+};
 
 // --- video export ---------------------------------------------------------------
 //
@@ -2239,13 +2313,23 @@ function endPlace() {
 function placeOnce() {
   const pls = placements();
   let any = false;
+  pasteLayers = { created: 0, hidden: 0, locked: 0 };
   pls.forEach((pl, k) => { if (placeOne(pl, k === 0)) any = true; });
   // Only the cut's first placement is the move; pasting it again copies.
   if (any && place) place.keepLayers = false;
+  if (pasteLayers.created) layersChanged(true);
   if (any) board.derive();
+  if (layersOn() && (pasteLayers.hidden || pasteLayers.locked)) {
+    const n = (k, what) => `${k} ${k === 1 ? "entity" : "entities"} on ${what} layers`;
+    const parts = [pasteLayers.hidden && n(pasteLayers.hidden, "hidden"), pasteLayers.locked && n(pasteLayers.locked, "inactive")].filter(Boolean);
+    toast(`Pasted ${parts.join(" and ")}.`, 4000);
+  }
   redraw();
   return any;
 }
+// What the last placeOnce() did to layers: new layers made by a paste, and
+// how many pasted entities landed where they cannot be seen or touched.
+let pasteLayers = { created: 0, hidden: 0, locked: 0 };
 
 // One placement, without re-deriving. Each is checked against the board as
 // the ones before it left it. Force build clears the way for the original
@@ -2255,12 +2339,30 @@ function placeOne(pl, original) {
   if (pl.kind === "stamp") {
     // A cut being put down is a move: its entities keep their layers. Any
     // other paste makes copies, which go on the current layer.
+    // Every other paste keeps them too, by NAME (layers.js resolveLayers): a
+    // name this save has merges into its layer, whose colour stands; a name
+    // it lacks becomes a new layer with the stamp's name and colour. That is
+    // what carries a stamp's layers into another save. A stamp from before
+    // layers were recorded goes on the current layer.
     const keep = original && place?.keepLayers;
-    const entries = keep ? pl.entries : pl.entries.map(e => ({ ...e, layer: undefined }));
+    let entries = pl.entries;
+    if (!keep) {
+      // Only for entries that will go down: a blocked entity makes no layer.
+      const fits = pl.entries.map((e, i) => !board.entryBlocked(e, pl.at[i][0], pl.at[i][1]).length);
+      const r = resolveLayers(board.layers, pl.entries.map((e, i) => (fits[i] ? e : { ...e, layerRef: undefined })));
+      entries = r.entries;
+      pasteLayers.created += r.created.length;
+    }
     // Labels always fit. A label edit is not a board edit (it must not
     // restart the simulation), so only placed entities count for the derive.
     if (pl.notes.length) { board.notes.push(...pl.notes.map(n => ({ ...n, rect: n.rect.slice() }))); board.notesRev++; }
-    return board.placeEntries(entries, pl.at, { derive: false }).size > 0;
+    const placed = board.placeEntries(entries, pl.at, { derive: false });
+    for (const i of placed) {
+      const id = entries[i].layer ?? board.layers.current;
+      if (!isVisible(board.layers, id)) pasteLayers.hidden++;
+      else if (!isActive(board.layers, id)) pasteLayers.locked++;
+    }
+    return placed.size > 0;
   }
   const blocked = placementCells(pl).filter(([x, y]) => !board.isFree(x, y));
   if (blocked.length) {
@@ -2506,7 +2608,9 @@ function selectCommand(c) {
   if (!sel) return;
   if (c === "delete") { setSel([], []); return; }
   const pose = [sel.px, sel.py];
-  const id = shell.addStamp(sel.stamp);
+  // The stamp records each entity's layer by name and colour, so pasting it
+  // -- here or into another save -- lands on layers of the same names.
+  const id = shell.addStamp({ ...sel.stamp, entries: tagLayers(board.layers, sel.stamp.entries) });
   if (c === "cut") { setSel([], []); enterPaste(id, pose); if (place) place.keepLayers = true; return; }
   // Copy: the selection goes back down. If all of it fit, there is nothing
   // left selected and the copy is ready to paste; anything that could not go
@@ -3135,6 +3239,7 @@ async function init() {
     onAudioOpen: () => redraw(),
     onTune: (t) => { setTune(t); redraw(); },
     onClearStamps: () => shell.clearStamps(),
+    ...presetActions,
     onCloseStatus: () => inspect(-1),
     // An inactive layer's entity is read only: the edit is refused and the
     // pane shows the value it still holds.
@@ -3148,6 +3253,7 @@ async function init() {
     onPresent: (kind) => presentAction(kind),
   });
   panel.setLocalSaves(listSaves());
+  refreshPresets();
   view = { ...panel.view };
   syncScreen();
 

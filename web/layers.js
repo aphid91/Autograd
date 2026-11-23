@@ -115,6 +115,58 @@ export function addLayer(t) {
   return id;
 }
 
+// --- layers in a stamp ----------------------------------------------------
+//
+// A stamp's entries carry their layer by NAME, so a stamp pasted into
+// another save lands on that save's layers. An entry's `layerRef` is:
+//   undefined   untagged (a stamp from before this): the current layer
+//   null        Background
+//   { name, colour }   a named layer
+// Copied with the entry through every transform ({ ...e }), and plain JSON,
+// so a stamp baked into a toolbar slot keeps it.
+
+// Names match ignoring case and the spaces at either end: "RAM" and "ram "
+// are one layer.
+export const layerKey = (name) => String(name ?? "").trim().toLowerCase();
+
+// `entries` with each one's layer, by id in `t`, recorded by name and colour.
+// An id the table does not know reads as Background, as everywhere else.
+export function tagLayers(t, entries) {
+  return entries.map(e => {
+    const l = byId(t, e.layer);
+    return { ...e, layerRef: !l || l.id === BACKGROUND ? null : { name: l.name, colour: l.colour } };
+  });
+}
+
+// `entries` with `layer` set from each one's `layerRef` against table `t`:
+// a name already in the table merges into that layer (its colour stands); a
+// name it lacks becomes a new layer with the stamp's name and colour.
+// Untagged entries get no layer (placeEntries puts them on the current one).
+// Mutates `t` for the layers it creates; returns { entries, created }, the
+// created layers' ids.
+export function resolveLayers(t, entries) {
+  const byKey = new Map();
+  for (const l of t.list) if (l.id !== BACKGROUND && !byKey.has(layerKey(l.name))) byKey.set(layerKey(l.name), l.id);
+  const created = [];
+  const out = entries.map(e => {
+    if (e.layerRef === undefined) return { ...e, layer: undefined };
+    if (e.layerRef === null) return { ...e, layer: BACKGROUND };
+    const key = layerKey(e.layerRef.name);
+    if (!key || key === layerKey(t.list[0].name)) return { ...e, layer: BACKGROUND };
+    let id = byKey.get(key);
+    if (id === undefined) {
+      const name = String(e.layerRef.name).trim().slice(0, 40);
+      id = t.next++;
+      t.list.push({ id, name, colour: isHex(e.layerRef.colour) ? e.layerRef.colour.toLowerCase() : PALETTE[(t.list.length - 1) % PALETTE.length],
+                    visible: true, active: true, tint: 0, label: 0, labelDx: 0, labelDy: 0 });
+      byKey.set(key, id);
+      created.push(id);
+    }
+    return { ...e, layer: id };
+  });
+  return { entries: out, created };
+}
+
 // Remove a layer from the table. Background cannot go. The caller moves its
 // entities to Background. If it was current, Background becomes current.
 export function removeLayer(t, id) {

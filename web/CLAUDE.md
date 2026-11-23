@@ -292,9 +292,20 @@ on the current layer.
   layer (`Board.tagLayer`). A selection keeps each entity's layer through
   lift, move, turn and put-down (`capture()` records it, `placeEntries()`
   honours `entry.layer`). A **cut**'s first placement is a move and keeps
-  them (`place.keepLayers`); every other paste -- a copy, a repeat paste,
-  vector copies -- is a copy and goes on the current layer. **Adopt**
-  rewrites the lifted entries' layer; it lands when the selection goes down.
+  them by id (`place.keepLayers`). **Every other paste keeps them too, by
+  name**: Copy and Cut record each entry's layer as `layerRef`
+  (`tagLayers()`: `{ name, colour }`, `null` for Background), and a paste
+  resolves it against the board's table (`resolveLayers()`) -- a name the
+  save already has merges into that layer (case and end spaces ignored,
+  and **its own colour wins**); a name it lacks becomes a new layer with
+  the stamp's name and colour. So a stamp copied in one save and pasted in
+  another brings its layers. An entity that does not fit makes no layer.
+  A stamp from before this has no `layerRef` and goes on the current
+  layer, as copies used to. A paste landing on hidden or inactive layers
+  says so in a toast (only while View > layers is on). New layers are part
+  of the paste's undo step. **Adopt**
+  rewrites the lifted entries' layer; it lands when the selection goes
+  down, and a Copy after it records the adopted layer.
 - **Undo**: `board.layersRev` is part of the history key, bumped for
   membership, names and colours (deleting a layer retags its rows to
   Background without a derive, so none of this restarts the simulation).
@@ -1554,6 +1565,18 @@ does not write the key back, and is deliberately left that way.
   blob costs the settings, never the board.
 - The baked audio itself is not saved: memory only, and tens of MB.
 
+**Presets** (Audio > presets; [audiopresets.js](audiopresets.js)) carry a
+sound between saves: the same record a save holds (every dial, the scale
+included, and the Bake dialog's seconds and rate -- not the switch, the
+audio selection or the region), kept under a name in this browser
+(`gates.web.audioPresets.v1`) and exported or imported as a tagged
+`.json` file. A preset stores **every** dial, defaults filled in, so
+loading one sets the whole sound rather than only the dials it recorded.
+Loading is a dial change like any other: it lands in the board's record,
+so the next save carries it. Importing applies the file at once and keeps
+it in the list under its own name (asking before replacing one). Cleaned
+on read with `cleanDials()`, like a save's. `tests/audiopresets.test.mjs`.
+
 Two practical notes: the `AudioContext` is created and resumed **inside the
 tap** (main.js `setAudio()`), before the dynamic import, since iOS will not
 start one made after an await; `navigator.audioSession.type = "playback"`
@@ -1847,6 +1870,7 @@ asserting every array matches and exactly the edited value differs.
 | `audio-dsp.js`, `audio-worklet.js` | the synthesiser, and its AudioWorklet wrapper |
 | `space.js` | spatial audio: distance to the region or screen box, the falloff and low-pass curves, per-run and per-gate weights |
 | `scale.js` | belt scales: the formula language, presets, tables, the wavelength table the synth reads |
+| `audiopresets.js` | audio presets: the dials under a name, in the browser and as `.json` files |
 | `audio-bake.js` | baking: a stretch of ticks rendered offline, and the WAV writer; loaded on demand |
 | `pixel.js` | the Pixel machine (web-only, in Sink's id), its screen, and the overlay's drawing |
 | `present.js` | presentation mode: the `#b=` route, its controls, the camera schedule, the info panel |

@@ -268,3 +268,69 @@ test("a label's offset and the labels switch survive a save; undo keeps the swit
   assert.equal(byId(b.layers, L).labelDx, 3);
   assert.equal(b.layers.showLabels, false);
 });
+
+// --- layers in a stamp (layers.js tagLayers / resolveLayers) ---------------
+
+import { tagLayers, resolveLayers, layerKey } from "../layers.js";
+
+function tableOf(...layers) {
+  const t = defaultLayers();
+  for (const [name, colour] of layers) {
+    const id = addLayer(t);
+    const l = t.list.find(x => x.id === id);
+    l.name = name; l.colour = colour;
+  }
+  return t;
+}
+
+test("a stamp records its layers by name and colour; Background and unknown ids as null", () => {
+  const t = tableOf(["RAM", "#112233"], ["ALU", "#445566"]);
+  const ram = t.list[1].id, alu = t.list[2].id;
+  const out = tagLayers(t, [{ layer: ram }, { layer: alu }, { layer: BACKGROUND }, { layer: 99 }]);
+  assert.deepEqual(out.map(e => e.layerRef), [
+    { name: "RAM", colour: "#112233" }, { name: "ALU", colour: "#445566" }, null, null]);
+  assert.equal(out[0].layer, ram, "the id is still there, for a cut put back where it was");
+});
+
+test("pasting into another save: names merge (existing colour wins), new names become layers", () => {
+  const src = tableOf(["RAM", "#112233"], ["Clock", "#abcdef"], ["alu", "#445566"]);
+  const entries = tagLayers(src, [
+    { layer: src.list[1].id }, { layer: src.list[2].id }, { layer: src.list[3].id },
+    { layer: src.list[2].id }, { layer: BACKGROUND }, {},
+  ]);
+  entries[5].layerRef = undefined;   // a stamp from before layers were recorded
+
+  const dst = tableOf([" ram ", "#ff0000"], ["ALU", "#00ff00"]);
+  dst.current = dst.list[2].id;
+  const before = dst.list.length;
+  const { entries: out, created } = resolveLayers(dst, entries);
+
+  const ram = dst.list.find(l => layerKey(l.name) === "ram");
+  const alu = dst.list.find(l => layerKey(l.name) === "alu");
+  assert.equal(out[0].layer, ram.id, "RAM merges into ' ram ' (case and end spaces ignored)");
+  assert.equal(ram.colour, "#ff0000", "on a merge the save's own colour wins");
+  assert.equal(out[2].layer, alu.id); assert.equal(alu.colour, "#00ff00");
+  assert.equal(created.length, 1, "only Clock was missing");
+  const clock = dst.list.find(l => l.name === "Clock");
+  assert.ok(clock && clock.colour === "#abcdef", "a new layer brings the stamp's name and colour");
+  assert.equal(out[1].layer, clock.id); assert.equal(out[3].layer, clock.id, "made once, used twice");
+  assert.equal(dst.list.length, before + 1);
+  assert.equal(out[4].layer, BACKGROUND);
+  assert.equal(out[5].layer, undefined, "an untagged entry goes on the current layer");
+  // Pasting again makes nothing new.
+  assert.equal(resolveLayers(dst, entries).created.length, 0);
+});
+
+test("a Board places resolved entries on their layers", () => {
+  const board = blank();
+  const t = board.layers;
+  const entries = resolveLayers(t, [
+    { type: "belt", dx: 0, dy: 0, dir: 0, flip: false, exit: false, partner: null, emit: null, seed: null,
+      layerRef: { name: "Imported", colour: "#123456" } },
+    { type: "belt", dx: 1, dy: 0, dir: 0, flip: false, exit: false, partner: null, emit: null, seed: null, layerRef: null },
+  ]).entries;
+  assert.equal(board.placeEntries(entries, [[3, 3], [4, 3]]).size, 2);
+  const layer = t.list.find(l => l.name === "Imported");
+  assert.equal(board.layerOf(board.entityAt(3, 3)), layer.id);
+  assert.equal(board.layerOf(board.entityAt(4, 3)), BACKGROUND);
+});
