@@ -329,7 +329,7 @@ function drawVideoFrame(ctx, s, vcam, alpha) {
   render(ctx, s.board, vcam, 1, {
     ...view, sim: s, alpha, ghosts: [],
     ...layerOpts(recLayers, view.gateStatus ? gateStatus(s) : null, view.beltStatus ? beltStatus(s) : null, true),
-    pixels: s.screen ? { screen: s.screen, alpha: view.pixelAlpha, max: view.pixelMax } : null,
+    pixels: s.screen ? { screen: s.screen, alpha: view.pixelAlpha, max: view.pixelMax, textBg: view.pixelTextBg } : null,
     onWorld: bloomHook("video"),
   });
 }
@@ -1070,7 +1070,7 @@ function paint(now) {
   render(ctx, board, cam, dpr, { ...view, selected: info, ghosts, sim, alpha: clock.alpha, hide, vector: vectorMarks(),
                                 indexLabels: indexLabels(), noteSel: noteEdit, noteGrips: labelHeld(),
                                 ghostNotes: ghostNotes(),
-                                pixels: sim?.screen ? { screen, alpha: view.pixelAlpha, max: view.pixelMax } : null,
+                                pixels: sim?.screen ? { screen, alpha: view.pixelAlpha, max: view.pixelMax, textBg: view.pixelTextBg } : null,
                                 frameBoxes: videoBoxes(),
                                 soundSpace: spaceMarks(),
                                 ...layerOpts(lv, gTint, bTint),

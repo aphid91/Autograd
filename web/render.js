@@ -211,7 +211,7 @@ export function render(ctx, board, cam, dpr, opts = {}) {
 
   // The pixel overlay (pixel.js): over the board and its items.
   if (view.pixels) {
-    drawPixels(ctx, board, view.pixels.screen, view.pixels.alpha, view.pixels.max, on);
+    drawPixels(ctx, board, view.pixels.screen, view.pixels.alpha, view.pixels.max, on, view.pixels.textBg);
     drawGhosts();
   }
 

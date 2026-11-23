@@ -107,7 +107,7 @@ export class Panel {
       board.addButton({ title: "Delete saved" }).on("click", () => this.local.saved && cb.onDeleteLocal(this.local.saved)),
     ];
 
-    this.view = { grid: false, ports: true, labels: true, seedTint: true, notes: true, momentum: true, items: true, belts: true, gates: true, gateStatus: true, sources: true, beltStatus: true, beltActive: true, fps: false, pixelAlpha: 0, pixelMax: 8, layers: false, ...LOOK_DEFAULTS, ...this.prefs.view };
+    this.view = { grid: false, ports: true, labels: true, seedTint: true, notes: true, momentum: true, items: true, belts: true, gates: true, gateStatus: true, sources: true, beltStatus: true, beltActive: true, fps: false, pixelAlpha: 0, pixelMax: 8, pixelTextBg: true, layers: false, ...LOOK_DEFAULTS, ...this.prefs.view };
     if (!/^#[0-9a-f]{6}$/i.test(this.view.bg)) this.view.bg = LOOK_DEFAULTS.bg;
     const view = this.pane.addFolder({ title: "View", expanded: false });
     this.viewBindings = [];
@@ -131,6 +131,13 @@ export class Panel {
         cb.onView({ ...this.view });
       }));
     }
+    // A character pixel (V above 1) over a black square, or over the board.
+    this.viewBindings.push(view.addBinding(this.view, "pixelTextBg", { label: "pixel text on black" }).on("change", () => {
+      if (this.applyingView) return;
+      this.prefs.view = { ...this.view };
+      savePrefs(this.prefs);
+      cb.onView({ ...this.view });
+    }));
 
     // View > look: the board's colour, rounded machine corners, chevron
     // opacity, and the bloom (bloom.js). Per player, with the panel's

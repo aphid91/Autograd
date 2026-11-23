@@ -55,14 +55,33 @@ test("Pixel takes Sink's id: H and V on cell 0, S above H, Z on the far corner; 
 });
 
 test("colour and size: hue wraps in turns, S and V clamp, NaN is 0; Z rounds within 1..max", () => {
-  assert.deepEqual(pixelOf([1.25, 2, -1, 3]), { h: 0.25, s: 1, v: 0, z: 3 });
-  assert.deepEqual(pixelOf([-0.25, NaN, 0.5, null]), { h: 0.75, s: 0, v: 0.5, z: 0 });
+  assert.deepEqual(pixelOf([1.25, 2, -1, 3]), { h: 0.25, s: 1, v: 0, ch: null, z: 3 });
+  assert.deepEqual(pixelOf([-0.25, NaN, 0.5, null]), { h: 0.75, s: 0, v: 0.5, ch: null, z: 0 });
   assert.equal(pixelSize(0, 8), 0); assert.equal(pixelSize(-2, 8), 0); assert.equal(pixelSize(NaN, 8), 0);
   assert.equal(pixelSize(0.2, 8), 1, "any positive Z draws at least the machine");
   assert.equal(pixelSize(1, 8), 1); assert.equal(pixelSize(2.6, 8), 3); assert.equal(pixelSize(40, 8), 8);
   assert.deepEqual(hsvToRgb(0, 1, 1), [1, 0, 0]);
   assert.deepEqual(hsvToRgb(1 / 3, 1, 1), [0, 1, 0]);
   assert.deepEqual(hsvToRgb(0.5, 0, 0.5), [0.5, 0.5, 0.5]);
+});
+
+test("V above 1 is an ASCII code; its fractional part is the value, 0 meaning full", () => {
+  const V = (v) => { const p = pixelOf([0, 0, v, 1]); return [p.ch, p.v]; };
+  assert.deepEqual(V(1), [null, 1], "exactly 1 is still the square at full value");
+  assert.deepEqual(V(0.5), [null, 0.5]);
+  assert.deepEqual(V(55), ["7", 1]);
+  assert.deepEqual(V(55.5), ["7", 0.5]);
+  assert.deepEqual(V(55.25), ["7", 0.25], "the fractional part is the value itself, not 1 - it");
+  assert.deepEqual(V(33), ["!", 1]); assert.deepEqual(V(126.75), ["~", 0.75]);
+  assert.deepEqual(V(32), [" ", 1], "a space is printable: an empty square");
+  // Non-printable codes are the square, with the same value rule.
+  assert.deepEqual(V(1.5), [null, 0.5]);
+  assert.deepEqual(V(10), [null, 1]);
+  assert.deepEqual(V(127.25), [null, 0.25]);
+  assert.deepEqual(V(200), [null, 1]);
+  assert.deepEqual(V(1e9 + 0.5), [null, 0.5]);
+  const scr = new Screen(); scr.fire(0, [0, 0, 55.5, 1]);
+  assert.equal(scr.px.get(0).css, "rgb(128,128,128)", "a half-value character is drawn at half value");
 });
 
 const save = join(here, "..", "..", "cpu.npz");
@@ -95,7 +114,7 @@ test("a fire records its colour on the screen, most recent last; not without all
   sim.forecast();                             // a forecast fires it and rolls back: not recorded
   assert.equal(screen.px.size, 0);
   sim.step();
-  assert.deepEqual({ ...screen.px.get(a), css: undefined }, { h: 0.5, s: 1, v: 1, z: 2, css: undefined });
+  assert.deepEqual({ ...screen.px.get(a), css: undefined }, { h: 0.5, s: 1, v: 1, ch: null, z: 2, css: undefined });
   assert.equal(screen.px.get(a).css, "rgb(0,255,255)");
   assert.ok(!sim.inHeld(a, 0) && !sim.inHeld(a, 3), "its inputs were consumed");
 

@@ -715,6 +715,17 @@ stamps naming "sink" resolve through `T.aliases` (`typeByName()`).
   the side in cells -- Z = 1 covers exactly the machine (2x2), Z = 2 a 4x4,
   centred on the machine's centre, which is always a grid corner, so every
   square sits on the grid.
+- **A V above 1 is a character.** `floor(V)` is an ASCII code and its
+  fractional part the value -- except a fractional part of exactly 0 means
+  *full* value, so 55 is a bright `7` and 55.5 a half-bright one (55.25 is
+  a quarter, not three quarters). 33..126 draw their glyph in a monospace
+  font whose full cell (ascent + descent) is the square's height, centred;
+  32 draws an empty square; every other code draws the ordinary square at
+  that same fractional value. V of exactly 1 is still a plain full square.
+  **View > pixel text on black** puts a black square behind a character
+  (and behind a space); off, the board shows through. The glyph is drawn
+  at a fixed 100px font and scaled into place, since canvas text a few
+  world units tall is quantised or floored by some browsers.
 - **View > pixel overlay** (0..1) is the screen's opacity, and 0 is off:
   the sim then has no `Screen` and a fire records nothing (the Pixel still
   consumes its inputs). Switching it on starts blank; so do every edit,

@@ -14,7 +14,7 @@
 //      V
 //
 // H, S and V set the hue, saturation and value of the square it projects;
-// Z its size. While View > pixel overlay is above 0, each fire records them
+// Z its size. A V above 1 is a character instead (see pixelOf()). While View > pixel overlay is above 0, each fire records them
 // on the Screen; at 0 a fire does nothing beyond consuming its inputs.
 
 export const PIXEL_TYPE = 6;   // Sink's id
@@ -60,15 +60,29 @@ export function installPixel(T) {
 }
 
 // A fire's four values as a colour and a size: hue in turns, wrapping;
-// saturation and value clamped to 0..1; NaN reads as 0. z is kept raw (the
-// size is worked out when drawn, against the View's max).
+// saturation clamped to 0..1; NaN reads as 0. z is kept raw (the size is
+// worked out when drawn, against the View's max).
+//
+// V is the value (brightness), clamped, while it is 1 or less. Strictly
+// above 1 it is a character: floor(V) an ASCII code, and its fractional
+// part the value -- except that a fractional part of exactly 0 means full
+// value, so 55 is a full-brightness '7' and 55.5 a half-brightness one.
+// The printable codes 33..126 draw their character and 32 an empty space;
+// any other code draws the ordinary square, at the same fractional value.
+// `ch` is the character to draw, or null for the square.
 export function pixelOf(values) {
   const n = (x) => (x === null || x === undefined || x !== x ? 0 : x);
-  const h = n(values[CH.H]), s = n(values[CH.S]), v = n(values[CH.V]);
+  const h = n(values[CH.H]), s = n(values[CH.S]), raw = n(values[CH.V]);
+  let v = Math.min(1, Math.max(0, raw)), ch = null;
+  if (raw > 1) {
+    const code = Math.floor(raw), f = raw - code;
+    v = f === 0 ? 1 : f;
+    if (code >= 32 && code <= 126) ch = String.fromCharCode(code);
+  }
   return {
     h: ((h % 1) + 1) % 1,
     s: Math.min(1, Math.max(0, s)),
-    v: Math.min(1, Math.max(0, v)),
+    v, ch,
     z: n(values[CH.Z]),
   };
 }
@@ -105,7 +119,11 @@ export class Screen {
 
 // Draw the screen in world space (the renderer's transform): each Pixel's
 // square centred on its footprint's centre, a grid corner, `alpha` opaque.
-export function drawPixels(ctx, board, screen, alpha, max, on) {
+// A character pixel draws its glyph in that square instead -- the font's
+// full cell (ascent + descent) as tall as the square, centred -- over a
+// black square when `textBg` is set, and over nothing otherwise. A space
+// draws only that background.
+export function drawPixels(ctx, board, screen, alpha, max, on, textBg = false) {
   if (!screen?.px.size || !(alpha > 0)) return;
   const E = board.T.entity;
   ctx.globalAlpha = Math.min(1, alpha);
@@ -115,8 +133,42 @@ export function drawPixels(ctx, board, screen, alpha, max, on) {
     const cx = board.field(row, E.F_ORIGIN_X) + board.field(row, E.F_W) / 2;
     const cy = board.field(row, E.F_ORIGIN_Y) + board.field(row, E.F_H) / 2;
     if (!on(cx - k, cy - k, 2 * k, 2 * k)) continue;
-    ctx.fillStyle = p.css;
-    ctx.fillRect(cx - k, cy - k, 2 * k, 2 * k);
+    if (p.ch === null || p.ch === undefined) {
+      ctx.fillStyle = p.css;
+      ctx.fillRect(cx - k, cy - k, 2 * k, 2 * k);
+      continue;
+    }
+    if (textBg) {
+      ctx.fillStyle = "#000";
+      ctx.fillRect(cx - k, cy - k, 2 * k, 2 * k);
+    }
+    if (p.ch !== " ") drawGlyph(ctx, p.ch, p.css, cx, cy, 2 * k);
   }
   ctx.globalAlpha = 1;
+}
+
+// The glyph font is set at a fixed size and scaled into place: canvas text
+// at a size of a few world units is quantised (or floored at a minimum
+// size) by some browsers, and the scale keeps it exact at any zoom.
+const GLYPH_PX = 100;
+const GLYPH_FONT = `${GLYPH_PX}px ui-monospace, Menlo, Consolas, "DejaVu Sans Mono", monospace`;
+let glyphCell = null;   // { asc, desc } of GLYPH_FONT, measured once
+
+function drawGlyph(ctx, ch, css, cx, cy, side) {
+  ctx.save();
+  ctx.font = GLYPH_FONT;
+  if (!glyphCell) {
+    const m = ctx.measureText("M");
+    const asc = m.fontBoundingBoxAscent, desc = m.fontBoundingBoxDescent;
+    glyphCell = asc > 0 && desc >= 0 ? { asc, desc } : { asc: 0.8 * GLYPH_PX, desc: 0.2 * GLYPH_PX };
+  }
+  const { asc, desc } = glyphCell, sc = side / (asc + desc);
+  // The world transform has y up; text wants y down, so flip it locally.
+  ctx.translate(cx, cy);
+  ctx.scale(sc, -sc);
+  ctx.textAlign = "center";
+  ctx.textBaseline = "alphabetic";
+  ctx.fillStyle = css;
+  ctx.fillText(ch, 0, (asc - desc) / 2);
+  ctx.restore();
 }
