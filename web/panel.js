@@ -14,6 +14,17 @@ import { persistEnabled } from "./persist.js";
 const PANE_KEY = "gates.web.pane.v1";
 const DIR_NAMES = ["+X east", "+Y north", "-X west", "-Y south"];
 
+// View > look: the shipped values, and the panel's dials in order.
+export const LOOK_DEFAULTS = { bg: "#1f1f24", corner: 0, chevronAlpha: 1, bloom: 0, bloomCutoff: 0.7, bloomRadius: 5 };
+const LOOK_SPEC = [
+  ["bg", "background", { view: "color" }],
+  ["corner", "corner radius", { min: 0, max: 0.5, step: 0.01 }],
+  ["chevronAlpha", "chevron opacity", { min: 0, max: 1, step: 0.01 }],
+  ["bloom", "bloom intensity", { min: 0, max: 4, step: 0.01 }],
+  ["bloomCutoff", "bloom cutoff", { min: 0, max: 1, step: 0.01 }],
+  ["bloomRadius", "bloom radius", { min: 1, max: 8, step: 0.05 }],
+];
+
 // The status colours' shipped values (View > status colours), as hex so
 // Tweakpane's picker -- a saturation/value square and a hue strip -- edits
 // them directly. main.js reads the live ones; a stored key this build does
@@ -96,7 +107,8 @@ export class Panel {
       board.addButton({ title: "Delete saved" }).on("click", () => this.local.saved && cb.onDeleteLocal(this.local.saved)),
     ];
 
-    this.view = { grid: false, ports: true, labels: true, seedTint: true, notes: true, momentum: true, items: true, belts: true, gates: true, gateStatus: true, sources: true, beltStatus: true, beltActive: true, fps: false, pixelAlpha: 0, pixelMax: 8, layers: false, ...this.prefs.view };
+    this.view = { grid: false, ports: true, labels: true, seedTint: true, notes: true, momentum: true, items: true, belts: true, gates: true, gateStatus: true, sources: true, beltStatus: true, beltActive: true, fps: false, pixelAlpha: 0, pixelMax: 8, layers: false, ...LOOK_DEFAULTS, ...this.prefs.view };
+    if (!/^#[0-9a-f]{6}$/i.test(this.view.bg)) this.view.bg = LOOK_DEFAULTS.bg;
     const view = this.pane.addFolder({ title: "View", expanded: false });
     this.viewBindings = [];
     for (const [key, label] of [["grid", "grid lines"], ["ports", "ports"], ["labels", "source values"], ["seedTint", "seed tint"], ["notes", "labels (notes)"], ["momentum", "pan momentum"], ["items", "items"], ["belts", "belts"], ["gates", "gates"], ["gateStatus", "gate status colours"], ["beltStatus", "belt status colours"], ["beltActive", "stalled but moving: green"], ["sources", "sources"], ["fps", "fps counter"], ["layers", "layers"]]) {
@@ -119,6 +131,20 @@ export class Panel {
         cb.onView({ ...this.view });
       }));
     }
+
+    // View > look: the board's colour, rounded machine corners, chevron
+    // opacity, and the bloom (bloom.js). Per player, with the panel's
+    // preferences, and in a presentation's views like the rest of View.
+    const look = view.addFolder({ title: "look", expanded: false });
+    for (const [key, label, opts] of LOOK_SPEC) {
+      this.viewBindings.push(look.addBinding(this.view, key, { label, ...opts }).on("change", () => {
+        if (this.applyingView) return;
+        this.prefs.view = { ...this.view };
+        savePrefs(this.prefs);
+        cb.onView({ ...this.view });
+      }));
+    }
+    look.addButton({ title: "Reset look" }).on("click", () => this.applyView({ view: { ...LOOK_DEFAULTS } }));
 
     // The status colours, each with a picker. Persisted with the panel.
     const known = Object.keys(STATUS_COLOUR_DEFAULTS);

@@ -104,10 +104,33 @@ function fmtNumber(v) {
 // inspected entity's {x, y, w, h} or null.
 export const DEFAULT_VIEW = { grid: true, ports: true, labels: true, seedTint: true };
 
+// View > look: the board's colour, how round a machine's corners are (in
+// cells, 0 square, 0.5 as round as a 1-wide body allows) and how opaque the
+// chevrons are, on belts, underground ends and the control overlays alike.
+// Set once per render, read by the drawing helpers.
+const LOOK = { corner: 0, chevrons: 1 };
+
+// Stroke the current path (or `path`) with the chevrons' opacity.
+function strokeChevrons(ctx, path) {
+  if (LOOK.chevrons <= 0) return;
+  const a = ctx.globalAlpha;
+  ctx.globalAlpha = a * LOOK.chevrons;
+  if (path) ctx.stroke(path); else ctx.stroke();
+  ctx.globalAlpha = a;
+}
+
+// A machine body: a rectangle, rounded by View > corner radius.
+function bodyRect(ctx, x, y, w, h) {
+  const r = Math.min(LOOK.corner, w / 2, h / 2);
+  if (r > 0) ctx.roundRect(x, y, w, h, r); else ctx.rect(x, y, w, h);
+}
+
 export function render(ctx, board, cam, dpr, opts = {}) {
   const view = { ...DEFAULT_VIEW, ...opts };
   const z = cam.zoom;
   lodZ = z;
+  LOOK.corner = Math.max(0, +view.corner || 0);
+  LOOK.chevrons = view.chevronAlpha ?? 1;
   ctx.setTransform(1, 0, 0, 1, 0, 0);
   ctx.fillStyle = COL.void;
   ctx.fillRect(0, 0, ctx.canvas.width, ctx.canvas.height);
@@ -122,7 +145,7 @@ export function render(ctx, board, cam, dpr, opts = {}) {
   const on = (x, y, w = 1, h = 1) => x + w >= v.x0 && x <= v.x1 && y + h >= v.y0 && y <= v.y1;
   const S = board.T.cell.DIR_STEPS;
 
-  ctx.fillStyle = COL.bg;
+  ctx.fillStyle = view.bg || COL.bg;
   ctx.fillRect(0, 0, board.width, board.height);
 
   // Grid, under everything, so belts read as joined across cell edges.
@@ -190,6 +213,15 @@ export function render(ctx, board, cam, dpr, opts = {}) {
   if (view.pixels) {
     drawPixels(ctx, board, view.pixels.screen, view.pixels.alpha, view.pixels.max, on);
     drawGhosts();
+  }
+
+  // Everything so far is the board itself; what follows is editing marks
+  // and screen-space text. The bloom (bloom.js) takes the picture here, so
+  // a selection or a frame box never glows, and lays its glow over it.
+  if (view.onWorld) {
+    ctx.save();
+    view.onWorld(ctx);
+    ctx.restore();
   }
 
   // The video frame (Video folder open): the crop box now, solid, and the
@@ -332,7 +364,7 @@ function drawBelts(ctx, belts, z, on, S, seedTint = true, tint = null) {
   ctx.strokeStyle = COL.chevron;
   ctx.lineWidth = 0.06;
   ctx.lineJoin = "miter";
-  ctx.stroke();
+  strokeChevrons(ctx);
 }
 
 // A ">" pointing along f, centred near (cx, cy).
@@ -362,7 +394,7 @@ function drawUnders(ctx, unders, z, on, S, tint = null) {
   }
   ctx.strokeStyle = COL.chevron;
   ctx.lineWidth = 0.07;
-  ctx.stroke();
+  strokeChevrons(ctx);
 }
 
 // One colour's worth of underground ends and spans; `col` null is their own.
@@ -462,7 +494,7 @@ function drawGhost(ctx, T, g, z, px, on, S, ports, labels, seedTint = true) {
   if (g.outlines?.length) {
     const pad = 1.5 * px;
     ctx.beginPath();
-    for (const b of g.outlines) if (on(b.x, b.y, b.w, b.h)) ctx.rect(b.x + pad, b.y + pad, b.w - 2 * pad, b.h - 2 * pad);
+    for (const b of g.outlines) if (on(b.x, b.y, b.w, b.h)) bodyRect(ctx, b.x + pad, b.y + pad, b.w - 2 * pad, b.h - 2 * pad);
     ctx.fillStyle = COL.liftedFill;
     ctx.fill();
     ctx.strokeStyle = COL.lifted;
@@ -491,10 +523,17 @@ function drawStructs(ctx, T, structs, z, px, on, S, ports, labels, tint = null) 
     if (!on(s.x, s.y, s.w, s.h)) continue;
     const c = (tint && s.row !== undefined && tint.get(s.row)) || types[s.type].colour || [0.5, 0.5, 0.5];
     ctx.fillStyle = css(c);
-    ctx.fillRect(s.x + inset, s.y + inset, s.w - 2 * inset, s.h - 2 * inset);
     ctx.strokeStyle = shade(c, 0.6);
     ctx.lineWidth = Math.max(px, 0.04);
-    ctx.strokeRect(s.x + inset, s.y + inset, s.w - 2 * inset, s.h - 2 * inset);
+    if (LOOK.corner > 0) {
+      ctx.beginPath();
+      bodyRect(ctx, s.x + inset, s.y + inset, s.w - 2 * inset, s.h - 2 * inset);
+      ctx.fill();
+      ctx.stroke();
+    } else {
+      ctx.fillRect(s.x + inset, s.y + inset, s.w - 2 * inset, s.h - 2 * inset);
+      ctx.strokeRect(s.x + inset, s.y + inset, s.w - 2 * inset, s.h - 2 * inset);
+    }
   }
   if (z < LOD.marks) return;
 
@@ -532,7 +571,7 @@ function drawStructs(ctx, T, structs, z, px, on, S, ports, labels, tint = null) 
   ctx.strokeStyle = COL.passChevron;
   ctx.lineWidth = 0.06;
   ctx.lineJoin = "miter";
-  ctx.stroke(chev);
+  strokeChevrons(ctx, chev);
 
   // The glyph, centred on the footprint. A Source whose number is shown
   // wears the number instead.

@@ -330,6 +330,7 @@ function drawVideoFrame(ctx, s, vcam, alpha) {
     ...view, sim: s, alpha, ghosts: [],
     ...layerOpts(recLayers, view.gateStatus ? gateStatus(s) : null, view.beltStatus ? beltStatus(s) : null, true),
     pixels: s.screen ? { screen: s.screen, alpha: view.pixelAlpha, max: view.pixelMax } : null,
+    onWorld: bloomHook("video"),
   });
 }
 
@@ -979,6 +980,29 @@ function countFrame(now, ticks) {
     Object.assign(fpsWin, { t0: now, frames: 0, ticks: 0 });
   }
 }
+// View > look > bloom (bloom.js): imported the first time the intensity is
+// raised, so a player who never blooms loads no WebGL. One instance for the
+// screen and one for video frames, which are another size. If WebGL2 is
+// missing the bloom is simply off.
+let bloomMod = null, bloomLoading = false, bloomFailed = false;
+const blooms = new Map();
+function bloomHook(key) {
+  if (!(view.bloom > 0) || bloomFailed) return undefined;
+  if (!bloomMod) {
+    if (!bloomLoading) {
+      bloomLoading = true;
+      import("./bloom.js").then(m => { bloomMod = m; redraw(); }, e => { bloomFailed = true; console.warn("bloom", e); });
+    }
+    return undefined;
+  }
+  return (c) => {
+    try {
+      if (!blooms.has(key)) blooms.set(key, new bloomMod.Bloom());
+      blooms.get(key).apply(c, { intensity: view.bloom, cutoff: view.bloomCutoff, radius: view.bloomRadius });
+    } catch (e) { bloomFailed = true; console.warn("bloom", e); }
+  };
+}
+
 function redraw() {
   if (queued) return;
   queued = true;
@@ -1050,7 +1074,8 @@ function paint(now) {
                                 frameBoxes: videoBoxes(),
                                 soundSpace: spaceMarks(),
                                 ...layerOpts(lv, gTint, bTint),
-                                layerLabelHits: labelHits = [], layerLabelSel: labelSel });
+                                layerLabelHits: labelHits = [], layerLabelSel: labelSel,
+                                onWorld: bloomHook("screen") });
   syncLayerPanel(lv);
   debug.renderMs = performance.now() - t0;
   if (sim && !clock.paused) redraw();

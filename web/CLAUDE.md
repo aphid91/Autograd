@@ -1214,9 +1214,27 @@ What sounds:
 - **A gate fire is a click**: an impulse into a two-pole resonator (tone,
   decay), per group -- **0: Swap, Route, Merge; 1: everything else**;
   Sources are silent (`audioGroupOf()`). Only the per-tick **count** per
-  group crosses threads, so fires cost the same on any board. Clicks
-  closer together than a click lasts overlap into a buzz at the tick rate,
-  by design: raise the rate and the ticking becomes a pitch.
+  group crosses threads, so fires cost the same on any board.
+- **Click timing** (a sub-folder; `clicks()` in audio-dsp.js). **Jitter**
+  (ticks, 0..4, default 1): at 0 a group's fires in one tick are a single
+  impulse at the tick's start -- many fires only louder, and a buzz at the
+  tick rate, the original sound. Above 0 each fire is its own click at a
+  uniformly random time up to `jitter` ticks after its tick's start: a
+  Poisson process conditioned on the tick's count. 1 spreads fires through
+  their own tick; more blurs the tick grid away (at the cost of up to that
+  many ticks of extra delay). Many fires then add in **power**, not
+  amplitude, so a busy tick is denser and quieter than at 0 --
+  deliberately: it should sound like many events in sequence. The times
+  are a hash of (tick, group, fire), not `Math.random`, so a bake is still
+  bit-identical however it is chunked: offline a fire at offset o in tick k
+  lands at sample `round((k + o) * sr / rate)`; realtime it follows the
+  playback speed. A group's fires in a tick become at most 64 clicks (the
+  weight shared), and at most 8192 are scheduled ahead (past that, one
+  plays at once). A stop drops the scheduled ones. **Detune** (semitones,
+  0..12, default 0): each group has five resonators, at the tone and spread
+  ±detune about it, and each fire picks one at random, so a dense patch
+  rings on several pitches rather than one struck faster. At 0 every fire
+  uses the first, which is exactly the single resonator.
 - **Normalisation is against the board, not the moment**: a drone is scaled
   by 1 / N^p with N the candidate runs, a group's clicks by 1 / N^p with N
   that group's gates. N changes only on an edit, so more activity is always
@@ -1532,6 +1550,35 @@ changing it reconfigures); the per-length gains, live; and the low cut. Mutation
 recording the forecast, never reusing a freed voice, and a wrong pitch law
 each fail it.
 
+## Look: background, corners, chevrons and bloom
+
+View > **look** (per player: the panel's preferences, and in a
+presentation's views like the rest of View; not in saves yet), with
+**Reset look**:
+
+- **background**: the board's colour (`COL.bg`; the void outside the board
+  and the grid lines are unchanged).
+- **corner radius** (cells, 0..0.5): machine bodies drawn with `roundRect`
+  (`bodyRect()` in render.js), ghosts and the lifted outlines too; 0 is the
+  old `fillRect` path.
+- **chevron opacity**: belts', underground ends' and the control overlays'
+  chevrons alike (`strokeChevrons()`).
+- **bloom intensity** (0 is off), **cutoff** (luminance 0..1) and
+  **radius** (1..8 levels). [bloom.js](bloom.js) is the one piece of WebGL2
+  in the app -- Canvas 2D can blur but not threshold -- imported only once
+  the intensity is raised; without WebGL2 the bloom is simply off. It has a
+  canvas of its own, never shown: render() calls `onWorld` at the point
+  where the board is drawn and the editing marks are not; the 2D canvas is
+  uploaded, bright-passed (a soft knee about the cutoff) to half size,
+  halved down a chain with a 13-tap filter and summed back up with a tent,
+  and the glow drawn into the 2D canvas with `"lighter"`. So selections,
+  frame boxes, the audio box and the screen-space text (Source values, item
+  numbers, notes, layer labels) draw crisp over the glow and never glow
+  themselves. A plain luminance cutoff, by choice: the player makes what
+  should glow the brightest thing on screen (the chevrons, `#bdc2d1`, are
+  bright -- chevron opacity is the usual lever). Video frames use a second
+  instance, so a recording glows as the screen does.
+
 ## Video
 
 The panel's **Video** folder renders a stretch of the simulation **offline**
@@ -1735,7 +1782,8 @@ asserting every array matches and exactly the edited value differs.
 
 ## Rules
 
-- **No build step, no npm, no framework.** Plain ES modules and Canvas 2D.
+- **No build step, no npm, no framework.** Plain ES modules and Canvas 2D
+  (the bloom's post-pass is the one WebGL2, optional and off by default).
   The point is to iterate cheaply.
 - **Hold the save's own arrays as the model.** `Board` keeps the int32 grid
   and float32 entity table exactly as the file has them, so writing a save
@@ -1797,6 +1845,7 @@ asserting every array matches and exactly the edited value differs.
 | `placer.js` | where a ghost's footprint sits: the port of `origin_for_cursor()` |
 | `glyphs.js` | the machine glyphs, ports of the shader's `sd_*` marks |
 | `tune.js` | the Dev dials: defaults, panel spec, the live values |
+| `bloom.js` | View > look's bloom: a WebGL2 post-pass over the 2D canvas; loaded on demand |
 | `history.js` | undo, redo and the checkpoint, over board snapshots |
 | `notes.js` | labels: the desktop's text-box records, hit-testing, wrapping, fitting a box to its text |
 | `indexer.js` | indexing: the orders, the value tables, the file parser, a·x+b |

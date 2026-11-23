@@ -91,7 +91,7 @@ test("nothing active and nothing firing is silence", () => {
 });
 
 test("fires every tick are a buzz at the tick rate", () => {
-  const s = synth({ g1DecayMs: 3 });
+  const s = synth({ g1DecayMs: 3, clickJitter: 0 });
   s.message({ type: "config", lengths: new Float64Array(0), groups: [0, 1] });
   const out = stream(s, 1, 1000, [], 0, 1);
   // The clicks repeat every tick (48 samples), more closely than at any
@@ -249,7 +249,7 @@ test("hold on underrun: the voices sound through a gap in the ticks, and carry o
 
 test("offline, tick k starts at sample k * sampleRate / rate exactly", () => {
   const s = new GatesSynth(SR, { offline: true });
-  s.message({ type: "params", p: { ...AUDIO_DEFAULTS, softClip: false } });
+  s.message({ type: "params", p: { ...AUDIO_DEFAULTS, softClip: false, clickJitter: 0 } });
   s.message({ type: "config", lengths: new Float64Array(0), groups: [0, 1] });
   const n = 40, W = 0, f1 = new Uint16Array(n);
   f1[37] = 1;                                  // one fire, on tick 37
@@ -257,6 +257,69 @@ test("offline, tick k starts at sample k * sampleRate / rate exactly", () => {
   const out = render(s, Math.ceil(40 * SR / 300));
   const first = out.findIndex(x => x !== 0);
   assert.equal(first, Math.round(37 * SR / 300));
+});
+
+// --- click jitter and detune ------------------------------------------------------
+
+// An offline synth fed n ticks at `rate` with f1 fires per tick, rendered in
+// chunks of `chunk` samples.
+function clickBake(params, n, rate, f1, chunk = 128) {
+  const s = new GatesSynth(SR, { offline: true });
+  s.message({ type: "params", p: { ...AUDIO_DEFAULTS, softClip: false, ...params } });
+  s.message({ type: "config", lengths: new Float64Array(0), groups: [0, 1] });
+  const fires = typeof f1 === "number" ? new Uint16Array(n).fill(f1) : f1;
+  s.message({ type: "ticks", n, tick0: 0, words: 0, rate, bits: new Uint32Array(0), f0: new Uint16Array(n), f1: fires });
+  const total = Math.ceil((n + 2) * SR / rate), out = new Float32Array(total);
+  for (let at = 0; at < total; at += chunk) { const k = Math.min(chunk, total - at); s.render(out.subarray(at, at + k), k); }
+  return out;
+}
+
+test("jitter 1: a fire clicks somewhere inside its own tick, not at its start", () => {
+  const n = 40, f1 = new Uint16Array(n);
+  f1[37] = 1;
+  const out = clickBake({ clickJitter: 1 }, n, 300, f1);
+  const first = out.findIndex(x => x !== 0), t0 = Math.round(37 * SR / 300), t1 = Math.round(38 * SR / 300);
+  assert.ok(first > t0 && first < t1, `${first} in (${t0}, ${t1})`);
+});
+
+test("jitter: a tick's fires are separate clicks spread through it, and a bake is the same however it is chunked", () => {
+  // 8 fires on one tick at 10 tps: 4800 samples to spread over. At jitter 0
+  // they are one impulse; at 1, eight onsets.
+  const n = 4, f1 = new Uint16Array(n);
+  f1[1] = 8;
+  const onsets = (a) => {           // a click starting: sound after 100 samples of near silence
+    let c = 0, quiet = 100;
+    for (let i = 0; i < a.length; i++) {
+      if (Math.abs(a[i]) < 1e-6) quiet++;
+      else { if (quiet >= 100) c++; quiet = 0; }
+    }
+    return c;
+  };
+  const p = { g1DecayMs: 0.3, g1Tone: 3100 };
+  assert.equal(onsets(clickBake({ ...p, clickJitter: 0 }, n, 10, f1)), 1);
+  const a = clickBake({ ...p, clickJitter: 1 }, n, 10, f1);
+  assert.ok(onsets(a) >= 6, `onsets ${onsets(a)}`);
+  const b = clickBake({ ...p, clickJitter: 1 }, n, 10, f1, 97);
+  assert.deepEqual(Buffer.from(a.buffer), Buffer.from(b.buffer), "bit-identical across chunking");
+});
+
+test("jitter 1 breaks the tick-rate buzz: one fire a tick no longer repeats at the tick's period", () => {
+  const out = clickBake({ g1DecayMs: 1, clickJitter: 1 }, 1000, 1000, 1);
+  const a = out.subarray(SR / 2);
+  let c = 0, e = 0;
+  for (let i = 0; i + 48 < a.length; i++) { c += a[i] * a[i + 48]; e += a[i] * a[i]; }
+  assert.ok(c / e < 0.5, `lag 48: ${c / e}`);
+});
+
+test("detune: 0 is one resonator; above 0 the clicks ring at several tones", () => {
+  // Energy near the tone vs a semitone-and-more away, by a single DFT bin.
+  const bin = (a, hz) => { let re = 0, im = 0; for (let i = 0; i < a.length; i++) { const w = 2 * Math.PI * hz * i / SR; re += a[i] * Math.cos(w); im += a[i] * Math.sin(w); } return Math.hypot(re, im); };
+  const p = { g1DecayMs: 60, g1Tone: 1000, clickJitter: 1 };
+  const one = clickBake({ ...p, clickDetune: 0 }, 200, 50, 4);
+  const many = clickBake({ ...p, clickDetune: 4 }, 200, 50, 4);
+  const up = 1000 * Math.pow(2, 4 / 12);       // the top resonator
+  assert.ok(bin(one, up) < 0.2 * bin(one, 1000), "undetuned: one tone");
+  assert.ok(bin(many, up) > 0.3 * bin(many, 1000), "detuned: the spread is heard");
 });
 
 test("WAV: a 16-bit PCM mono header and the samples", () => {

@@ -40,6 +40,10 @@ export const AUDIO_DEFAULTS = {
   g1Gain: 1,            // every other machine
   g1Tone: 1800,
   g1DecayMs: 3,
+  // Both groups: when in its tick a fire clicks, and how many tones it may
+  // click at (audio-dsp.js, clicks()).
+  clickJitter: 1,       // 0: a tick's fires are one click at its start; 1: each at a random time in its tick; more: blurred across ticks
+  clickDetune: 0,       // semitones: fires pick at random from 5 resonators spread +-this about the tone; 0 is one resonator
   // Space (space.js): camera-aware audio hears the screen, scaled about its
   // centre; the fringe and low-pass soften the screen's edge and the audio
   // region's alike. 0 and 0 is a hard edge, as the region always was.
@@ -90,6 +94,9 @@ export const AUDIO_SPEC = [
   ["g1Gain", "gain", { min: 0, max: 4, step: 0.01 }],
   ["g1Tone", "tone Hz", { min: 50, max: 12000, step: 10 }],
   ["g1DecayMs", "decay ms", { min: 0.2, max: 100, step: 0.1 }],
+  ["---", "click timing"],
+  ["clickJitter", "jitter (ticks)", { min: 0, max: 4, step: 0.05 }],
+  ["clickDetune", "detune (semis)", { min: 0, max: 12, step: 0.05 }],
   ["---", "space"],
   ["camAudio", "camera-aware"],
   ["camScale", "screen scale", { min: 0.1, max: 3, step: 0.05 }],
