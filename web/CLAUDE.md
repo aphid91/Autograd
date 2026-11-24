@@ -1095,11 +1095,12 @@ is harmless and removes double-tap arbitration.
 
 [sim.js](sim.js) is a port of the desktop's **CPU** tick --
 `core/segments.py`, `core/belts.py`, `core/gates.py`, `core/tick.py` and the
-tick half of `engine.py` -- with every scheduler left out: no wake lists, no
-gate sleep, no constant folding, no GPU. The two optimisations kept are the
-closed-form belt (a run ticks in O(1) however many items are on it) and the
-gate prefilter (an occupancy test rejects gates that cannot act before the
-full firing rule runs). One module, no DOM, so Node can run it.
+tick half of `engine.py` -- with the desktop's schedulers left out (no
+constant folding, no GPU) and **a wake list of its own** (below), exact
+where the desktop's gate sleep was a heuristic. The other optimisations are
+the closed-form belt (a run ticks in O(1) however many items are on it) and
+the gate prefilter (an occupancy test rejects gates that cannot act before
+the full firing rule runs). One module, no DOM, so Node can run it.
 
 **It matches the desktop tick for tick**, and
 [tools/check_web_sim.py](../tools/check_web_sim.py) is what says so: it runs
@@ -1145,11 +1146,81 @@ passes on every save, `test` and `GameOfLife_SLOW` included:
   -- an alive flag and a grid read for the ghost bit -- on every run every
   tick, ~2000 calls to learn what only an edit (a rebuild) can change.
 
-What is left is three scans over everything -- every gate, every run, every
+That left three scans over everything -- every gate, every run, every
 direct edge -- to find the few with work: on `test` 0.27% of runs and 0.08%
-of gates change in a tick. That is a wake list's job, which "Rules" rules
-out for now. Audio adds 3-50% (the recorder's per-run position compare;
-`GameOfLife_SLOW` 0.70 -> 0.98 ms).
+of gates change in a tick. The wake list is what removed them.
+
+### The wake list
+
+`Sim.sleepStep()` visits only what can act; `Sim.fullStep()` is the old scan,
+kept for the forecast and as the reference. **They are the same tick** --
+every rule below only ever skips work that would change nothing -- and
+`check_web_sim.py` still passes on every save against the desktop. The
+reasoning is in the comment above `makeSched()`; in short:
+
+- **A gate's firing reads only its own row**, so it is asked again only
+  when one of its channels was written (`touch()`, from the four channel
+  setters). In row order: Pixels fired in one tick paint in that order, and
+  a spatial recorder sums float gains in it.
+- **A direct edge** is checked only when its source or target row changed
+  since the last hand-off. All decided, then all applied, as before.
+- **A run touches only its own two lanes** (each lane has exactly one run
+  or edge on it), so runs never see each other within the belt phase, in
+  any order. One that ticks with no pop, no push and its anchor at the end
+  sleeps until its producer fills the zone it takes from (`setOut()` wakes
+  it), its consumer empties the lane it pops into (`clearIn()`), or -- by
+  the closed form alone, with nobody ticking it -- its head reaches the end
+  or room opens behind its newest item: a **timed wake** at entry +
+  length / speed or entry + spacing / speed (`wakeAt`). That is the case
+  the desktop's belt sleep once got wrong (a seeded item sliding down a
+  sleeping run, never popped); here the arrival tick is computed. Asleep, a
+  run's anchor is always at the end, so its skipped ticks lose nothing.
+- **Anything structural wakes everything** -- an edit's rebuild, Reset, a
+  bake's restore, a clone, a new audio recorder (`makeSched()`) -- and
+  waking too much is always safe, so every rule errs that way.
+- **The forecast runs `fullStep()`** with the scheduler set aside, so it
+  has nothing of the wake list's to roll back.
+- **Audio rides on it.** The recorder no longer scans: the sim calls
+  `Recorder.hit(seg)` for each run active on the tick -- every run it
+  ticks, by the drone's rule as before, and every sleeping run whose newest
+  item is still sliding into place, by the closed form (`moveUntil`,
+  `movers`; with the anchor at the end it moves on every tick before entry
+  + its packed place / speed). The bits are identical to the scan's.
+
+**Measured** (Node, `step()` alone, best of 5):
+
+| board | full scan | wake list |
+|---|---|---|
+| `test` (3.4k gates, 2k runs) | 102 µs | **4.4 µs** -- 230k ticks/s |
+| `Ram2.npz` | 22 µs | **0.9 µs** |
+| `cpu.npz` | 21.5 µs | **6.1 µs** |
+| `GameOfLife_SLOW` (15% of runs active) | 690 µs | **265 µs** |
+
+So the tick now costs what the board *does*, not what it *holds*: per tick
+on `cpu.npz` about 13 gates asked, 12 runs ticked, 12 edges checked. In the
+editor, `test` reaches the 10000 tps ceiling with the step at ~1 ms of a
+frame -- rendering is the frame now. On `GameOfLife_SLOW` the editor
+reaches ~555 tps: its frame is 27 ms of rendering, and the step gets only
+its 12 ms budget per frame, so the frame rate caps the tick rate. Moving
+the tick to a worker is what unhooks the two.
+
+**`tests/sleep.test.mjs` is the differential check**: a sleeping and a
+full timeline on six saves (and four more at belt constants other than
+the shipped ones), compared every tick -- every ring, counter and anchor,
+every gate channel, the activity stamps, the Pixel screen in paint order,
+and the audio recorder's bits and fire counts -- with a recorder attached
+partway and a Reset halfway. It also asserts the wake list actually slept
+(under 60% of the work visited) and fired timed wakes, so a run that never
+slept cannot pass it. **Mutation-tested, eleven ways**, every one caught:
+no timed wakes, no head-arrival wake, no room wake, no wake on a consumer
+emptying or a producer filling, a pop's input or a push's emptied zone not
+marking the gate, direct edges never checked, sleeping with the anchor
+short, sliding sleepers not heard, gates asked out of row order. Three of
+those passed at first: the room wake and the anchor rule cannot matter at
+the shipped constants (spacing == speed: a run with no room has just
+pushed, and one tick after a pop the anchor is back), hence the runs under
+other constants; and gate order shows only on the Pixel screen, hence
+comparing it.
 
 One trap: a version of `deliverDirect()` over flat `Int32Array` offsets
 measured 25x *slower* in the step (0.38 ms) and was also wrong -- it ended
@@ -1320,7 +1391,8 @@ What sounds:
 
 - **A belt run is active on a tick** if it pushed or popped, or its newest
   item moved (the belt status colours' "moving", with "stalled but moving:
-  green"). Two `positionOf()` calls per candidate per tick. Its drone has
+  green"). The sim reports it (`Recorder.hit()`, see "The wake list"), so
+  it costs nothing for a run that is asleep and still. Its drone has
   pitch **min-length Hz × min length / length** (the sim's length, buried
   underground tiles included): the dial is the pitch of the shortest run
   that sounds, so raising min length transposes everything up and the
@@ -2032,10 +2104,13 @@ largest JS span left.
   batched path per family, culled to the viewport, with detail gated on zoom
   (`LOD` in `render.js`). No `closePath()` on a batched path (see
   "Profiling a frame").
-- **The tick stays the desktop's CPU tick.** The closed-form belt transport
-  and the simple gate prefilter are the only optimisations wanted. No wake
-  lists, no folding, no GPU. A change to the desktop's tick semantics needs
-  the same change in `sim.js`, and `tools/check_web_sim.py` must still pass.
+- **The tick stays the desktop's CPU tick.** The closed-form belt transport,
+  the gate prefilter and the wake list are its optimisations, all exact:
+  `tools/check_web_sim.py` must still pass, and so must
+  `tests/sleep.test.mjs` (sleeping against full, every tick). No folding,
+  no GPU yet. A change to the desktop's tick semantics needs the same
+  change in `sim.js` -- and any new way a gate's channels or a run's state
+  can change needs a wake, or the sleeping tick drifts from the full one.
 
 ## Files
 
@@ -2043,7 +2118,7 @@ largest JS span left.
 |---|---|
 | `index.html`, `style.css` | the shell: board, controls row, swatch bar, picker sheet |
 | `main.js` | wiring: applies the shell's and panel's requests to the board; resize, redraw, the play loop |
-| `sim.js` | the simulation: segment index, closed-form belts, gates, the clock -- the desktop's CPU tick; `forecast()` |
+| `sim.js` | the simulation: segment index, closed-form belts, gates, the wake list, the clock -- the desktop's CPU tick; `forecast()` |
 | `flow.js` | where items are drawn: belt paths, the machines' internal links and wait points, the tick animated from the forecast |
 | `ui.js` | the shell's state and DOM: modes, sim and turn buttons, thumb pads, swatches, long press, picker |
 | `tools.js` | the tool catalog (from `types.json`) and the swatch drawings |
@@ -2109,7 +2184,8 @@ node --test web/tests/*.test.mjs
 
 Pure-JS tests (the planner, the placer, the stamp transforms, the run
 tracer, the closed form against the naive oracle, the opcodes, the clock,
-the `.npz` writer, audio settings in a save) run in Node, with no npm and no browser. The whole tick against the
+the `.npz` writer, audio settings in a save, and the wake list against the
+full tick) run in Node, with no npm and no browser. The whole tick against the
 desktop's is a separate, slower check (about 25 s for every save):
 
 ```bash

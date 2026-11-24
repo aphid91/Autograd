@@ -76,6 +76,11 @@ export class Sim {
     // Pixel's fire records its colour there. Web-only; no desktop analogue.
     this.screen = null;
     this.fc = null;                 // the last forecast
+    // The wake list (see "the wake list" below): on unless a checker or a
+    // debug switch turns it off (setSleeping()); `sched` is its state, null
+    // while off and while a forecast runs.
+    this.sleeping = true;
+    this.sched = null;
     this.sync();
   }
 
@@ -283,10 +288,12 @@ export class Sim {
     if (this.board.revision === this.seen) return false;
     this.seen = this.board.revision;
     this.version++;
+    this.sched = null;          // built for the new runs below, everything awake
     this.rebuild();
     this.flush();
     this.seed();
     this.screen?.clear();      // an edit, a Reset: the screen starts blank
+    if (this.sleeping) this.sched = this.makeSched();
     return true;
   }
 
@@ -509,10 +516,23 @@ export class Sim {
   inValue(row, c) { return this.board.entities[row * this.ST + this.F_IN_VALUE + c]; }
   outHeld(row, c) { return this.board.entities[row * this.ST + this.F_OUT_HELD + c] > 0; }
   outValue(row, c) { return this.board.entities[row * this.ST + this.F_OUT_VALUE + c]; }
-  setIn(row, c, v) { this.setF(row, this.F_IN_VALUE + c, v); this.setF(row, this.F_IN_HELD + c, 1); }
-  clearIn(row, c) { this.setF(row, this.F_IN_VALUE + c, 0); this.setF(row, this.F_IN_HELD + c, 0); }
-  setOut(row, c, v) { this.setF(row, this.F_OUT_VALUE + c, v); this.setF(row, this.F_OUT_HELD + c, 1); }
-  clearOut(row, c) { this.setF(row, this.F_OUT_VALUE + c, 0); this.setF(row, this.F_OUT_HELD + c, 0); }
+  // Every change to a gate's channels comes through these four, so they are
+  // where the wake list hears of it (touch(), wakeRun()): the gate is asked
+  // again next structure phase, its direct edges next hand-off, and a run
+  // that can now act is woken -- the one an output feeds when the output
+  // fills, the one feeding an input when the input empties.
+  setIn(row, c, v) { this.setF(row, this.F_IN_VALUE + c, v); this.setF(row, this.F_IN_HELD + c, 1); if (this.sched) this.touch(row); }
+  clearIn(row, c) {
+    this.setF(row, this.F_IN_VALUE + c, 0); this.setF(row, this.F_IN_HELD + c, 0);
+    const S = this.sched;
+    if (S) { this.touch(row); this.wakeRun(S.runIn[row * S.C + c]); }
+  }
+  setOut(row, c, v) {
+    this.setF(row, this.F_OUT_VALUE + c, v); this.setF(row, this.F_OUT_HELD + c, 1);
+    const S = this.sched;
+    if (S) { this.touch(row); this.wakeRun(S.runOut[row * S.C + c]); }
+  }
+  clearOut(row, c) { this.setF(row, this.F_OUT_VALUE + c, 0); this.setF(row, this.F_OUT_HELD + c, 0); if (this.sched) this.touch(row); }
 
   // Engine.flush_material(): every item off every belt and out of every gate.
   //
@@ -662,18 +682,40 @@ export class Sim {
 
   // --- the tick -----------------------------------------------------------------
 
-  // One whole tick: structure phase, belt phase, then the counter.
+  // One whole tick: structure phase, belt phase, then the counter. With the
+  // wake list on, only what can act is visited (sleepStep()); otherwise --
+  // and always for a forecast -- everything is (fullStep()). The two are the
+  // same tick: tests/sleep.test.mjs runs them side by side.
   step() {
     this.sync();
+    if (this.sched && !this.rec) return this.sleepStep();
+    this.fullStep();
+  }
+
+  fullStep() {
     this.version++;
     // Not while forecasting: that step is rolled back, and is not heard.
     const A = this.rec ? null : this.audio;
     if (A) A.pre(this);
     this.structurePhase(A, this.rec ? null : this.screen);
-    for (const seg of this.order) this.tickSegment(seg, this.tick);
+    const t = this.tick;
+    if (A) for (const seg of this.order) this.tickHeard(seg, t, A);
+    else for (const seg of this.order) this.tickSegment(seg, t);
     this.deliverDirect();
     this.tick++;
     if (A) A.post(this);
+  }
+
+  // A run's tick, telling the audio recorder whether it was active: it
+  // pushed or popped, or its newest item moved (the drone's rule). Returns
+  // whether it pushed or popped.
+  tickHeard(seg, t, A) {
+    const h0 = seg.head, t0 = seg.tail;
+    const p0 = A && t0 > h0 ? this.positionOf(seg, t0 - 1, t) : -1;
+    this.tickSegment(seg, t);
+    const moved = seg.head !== h0 || seg.tail !== t0;
+    if (A && (moved || (t0 > h0 && this.positionOf(seg, t0 - 1, t + 1) > p0))) A.hit(seg);
+    return moved;
   }
 
   // The prefilter (GateSim._candidate_rows) and the per-gate firing rule.
@@ -687,9 +729,9 @@ export class Sim {
   // output at all was free, which a dangling one always is -- so every
   // Source with an unconnected face passed, and fire() was called ~1770
   // times a tick on `test` to fire about once.
-  structurePhase(A = null, P = null) {
+  structurePhase(A = null, P = null, gates = this.gates) {
     const E = this.board.entities, ST = this.ST, IH = this.F_IN_HELD, OH = this.F_OUT_HELD;
-    for (const g of this.gates) {
+    for (const g of gates) {
       const row = g.row, s = g.sim, drains = g.drains, base = row * ST;
       if (s.n_in === 0) {
         let free = false;
@@ -776,9 +818,9 @@ export class Sim {
   // GateSim.deliver_direct(): decide every hand-off from the state as the
   // belt phase left it, then apply them all -- the desktop does this as one
   // vectorised gather and scatter, so no transfer sees another's result.
-  deliverDirect() {
+  deliverDirect(edges = this.edges) {
     const live = [];
-    for (const e of this.edges) {
+    for (const e of edges) {
       if (this.outHeld(e[0], e[1]) && !this.inHeld(e[2], e[3])) live.push(e);
     }
     const values = live.map(e => this.outValue(e[0], e[1]));
@@ -787,6 +829,212 @@ export class Sim {
     for (const e of live) this.clearOut(e[0], e[1]);
     this.stats.direct += live.length;
     return live.length;
+  }
+
+  // --- the wake list ---------------------------------------------------------------
+  //
+  // A tick used to visit every gate, every run and every direct edge to find
+  // the few with something to do: on `test` 0.27% of runs and 0.08% of gates
+  // change in a tick. sleepStep() visits only those that can. It is the same
+  // tick, not an approximation -- tests/sleep.test.mjs and check_web_sim.py
+  // hold it to fullStep() and to the desktop -- because every rule below
+  // only ever skips work that would have changed nothing:
+  //
+  // - A GATE's firing reads its own row and nothing else (its channels; its
+  //   drains and emit value are fixed between edits). So it is asked again
+  //   only when one of its channels was written since it was last asked
+  //   (`gList`, from touch() in the four channel setters) -- its own fire,
+  //   a run's pop or push, a hand-off. Asked in row order, as the full scan
+  //   does: Pixels that fire in one tick paint over each other in that order.
+  // - A DIRECT EDGE delivers when its source holds and its target lane is
+  //   empty: two rows. So it is checked only when either row changed since
+  //   the last hand-off (`dList`). All decided, then all applied, as before.
+  // - A RUN touches only its own two lanes -- the output zone it takes from
+  //   and the input it pops into, each with exactly one run or edge on it --
+  //   so runs never affect one another within the belt phase, and a run's
+  //   tick changes nothing when (a) its anchor is at the end, (b) its head
+  //   is short of the end or its consumer's lane is full, and (c) it has no
+  //   room or its producer holds nothing. A run that ticks with no pop and no
+  //   push and its anchor at the end sleeps until one of those can change:
+  //     * its producer fills the zone it takes from   -> setOut() wakes it
+  //     * its consumer empties the lane it pops into  -> clearIn() wakes it
+  //     * its head reaches the end, or room opens behind its newest item, by
+  //       the closed form alone -- a timed wake (`wakeAt`, tick -> runs) at
+  //       entry + length / speed and entry + spacing / speed, the tick each
+  //       becomes true (positions are a closed form over the tick, so an item
+  //       moving down a sleeping run moves with nobody ticking it).
+  //   A pop leaves the anchor short of the end, so a run that popped stays
+  //   awake until it is back; asleep, the anchor is always at the end, which
+  //   is why skipping its ticks loses nothing.
+  // - An edit, a Reset, a bake's restore or a new recorder wakes everything
+  //   (makeSched()); waking more than needed is always safe -- a tick of a
+  //   run or a look at a gate that does nothing is exactly what the full
+  //   step does -- so every wake rule errs that way.
+  //
+  // Audio: the recorder's "this run was active" bit (a push, a pop, or the
+  // newest item moving) is worked out for each run ticked, as before, and
+  // for a sleeping run whose newest item is still sliding into place, by
+  // the closed form: with the anchor at the end it moves on every tick
+  // before entry + (its packed place) / speed (`moveUntil`, `movers`).
+  makeSched() {
+    const R = this.board.rows, C = this.T.sim.MAX_CHANNELS, n = this.order.length;
+    const S = {
+      C,
+      gDirty: new Uint8Array(R), gList: [],        // gates to ask next structure phase
+      dDirty: new Uint8Array(R), dList: [],        // rows whose edges to check next hand-off
+      awake: new Uint8Array(n), aList: [],         // runs (by index in `order`) to tick
+      ran: new Int32Array(n).fill(-1),             // the tick each run was last ticked
+      runOut: new Int32Array(R * C).fill(-1),      // (row, output channel) -> the run it feeds
+      runIn: new Int32Array(R * C).fill(-1),       // (row, input channel) -> the run feeding it
+      rowEdges: new Map(),                         // row -> its direct edges, by index
+      eMark: new Uint8Array(this.edges.length),    // edges already gathered this hand-off
+      gateAt: new Array(R).fill(null),             // row -> gate record (gateOf, as an array)
+      wakeAt: new Map(),                           // tick -> runs to wake then
+      movers: [], moversNext: [],                  // sleeping runs still sliding (audio only)
+      stats: { ticks: 0, gates: 0, runs: 0, edges: 0, timed: 0 },
+    };
+    this.order.forEach((seg, i) => {
+      seg.oi = i;
+      if (seg.srcRow) S.runOut[seg.srcRow * C + seg.srcCh] = i;
+      if (seg.dstRow) S.runIn[seg.dstRow * C + seg.dstCh] = i;
+    });
+    this.edges.forEach((e, i) => {
+      for (const r of [e[0], e[2]]) {
+        let l = S.rowEdges.get(r);
+        if (!l) S.rowEdges.set(r, l = []);
+        l.push(i);
+      }
+    });
+    for (const g of this.gates) {
+      S.gateAt[g.row] = g;
+      S.gDirty[g.row] = 1; S.gList.push(g.row);
+      S.dDirty[g.row] = 1; S.dList.push(g.row);
+    }
+    for (let i = 0; i < n; i++) { S.awake[i] = 1; S.aList.push(i); }
+    return S;
+  }
+
+  // Everything awake: the next tick visits all of it, then lets it sleep.
+  wakeAll() { if (this.sched) this.sched = this.makeSched(); }
+
+  // The wake list on or off (a checker's reference timeline, or to measure).
+  setSleeping(on) {
+    this.sleeping = !!on;
+    this.sched = on ? this.makeSched() : null;
+  }
+
+  touch(row) {
+    const S = this.sched;
+    if (!S.gDirty[row]) { S.gDirty[row] = 1; S.gList.push(row); }
+    if (!S.dDirty[row]) { S.dDirty[row] = 1; S.dList.push(row); }
+  }
+
+  wakeRun(oi) {
+    const S = this.sched;
+    if (oi >= 0 && !S.awake[oi]) { S.awake[oi] = 1; S.aList.push(oi); }
+  }
+
+  sleepStep() {
+    this.version++;
+    const A = this.audio, t = this.tick;
+    if (A) A.pre(this);              // may wake everything (a new recorder): read sched after
+    const S = this.sched;
+    S.stats.ticks++;
+    // Structure: the gates whose channels changed since they were last asked,
+    // in row order -- the only list whose order shows: Pixels fired in one
+    // tick paint in it, and a spatial recorder sums float gains in it. (A
+    // typed array's sort is numeric and several times a comparator's speed.)
+    const gl = Int32Array.from(S.gList).sort();
+    S.gList = [];
+    const gates = [];
+    for (let i = 0; i < gl.length; i++) {
+      const row = gl[i];
+      S.gDirty[row] = 0;
+      const g = S.gateAt[row];
+      if (g) gates.push(g);
+    }
+    S.stats.gates += gates.length;
+    this.structurePhase(A, this.screen, gates);
+    // Belt: the runs woken by an event (the structure phase's included) or
+    // by the clock.
+    const timed = S.wakeAt.get(t);
+    if (timed) {
+      S.wakeAt.delete(t);
+      S.stats.timed += timed.length;
+      for (const oi of timed) this.wakeRun(oi);
+    }
+    // In any order: each run touches only its own two lanes, so no run's tick
+    // can see another's.
+    const al = S.aList;
+    S.aList = [];
+    for (const oi of al) S.awake[oi] = 0;
+    S.stats.runs += al.length;
+    for (const oi of al) this.tickAwake(this.order[oi], oi, t, A);
+    if (A) this.hearMovers(t, A);
+    // Direct hand-offs: the edges of every row that changed.
+    // All decided from one state before any is applied, so in any order.
+    const rows = S.dList;
+    S.dList = [];
+    const edges = [], mark = S.eMark;
+    for (const r of rows) {
+      S.dDirty[r] = 0;
+      const l = S.rowEdges.get(r);
+      if (l) for (const i of l) if (!mark[i]) { mark[i] = 1; edges.push(i); }
+    }
+    if (edges.length) {
+      for (let j = 0; j < edges.length; j++) { mark[edges[j]] = 0; edges[j] = this.edges[edges[j]]; }
+      S.stats.edges += edges.length;
+      this.deliverDirect(edges);
+    }
+    this.tick++;
+    if (A) A.post(this);
+  }
+
+  // One awake run's tick, and whether it may sleep after it.
+  tickAwake(seg, oi, t, A) {
+    const S = this.sched;
+    S.ran[oi] = t;
+    const moved = this.tickHeard(seg, t, A);
+    const L = seg.length * this.UNIT;
+    if (moved || seg.anchor < L) { this.wakeRun(oi); return; }
+    if (seg.head === seg.tail) return;       // empty: only a push can change it, and that is an event
+    // Asleep from here; when could the closed form alone make it act?
+    const v = this.speed, d = this.spacing, h = seg.head, n = seg.tail - 1;
+    let w = Infinity;
+    if (this.positionOf(seg, h, t) < L) w = seg.enter[h % seg.cap] + Math.ceil(L / v);   // the head arrives
+    if (!this.hasRoom(seg, t) && L - (n - h) * d >= d) {
+      w = Math.min(w, seg.enter[n % seg.cap] + Math.ceil(d / v));                        // room opens
+    }
+    if (w !== Infinity) {
+      if (w <= t) w = t + 1;                 // never in the past: a wake too early is only a wasted look
+      let l = S.wakeAt.get(w);
+      if (!l) S.wakeAt.set(w, l = []);
+      l.push(oi);
+    }
+    if (A) {
+      const P = Math.max(0, L - (n - h) * d);
+      seg.moveUntil = seg.enter[n % seg.cap] + Math.ceil(P / v);
+      if (seg.moveUntil > t + 1) S.moversNext.push(oi);
+    }
+  }
+
+  // The audio bit for sleeping runs whose newest item is still sliding: on
+  // every tick before `moveUntil`. A run ticked this tick was heard there.
+  hearMovers(t, A) {
+    const S = this.sched, m = S.movers;
+    let j = 0;
+    for (let i = 0; i < m.length; i++) {
+      const oi = m[i];
+      if (S.ran[oi] === t) continue;
+      const seg = this.order[oi];
+      if (t < seg.moveUntil) {
+        A.hit(seg);
+        if (t + 1 < seg.moveUntil) m[j++] = oi;
+      }
+    }
+    m.length = j;
+    for (const oi of S.moversNext) m.push(oi);
+    S.moversNext = [];
   }
 
   // --- the forecast ------------------------------------------------------------------
@@ -809,6 +1057,11 @@ export class Sim {
   forecast() {
     this.sync();
     if (this.fc && this.fc.version === this.version) return this.fc;
+    // The forecast's step is the full one, with the wake list set aside: the
+    // same tick (that is the wake list's whole claim), and nothing of the
+    // scheduler's to roll back.
+    const sched = this.sched;
+    this.sched = null;
     const undo = this.undoLog = [];
     const segs = this.order.map(seg => [seg, seg.head, seg.tail, seg.anchor]);
     const tick = this.tick, version = this.version, stats = { ...this.stats };
@@ -824,6 +1077,7 @@ export class Sim {
     } finally {
       this.rec = null;
       this.undoLog = null;
+      this.sched = sched;
       const E = this.board.entities;
       for (let i = undo.length - 2; i >= 0; i -= 2) E[undo[i]] = undo[i + 1];
       for (const [seg, h, t, a] of segs) { seg.head = h; seg.tail = t; seg.anchor = a; }
@@ -873,6 +1127,7 @@ export class Sim {
     c.stats = { ...this.stats };
     c.audio = null; c.rec = null; c.fc = null; c.screen = null; c.undoLog = null;
     c.fired = this.fired.slice();
+    c.sched = this.sched ? c.makeSched() : null;   // its own, everything awake
     return c;
   }
 
@@ -894,6 +1149,7 @@ export class Sim {
     this.version++;
     this.fc = null;
     this.screen?.clear();
+    if (this.sched) this.sched = this.makeSched();
   }
 
   // --- reading it back ------------------------------------------------------------

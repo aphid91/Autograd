@@ -34,7 +34,6 @@ export class Recorder {
     this.sim = null;
     this.rebuilds = -1;
     this.cands = [];
-    this.h = new Int32Array(0); this.t = new Int32Array(0); this.pos = new Float64Array(0);
     this.words = 0;
     this.fires = new Float64Array(3);
     this.n = 0;
@@ -106,7 +105,12 @@ export class Recorder {
     // A run sounds if any of its cells is selected, underground ends included.
     this.cands = eligibleRuns(sim, this.minLen, this.cutoff, sel);
     const n = this.cands.length;
-    this.h = new Int32Array(n); this.t = new Int32Array(n); this.pos = new Float64Array(n);
+    // Each run's bit, for hit(): -1 for a run that does not sound.
+    for (const seg of sim.order) seg.aIdx = -1;
+    this.cands.forEach((seg, i) => { seg.aIdx = i; });
+    // The sim's wake list hears sleeping runs only from when it is told about
+    // them (Sim.tickAwake()), so a new recorder starts with every run awake.
+    sim.wakeAll?.();
     this.words = (n + 31) >>> 5;
     this.cap = 0;
     const groups = [0, 0];
@@ -132,33 +136,33 @@ export class Recorder {
     if (this.space) this.sendSpace(sim);
   }
 
-  // Called by Sim.step() after its sync, before the structure phase.
+  // Called by Sim.step() after its sync, before the structure phase: this
+  // tick's row of run bits, cleared. The sim then calls hit() for each run
+  // active on the tick -- it pushed or popped, or its newest item moved --
+  // since only the sim knows which runs it visited (Sim.tickHeard(), and its
+  // wake list's sleeping runs still sliding into place, Sim.hearMovers()).
+  // The recorder used to compare every candidate's newest item before and
+  // after the step itself, two positionOf() calls per run per tick: up to
+  // half the tick on a big board.
   pre(sim) {
     if (sim.stats.rebuilds !== this.rebuilds) this.configure(sim);
     if (this.spaceAt) this.setSpace(this.spaceAt(sim.tick));
     if (!this.n) this.tick0 = sim.tick;
-    const c = this.cands, h = this.h, t = this.t, pos = this.pos;
-    for (let i = 0; i < c.length; i++) {
-      const seg = c[i];
-      h[i] = seg.head; t[i] = seg.tail;
-      pos[i] = seg.tail > seg.head ? sim.positionOf(seg, seg.tail - 1, sim.tick) : -1;
-    }
+    if (this.n >= this.cap) this.grow();
+    const W = this.words, off = this.n * W, bits = this.bits;
+    for (let w = 0; w < W; w++) bits[off + w] = 0;
+    this.off = off;
     this.fires[0] = this.fires[1] = 0;
+  }
+
+  hit(seg) {
+    const i = seg.aIdx;
+    if (i >= 0) this.bits[this.off + (i >>> 5)] |= 1 << (i & 31);
   }
 
   // Called by Sim.step() once the tick counter has moved.
   post(sim) {
-    const W = this.words;
-    if (this.n >= this.cap) this.grow();
-    const k = this.n++, off = k * W, bits = this.bits;
-    for (let w = 0; w < W; w++) bits[off + w] = 0;
-    const c = this.cands, h = this.h, t = this.t, pos = this.pos;
-    for (let i = 0; i < c.length; i++) {
-      const seg = c[i];
-      let on = seg.head !== h[i] || seg.tail !== t[i];
-      if (!on && t[i] > h[i]) on = sim.positionOf(seg, t[i] - 1, sim.tick) > pos[i];
-      if (on) bits[off + (i >>> 5)] |= 1 << (i & 31);
-    }
+    const k = this.n++;
     this.f0[k] = this.fires[0];
     this.f1[k] = this.fires[1];
   }
