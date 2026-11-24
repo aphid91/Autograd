@@ -908,7 +908,14 @@ function stepToDir(dx, dy) {
   throw new Error(`not a unit step: ${dx}, ${dy}`);
 }
 
-const clampValue = (v, L) => (v !== v ? v : v > L ? L : v < -L ? -L : v);
+// entity.clamp_value(): only a result that is infinite *as float32* clamps,
+// to +/- VALUE_LIMIT. Every finite float32 passes through, integer-exact or
+// not, and NaN passes through too. JS computes in float64, so 1/1e-40 is
+// finite here and infinite once it reaches the Float32Array -- hence fround.
+const clampValue = (v, L) => {
+  const f = Math.fround(v);
+  return f === Infinity ? L : f === -Infinity ? -L : v;
+};
 
 // Entity.eval_ops(): a machine's arithmetic, from its exported opcode table.
 // One entry per output channel; null means "emit nothing". `values` are the

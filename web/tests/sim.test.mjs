@@ -106,6 +106,14 @@ test("the opcodes clamp and propagate as eval_ops does", () => {
   assert.deepEqual(evalOps(T, route, [7, 1], 0), [null, 7, 1]);
   assert.deepEqual(evalOps(T, route, [7, -1], 0), [7, null, -1]);
   assert.deepEqual(evalOps(T, [[O.OP_CONST]], [], 5), [5]);
+  // Only an infinity clamps: Max(big, 0) used to come back as 2^24 and
+  // stall any accumulating loop through it.
+  assert.deepEqual(evalOps(T, [[O.OP_MAX, 0, 1]], [2 ** 30, 0], 0), [2 ** 30]);
+  assert.deepEqual(evalOps(T, [[O.OP_MAX, 0, 1]], [Infinity, 0], 0), [L]);
+  assert.deepEqual(evalOps(T, [[O.OP_FLOOR, 0]], [3e7], 0), [3e7]);
+  assert.ok(evalOps(T, [[O.OP_RECIP, 0]], [1e-30], 0)[0] > 1e29, "a finite reciprocal must not clamp");
+  // Finite in float64, infinite as the float32 the row stores.
+  assert.deepEqual(evalOps(T, [[O.OP_RECIP, 0]], [1e-40], 0), [L]);
 });
 
 test("the clock spends banked time in whole ticks and keeps the remainder", () => {

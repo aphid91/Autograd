@@ -177,7 +177,7 @@ class Entity:
     #   OP_IN        a              pass input `a` through unchanged
     #   OP_ADD       a, b           a + b
     #   OP_MAC       a, b, c        c + a*b
-    #   OP_RECIP     a              1/a, clamped (see VALUE_LIMIT)
+    #   OP_RECIP     a              1/a; an infinite result clamps (VALUE_LIMIT)
     #   OP_MAX       a, b           max(a, b), NaN-propagating
     #   OP_FLOOR     a              floor(a), clamped before flooring
     #   OP_SEL       c, a, b        a if c > 0 else b
@@ -1042,34 +1042,38 @@ class Structure(Entity):
 # cell of the footprint, not on all of them.
 
 
-#: Largest magnitude a value may take. Beyond this a float32 is still exact
-#: but the *integers* are not contiguous, so arithmetic stops behaving like
-#: the numbers the player sees: 2^24 + 1 is not representable.
-#:
-#: Items are float32 (the entity array is destined for an SSBO), so this is
-#: the honest ceiling rather than an arbitrary one. Division can produce
-#: infinity and `floor(inf)` has no answer at all, so both clamp here instead
-#: of propagating a value nothing downstream can use. A real decision about
+#: What an *infinite* result becomes. Division can produce infinity and
+#: `floor(inf)` has no answer at all, so both land here instead of
+#: propagating a value nothing downstream can use. A real decision about
 #: saturating vs. wrapping vs. an error item is deferred -- see the Deferred
 #: notes -- and this is the placeholder that keeps the board finite meanwhile.
+#:
+#: It is **only** for infinities. Finite results keep the whole float32 range,
+#: integer-exact or not: this used to clamp every result past 2^24, so
+#: Max(big, 0) quietly returned 16777216 and capped any loop through it.
 VALUE_LIMIT = float(2 ** 24)
+
+#: The smallest magnitude that rounds to infinity when stored as float32
+#: (FLT_MAX plus half an ulp; the tie rounds up, FLT_MAX's mantissa being odd).
+#: Python computes in float64, so 1/1e-40 is finite here and infinite once it
+#: reaches the float32 row -- and infinite in the GLSL, which computes in
+#: float32. Testing against this is what keeps the two paths agreeing.
+F32_OVERFLOW = 3.4028234663852886e38 + 2.0 ** 103
 
 
 def clamp_value(v):
-    """Bring a result into the representable-integer range.
+    """Replace a result that is infinite *as float32* with +/- VALUE_LIMIT.
 
-    Infinities clamp to +/- VALUE_LIMIT. **NaN passes through unchanged**,
-    deliberately: it is the one value that means "this computation had no
-    answer", and collapsing it to a number would hide that. Max of a NaN
-    reports NaN for exactly this reason.
+    Every finite float32 passes through unchanged. **NaN passes through
+    unchanged** too, deliberately: it is the one value that means "this
+    computation had no answer", and collapsing it to a number would hide
+    that. Max of a NaN reports NaN for exactly this reason.
     """
-    if v != v:                       # NaN: no ordering, so no clamping
-        return v
-    if v > VALUE_LIMIT:
+    if v >= F32_OVERFLOW:
         return VALUE_LIMIT
-    if v < -VALUE_LIMIT:
+    if v <= -F32_OVERFLOW:
         return -VALUE_LIMIT
-    return v
+    return v                         # NaN fails both tests and passes through
 
 
 class Swap(Structure):
@@ -2133,6 +2137,9 @@ def _self_check():
     assert rc.fire([0.0]) == [VALUE_LIMIT], "1/0 must clamp, not be inf"
     assert rc.fire([-0.0]) == [-VALUE_LIMIT], "1/-0 keeps the sign"
     assert math.isfinite(rc.fire([1e-30])[0]), "a tiny divisor must not be inf"
+    assert rc.fire([1e-30])[0] > 1e29, "a finite reciprocal must not clamp"
+    # Finite in float64, infinite as the float32 the row stores.
+    assert rc.fire([1e-40]) == [VALUE_LIMIT], "float32 overflow clamps"
     assert not Reciprocal.PASS_THROUGH, "a mutated channel is not a control"
 
     # Max: both outputs carry the larger value, and NaN propagates.
@@ -2141,6 +2148,11 @@ def _self_check():
     assert mx.fire([7.0, 3.0]) == [7.0, 7.0]
     assert mx.fire([-5.0, -2.0]) == [-2.0, -2.0]
     assert mx.fire([4.0, 4.0]) == [4.0, 4.0]
+    # Finite values past 2^24 are not clamped: this capped Max(big, 0) at
+    # 16777216 and stalled any accumulating loop through a Max.
+    assert mx.fire([2.0 ** 30, 0.0]) == [2.0 ** 30, 2.0 ** 30]
+    assert mx.fire([-1e30, -2e30]) == [-1e30, -1e30]
+    assert mx.fire([float("inf"), 0.0]) == [VALUE_LIMIT, VALUE_LIMIT]
     _nan = float("nan")
     for args in ([_nan, 1.0], [1.0, _nan]):
         got = mx.fire(args)
@@ -2154,6 +2166,7 @@ def _self_check():
     assert fl.fire([1.7]) == [1.0]
     assert fl.fire([-1.2]) == [-2.0], "floor goes toward -inf, not toward 0"
     assert fl.fire([3.0]) == [3.0]
+    assert fl.fire([3e7 + 0.0]) == [3e7], "a finite value must not clamp"
     assert fl.fire([float("inf")]) == [VALUE_LIMIT]
     assert fl.fire([float("-inf")]) == [-VALUE_LIMIT]
     assert fl.fire([_nan])[0] != fl.fire([_nan])[0], "NaN must pass through"

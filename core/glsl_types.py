@@ -246,6 +246,11 @@ def _gate_ops():
                  "OP_MAX", "OP_FLOOR", "OP_SEL", "OP_GATED", "OP_CONST"):
         lines.append(f"const int {name} = {getattr(Entity, name)};")
     lines.append(f"const float VALUE_LIMIT = {float(VALUE_LIMIT)};")
+    lines += [
+        "// An infinite result becomes +/- VALUE_LIMIT; every finite one,",
+        "// integer-exact or not, passes through (entity.clamp_value()).",
+        "float clamp_inf(float x) { return isinf(x) ? sign(x) * VALUE_LIMIT : x; }",
+    ]
     lines.append("")
 
     body = []
@@ -279,17 +284,17 @@ def _gate_ops():
         "    if (op == OP_RECIP) {",
         "        // 1/0 has no answer; clamp carrying the sign of the zero.",
         "        if (a == 0.0) return sign(1.0 / a) * VALUE_LIMIT;",
-        "        return clamp(1.0 / a, -VALUE_LIMIT, VALUE_LIMIT);",
+        "        return clamp_inf(1.0 / a);",
         "    }",
         "    if (op == OP_MAX) {",
         "        // NaN propagates rather than being ordered.",
         "        if (isnan(a) || isnan(b)) return a + b;",
-        "        return clamp(max(a, b), -VALUE_LIMIT, VALUE_LIMIT);",
+        "        return clamp_inf(max(a, b));",
         "    }",
         "    if (op == OP_FLOOR) {",
         "        if (isnan(a)) return a;",
         "        // Clamp *before* flooring: floor(inf) has no value.",
-        "        return floor(clamp(a, -VALUE_LIMIT, VALUE_LIMIT));",
+        "        return floor(clamp_inf(a));",
         "    }",
         "    if (op == OP_SEL)   return (a > 0.0) ? b : c;",
         "    if (op == OP_GATED) {",

@@ -472,7 +472,13 @@ def test_glsl_gate_eval_mirrors_the_python_reference():
     assert "c + a * b" in body, "OP_MAC must compute c + a*b"
     # OP_FLOOR clamps before flooring; the reverse raises in Python and
     # silently returns garbage in GLSL.
-    assert "floor(clamp(a" in body, "OP_FLOOR must clamp before flooring"
+    assert "floor(clamp_inf(a" in body, "OP_FLOOR must clamp before flooring"
+    # Only an infinity clamps. A bounds clamp here capped Max(big, 0) at
+    # 2^24 and stalled any loop through it.
+    assert "clamp(" not in body.replace("clamp_inf(", ""), (
+        "gate_eval() must clamp infinities only, not finite values")
+    assert "isinf(x) ? sign(x) * VALUE_LIMIT : x" in _tables, (
+        "clamp_inf() must replace only an infinity")
     # OP_MAX propagates NaN rather than ordering it.
     assert "isnan(a) || isnan(b)" in body, "OP_MAX must propagate NaN"
     # OP_GATED's silence is a real decision, not a zero.
