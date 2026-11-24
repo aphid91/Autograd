@@ -408,9 +408,9 @@ let recLayers = null;
 function drawVideoFrame(ctx, s, vcam, alpha) {
   render(ctx, s.board, vcam, 1, {
     ...view, sim: s, alpha, ghosts: [],
-    // The afterglow at the video's own time and tick rate.
-    ...layerOpts(recLayers, view.gateStatus ? gateStatus(s, s.tick + alpha, panel.video.tps) : null,
-                 view.beltStatus ? beltStatus(s, s.tick + alpha, panel.video.tps) : null, true),
+    // The afterglow at the video's own time.
+    ...layerOpts(recLayers, view.gateStatus ? gateStatus(s, s.tick + alpha) : null,
+                 view.beltStatus ? beltStatus(s, s.tick + alpha) : null, true),
     pixels: s.screen ? { screen: s.screen, alpha: view.pixelAlpha, max: view.pixelMax, textBg: view.pixelTextBg } : null,
     onWorld: bloomHook("video"),
   });
@@ -1540,7 +1540,10 @@ const layerActions = {
 // View > gate and belt status colours: each machine and run coloured by
 // what it is doing, plus an AFTERGLOW (View > status colours > afterglow):
 // it lights up the moment it acts and cools back to its resting colour
-// over that many seconds.
+// over that many TICKS -- ticks, not seconds, so the share of the time a
+// machine spends lit, and so how bright a busy board looks, is the same at
+// every tick rate. Glow sluggishness stretches a run's glow by its length
+// (as Audio's sluggishness does a drone's envelope).
 //
 // Machines rest at BLOCKED (an output with somewhere to go holds a result
 // it could not hand on -- that wins, since the gate made something that
@@ -1612,11 +1615,11 @@ function cacheOf(s) {
 }
 
 // `s` is the sim to read (the live one, or a video's copy), `at` the time
-// on screen in ticks and `rate` the ticks a second the fade is timed by.
-function gateStatus(s = sim, at = s ? s.tick + clock.alpha : 0, rate = clock.rate) {
+// on screen in ticks.
+function gateStatus(s = sim, at = s ? s.tick + clock.alpha : 0) {
   if (!s) return new Map();
   s.sync();   // may rebuild, which moves the version
-  const pal = statusPalette(), fade = (view.statusFade || 0) * rate, c = cacheOf(s);
+  const pal = statusPalette(), fade = view.statusGlow || 0, c = cacheOf(s);
   const key = `${s.version}|${at}|${fade}|${pal.key}`;
   if (c.gate?.[0] === key) return c.gate[1];
   if (c.gateState?.[0] !== s.version) c.gateState = [s.version, gateStateOf(s)];
@@ -1642,19 +1645,32 @@ function gateStateOf(s) {
 // is stalled once its head reaches the end and sits there, whatever is
 // still closing up behind it, and pushes do not warm it. Returns
 // (x, y) -> css.
-function beltStatus(s = sim, at = s ? s.tick + clock.alpha : 0, rate = clock.rate) {
+//
+// Glow sluggishness s scales a run's fade by (length / 10)^s -- the sim's
+// length, buried tiles included, the same law and reference length as
+// Audio's sluggishness -- so at 1 a 20-tile run glows twice as long as a
+// 10-tile one. One multiply per run per frame: the factor is looked up per
+// length, and lengths repeat.
+const GLOW_REF_LENGTH = 10;
+function beltStatus(s = sim, at = s ? s.tick + clock.alpha : 0) {
   if (!s) return null;
   s.sync();
-  const pal = statusPalette(), fade = (view.statusFade || 0) * rate, c = cacheOf(s);
+  const pal = statusPalette(), fade = view.statusGlow || 0, slug = view.statusSluggish || 0, c = cacheOf(s);
   const whole = view.beltActive !== false;
-  const key = `${s.version}|${at}|${fade}|${pal.key}|${whole}`;
+  const key = `${s.version}|${at}|${fade}|${slug}|${pal.key}|${whole}`;
   if (c.belt?.[0] === key) return c.belt[1];
+  const byLength = new Map();   // length -> its fade, in ticks
+  const fadeFor = (n) => {
+    let f = byLength.get(n);
+    if (f === undefined) byLength.set(n, f = slug ? fade * (n / GLOW_REF_LENGTH) ** slug : fade);
+    return f;
+  };
   const bySid = new Map();
   for (const seg of s.segments.values()) {
     const empty = seg.head === seg.tail;
     let end = whole ? Math.max(seg.lastPush, seg.lastPop) : seg.lastPop;
     if (!empty) end = Math.max(end, s.restTick(seg, whole ? seg.tail - 1 : seg.head));
-    bySid.set(seg.sid, pal.belt[empty ? BELT_EMPTY : BELT_STALLED][heatLevel(end, at, fade)]);
+    bySid.set(seg.sid, pal.belt[empty ? BELT_EMPTY : BELT_STALLED][heatLevel(end, at, fadeFor(seg.length))]);
   }
   const W = s.board.width;
   const fn = (x, y) => bySid.get(s.segAt[y * W + x]) || null;

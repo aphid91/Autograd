@@ -212,12 +212,23 @@ under.
 
 #### The afterglow
 
-View > status colours > **afterglow** (seconds, 0.5 by default, 0 off): a
-machine or run lights up the moment it acts and cools back to its resting
-colour over that time -- for machines from RUNNING to blocked or starved,
-for runs from MOVING to stalled or empty. Timed in seconds at the current
-rate (the elapsed ticks over the rate), so it reads the same at 1 tps and
-5000, and it **freezes while paused**. It rides presentations' views.
+View > status colours > **afterglow** (ticks, 0..250, 15 by default, 0
+off): a machine or run lights up the moment it acts and cools back to its
+resting colour over that many ticks -- for machines from RUNNING to blocked
+or starved, for runs from MOVING to stalled or empty. **Ticks, not
+seconds**, so the share of the time something spends lit -- how bright a
+busy board looks -- is the same at every tick rate; it **freezes while
+paused**. (It was seconds at first, stored as `statusFade`; the new key is
+`statusGlow`, so a stored seconds value is never read as ticks.)
+
+**Glow sluggishness** (-2..2, 0 by default) scales a **run's** fade by
+(length / 10)^s -- the sim's length, buried tiles included, the law and
+reference length Audio's sluggishness uses -- so at 1 a 20-tile run glows
+twice as long as a 10-tile one, and below 0 long runs cool faster.
+Machines are unaffected. One multiply per run per frame, the factor looked
+up per length: `beltStatus()` measured 0.20 ms a frame on `test` with it on
+and off. Both dials ride presentations' views. **Reset colours** asks
+before resetting, and leaves both dials alone.
 
 - **Activity is read back, not predicted.** The sim stamps the tick a gate
   last fired (`Sim.fired[row]`) and a run last pushed or popped
@@ -1830,8 +1841,9 @@ the schedule. Preview and the hammer, driven as a Pixel 7: an edit, a
 preview, a tap to begin, the hammer back -- undo still there, view, camera
 and board restored, no presentation element left, localStorage
 byte-identical; the hammer straight off the cover and Esc likewise; and
-`#b=test`'s hammer opening it in the editor with its settings. Driven in Chromium as a Pixel 7: export, unzip, open; the
-cover's drag leaves the camera; the schedule zooms with the ticks and Reset
+`#b=test`'s hammer opening it in the editor with its settings. The show
+itself, also as a Pixel 7: export, unzip, open; the cover's drag leaves the
+camera; the schedule zooms with the ticks and Reset
 returns it; i cycles; a machine tap pauses and the dismiss resumes; a pan
 and a rate change each end the schedule; localStorage byte-identical after.
 
