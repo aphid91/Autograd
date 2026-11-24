@@ -1146,13 +1146,24 @@ html, body {
 }
 .pr-i {
   position: absolute;
-  right: calc(10 * var(--u));
+  right: calc(54 * var(--u));   /* left of the hammer */
   bottom: calc(10 * var(--u));
   padding: 0;
   font: italic 700 calc(17 * var(--u)) / 1 Georgia, "Times New Roman", serif;
   color: var(--ink);
 }
 .pr-i[hidden] { display: none; }
+/* The hammer (to the editor): bottom right of the stage, over the
+   tap-to-begin cover (fixed, z-index 50), so a preview can be left without
+   starting it. */
+.pr-edit {
+  position: absolute;
+  right: calc(10 * var(--u));
+  bottom: calc(10 * var(--u));
+  z-index: 51;
+  color: var(--ink);
+}
+.pr-edit[hidden] { display: none; }
 /* Above the button row, so up to five rates never reach the centred buttons
    on a phone. */
 .pr-speed {

@@ -30,6 +30,14 @@ export function presentationName(hash = location.hash) {
   try { return decodeURIComponent(m[1]).trim() || null; } catch { return null; }
 }
 
+// The presentation the editor is asked to open for editing, or null:
+// `#edit=<name>` -- where a deployed presentation's hammer leads.
+export function editName(hash = location.hash) {
+  const m = /^#edit=(.+)$/.exec(hash || "");
+  if (!m) return null;
+  try { return decodeURIComponent(m[1]).trim() || null; } catch { return null; }
+}
+
 // A file name a presentation may have: letters, digits, space, - and _.
 export const safeName = (s) => String(s || "").trim().replace(/[^\w -]+/g, "_").replace(/^[ _-]+|[ _-]+$/g, "");
 
@@ -67,20 +75,35 @@ export function schedulePose(rec, tick) {
 
 const el = (tag, cls, html = "") => { const e = document.createElement(tag); if (cls) e.className = cls; e.innerHTML = html; return e; };
 
-export async function startPresentation(name, api) {
+// The record and the board's bytes of a deployed presentation.
+export async function fetchPresentation(name) {
+  const res = await fetch(`${PRESENT_DIR}/${encodeURIComponent(name)}.json`);
+  if (!res.ok) throw new Error(`no ${PRESENT_DIR}/${name}.json (HTTP ${res.status})`);
+  const rec = await res.json();
+  if (!rec || !Array.isArray(rec.views) || !rec.views.length) throw new Error("its JSON has no views");
+  const boardFile = rec.board || `${name}.npz`;
+  const bres = await fetch(`${PRESENT_DIR}/${encodeURIComponent(boardFile)}`);
+  if (!bres.ok) throw new Error(`no ${PRESENT_DIR}/${boardFile} (HTTP ${bres.status})`);
+  return { rec, bytes: await bres.arrayBuffer() };
+}
+
+// `opts.rec`: a record to show instead of fetching one -- the editor's
+// preview, which shows the board already loaded (no `api.loadBoard`).
+// `opts.onEdit`: what the hammer button (bottom right) does: back to the
+// editor. Resolves once the page is built, before "tap to begin" is
+// tapped; the returned presenter's `close()` takes every element it made
+// back off the page (the preview's exit).
+export async function startPresentation(name, api, opts = {}) {
   const fail = (msg) => { showMessage(`Could not open “${name}”: ${msg}`); };
-  let rec;
-  try {
-    const res = await fetch(`${PRESENT_DIR}/${encodeURIComponent(name)}.json`);
-    if (!res.ok) return fail(`no ${PRESENT_DIR}/${name}.json (HTTP ${res.status})`);
-    rec = await res.json();
-    if (!rec || !Array.isArray(rec.views) || !rec.views.length) return fail("its JSON has no views");
-    const boardFile = rec.board || `${name}.npz`;
-    const bres = await fetch(`${PRESENT_DIR}/${encodeURIComponent(boardFile)}`);
-    if (!bres.ok) return fail(`no ${PRESENT_DIR}/${boardFile} (HTTP ${bres.status})`);
-    await api.loadBoard(name, await bres.arrayBuffer());
-  } catch (e) {
-    return fail(e.message);
+  let rec = opts.rec;
+  if (!rec) {
+    try {
+      const got = await fetchPresentation(name);
+      rec = got.rec;
+      await api.loadBoard(name, got.bytes);
+    } catch (e) {
+      return fail(e.message);
+    }
   }
 
   // --- state -----------------------------------------------------------------
@@ -115,6 +138,12 @@ export async function startPresentation(name, api) {
   const infoBtn = el("button", "pr-btn pr-i", "i");
   infoBtn.setAttribute("aria-label", "Change view");
   infoBtn.hidden = rec.views.length < 2;
+  // The hammer: to the editor. Above the tap-to-begin cover, so a preview
+  // can be left without starting it.
+  const editBtn = el("button", "pr-btn pr-edit", icon("build"));
+  editBtn.setAttribute("aria-label", "Edit");
+  editBtn.hidden = !opts.onEdit;
+  editBtn.onclick = () => opts.onEdit?.();
   ui.append(simBox, infoBtn);
 
   const rates = speedRates(rec);
@@ -150,17 +179,21 @@ export async function startPresentation(name, api) {
   // --- tap to begin ------------------------------------------------------------
   // The cover takes the whole gesture -- a tap or a drag -- so the drag that
   // dismisses it neither pans nor ends the schedule. Its lift is also the
-  // gesture a browser needs before sound may start.
+  // gesture a browser needs before sound may start. Not awaited: the
+  // presenter exists (and can be closed) while the cover is up.
+  let begun = false, closed = false;
   const cover = el("div", "pr-cover", `<div class="pr-cover-msg">tap to begin</div>`);
   document.body.append(cover);
-  await new Promise(resolve => {
-    cover.addEventListener("pointerdown", (e) => { e.preventDefault(); cover.setPointerCapture?.(e.pointerId); });
-    cover.addEventListener("pointerup", () => resolve(), { once: true });
-  });
-  cover.remove();
-  api.setPlaying(true);
-  syncPlay();
-  toast("drag to pan, pinch to zoom");
+  stage.append(editBtn);   // in the stage, beside the other buttons; z-index puts it over the cover
+  cover.addEventListener("pointerdown", (e) => { e.preventDefault(); cover.setPointerCapture?.(e.pointerId); });
+  cover.addEventListener("pointerup", () => {
+    cover.remove();
+    if (closed) return;
+    begun = true;
+    api.setPlaying(true);
+    syncPlay();
+    toast("drag to pan, pinch to zoom");
+  }, { once: true });
 
   // --- the info panel ----------------------------------------------------------
   // A tap on a machine pauses and shows its name; any tap or drag anywhere
@@ -175,7 +208,7 @@ export async function startPresentation(name, api) {
     panel.append(title);
     catcher.append(panel);
     document.body.append(catcher);
-    info = { wasPlaying };
+    info = { wasPlaying, catcher };
     catcher.addEventListener("pointerdown", (e) => {
       e.preventDefault();
       catcher.setPointerCapture?.(e.pointerId);
@@ -193,7 +226,7 @@ export async function startPresentation(name, api) {
   // longer where it last put it, which means the player moved it (a drag,
   // a pinch, the wheel, a glide): then the schedule is over for good.
   function frame() {
-    if (!scheduled) return;
+    if (!scheduled || closed) return;
     const c = api.cam;
     if (placed && (Math.abs(c.cx - placed.cx) > 1e-6 || Math.abs(c.cy - placed.cy) > 1e-6 || Math.abs(c.zoom - placed.zoom) > 1e-9)) {
       scheduled = false;
@@ -203,8 +236,14 @@ export async function startPresentation(name, api) {
   }
   return {
     frame,
-    tap(entityName) { if (entityName && !info) openInfo(entityName); },
-    togglePlay() { playBtn.click(); },
+    tap(entityName) { if (begun && !closed && entityName && !info) openInfo(entityName); },
+    togglePlay() { if (begun && !closed) playBtn.click(); },
+    // Everything this page put on the screen, taken off again.
+    close() {
+      closed = true;
+      for (const n of [ui, cover, editBtn, info?.catcher, ...document.querySelectorAll(".pr-toast")]) n?.remove();
+      info = null;
+    },
     get scheduled() { return scheduled; },
     get viewIndex() { return viewIndex; },
     record: rec,
@@ -212,6 +251,7 @@ export async function startPresentation(name, api) {
 }
 
 function toast(text) {
+  document.querySelectorAll(".pr-toast").forEach(t => t.remove());
   const t = el("div", "pr-toast");
   t.textContent = text;
   document.body.append(t);

@@ -201,19 +201,53 @@ panel.js); a stored key this build does not know, or a value that is not a
 `#rrggbb`, is ignored.
 
 **Belt status colours** do the same for belts, per run (segment), in
-`beltStatus()`: **red** empty; **yellow** stalled -- the head item is at the
-run's end and will not leave on the coming tick (the forecast has no pop),
-so items are stuck on it; **green** carrying and moving. **Stalled but
-moving: green** (on by default) keeps a stalled run green while anything on
-it still moves -- an item is pushed on this tick, or its newest item is
-still closing up (items pack from the head, so if the newest has stopped
-they all have: one closed-form comparison per run). So yellow means
-static, and a run a gate takes from every other tick does not flicker.
-Traced on a sparse run hitting a dead end: yellow at the tick its head
-arrives without the check, at the tick the last item packs with it.
-Underground ends
-take their run's colour too, and the dots over a buried span a lighter wash
-of it. The seed tint still draws under.
+`beltStatus()`: **red** empty; **yellow** stalled -- holding items, none of
+them moving and nothing pushed or popped lately; **green** moving.
+**Stalled but moving: green** (on by default) counts the whole run: a push,
+a pop, or any item still closing up. Off, only the head counts -- a run is
+stalled once its head reaches the end and sits there, whatever is still
+packing behind it. Underground ends take their run's colour too, and the
+dots over a buried span a lighter wash of it. The seed tint still draws
+under.
+
+#### The afterglow
+
+View > status colours > **afterglow** (seconds, 0.5 by default, 0 off): a
+machine or run lights up the moment it acts and cools back to its resting
+colour over that time -- for machines from RUNNING to blocked or starved,
+for runs from MOVING to stalled or empty. Timed in seconds at the current
+rate (the elapsed ticks over the rate), so it reads the same at 1 tps and
+5000, and it **freezes while paused**. It rides presentations' views.
+
+- **Activity is read back, not predicted.** The sim stamps the tick a gate
+  last fired (`Sim.fired[row]`) and a run last pushed or popped
+  (`seg.lastPush`, `seg.lastPop`) -- one write per event, never read by the
+  tick, skipped while forecasting, cleared on every rebuild, carried by
+  `clone()` and `restoreFrom()`. An item travelling down a run makes no
+  event, so a run is also hot until **`Sim.restTick()`**: when its newest
+  item (or its head, with the option off) comes to rest if nothing more
+  happens -- the later of its entry tick plus its packed place over the
+  speed, and the last pop plus spacing over speed (the anchor's way back
+  to the end). That is a constant between pops, so the colour is a pure
+  function of the state on screen and the time: no per-frame history, so
+  a gate that fired once between two frames at 5000 tps still lights, and
+  a video's copy colours as the screen does. `tests/sim.test.mjs` pins
+  `restTick()` against running the run on with nothing offered or taken
+  (150 random runs, speeds and spacings), and that it does not move
+  without a pop; mutation-tested (drop the anchor term, an off-by-one, the
+  wrong stamp, the wrong packed place: each fails).
+- **Two ticks of look-back replace the old look-ahead.** Anything that
+  acted in the last `AFTERGLOW_HOLD` (2) ticks is fully hot at any fade, so
+  a run a gate takes from every other tick does not flicker. The status
+  colours used to ask the forecast "will the head pop on the coming tick?"
+  for that; they no longer read the forecast at all. A machine that is
+  ready and unblocked (it fires on the coming tick) is RUNNING, as before.
+- **Heat is rounded to 16 levels**, and every (state, level) colour is
+  built once per colour change (`statusPalette()`), so a fading board is a
+  few dozen colours and render.js's batching by colour holds.
+- **Cost**: a gate's resting state is worked out once per sim version (at
+  most once a frame); heat is per frame, one stamp read per machine and run.
+  On `test`, both together about 0.5 ms a frame.
 
 ### Pan momentum
 
@@ -1771,8 +1805,32 @@ them: the panel's **Presentation** folder, and **Export presentation
   on if it was playing. Long press, selection drags and editing keys are
   all off.
 
+- **The hammer** (bottom right, over the tap-to-begin cover) goes to the
+  editor: `#edit=<name>`, which loads that presentation's board, applies
+  its default view, fills the Presentation folder from its record (name,
+  rates, cameras, schedule, detail view) and sets the start camera -- so a
+  deployed show can be changed and exported again. The hash is dropped once
+  read, so a reload resumes as usual. Loading it is not an edit, so no save
+  is written until something changes.
+- **Preview** (Presentation > Preview presentation) shows the presentation
+  the folder describes -- the record Export would write -- on the board in
+  front of the player, **in the page**, with no reload: the hammer or Esc
+  comes back with the undo history, stamps, tool bar and board untouched
+  (`enterPreview()` / `exitPreview()` in main.js). The preview starts from
+  Reset, as a viewer's would. On the way out the view (View, colours, Dev
+  dials, layer visibility), camera, rate and play state are put back, all
+  while the stores are still frozen (`unfreezePersist()` comes last), so
+  localStorage is byte-identical after a preview. `startPresentation()`
+  takes the record directly (`opts.rec`, no board load) and returns before
+  the cover is tapped, so its `close()` can take everything it made back
+  off the page at any point.
+
 `tests/present.test.mjs` covers the hash, the record, the speed panel and
-the schedule. Driven in Chromium as a Pixel 7: export, unzip, open; the
+the schedule. Preview and the hammer, driven as a Pixel 7: an edit, a
+preview, a tap to begin, the hammer back -- undo still there, view, camera
+and board restored, no presentation element left, localStorage
+byte-identical; the hammer straight off the cover and Esc likewise; and
+`#b=test`'s hammer opening it in the editor with its settings. Driven in Chromium as a Pixel 7: export, unzip, open; the
 cover's drag leaves the camera; the schedule zooms with the ticks and Reset
 returns it; i cycles; a machine tap pauses and the dismiss resumes; a pan
 and a rate change each end the schedule; localStorage byte-identical after.
@@ -1869,8 +1927,11 @@ What it took, each found by the tree:
   (a `lineTo` to the first vertex and on to the second, so a stroke still
   joins the corner). `arc()`, `rect()` and SVG `Z` in a `Path2D` string
   are all linear.
-- **Status colours once per tick.** `gateStatus()` / `beltStatus()` are
-  cached on `Sim.version` and the colours, not recomputed per frame.
+- **Status colours at most once per frame.** They are worked out in
+  `paint()` after the frame's ticks, for the state on screen only, and
+  cached on that state and the time, so a frame with no new tick (a slow
+  rate, or panning while paused) reuses them. (Now the afterglow's; see
+  "Gate status colours".)
 - **The forecast rolls back with an undo log**, not a copy of the entity
   table: `setF()` logs each value it replaces while a forecast runs. The
   copy was 3.6 MB on a 32k-row board and three quarters of the forecast.

@@ -35,6 +35,7 @@
 // job, as ctrl+R's on the desktop.
 
 const BELT = 1, UNDER = 7, EMPTY = 0;
+const NEVER = -(2 ** 30);   // an activity stamp for "never" (see flush())
 
 export class Sim {
   constructor(T, board) {
@@ -332,6 +333,7 @@ export class Sim {
     const seg = {
       sid, cells, length,
       head: 0, tail: 0, anchor: length * this.UNIT,
+      lastPush: NEVER, lastPop: NEVER,   // activity stamps (see flush())
       cap, enter: new Float64Array(cap), payload: new Float32Array(cap),
       offs: new Int32Array(cells.length),
       src: this.nodeBehind(cells[0]), dst: this.nodeAhead(cells[cells.length - 1]),
@@ -497,11 +499,20 @@ export class Sim {
   clearOut(row, c) { this.setF(row, this.T.sim.F_OUT_VALUE + c, 0); this.setF(row, this.T.sim.F_OUT_HELD + c, 0); }
 
   // Engine.flush_material(): every item off every belt and out of every gate.
+  //
+  // Also clears the activity stamps the status colours' afterglow reads
+  // (main.js): `seg.lastPush` / `seg.lastPop`, and `fired[row]`, each the
+  // tick a run last pushed or popped, or a gate last fired, as the tick the
+  // state was in after that step (so "just now" is `this.tick`). Written by
+  // step() and never read by it, so the tick is unchanged by them; not
+  // written by a forecast, which is rolled back.
   flush() {
     for (const seg of this.segments.values()) {
       seg.head = seg.tail = 0;
       seg.anchor = seg.length * this.UNIT;
+      seg.lastPush = seg.lastPop = NEVER;
     }
+    this.fired = new Int32Array(this.board.rows).fill(NEVER);
     for (const g of this.gates) {
       for (let c = 0; c < g.sim.n_in; c++) this.clearIn(g.row, c);
       for (let c = 0; c < g.sim.n_out; c++) this.clearOut(g.row, c);
@@ -553,6 +564,27 @@ export class Sim {
     return Math.min(unblocked, packed);
   }
 
+  // The tick from which item k is at rest if nothing pops or pushes on its
+  // run from now on: the first tick t whose step, and every step after it,
+  // leaves k where it is -- in the units of the activity stamps, so an item
+  // last moved by the step at tick t - 1 rests from t. Position is the min
+  // of two terms that each grow by `speed` a step until they stop: the
+  // unblocked one reaches k's packed place P at its entry tick + P / speed;
+  // the anchor is at the end except for the steps after a pop (which sets it
+  // to length - spacing), and is back by the pop's step + spacing / speed.
+  // Nothing in it depends on the current tick, so between pops it is a
+  // constant (a push does not move it for the items already on the run),
+  // which is what lets the afterglow read it at any frame.
+  // `tests/sim.test.mjs` pins it against running the run on with no
+  // producer or consumer.
+  restTick(seg, k) {
+    const L = seg.length * this.UNIT, v = this.speed;
+    const P = Math.max(0, L - (k - seg.head) * this.spacing);
+    const unblocked = seg.enter[k % seg.cap] + Math.ceil(P / v) + 1;
+    const anchor = seg.lastPop + Math.ceil(Math.min(this.spacing, L) / v);
+    return Math.max(unblocked, anchor);
+  }
+
   hasRoom(seg, tick) {
     if (seg.head === seg.tail) return true;
     return this.positionOf(seg, seg.tail - 1, tick) >= this.spacing;
@@ -579,6 +611,7 @@ export class Sim {
         seg.head++;
         seg.anchor = Math.max(0, length - this.spacing);
         this.stats.popped++;
+        if (!this.rec) seg.lastPop = tick + 1;
       }
     }
     if (this.hasRoom(seg, tick)) {
@@ -587,6 +620,7 @@ export class Sim {
         if (this.rec) this.rec.pushes.set(seg, v);
         this.push(seg, v, tick);
         this.took(seg);
+        if (!this.rec) seg.lastPush = tick + 1;
       }
     }
   }
@@ -645,6 +679,7 @@ export class Sim {
       }
       if (this.fire(g, P)) {
         this.stats.fired++;
+        if (!this.rec) this.fired[row] = this.tick + 1;
         if (A) A.fires[g.agroup] += g.again ?? 1;   // a far gate (space.js) counts for less
       }
     }
@@ -811,6 +846,7 @@ export class Sim {
     c.order = this.order.map(seg => c.segments.get(seg.sid));
     c.stats = { ...this.stats };
     c.audio = null; c.rec = null; c.fc = null; c.screen = null; c.undoLog = null;
+    c.fired = this.fired.slice();
     return c;
   }
 
@@ -823,9 +859,11 @@ export class Sim {
     for (const seg of this.order) {
       const s = snap.segments.get(seg.sid);
       seg.head = s.head; seg.tail = s.tail; seg.anchor = s.anchor;
+      seg.lastPush = s.lastPush; seg.lastPop = s.lastPop;
       seg.enter.set(s.enter); seg.payload.set(s.payload);
     }
     this.tick = snap.tick;
+    this.fired.set(snap.fired);
     Object.assign(this.stats, snap.stats);
     this.version++;
     this.fc = null;

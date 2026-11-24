@@ -31,10 +31,10 @@ import { openAssembler, isAssemblerOpen } from "./assembler.js";
 import { toast } from "./toast.js";
 import { entrySize, typeByName } from "./stamp.js";
 import { installPixel, Screen } from "./pixel.js";
-import { cropBox, evenDim, frameBox, frameCount, viewBox } from "./video-params.js";
-import { presentationName, startPresentation, presentationRecord, safeName } from "./present.js";
+import { cropBox, evenDim, fitBox, frameBox, frameCount, viewBox } from "./video-params.js";
+import { presentationName, editName, startPresentation, fetchPresentation, presentationRecord, safeName } from "./present.js";
 import * as P from "./prof.js";
-import { freezePersist, persistEnabled } from "./persist.js";
+import { freezePersist, unfreezePersist, persistEnabled } from "./persist.js";
 import { presetNames, readPresets, putPreset, deletePreset, presetFile, parsePresetFile } from "./audiopresets.js";
 import { writeZip } from "./npz.js";
 import { spaceWeights, spaceKey, fringeOf } from "./space.js";
@@ -132,7 +132,9 @@ function setPickV(v) { if (vec.picking === "select") vec.sv = v; else vec.v = v;
 
 // Presentation mode (present.js): `#b=<name>` in the URL. Decided once, at
 // load; a change of hash reloads the page.
-const presenting = presentationName();
+// The editor's own preview (Presentation > Preview) sets it too, in the
+// page, and clears it on the way back (enterPreview()).
+let presenting = presentationName();
 let presenter = null;
 
 // A handle for the console and for headless tests. Not an API.
@@ -406,7 +408,9 @@ let recLayers = null;
 function drawVideoFrame(ctx, s, vcam, alpha) {
   render(ctx, s.board, vcam, 1, {
     ...view, sim: s, alpha, ghosts: [],
-    ...layerOpts(recLayers, view.gateStatus ? gateStatus(s) : null, view.beltStatus ? beltStatus(s) : null, true),
+    // The afterglow at the video's own time and tick rate.
+    ...layerOpts(recLayers, view.gateStatus ? gateStatus(s, s.tick + alpha, panel.video.tps) : null,
+                 view.beltStatus ? beltStatus(s, s.tick + alpha, panel.video.tps) : null, true),
     pixels: s.screen ? { screen: s.screen, alpha: view.pixelAlpha, max: view.pixelMax, textBg: view.pixelTextBg } : null,
     onWorld: bloomHook("video"),
   });
@@ -1533,76 +1537,129 @@ const layerActions = {
   },
 };
 
-// View > gate status colours: each machine's body coloured by what it is
-// doing in the state on screen. BLOCKED (yellow) when an output with
-// somewhere to go is holding a result it could not hand on -- that wins,
-// since the gate made something that cannot leave; STARVED (red) when it
-// does not have what its own firing rule needs (a Merge needs its control
-// and the lane that selects, a Sink any one lane; a Source never starves);
-// RUNNING (green) otherwise. Dangling outputs discard and never block.
-// The colours are the player's (View > status colours, panel.js).
+// View > gate and belt status colours: each machine and run coloured by
+// what it is doing, plus an AFTERGLOW (View > status colours > afterglow):
+// it lights up the moment it acts and cools back to its resting colour
+// over that many seconds.
+//
+// Machines rest at BLOCKED (an output with somewhere to go holds a result
+// it could not hand on -- that wins, since the gate made something that
+// cannot leave), STARVED (it does not have what its own firing rule needs:
+// a Merge its control and the selected lane, a Sink any one lane; a Source
+// never starves) or RUNNING (neither: it fires on the coming tick).
+// Dangling outputs discard and never block. Runs rest at EMPTY or STALLED
+// (holding items, none moving). The hot colour is RUNNING for machines and
+// MOVING for runs. The colours are the player's (panel.js).
+//
+// Activity is read back, not predicted: the sim stamps the tick a gate
+// last fired and a run last pushed or popped (sim.js flush()), and an item
+// still travelling down a run, which makes no event, is covered by
+// Sim.restTick() -- when the run's newest item comes to rest if nothing
+// more happens, a constant between events. So a colour is a function of the
+// state on screen and the time, whatever frames were or were not drawn
+// between: at 5000 tps a gate that fired once between two frames still
+// lights, and a video's copy of the sim colours the same as the screen.
+//
+// Anything that acted in the last AFTERGLOW_HOLD ticks reads fully hot,
+// at any fade: a run a gate takes from every other tick would otherwise
+// flicker between stalled and moving. (Before the afterglow this was a
+// look-ahead -- "will the head pop on the coming tick?" -- from the
+// forecast; looking back two ticks does the same job.)
+//
+// Heat is rounded to HEAT_LEVELS steps, so a whole board fading still
+// draws as a few dozen colours (render.js batches by colour).
 const hexRgb = (h) => [1, 3, 5].map(i => parseInt(h.slice(i, i + 2), 16) / 255);
-// Both are a function of the sim's state and the colours alone, so each is
-// worked out once per tick (Sim.version moves on every step and rebuild),
-// not once per frame: a whole-board pass, 2-3 ms a frame on a big board.
-// `s` is the sim to read (the live one, or a video's copy).
-const statusCache = new WeakMap();   // sim -> { gate: [key, value], belt: [key, value] }
-function cachedStatus(s, which, extra, make) {
-  s.sync();   // may rebuild, which moves the version
-  const key = `${s.version}|${JSON.stringify(statusColours)}|${extra}`;
+const AFTERGLOW_HOLD = 2;
+const HEAT_LEVELS = 16;
+const GATE_RUNNING = 0, GATE_STARVED = 1, GATE_BLOCKED = 2;
+const BELT_EMPTY = 0, BELT_STALLED = 1;
+
+// How hot something is, 0..HEAT_LEVELS, from the tick it last acted
+// (`end`; still acting if in the future), the time on screen and the fade
+// in ticks.
+function heatLevel(end, at, fadeTicks) {
+  const since = at - end;
+  if (since < AFTERGLOW_HOLD) return HEAT_LEVELS;
+  if (!(fadeTicks > 0)) return 0;
+  return Math.max(0, Math.round(HEAT_LEVELS * (1 - (since - AFTERGLOW_HOLD) / fadeTicks)));
+}
+
+// The colours for every resting state at every heat level, rebuilt only
+// when the player changes a colour: the same array (gates) or string
+// (belts) object for the same colour, frame after frame.
+let palette = null;
+function statusPalette() {
+  const key = JSON.stringify(statusColours);
+  if (palette?.key === key) return palette;
+  const c = statusColours;
+  const ramp = (cool, hot) => Array.from({ length: HEAT_LEVELS + 1 }, (_, l) => mix(cool, hot, l / HEAT_LEVELS));
+  const run = hexRgb(c.gateRunning), moving = hexRgb(c.beltMoving);
+  const gate = [ramp(run, run), ramp(hexRgb(c.gateStarved), run), ramp(hexRgb(c.gateBlocked), run)];
+  const belt = [ramp(hexRgb(c.beltEmpty), moving), ramp(hexRgb(c.beltStalled), moving)].map(r => r.map(rgbCss));
+  palette = { key, gate, belt };
+  return palette;
+}
+
+// Each machine's resting state is a function of the sim's state alone, so
+// it is worked out once per tick at most (Sim.version moves on every step
+// and rebuild) -- in practice at most once per frame, for the state on
+// screen, since nothing asks in between. The heat is per frame.
+const statusCache = new WeakMap();   // sim -> { gateState: [version, Map], gate: [key, Map], belt: [key, fn] }
+function cacheOf(s) {
   let c = statusCache.get(s);
   if (!c) statusCache.set(s, c = {});
-  if (c[which]?.[0] !== key) c[which] = [key, make()];
-  return c[which][1];
+  return c;
 }
-function gateStatus(s = sim) {
+
+// `s` is the sim to read (the live one, or a video's copy), `at` the time
+// on screen in ticks and `rate` the ticks a second the fade is timed by.
+function gateStatus(s = sim, at = s ? s.tick + clock.alpha : 0, rate = clock.rate) {
   if (!s) return new Map();
-  return cachedStatus(s, "gate", "", () => gateStatusOf(s));
-}
-function gateStatusOf(s) {
+  s.sync();   // may rebuild, which moves the version
+  const pal = statusPalette(), fade = (view.statusFade || 0) * rate, c = cacheOf(s);
+  const key = `${s.version}|${at}|${fade}|${pal.key}`;
+  if (c.gate?.[0] === key) return c.gate[1];
+  if (c.gateState?.[0] !== s.version) c.gateState = [s.version, gateStateOf(s)];
   const out = new Map();
-  const STATUS_COL = { blocked: hexRgb(statusColours.gateBlocked), starved: hexRgb(statusColours.gateStarved), running: hexRgb(statusColours.gateRunning) };
+  for (const [row, st] of c.gateState[1]) {
+    out.set(row, pal.gate[st][st === GATE_RUNNING ? HEAT_LEVELS : heatLevel(s.fired[row], at, fade)]);
+  }
+  c.gate = [key, out];
+  return out;
+}
+function gateStateOf(s) {
+  const out = new Map();
   for (const g of s.gates) {
-    const blocked = g.drains.some(c => s.outHeld(g.row, c));
+    const blocked = g.drains.some(ch => s.outHeld(g.row, ch));
     const starved = g.sim.n_in > 0 && !s.inputsReady(g);
-    out.set(g.row, blocked ? STATUS_COL.blocked : starved ? STATUS_COL.starved : STATUS_COL.running);
+    out.set(g.row, blocked ? GATE_BLOCKED : starved ? GATE_STARVED : GATE_RUNNING);
   }
   return out;
 }
 
-// View > belt status colours, per run (segment), in the state on screen:
-// RED empty; YELLOW stalled -- its head item is at the end and will not
-// leave on the coming tick (the forecast has no pop), so items are stuck on
-// it (and, by default, nothing on it is moving either -- see below); GREEN
-// otherwise (carrying, and moving). Returns (x, y) -> colour.
-function beltStatus(s = sim) {
+// Per run: hot while anything on it moves or it pushed or popped lately.
+// With View > "stalled but moving: green" off, only the head counts: a run
+// is stalled once its head reaches the end and sits there, whatever is
+// still closing up behind it, and pushes do not warm it. Returns
+// (x, y) -> css.
+function beltStatus(s = sim, at = s ? s.tick + clock.alpha : 0, rate = clock.rate) {
   if (!s) return null;
-  return cachedStatus(s, "belt", view.beltActive !== false, () => beltStatusOf(s));
-}
-function beltStatusOf(s) {
-  const BELT_STATUS_COL = { empty: statusColours.beltEmpty, stalled: statusColours.beltStalled, moving: statusColours.beltMoving };
   s.sync();
-  const F = P.span("forecast", () => s.forecast());   // shared with the items' animation (flow.js)
+  const pal = statusPalette(), fade = (view.statusFade || 0) * rate, c = cacheOf(s);
+  const whole = view.beltActive !== false;
+  const key = `${s.version}|${at}|${fade}|${pal.key}|${whole}`;
+  if (c.belt?.[0] === key) return c.belt[1];
   const bySid = new Map();
   for (const seg of s.segments.values()) {
-    let st = "moving";
-    if (seg.head === seg.tail) st = "empty";
-    else if (s.positionOf(seg, seg.head, s.tick) >= seg.length * s.UNIT && !F.pops.has(seg)) {
-      st = "stalled";
-      // View > "stalled but moving: green": a stalled run whose items are
-      // still moving -- one is pushed on this tick, or the newest is still
-      // closing up (items pack from the head, so if the newest has stopped
-      // they all have) -- is not static, and reads green. O(1) per run.
-      if (view.beltActive !== false) {
-        const k = seg.tail - 1;
-        const moving = s.positionOf(seg, k, s.tick, 1) > s.positionOf(seg, k, s.tick, 0);
-        if (moving || F.pushes.has(seg)) st = "moving";
-      }
-    }
-    bySid.set(seg.sid, BELT_STATUS_COL[st]);
+    const empty = seg.head === seg.tail;
+    let end = whole ? Math.max(seg.lastPush, seg.lastPop) : seg.lastPop;
+    if (!empty) end = Math.max(end, s.restTick(seg, whole ? seg.tail - 1 : seg.head));
+    bySid.set(seg.sid, pal.belt[empty ? BELT_EMPTY : BELT_STALLED][heatLevel(end, at, fade)]);
   }
   const W = s.board.width;
-  return (x, y) => bySid.get(s.segAt[y * W + x]) || null;
+  const fn = (x, y) => bySid.get(s.segAt[y * W + x]) || null;
+  c.belt = [key, fn];
+  return fn;
 }
 
 // What the Status pane's live readout says about a row: a gate's channels,
@@ -3135,18 +3192,20 @@ async function presentAction(kind) {
   else if (kind === "detail") panel.setPresent({ detail: captureViewState("detail") });
   else if (kind === "clearDetail") panel.setPresent({ detail: null });
   else if (kind === "export") await exportPresentation();
+  else if (kind === "preview") { await enterPreview(); return; }
   redraw();
 }
 
-// The board as it stands (audio settings and labels ride in the save), the
-// view in front of the player as "default", the captured detail view, and
-// the draft's rates and camera schedule, zipped as <name>.json + <name>.npz.
-async function exportPresentation() {
+// The presentation the editor's settings describe: the view in front of the
+// player as "default", the captured detail view, and the draft's rates and
+// camera schedule. Puts a selection down first (null if the player then
+// declines to go on without what does not fit).
+function presentationNow(verb) {
   const d = panel.present;
   const name = safeName(d.name) || "presentation";
   dropAll();
   const lifted = sel ? sel.stamp.entries.length : 0;
-  if (lifted && !confirm(`${lifted} selected ${lifted === 1 ? "entity does" : "entities do"} not fit back on the board and will not be in the presentation. Export anyway?`)) return;
+  if (lifted && !confirm(`${lifted} selected ${lifted === 1 ? "entity does" : "entities do"} not fit back on the board and will not be in the presentation. ${verb} anyway?`)) return null;
   const b = board.bounds;
   const fit = b ? { cx: (b.minX + b.maxX) / 2, cy: (b.minY + b.maxY) / 2,
                     hw: Math.max(1, b.maxX - b.minX) * 0.575, hh: Math.max(1, b.maxY - b.minY) * 0.575 }
@@ -3157,6 +3216,15 @@ async function exportPresentation() {
     ...d, rates: [d.rate1, d.rate2, d.rate3, d.rate4],
     startCamera: d.startCamera || fit,
   }, views);
+  return { name, rec };
+}
+
+// The board as it stands (audio settings and labels ride in the save) and
+// the record, zipped as <name>.json + <name>.npz.
+async function exportPresentation() {
+  const p = presentationNow("Export");
+  if (!p) return;
+  const { name, rec } = p;
   try {
     const npz = new Uint8Array(await board.toNpz());
     const json = new TextEncoder().encode(JSON.stringify(rec, null, 1));
@@ -3173,6 +3241,84 @@ async function exportPresentation() {
   } catch (err) {
     alert(`Could not export: ${err.message}`);
   }
+}
+
+// --- previewing a presentation in the editor -------------------------------
+//
+// Presentation > Preview shows the presentation the folder describes -- the
+// same record Export would write -- on the board in front of the player,
+// in this page, and the hammer (bottom right) or Esc comes back. Nothing is
+// reloaded, so the undo history, the stamps and the tool bar are all still
+// there after. What the preview changes is put back on the way out: the
+// view (View, status colours, Dev dials, layer visibility -- applied by the
+// presentation's views), the camera, the tick rate and play state. The
+// stores are frozen meanwhile (persist.js), as in presentation mode, so
+// none of that reaches the player's preferences. The simulation starts
+// from Reset, as a viewer's would, and is left where the preview got it.
+let previewSaved = null;
+async function enterPreview() {
+  if (!board || presenting) return;
+  const p = presentationNow("Preview");
+  if (!p) return;
+  // Whatever was in progress belongs to editing, not to the show.
+  run = null; place = null; grab = null; boxRect = null;
+  if (shell.state.pasteStamp !== null) exitPaste();
+  if (vec.picking) closePicker(true);
+  inspect(-1);
+  endDryRun();
+  previewSaved = { view: captureViewState("editor"), cam: { cx: cam.cx, cy: cam.cy, zoom: cam.zoom },
+                   rate: clock.rate, paused: clock.paused };
+  freezePersist();
+  document.body.classList.add("presenting");
+  presenting = p.name;
+  resize();
+  resetSim();
+  presenter = await startPresentation(p.name, presentApi, { rec: p.rec, onEdit: exitPreview });
+}
+
+function exitPreview() {
+  if (!previewSaved) return;
+  const s = previewSaved;
+  previewSaved = null;
+  presenter?.close();
+  presenter = null;
+  presenting = null;
+  document.body.classList.remove("presenting");
+  // All of it put back while still frozen: the preferences were never
+  // touched, so the restored state needs no writing either.
+  applyViewState(s.view);
+  shell.setRate(s.rate);
+  shell.setPaused(s.paused);
+  unfreezePersist();
+  resize();
+  cam.cx = s.cam.cx; cam.cy = s.cam.cy; cam.zoom = s.cam.zoom;
+  syncBar();
+  redraw();
+}
+
+// A deployed presentation's hammer leads here (`#edit=<name>`): its board,
+// its default view, and its settings in the Presentation folder, ready to
+// change and preview or export again. Not an edit, so no save is written
+// until the player changes something.
+async function openForEditing(name) {
+  const { rec, bytes } = await fetchPresentation(name);
+  await show(name, bytes);
+  applyViewState(rec.views[0]);
+  const rates = rec.rates || [];
+  const sch = rec.schedule || {};
+  panel.setPresent({
+    name, rate: String(rec.rate ?? 30),
+    rate1: String(rates[0] ?? ""), rate2: String(rates[1] ?? ""), rate3: String(rates[2] ?? ""), rate4: String(rates[3] ?? ""),
+    ticks: sch.ticks ?? 0, lerpStart: sch.lerpStart ?? 0, lerpEnd: sch.lerpEnd ?? 1, fadeIn: sch.fadeIn ?? 0.25, fadeOut: sch.fadeOut ?? 0.25,
+    startCamera: rec.startCamera || null, endCamera: rec.endCamera || null,
+    detail: rec.views[1] ? { ...rec.views[1], name: "detail" } : null,
+  });
+  if (Number(rec.rate) > 0) shell.setRate(Math.min(RATE_MAX, Math.max(RATE_MIN, Number(rec.rate))));
+  if (rec.startCamera) {
+    const f = fitBox(rec.startCamera, cam.w, cam.h);
+    cam.cx = f.cx; cam.cy = f.cy; cam.zoom = f.zoom;
+  }
+  redraw();
 }
 
 // The presentation page's handle on the app: everything present.js needs,
@@ -3340,6 +3486,7 @@ async function init() {
     if (e.target instanceof HTMLInputElement || e.target instanceof HTMLTextAreaElement) return;
     if (presenting) {
       if (e.code === "Space") { e.preventDefault(); presenter?.togglePlay(); }
+      if (e.code === "Escape" && previewSaved) { e.preventDefault(); exitPreview(); }
       return;
     }
     if (e.code === "Space") { e.preventDefault(); document.getElementById("btn-play").click(); }
@@ -3350,7 +3497,9 @@ async function init() {
 
   if (presenting) {
     window.addEventListener("hashchange", () => location.reload());
-    presenter = await startPresentation(presenting, presentApi);
+    // The hammer opens this presentation in the editor (openForEditing()).
+    presenter = await startPresentation(presenting, presentApi,
+      { onEdit: () => { location.hash = `#edit=${encodeURIComponent(presenting)}`; } });
     return;
   }
 
@@ -3371,9 +3520,15 @@ async function init() {
   } catch { /* none */ }
   panel.setSaves([...saves.map(n => ({ label: n, value: n })),
                   ...shows.map(n => ({ label: `${n} (presentation)`, value: `presentations/${n}.npz` }))], first);
-  // Pick up where the last session left off, if it saved anything.
+  // `#edit=<name>` (a presentation's hammer) opens that presentation;
+  // otherwise pick up where the last session left off, if it saved anything.
+  // The hash is dropped once read, so a reload does not open it again over
+  // the player's edits.
+  const editing = editName();
+  if (editing) window.history.replaceState(null, "", location.pathname + location.search);
   const resume = resumeSave();
-  if (resume) await loadLocal(resume.name);
+  if (editing) await openForEditing(editing).catch(e => { alert(`Could not open “${editing}”: ${e.message}`); });
+  else if (resume) await loadLocal(resume.name);
   else if (first) await loadBundled(first).catch(e => alert(e.message));
 
   for (const tier of AUTOSAVES) setInterval(() => autosave(tier), tier.ms);

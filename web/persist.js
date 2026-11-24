@@ -6,3 +6,8 @@
 let enabled = true;
 export const persistEnabled = () => enabled;
 export function freezePersist() { enabled = false; }
+// The editor's preview (main.js enterPreview()) freezes the stores while
+// the presentation's views are applied, and thaws them on the way back,
+// after putting the editor's own view back -- so the preview leaves the
+// player's preferences exactly as they were.
+export function unfreezePersist() { enabled = true; }
