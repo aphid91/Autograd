@@ -61,8 +61,10 @@ const ITEM_TEXT = { size: 0.3, glyph: 0.336 };   // its fade band: TUNE.itemText
 // `z` (which also sets sizes, so it cannot simply be swapped), so the
 // override rescales each threshold instead: z >= t * z / o exactly when
 // o >= t. `lodZ` is the zoom of the render in progress, set by render().
-let lodZ = 1;
-const lod = (t) => (TUNE.lodZoom > 0 ? t * lodZ / TUNE.lodZoom : t);
+// View > simple view is exactly an override of 1, and wins over the Dev
+// dial while ticked (`lodO`, also set by render()).
+let lodZ = 1, lodO = 0;
+const lod = (t) => (lodO > 0 ? t * lodZ / lodO : t);
 const LOD = {
   get beltSolid() { return lod(TUNE.lodBeltSolid); },
   get gridLines() { return lod(TUNE.lodGrid); },
@@ -136,6 +138,7 @@ export function render(ctx, board, cam, dpr, opts = {}) {
   const view = { ...DEFAULT_VIEW, ...opts };
   const z = cam.zoom;
   lodZ = z;
+  lodO = view.simpleView ? 1 : TUNE.lodZoom;
   LOOK.corner = Math.max(0, +view.corner || 0);
   LOOK.chevrons = view.chevronAlpha ?? 1;
   ctx.setTransform(1, 0, 0, 1, 0, 0);

@@ -18,7 +18,7 @@ const VIEW = {
   colours: { running: "#00ff00" },
   dev: { beltWidth: 1.2, forceBuild: false },
   layers: [{ id: 0, visible: true, active: true, tint: 0, label: 0 },
-           { id: 3, visible: false, active: false, tint: 0.7, label: 2 }],
+           { id: 3, name: "Memory", visible: false, active: false, tint: 0.7, label: 2 }],
   showLabels: false,
 };
 

@@ -489,6 +489,10 @@ from which items are ringed discs rather than plain squares (6); and the
 numbers fading in between two values, and a label's text appearing from
 one. `render.js`'s `LOD` reads them live through getters.
 
+**View > simple view** is exactly override zoom 1, and wins over the Dev
+dial while ticked (unticked, the dial applies as usual). It is in View, so
+it rides presets and presentation views.
+
 **Override zoom** (first in the zoom thresholds; 0 is off): above 0, the
 thresholds decide as if the zoom were that value, whatever the real zoom
 -- for a far-out view with full detail, or a close one without. The real
@@ -2086,7 +2090,7 @@ them: the panel's **Presentation** folder, and **Export presentation
   the default. A view is the panel's View, status colours and Dev dials
   (`Panel.captureView()` / `applyView()`) plus each layer's visible, active,
   tint and label size and the labels' master switch (`captureViewState()`
-  / `applyViewState()` in main.js; layers are matched by id).
+  / `applyViewState()` in main.js; layers are matched by name, below).
 - **Export** takes the board as it stands -- a selection put down first;
   audio settings and labels ride in the save -- the stored standard view as
   "default" (the view in front of the player if none is set), the captured
@@ -2102,7 +2106,7 @@ them: the panel's **Presentation** folder, and **Export presentation
   standard view means "the live view at Export", as before it existed, so
   a draft from before keeps its behaviour. `#edit=` fills both from the
   record.
-- **View presets** (Presentation > views > view presets;
+- **View presets** (View > presets, beside the settings they hold;
   [viewpresets.js](viewpresets.js)): a view -- the same record
   `captureViewState()` makes, minus its name -- kept under a name in this
   browser (`gates.web.viewPresets.v1`) and exported or imported as a tagged
@@ -2111,8 +2115,13 @@ them: the panel's **Presentation** folder, and **Export presentation
   where Set standard / detail view makes it either view. Cleaning on read
   is structural only (scalars, layer entries with an integer id);
   `applyViewState()` already takes only keys the panel knows, of the right
-  type, and only layers the board has by **id** -- so on another board the
-  panel dials apply in full and only the layers whose ids line up do.
+  type.
+- **Layers in a view are matched by name** (`layerKey()`: case and end
+  spaces ignored, as a paste's are), presets and presentation views alike,
+  so a view carries to another board: a layer whose name the view does not
+  mention, or a name the board lacks, is left alone; two layers of one name
+  both take it. A view recorded before names were (an older presentation
+  JSON) has none, and matches by id as it always did.
   `tests/viewpresets.test.mjs`.
 - **The page** shows the board, the sound button, Reset and Play/Pause
   (bottom middle), an **i** button cycling the views (hidden with only

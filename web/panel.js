@@ -107,11 +107,11 @@ export class Panel {
       board.addButton({ title: "Delete saved" }).on("click", () => this.local.saved && cb.onDeleteLocal(this.local.saved)),
     ];
 
-    this.view = { grid: false, ports: true, labels: true, seedTint: true, notes: true, momentum: true, items: true, belts: true, gates: true, gateStatus: true, sources: true, beltStatus: true, beltActive: true, statusGlow: 15, statusGlowTime: false, statusGlowS: 0.5, statusSluggish: 0, fps: false, pixelAlpha: 0, pixelMax: 8, pixelTextBg: true, layers: false, ...LOOK_DEFAULTS, ...this.prefs.view };
+    this.view = { grid: false, ports: true, labels: true, seedTint: true, notes: true, momentum: true, items: true, belts: true, gates: true, gateStatus: true, sources: true, beltStatus: true, beltActive: true, statusGlow: 15, statusGlowTime: false, statusGlowS: 0.5, statusSluggish: 0, fps: false, pixelAlpha: 0, pixelMax: 8, pixelTextBg: true, layers: false, simpleView: false, ...LOOK_DEFAULTS, ...this.prefs.view };
     if (!/^#[0-9a-f]{6}$/i.test(this.view.bg)) this.view.bg = LOOK_DEFAULTS.bg;
     const view = this.pane.addFolder({ title: "View", expanded: false });
     this.viewBindings = [];
-    for (const [key, label] of [["grid", "grid lines"], ["ports", "ports"], ["labels", "source values"], ["seedTint", "seed tint"], ["notes", "labels (notes)"], ["momentum", "pan momentum"], ["items", "items"], ["belts", "belts"], ["gates", "gates"], ["gateStatus", "gate status colours"], ["beltStatus", "belt status colours"], ["beltActive", "stalled but moving: green"], ["sources", "sources"], ["fps", "fps counter"], ["layers", "layers"]]) {
+    for (const [key, label] of [["grid", "grid lines"], ["ports", "ports"], ["labels", "source values"], ["seedTint", "seed tint"], ["notes", "labels (notes)"], ["momentum", "pan momentum"], ["items", "items"], ["belts", "belts"], ["gates", "gates"], ["gateStatus", "gate status colours"], ["beltStatus", "belt status colours"], ["beltActive", "stalled but moving: green"], ["sources", "sources"], ["fps", "fps counter"], ["layers", "layers"], ["simpleView", "simple view"]]) {
       this.viewBindings.push(view.addBinding(this.view, key, { label }).on("change", () => {
         if (this.applyingView) return;
         this.prefs.view = { ...this.view };
@@ -138,6 +138,24 @@ export class Panel {
       savePrefs(this.prefs);
       cb.onView({ ...this.view });
     }));
+
+    // View > presets (viewpresets.js): the whole view -- View, status
+    // colours, Dev dials, layers -- under a name, in this browser and as
+    // .json files. Loading one sets the view in front of the player, so
+    // "load preset, then Presentation > Set standard view" makes it that.
+    const vpre = view.addFolder({ title: "presets", expanded: false });
+    this.viewPresetFolder = vpre;
+    this.viewPreset = { name: "", saved: "" };
+    vpre.addBinding(this.viewPreset, "name", { label: "name" });
+    this.viewPresetSaveBtn = vpre.addButton({ title: "Save current view as preset" });
+    this.viewPresetSaveBtn.on("click", () => cb.onSaveViewPreset?.(this.viewPreset.name.trim()));
+    this.viewPresetBinding = null;
+    this.viewPresetActions = [
+      vpre.addButton({ title: "Load preset" }).on("click", () => this.viewPreset.saved && cb.onLoadViewPreset?.(this.viewPreset.saved)),
+      vpre.addButton({ title: "Export preset .json" }).on("click", () => this.viewPreset.saved && cb.onExportViewPreset?.(this.viewPreset.saved)),
+      vpre.addButton({ title: "Delete preset" }).on("click", () => this.viewPreset.saved && cb.onDeleteViewPreset?.(this.viewPreset.saved)),
+    ];
+    vpre.addButton({ title: "Import preset .json…" }).on("click", () => cb.onImportViewPreset?.());
 
     // View > look: the board's colour, rounded machine corners, chevron
     // opacity, and the bloom (bloom.js). Per player, with the panel's
@@ -320,22 +338,6 @@ export class Panel {
     this.loadDetailBtn = pviews.addButton({ title: "Load detail view" }).on("click", () => cb.onPresent("loadDetail"));
     this.clearDetailBtn = pviews.addButton({ title: "Clear detail view" }).on("click", () => cb.onPresent("clearDetail"));
 
-    // View presets (viewpresets.js): a view under a name, in this browser
-    // and as .json files. Loading one sets the view in front of the player,
-    // so "load preset, then Set standard view" makes it the standard view.
-    const vpre = pviews.addFolder({ title: "view presets", expanded: false });
-    this.viewPresetFolder = vpre;
-    this.viewPreset = { name: "", saved: "" };
-    vpre.addBinding(this.viewPreset, "name", { label: "name" });
-    this.viewPresetSaveBtn = vpre.addButton({ title: "Save current view as preset" });
-    this.viewPresetSaveBtn.on("click", () => cb.onSaveViewPreset?.(this.viewPreset.name.trim()));
-    this.viewPresetBinding = null;
-    this.viewPresetActions = [
-      vpre.addButton({ title: "Load preset" }).on("click", () => this.viewPreset.saved && cb.onLoadViewPreset?.(this.viewPreset.saved)),
-      vpre.addButton({ title: "Export preset .json" }).on("click", () => this.viewPreset.saved && cb.onExportViewPreset?.(this.viewPreset.saved)),
-      vpre.addButton({ title: "Delete preset" }).on("click", () => this.viewPreset.saved && cb.onDeleteViewPreset?.(this.viewPreset.saved)),
-    ];
-    vpre.addButton({ title: "Import preset .json…" }).on("click", () => cb.onImportViewPreset?.());
     this.presentText = { text: "" };
     pres.addBinding(this.presentText, "text", { label: "", readonly: true, multiline: true, rows: 3, interval: 250 });
     // The presentation these settings describe, on this board, in this page;

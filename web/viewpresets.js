@@ -4,7 +4,7 @@
 // makes and applyViewState() takes:
 //
 //   { view, colours, dev,            the panel's View, status colours, Dev dials
-//     layers: [{ id, visible, active, tint, label }],   matched by id on load
+//     layers: [{ id, name, visible, active, tint, label }],   matched by name on load
 //     showLabels }                   the labels' master switch
 //
 // Kept in this browser and as a tagged .json file, like audio presets
@@ -13,9 +13,9 @@
 //
 // Cleaning here is structural only (objects, a list of layer entries with
 // an integer id); applyViewState() already takes a key only when the panel
-// knows it and the type matches, and a layer only when the board has that
-// id -- so a preset made on another board sets the panel and whichever
-// layers line up, and leaves the rest alone.
+// knows it and the type matches, and a layer only when the board has one of
+// that name -- so a preset made on another board sets the panel and
+// whichever layers share a name, and leaves the rest alone.
 //
 // Pure apart from the storage, which is passed in (localStorage in the app,
 // a Map-backed stand-in in the tests).
@@ -35,6 +35,7 @@ const plain = (o) => {
 function cleanLayer(l) {
   if (!l || typeof l !== "object" || !Number.isInteger(l.id)) return null;
   const out = { id: l.id };
+  if (typeof l.name === "string") out.name = l.name;
   if (typeof l.visible === "boolean") out.visible = l.visible;
   if (typeof l.active === "boolean") out.active = l.active;
   if (Number.isFinite(l.tint)) out.tint = l.tint;

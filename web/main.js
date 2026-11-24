@@ -13,7 +13,7 @@ import { render, BASE_COLOURS } from "./render.js";
 import { LayerPanel } from "./layerpanel.js";
 import { SCALE_PRESETS, SCALE_NAMES, compileScale, parseLut, scaleTable, scaleHz, noteName } from "./scale.js";
 import { BACKGROUND, byId, addLayer, removeLayer, renameLayer, setCurrent, isVisible, isActive,
-         setForActive, layerStats, mix, parseCss, rgbCss, isolate, tagLayers, resolveLayers } from "./layers.js";
+         setForActive, layerStats, mix, parseCss, rgbCss, isolate, tagLayers, resolveLayers, layerKey } from "./layers.js";
 import { Shell } from "./ui.js";
 import { Panel, STATUS_COLOUR_DEFAULTS } from "./panel.js";
 import { ROUTE_NAMES, ROUTE_H_FIRST, ROUTE_V_FIRST, chooseRoute, planRun, routeWorks, turnTip } from "./planner.js";
@@ -3409,23 +3409,36 @@ function captureViewState(name = "default") {
   const t = board.layers;
   return {
     name, ...panel.captureView(),
-    layers: t.list.map(l => ({ id: l.id, visible: l.visible, active: l.active, tint: l.tint, label: l.label })),
+    layers: t.list.map(l => ({ id: l.id, name: l.name, visible: l.visible, active: l.active, tint: l.tint, label: l.label })),
     showLabels: t.showLabels !== false,
   };
+}
+function applyLayerView(l, s) {
+  if (typeof s.visible === "boolean") l.visible = s.visible;
+  if (typeof s.active === "boolean") l.active = s.active;
+  if (l.id !== BACKGROUND && Number.isFinite(s.tint)) l.tint = s.tint;
+  if (l.id !== BACKGROUND && Number.isFinite(s.label)) l.label = s.label;
 }
 function applyViewState(v) {
   panel.applyView(v);
   if (board && Array.isArray(v.layers)) {
     const t = board.layers;
+    // Matched by name (case and end spaces ignored, as a paste's layers
+    // are), so a view carries to another board; a layer the view does not
+    // name, or a name the board lacks, is left alone. Every layer of that
+    // name takes it. A view from before names were recorded matches by id.
+    const byName = new Map();
+    for (const l of t.list) {
+      const k = layerKey(l.name);
+      if (!byName.has(k)) byName.set(k, []);
+      byName.get(k).push(l);
+    }
     for (const s of v.layers) {
-      const l = byId(t, s.id);
-      if (!l) continue;
-      if (typeof s.visible === "boolean") l.visible = s.visible;
-      if (typeof s.active === "boolean") l.active = s.active;
-      if (l.id !== BACKGROUND && Number.isFinite(s.tint)) l.tint = s.tint;
-      if (l.id !== BACKGROUND && Number.isFinite(s.label)) l.label = s.label;
+      const ls = typeof s.name === "string" ? byName.get(layerKey(s.name)) || [] : [byId(t, s.id)].filter(Boolean);
+      for (const l of ls) applyLayerView(l, s);
     }
     if (typeof v.showLabels === "boolean") t.showLabels = v.showLabels;
+
     // The current layer is always visible and active; a view hiding it moves
     // "current" to the first layer it leaves showing.
     const cur = byId(t, t.current);
