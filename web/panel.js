@@ -239,12 +239,18 @@ export class Panel {
       savePrefs(this.prefs);
       // A refresh from applyAudio() fires change too (Tweakpane re-snaps
       // to the step): a load, not the player, so not reported.
+      if (this.advFolder) this.advFolder.hidden = !this.audio.advAudio;
       if (!this.applyingAudio) cb.onAudio({ ...this.audio });
     };
     const audioBindings = this.audioBindings = [];
     let agroup = audio;
     for (const [key, label, opts] of AUDIO_SPEC) {
-      if (key === "---") { agroup = audio.addFolder({ title: label, expanded: false }); continue; }
+      if (key === "---") {
+        agroup = audio.addFolder({ title: label, expanded: false });
+        // Audio > advanced shows only while its switch is on.
+        if (opts?.adv) { this.advFolder = agroup; agroup.hidden = !this.audio.advAudio; }
+        continue;
+      }
       audioBindings.push(agroup.addBinding(this.audio, key, { label, ...(opts || {}) }).on("change", pushAudio));
     }
     // The sound selection: the selected entities are the only ones heard
@@ -435,6 +441,7 @@ export class Panel {
     Object.assign(this.audio, dials);
     this.applyingAudio = true;
     try { for (const b of this.audioBindings) b.refresh(); } finally { this.applyingAudio = false; }
+    if (this.advFolder) this.advFolder.hidden = !this.audio.advAudio;
     this.prefs.audio = { ...this.audio };
     savePrefs(this.prefs);
   }

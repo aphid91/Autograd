@@ -111,6 +111,12 @@ export class GatesSynth {
     this.vFT = new Uint8Array(V); this.vFT0 = new Uint8Array(V);
     this.vX = new Float64Array(V); this.vPhF = new Float64Array(V);
     this.vLpAF = new Float64Array(V).fill(1); this.vLpYF = new Float64Array(V);
+    this.vAtkF = new Float64Array(V); this.vRelF = new Float64Array(V);   // the falsy envelope (= vAtk/vRel unless advanced)
+    // Advanced audio: the tremolo/vibrato, per half, as per-sample gain and
+    // pitch factors over the span being rendered (lfo()); off, never read.
+    this.lfoOn = false; this.lfoOff = 0;
+    this.lfGT = new Float64Array(0); this.lfPT = new Float64Array(0);
+    this.lfGF = new Float64Array(0); this.lfPF = new Float64Array(0);
     this.cTruth = new Uint8Array(0);     // per candidate: its run's truthiness (1 truthy)
     this.tableF = new Float32Array(TABLE + 1);
     this.shapeF = -1;
@@ -144,6 +150,13 @@ export class GatesSynth {
     const R = RES_SLOTS;
     this.R = 0; this.resS = 0; this.resT = 0; this.resF = 0;
     this.rowHas = new Uint8Array(R);
+    // Advanced audio's noise exciter, per resonator: the share of a click
+    // that is a noise burst (0: the impulse alone, never read), its scale,
+    // its per-sample decay, the burst's level now, and its own noise
+    // generator -- one per resonator, so a bake is the same however it is
+    // chunked.
+    this.rNoise = new Float64Array(R); this.rNScale = new Float64Array(R); this.rNDec = new Float64Array(R);
+    this.nAmp = new Float64Array(R); this.nzS = new Uint32Array(R).map((_, r) => 0x9e3779b9 ^ (r * 2654435761));
     this.ry1 = new Float64Array(R); this.ry2 = new Float64Array(R);
     this.rc1 = new Float64Array(R); this.rc2 = new Float64Array(R); this.rx = new Float64Array(R);
     this.hx1 = this.hx2 = this.hy1 = this.hy2 = 0;   // the low cut's state
@@ -190,31 +203,46 @@ export class GatesSynth {
     // changes (a slider drag elsewhere must not recompile the formula).
     const sk = `${p.scaleMode}|${p.scaleExpr}|${p.scaleLut}|${p.beltMinLen}`;
     if (sk !== this.scaleKey) { this.scaleKey = sk; this.scale = scaleTable(p).f; }
-    if (p.beltShape !== this.shape) this.buildTable(p.beltShape);
+    const adv = this.adv = !!p.advAudio;
+    // The drone's waveform: the shape dial, blended toward a pulse with
+    // advanced audio (rebuilt only when what it depends on changes).
+    const tk = adv && p.beltPulse > 0 ? `${p.beltShape}|${p.beltPulse}|${p.beltPW}` : p.beltShape;
+    if (tk !== this.shape) { this.shape = tk; this.fillTable(this.table, p.beltShape, adv ? p.beltPulse : 0, p.beltPW); }
     // The resonators' layout; a new one drops whatever was ringing.
     const N = Math.min(RES_MAX, Math.max(1, Math.round(p.clickRes) || 5)), tr = !!p.truthAudio;
     const nT = tr ? Math.ceil(N / 2) : N, nF = tr ? Math.max(1, N - nT) : 0;
     if (nT !== this.resT || nF !== this.resF) {
       this.resT = nT; this.resF = nF; this.resS = nT + nF; this.R = 2 * this.resS;
-      this.ry1.fill(0); this.ry2.fill(0); this.imp.fill(0); this.evN = 0;
+      this.ry1.fill(0); this.ry2.fill(0); this.imp.fill(0); this.nAmp.fill(0); this.evN = 0;
     }
-    const tune = (g, base, n, tone0, decay, detune) => {
+    const tune = (g, base, n, tone0, decay, detune, noise, noiseMs) => {
       const r = Math.exp(-1 / Math.max(1, sr * decay / 1000));
+      const nLen = Math.max(1, sr * noiseMs / 1000);
       for (let j = 0; j < n; j++) {
         const k = base + j;
         const tone = Math.min(tone0 * Math.pow(2, (detune || 0) * detuneAt(j, n) / 12), sr * 0.45);
         const w = 2 * Math.PI * tone / sr;
         this.rc1[k] = 2 * r * Math.cos(w); this.rc2[k] = -r * r;
         this.rx[k] = Math.sin(w);        // impulse scale: the response peaks near 1
+        // The noise burst: about as loud as the impulse it replaces.
+        this.rNoise[k] = adv ? Math.min(1, Math.max(0, noise || 0)) : 0;
+        this.rNScale[k] = this.rx[k] * 4 / Math.sqrt(nLen);
+        this.rNDec[k] = Math.exp(-1 / nLen);
       }
     };
     for (let g = 0; g < 2; g++) {
-      tune(g, g * this.resS, nT, p[`g${g}Tone`], p[`g${g}DecayMs`], p.clickDetune);
-      if (nF) tune(g, g * this.resS + nT, nF, p[`g${g}ToneF`], p[`g${g}DecayMsF`], p.clickDetuneF);
+      tune(g, g * this.resS, nT, p[`g${g}Tone`], p[`g${g}DecayMs`], p.clickDetune, p.clickNoise, p.clickNoiseMs);
+      if (nF) tune(g, g * this.resS + nT, nF, p[`g${g}ToneF`], p[`g${g}DecayMsF`], p.clickDetuneF, p.clickNoiseF, p.clickNoiseMsF);
     }
+    // Tremolo and vibrato, per half, with advanced audio.
+    this.lfoT = adv && (p.tremDepth > 0 || p.vibDepth > 0);
+    this.lfoF = adv && tr && (p.tremDepthF > 0 || p.vibDepthF > 0);
+    this.lfoOn = this.lfoT || this.lfoF;
+    if (!tr) { this.trF = 1; this.xStep = 1; }
     // The falsy drone: its waveform, transposition, low-pass and crossfade.
     if (tr) {
-      if (p.beltShapeF !== this.shapeF) { this.shapeF = p.beltShapeF; this.fillTable(this.tableF, p.beltShapeF); }
+      const tkF = adv && p.beltPulseF > 0 ? `${p.beltShapeF}|${p.beltPulseF}|${p.beltPWF}` : p.beltShapeF;
+      if (tkF !== this.shapeF) { this.shapeF = tkF; this.fillTable(this.tableF, p.beltShapeF, adv ? p.beltPulseF : 0, p.beltPWF); }
       this.trF = Math.pow(2, (p.beltTransposeF || 0) / 12);
       this.xStep = p.truthXfadeMs > 0 ? 1000 / (p.truthXfadeMs * sr) : 1;
       for (let v = 0; v < this.nv; v++) if (this.vSeg[v] >= 0) this.vLpAF[v] = this.lpCoefF(this.vSeg[v]);
@@ -239,6 +267,29 @@ export class GatesSynth {
     const coef = (ms) => 1 - Math.exp(-1 / Math.max(1, this.sr * ms * k / 1000));
     this.vAtk[v] = coef(p.attackMs);
     this.vRel[v] = coef(p.releaseMs);
+    // The falsy half's own envelope, with advanced audio and truthiness.
+    const own = this.adv && p.truthAudio;
+    this.vAtkF[v] = own ? coef(p.attackMsF) : this.vAtk[v];
+    this.vRelF[v] = own ? coef(p.releaseMsF) : this.vRel[v];
+  }
+
+  // Advanced audio's tremolo and vibrato over `len` samples from absolute
+  // sample `abs0`: a function of the sample clock alone, so how the
+  // rendering is split never changes it. The truthy half's dials, then the
+  // falsy half's; a half with nothing set stays at 1.
+  lfo(len, abs0, off) {
+    this.lfoOff = off;
+    if (this.lfGT.length < len) for (const k of ["lfGT", "lfPT", "lfGF", "lfPF"]) this[k] = new Float64Array(Math.max(len, 128));
+    const p = this.p, sr = this.sr, TAU = 2 * Math.PI;
+    const fill = (on, G, P, tR, tD, vR, vD) => {
+      for (let q = 0; q < len; q++) {
+        const t = (abs0 + q) / sr;
+        G[q] = on && tD > 0 ? 1 - tD * 0.5 * (1 - Math.cos(TAU * tR * t)) : 1;
+        P[q] = on && vD > 0 ? Math.pow(2, vD * Math.sin(TAU * vR * t) / 12) : 1;
+      }
+    };
+    fill(this.lfoT, this.lfGT, this.lfPT, p.tremRate, p.tremDepth, p.vibRate, p.vibDepth);
+    fill(this.lfoF, this.lfGF, this.lfPF, p.tremRateF, p.tremDepthF, p.vibRateF, p.vibDepthF);
   }
 
   // A run's own gain: the tone dials for lengths 1-6, 1 for anything longer.
@@ -258,13 +309,20 @@ export class GatesSynth {
     this.shape = s;
     this.fillTable(this.table, s);
   }
-  fillTable(table, s) {
+  // `pulse` (advanced audio) blends toward a pulse wave `pw` of the cycle
+  // high, centred so it has no offset; 0 leaves the shape exactly as it was.
+  fillTable(table, s, pulse = 0, pw = 0.5) {
     for (let i = 0; i <= TABLE; i++) {
       const x = (i % TABLE) / TABLE;
       const sine = Math.sin(2 * Math.PI * x);
       const tri = x < 0.25 ? 4 * x : x < 0.75 ? 2 - 4 * x : 4 * x - 4;
       const saw = x < 0.5 ? 2 * x : 2 * x - 2;
       table[i] = s < 0.5 ? sine + (tri - sine) * s * 2 : tri + (saw - tri) * (s - 0.5) * 2;
+      if (pulse > 0) {
+        const w = Math.min(0.5, Math.max(0.01, pw));
+        const pv = (x < w ? 1 : -1) - (2 * w - 1);   // mean zero
+        table[i] += (pv - table[i]) * pulse;
+      }
     }
   }
 
@@ -433,7 +491,11 @@ export class GatesSynth {
     if (this.logging) {
       this.vTgt0[v] = 0;
       this.logOn(v, 1);
-      const ph = -this.logAt * this.vInc[v];
+      // Under vibrato the pitch moved over those samples: wound back by
+      // what they actually advanced.
+      let span = this.logAt;
+      if (this.lfoOn) { span = 0; for (let q = 0; q < this.logAt; q++) span += this.lfPT[q]; }
+      const ph = -span * this.vInc[v];
       this.vPhase[v] = ph - Math.floor(ph);
     }
     this.vGain[v] = this.lenGain(i);
@@ -443,7 +505,9 @@ export class GatesSynth {
     this.vFT[v] = this.vFT0[v] = this.vX[v] = this.cTruth[i] ? 0 : 1;
     // The falsy oscillator is wound back as the truthy one is, at its own
     // rate, so both are at 0 where the voice starts.
-    const phF = this.logging && this.p.truthAudio ? -this.logAt * Math.min(this.vInc[v] * this.trF, 0.45) : 0;
+    let spanF = this.logAt;
+    if (this.logging && this.lfoOn) { spanF = 0; for (let q = 0; q < this.logAt; q++) spanF += this.lfPF[q]; }
+    const phF = this.logging && this.p.truthAudio ? -spanF * Math.min(this.vInc[v] * this.trF, 0.45) : 0;
     this.vPhF[v] = phF - Math.floor(phF); this.vLpYF[v] = 0;
     if (this.p.truthAudio) this.vLpAF[v] = this.lpCoefF(i);
     this.envFor(v, i);
@@ -466,6 +530,7 @@ export class GatesSynth {
       this.vAtk[v] = this.vAtk[last]; this.vRel[v] = this.vRel[last];
       this.vS[v] = this.vS[last]; this.vLpA[v] = this.vLpA[last]; this.vLpY[v] = this.vLpY[last];
       this.vFT[v] = this.vFT[last]; this.vFT0[v] = this.vFT0[last]; this.vX[v] = this.vX[last];
+      this.vAtkF[v] = this.vAtkF[last]; this.vRelF[v] = this.vRelF[last];
       this.vPhF[v] = this.vPhF[last]; this.vLpAF[v] = this.vLpAF[last]; this.vLpYF[v] = this.vLpYF[last];
       if (this.vSeg[v] >= 0) this.voiceOf[this.vSeg[v]] = v;
     }
@@ -695,8 +760,12 @@ export class GatesSynth {
   renderBlock(out, n) {
     const sr = this.sr, nv0 = this.nv;
     for (let v = 0; v < nv0; v++) this.vTgt0[v] = this.vOn[v];
-    const truth = !!this.p.truthAudio;
+    // Truthiness, or advanced audio's tremolo/vibrato: the two-oscillator
+    // voice (truthRun()); otherwise the plain one, exactly as before.
+    const truth = !!this.p.truthAudio || this.lfoOn;
     if (truth) for (let v = 0; v < nv0; v++) this.vFT0[v] = this.vFT[v];
+    // Before the walk, which allocates voices against it (alloc()).
+    if (this.lfoOn) this.lfo(n, this.abs, 0);
     this.lgN = 0; this.segN = 0;
     this.pushSeg(0);
     this.logging = true; this.logAt = 0;
@@ -819,28 +888,33 @@ export class GatesSynth {
   truthRun(out, v, s, e, tgt, ft, gT, gF) {
     if (s >= e) return;
     const T = this.table, TF = this.tableF, xs = this.xStep;
-    const inc = this.vInc[v], incF = Math.min(inc * this.trF, 0.45), coef = tgt ? this.vAtk[v] : this.vRel[v];
+    const inc = this.vInc[v], incF = Math.min(inc * this.trF, 0.45);
+    // The envelope runs at the pace of the half it is heading for (the two
+    // are the same unless advanced audio gives the falsy half its own).
+    const coef = tgt ? (ft ? this.vAtkF[v] : this.vAtk[v]) : (ft ? this.vRelF[v] : this.vRel[v]);
     const aT = this.vLpA[v], aF = this.vLpAF[v];
+    const L = this.lfoOn, lo = this.lfoOff, GT = this.lfGT, PT = this.lfPT, GF = this.lfGF, PF = this.lfPF;
     let env = this.vEnv[v], ph = this.vPhase[v], phF = this.vPhF[v], x = this.vX[v], yT = this.vLpY[v], yF = this.vLpYF[v];
     for (; s < e; s++) {
       if (x !== ft) x = ft > x ? Math.min(ft, x + xs) : Math.max(ft, x - xs);
       env += (tgt - env) * coef;
-      let o = 0;
+      let o = 0, gt = gT, gf = gF, iT = inc, iF = incF;
+      if (L) { const q = s - lo; gt *= GT[q]; gf *= GF[q]; iT *= PT[q]; iF *= PF[q]; }
       if (x < 1) {
         const fi = ph * TABLE, j = fi | 0;
         let w = T[j] + (T[j + 1] - T[j]) * (fi - j);
         if (aT < 1) { yT += aT * (w - yT); w = yT; }
-        o += (1 - x) * gT * w;
+        o += (1 - x) * gt * w;
       }
       if (x > 0) {
         const fi = phF * TABLE, j = fi | 0;
         let w = TF[j] + (TF[j + 1] - TF[j]) * (fi - j);
         if (aF < 1) { yF += aF * (w - yF); w = yF; }
-        o += x * gF * w;
+        o += x * gf * w;
       }
       out[s] += env * o;
-      ph += inc; if (ph >= 1) ph -= 1;
-      phF += incF; if (phF >= 1) phF -= 1;
+      ph += iT; if (ph >= 1) ph -= 1;
+      phF += iF; if (phF >= 1) phF -= 1;
     }
     this.vEnv[v] = env; this.vPhase[v] = ph; this.vPhF[v] = phF; this.vX[v] = x; this.vLpY[v] = yT; this.vLpYF[v] = yF;
   }
@@ -890,8 +964,33 @@ export class GatesSynth {
       let y1 = this.ry1[r], y2 = this.ry2[r];
       const has = rowHas[r];
       rowHas[r] = 0;
-      if (y1 === 0 && y2 === 0 && this.imp[r] === 0 && !has) continue;   // silent
+      if (y1 === 0 && y2 === 0 && this.imp[r] === 0 && !has && this.nAmp[r] === 0) continue;   // silent
       const c1 = this.rc1[r], c2 = this.rc2[r], rx = this.rx[r];
+      const m = this.rNoise[r];
+      if (m > 0 || this.nAmp[r] > 0) {
+        // Advanced audio's noise exciter: a share m of each click is a
+        // burst of noise into the resonator, decaying over the dial's time.
+        const ns = this.rNScale[r], dec = this.rNDec[r], inj = this.inj, o = r * len;
+        let na = this.nAmp[r] + this.imp[r] * m * ns, st = this.nzS[r], x = this.imp[r] * rx * (1 - m);
+        this.imp[r] = 0;
+        for (let s = 0; s < len; s++) {
+          if (has) { const a = inj[o + s]; if (a !== 0) { x += a * rx * (1 - m); na += a * m * ns; inj[o + s] = 0; } }
+          if (na > 0) {
+            st = (Math.imul(st, 1664525) + 1013904223) >>> 0;
+            x += na * (st / 2147483648 - 1);
+            na *= dec;
+            if (na < 1e-12) na = 0;
+          }
+          let y = c1 * y1 + c2 * y2 + x;
+          x = 0;
+          if (y < 1e-20 && y > -1e-20) y = 0;
+          y2 = y1; y1 = y;
+          out[at + s] += y;
+        }
+        this.nAmp[r] = na; this.nzS[r] = st;
+        this.ry1[r] = y1; this.ry2[r] = y2;
+        continue;
+      }
       let x = this.imp[r] * rx;
       this.imp[r] = 0;
       // A click that has died away is flushed to zero per sample (no
@@ -938,7 +1037,8 @@ export class GatesSynth {
       this.ampS = this.ampS < 0 ? want : this.ampS + (want - this.ampS) * glide;
       amp = this.ampS;
     } else this.ampS = -1;
-    if (this.p.truthAudio) {
+    if (this.p.truthAudio || this.lfoOn) {
+      if (this.lfoOn) this.lfo(len, this.abs - len, at);
       const ampF = this.ampFalsy(glide);
       for (let v = 0; v < this.nv; v++) {
         if (this.spaced && this.vSeg[v] >= 0) this.vS[v] += (this.sGain[this.vSeg[v]] - this.vS[v]) * glide;

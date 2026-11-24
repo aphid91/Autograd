@@ -2003,6 +2003,47 @@ audio presets and bakes like any dial.
   closed, a voice allocated mid-block warms its filter over the block's
   silent start, as the distance low-pass does (under 1%).
 
+### Advanced audio
+
+Audio > **advanced audio** (a switch beside truthiness) shows Audio >
+**advanced** and turns on four timbre features. Off, the folder is hidden
+and the synth reads none of its dials: every advanced branch is behind a
+flag set in `applyParams()`, and `tests/advaudio.test.mjs` asserts the
+output is **bit-identical** whatever the advanced dials hold, and also with
+the switch on at its defaults. Each feature has a truthy dial set (applied
+to everything) and a falsy one (only with truthiness on). The dials ride
+saves, audio presets and bakes like any dial.
+
+- **Falsy envelope** (`attackMsF`, `releaseMsF`): a falsy run's own attack
+  and release, sluggishness included. The envelope runs at the pace of the
+  half it is heading for (`vAtkF`/`vRelF`, equal to the truthy ones
+  otherwise), so e.g. truthy runs sustain while falsy ones pluck.
+- **Pulse wave** (`beltPulse`, `beltPW`): blends the sine/tri/saw table
+  toward a mean-zero pulse of the given width -- a square at 0.5, nasal
+  below. Only the table changes (rebuilt when the dials move), so it costs
+  nothing per sample.
+- **Tremolo and vibrato** (`trem*`, `vib*`: Hz, and depth -- a share of
+  the gain, or semitones): per-sample gain and pitch factors for each half,
+  computed once per span (`lfo()`) as a function of the **absolute sample
+  clock**, so how the rendering is split never changes them; then every
+  voice multiplies by them. With either on, voices take the two-oscillator
+  path (`truthRun()`) even with truthiness off. A voice allocated mid-block
+  winds its phase back by the pitch it would actually have advanced, or
+  the block renderer drifts from the per-tick reference under vibrato.
+- **Noise exciter** (`clickNoise`, `clickNoiseMs`): a share of each click
+  becomes a burst of noise into its resonator, decaying over the dial's
+  time, scaled to about the impulse's loudness -- a "tsk" rather than a
+  ping, and with a long burst a snare-like wash. Each resonator has its
+  own noise generator, so a bake is the same however it is chunked;
+  resonators with no noise take the old loop.
+
+`tests/advaudio.test.mjs`: off and at defaults bit-identical; with every
+feature on, a bake chunked two ways identical and the block renderer equal
+to the per-tick reference; the pulse's duty cycle; tremolo's dip and
+vibrato's spread of periods; a noise burst still ringing where an impulse
+has died; and a falsy run's own attack. Mutation-tested: the noise read
+while off, and the vibrato wind-back dropped, each fail it.
+
 **Presets** (Audio > presets; [audiopresets.js](audiopresets.js)) carry a
 sound between saves: the same record a save holds (every dial, the scale
 included, and the Bake dialog's seconds and rate -- not the switch, the
