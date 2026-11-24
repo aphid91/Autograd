@@ -37,6 +37,7 @@ import * as P from "./prof.js";
 import { applyDelta, exportFull, boardMessage } from "./simhost.js";
 import { freezePersist, unfreezePersist, persistEnabled } from "./persist.js";
 import { presetNames, readPresets, putPreset, deletePreset, presetFile, parsePresetFile } from "./audiopresets.js";
+import { viewPresetNames, readViewPresets, putViewPreset, deleteViewPreset, viewPresetFile, parseViewPresetFile } from "./viewpresets.js";
 import { writeZip } from "./npz.js";
 import { spaceWeights, spaceKey, fringeOf } from "./space.js";
 import { noteAt, gripAt, isText, newRect, MIN_W, MIN_H } from "./notes.js";
@@ -374,6 +375,76 @@ const presetActions = {
       }
       refreshPresets(got.name);
       toast(`Imported audio preset "${got.name}".`);
+    };
+    input.click();
+  },
+};
+
+// View presets (viewpresets.js): everything a presentation view holds -- the
+// panel's View, status colours and Dev dials, each layer's view and the
+// labels' switch -- under a name, in this browser or a .json file. Loading
+// one sets the view in front of the player (applyViewState(), layers matched
+// by id), from where Set standard / detail view captures it.
+const viewPresetStore = () => (persistEnabled() ? localStorage : null);
+function refreshViewPresets(selected) {
+  const st = viewPresetStore();
+  panel.setViewPresets(st ? viewPresetNames(st) : [], selected);
+}
+function applyViewPreset(record) {
+  applyViewState(record);
+  redraw();
+}
+const viewPresetActions = {
+  onSaveViewPreset: (name) => {
+    const st = viewPresetStore();
+    if (!st || !board) return;
+    if (!name) { alert("Give the preset a name first."); return; }
+    if (name in readViewPresets(st) && !confirm(`Replace the view preset "${name}"?`)) return;
+    try { refreshViewPresets(putViewPreset(st, name, captureViewState())); toast(`Saved view preset "${name}".`); }
+    catch (err) { alert(`Could not save the preset: ${err.message}`); }
+  },
+  onLoadViewPreset: (name) => {
+    const st = viewPresetStore();
+    const r = st && readViewPresets(st)[name];
+    if (!r) { refreshViewPresets(); return; }
+    applyViewPreset(r);
+    toast(`Loaded view preset "${name}".`);
+  },
+  onDeleteViewPreset: (name) => {
+    const st = viewPresetStore();
+    if (!st || !confirm(`Delete the view preset "${name}"?`)) return;
+    deleteViewPreset(st, name);
+    refreshViewPresets();
+  },
+  onExportViewPreset: (name) => {
+    const st = viewPresetStore();
+    const r = st && readViewPresets(st)[name];
+    if (!r) return;
+    const a = document.createElement("a");
+    a.href = URL.createObjectURL(new Blob([viewPresetFile(name, r)], { type: "application/json" }));
+    a.download = `${name.replace(/[^\w.-]+/g, "_")}.view.json`;
+    a.click();
+    setTimeout(() => URL.revokeObjectURL(a.href), 10000);
+  },
+  // Applied at once and kept in the list under its own name, as an audio
+  // preset's import is.
+  onImportViewPreset: () => {
+    const input = document.createElement("input");
+    input.type = "file";
+    input.accept = ".json,application/json";
+    input.onchange = async () => {
+      const f = input.files?.[0];
+      if (!f) return;
+      let got;
+      try { got = parseViewPresetFile(await f.text(), f.name.replace(/(\.view)?\.json$/i, "")); }
+      catch (err) { alert(`Could not import "${f.name}": ${err.message}`); return; }
+      applyViewPreset(got.record);
+      const st = viewPresetStore();
+      if (st && (!(got.name in readViewPresets(st)) || confirm(`Replace the view preset "${got.name}" with the imported one?`))) {
+        try { putViewPreset(st, got.name, got.record); } catch (err) { alert(`Could not keep the preset: ${err.message}`); }
+      }
+      refreshViewPresets(got.name);
+      toast(`Imported view preset "${got.name}".`);
     };
     input.click();
   },
@@ -3374,8 +3445,12 @@ async function presentAction(kind) {
   if (kind === "start") panel.setPresent({ startCamera: box() });
   else if (kind === "end") panel.setPresent({ endCamera: box() });
   else if (kind === "clearEnd") panel.setPresent({ endCamera: null });
-  else if (kind === "detail") panel.setPresent({ detail: captureViewState("detail") });
+  else if (kind === "standard") { panel.setPresent({ standard: captureViewState("default") }); toast("Standard view set."); }
+  else if (kind === "clearStandard") panel.setPresent({ standard: null });
+  else if (kind === "loadStandard") { if (panel.present.standard) { applyViewState(panel.present.standard); toast("Standard view loaded."); } }
+  else if (kind === "detail") { panel.setPresent({ detail: captureViewState("detail") }); toast("Detail view set."); }
   else if (kind === "clearDetail") panel.setPresent({ detail: null });
+  else if (kind === "loadDetail") { if (panel.present.detail) { applyViewState(panel.present.detail); toast("Detail view loaded."); } }
   else if (kind === "export") await exportPresentation();
   else if (kind === "preview") { await enterPreview(); return; }
   redraw();
@@ -3395,7 +3470,8 @@ function presentationNow(verb) {
   const fit = b ? { cx: (b.minX + b.maxX) / 2, cy: (b.minY + b.maxY) / 2,
                     hw: Math.max(1, b.maxX - b.minX) * 0.575, hh: Math.max(1, b.maxY - b.minY) * 0.575 }
                 : viewBox(cam);
-  const views = [captureViewState("default")];
+  // The stored standard view if one is set, else the view in front of the player.
+  const views = [d.standard ? { ...d.standard, name: "default" } : captureViewState("default")];
   if (d.detail) views.push({ ...d.detail, name: "detail" });
   const rec = presentationRecord(name, {
     ...d, rates: [d.rate1, d.rate2, d.rate3, d.rate4],
@@ -3496,6 +3572,7 @@ async function openForEditing(name) {
     rate1: String(rates[0] ?? ""), rate2: String(rates[1] ?? ""), rate3: String(rates[2] ?? ""), rate4: String(rates[3] ?? ""),
     ticks: sch.ticks ?? 0, lerpStart: sch.lerpStart ?? 0, lerpEnd: sch.lerpEnd ?? 1, fadeIn: sch.fadeIn ?? 0.25, fadeOut: sch.fadeOut ?? 0.25,
     startCamera: rec.startCamera || null, endCamera: rec.endCamera || null,
+    standard: { ...rec.views[0], name: "default" },
     detail: rec.views[1] ? { ...rec.views[1], name: "detail" } : null,
   });
   if (Number(rec.rate) > 0) shell.setRate(Math.min(RATE_MAX, Math.max(RATE_MIN, Number(rec.rate))));
@@ -3631,6 +3708,7 @@ async function init() {
     onTune: (t) => { setTune(t); redraw(); },
     onClearStamps: () => shell.clearStamps(),
     ...presetActions,
+    ...viewPresetActions,
     onCloseStatus: () => inspect(-1),
     // An inactive layer's entity is read only: the edit is refused and the
     // pane shows the value it still holds.
@@ -3645,6 +3723,7 @@ async function init() {
   });
   panel.setLocalSaves(listSaves());
   refreshPresets();
+  refreshViewPresets();
   view = { ...panel.view };
   syncScreen();
 

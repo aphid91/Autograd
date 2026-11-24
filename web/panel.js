@@ -52,7 +52,7 @@ function savePrefs(p) {
 export const PRESENT_DEFAULTS = {
   name: "presentation", rate: "30", rate1: "", rate2: "", rate3: "", rate4: "",
   ticks: 0, lerpStart: 0, lerpEnd: 1, fadeIn: 0.25, fadeOut: 0.25,
-  startCamera: null, endCamera: null, detail: null,
+  startCamera: null, endCamera: null, standard: null, detail: null,
 };
 function cleanPresent(p) {
   const out = { ...PRESENT_DEFAULTS };
@@ -308,8 +308,34 @@ export class Panel {
     pcam.addButton({ title: "Clear end camera" }).on("click", () => cb.onPresent("clearEnd"));
     pb(pcam, "ticks", { label: "ticks", min: 0, max: 1000000, step: 1 });
     for (const [key, label, opts] of CAMERA_SPEC) pb(pcam, key, { label, ...opts });
-    pres.addButton({ title: "Set detail view" }).on("click", () => cb.onPresent("detail"));
-    pres.addButton({ title: "Clear detail view" }).on("click", () => cb.onPresent("clearDetail"));
+    // The two views the "i" button cycles. Set captures the view in front of
+    // the player (View, status colours, Dev dials, layers); Load puts a
+    // captured one back in front of the player, to change and Set again.
+    // With no standard view set, Export and Preview take the live view.
+    const pviews = pres.addFolder({ title: "views", expanded: true });
+    pviews.addButton({ title: "Set standard view" }).on("click", () => cb.onPresent("standard"));
+    this.loadStandardBtn = pviews.addButton({ title: "Load standard view" }).on("click", () => cb.onPresent("loadStandard"));
+    this.clearStandardBtn = pviews.addButton({ title: "Clear standard view" }).on("click", () => cb.onPresent("clearStandard"));
+    pviews.addButton({ title: "Set detail view" }).on("click", () => cb.onPresent("detail"));
+    this.loadDetailBtn = pviews.addButton({ title: "Load detail view" }).on("click", () => cb.onPresent("loadDetail"));
+    this.clearDetailBtn = pviews.addButton({ title: "Clear detail view" }).on("click", () => cb.onPresent("clearDetail"));
+
+    // View presets (viewpresets.js): a view under a name, in this browser
+    // and as .json files. Loading one sets the view in front of the player,
+    // so "load preset, then Set standard view" makes it the standard view.
+    const vpre = pviews.addFolder({ title: "view presets", expanded: false });
+    this.viewPresetFolder = vpre;
+    this.viewPreset = { name: "", saved: "" };
+    vpre.addBinding(this.viewPreset, "name", { label: "name" });
+    this.viewPresetSaveBtn = vpre.addButton({ title: "Save current view as preset" });
+    this.viewPresetSaveBtn.on("click", () => cb.onSaveViewPreset?.(this.viewPreset.name.trim()));
+    this.viewPresetBinding = null;
+    this.viewPresetActions = [
+      vpre.addButton({ title: "Load preset" }).on("click", () => this.viewPreset.saved && cb.onLoadViewPreset?.(this.viewPreset.saved)),
+      vpre.addButton({ title: "Export preset .json" }).on("click", () => this.viewPreset.saved && cb.onExportViewPreset?.(this.viewPreset.saved)),
+      vpre.addButton({ title: "Delete preset" }).on("click", () => this.viewPreset.saved && cb.onDeleteViewPreset?.(this.viewPreset.saved)),
+    ];
+    vpre.addButton({ title: "Import preset .json…" }).on("click", () => cb.onImportViewPreset?.());
     this.presentText = { text: "" };
     pres.addBinding(this.presentText, "text", { label: "", readonly: true, multiline: true, rows: 3, interval: 250 });
     // The presentation these settings describe, on this board, in this page;
@@ -436,7 +462,11 @@ export class Panel {
     const p = this.present;
     const box = (b) => (b ? `${b.cx.toFixed(1)},${b.cy.toFixed(1)} ±${b.hw.toFixed(1)}` : "–");
     this.presentText.text = `start ${p.startCamera ? box(p.startCamera) : "fit board"} · end ${box(p.endCamera)}\n` +
-      `detail view: ${p.detail ? "set" : "–"}` + (extra ? `\n${extra}` : "");
+      `standard view: ${p.standard ? "set" : "live"} · detail view: ${p.detail ? "set" : "–"}` + (extra ? `\n${extra}` : "");
+    if (this.loadStandardBtn) {
+      this.loadStandardBtn.disabled = this.clearStandardBtn.disabled = !p.standard;
+      this.loadDetailBtn.disabled = this.clearDetailBtn.disabled = !p.detail;
+    }
   }
   setVideoProgress(text) { this.videoStatus = text; this.updateVideoText(); }
   setVideoRecording(on) { this.recordBtn.title = on ? "Cancel recording" : "Begin recording"; }
@@ -504,6 +534,15 @@ export class Panel {
     const at = this.presetFolder.children.indexOf(this.presetSaveBtn) + 1;
     this.presetBinding = this.presetFolder.addBinding(this.preset, "saved", { label: "saved", options, index: at });
     for (const b of this.presetActions) b.disabled = !names.length;
+  }
+
+  setViewPresets(names, selected = this.viewPreset.saved) {
+    if (this.viewPresetBinding) this.viewPresetBinding.dispose();
+    this.viewPreset.saved = names.includes(selected) ? selected : (names[0] ?? "");
+    const options = names.length ? Object.fromEntries(names.map(n => [n, n])) : { "(none yet)": "" };
+    const at = this.viewPresetFolder.children.indexOf(this.viewPresetSaveBtn) + 1;
+    this.viewPresetBinding = this.viewPresetFolder.addBinding(this.viewPreset, "saved", { label: "saved", options, index: at });
+    for (const b of this.viewPresetActions) b.disabled = !names.length;
   }
 
   // Show `info` (from Board.describe) in the Status folder, or hide it.

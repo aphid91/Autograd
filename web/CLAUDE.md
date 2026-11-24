@@ -2088,11 +2088,32 @@ them: the panel's **Presentation** folder, and **Export presentation
   tint and label size and the labels' master switch (`captureViewState()`
   / `applyViewState()` in main.js; layers are matched by id).
 - **Export** takes the board as it stands -- a selection put down first;
-  audio settings and labels ride in the save -- the view in front of the
-  player as "default", the captured detail view if set, and the folder's
+  audio settings and labels ride in the save -- the stored standard view as
+  "default" (the view in front of the player if none is set), the captured
+  detail view if set, and the folder's
   draft: name, start rate and four rate boxes (blank or 0 unused), the
   cameras (no start camera: the whole board) and the schedule. The draft
   persists with the panel's preferences.
+- **The views** (Presentation > views): **Set standard view** and **Set
+  detail view** capture the view in front of the player into the draft;
+  **Load** puts one back in front of the player, so changing one setting
+  of a view is Load, change, Set -- not rebuilding it from memory; **Clear**
+  drops it (Load and Clear are disabled while it is unset). A cleared
+  standard view means "the live view at Export", as before it existed, so
+  a draft from before keeps its behaviour. `#edit=` fills both from the
+  record.
+- **View presets** (Presentation > views > view presets;
+  [viewpresets.js](viewpresets.js)): a view -- the same record
+  `captureViewState()` makes, minus its name -- kept under a name in this
+  browser (`gates.web.viewPresets.v1`) and exported or imported as a tagged
+  `.json` (`gates-view-preset`, so an audio preset is refused). Loading one
+  sets the view in front of the player through `applyViewState()`, from
+  where Set standard / detail view makes it either view. Cleaning on read
+  is structural only (scalars, layer entries with an integer id);
+  `applyViewState()` already takes only keys the panel knows, of the right
+  type, and only layers the board has by **id** -- so on another board the
+  panel dials apply in full and only the layers whose ids line up do.
+  `tests/viewpresets.test.mjs`.
 - **The page** shows the board, the sound button, Reset and Play/Pause
   (bottom middle), an **i** button cycling the views (hidden with only
   one), and the **speed** panel (bottom left, level with the buttons: the
@@ -2325,6 +2346,7 @@ largest JS span left.
 | `space.js` | spatial audio: distance to the region or screen box, the falloff and low-pass curves, per-run and per-gate weights |
 | `scale.js` | belt scales: the formula language, presets, tables, the wavelength table the synth reads |
 | `audiopresets.js` | audio presets: the dials under a name, in the browser and as `.json` files |
+| `viewpresets.js` | view presets: a presentation view (View, colours, Dev, layers) under a name, in the browser and as `.json` files |
 | `audio-bake.js` | baking: a stretch of ticks rendered offline, and the WAV writer; loaded on demand |
 | `pixel.js` | the Pixel machine (web-only, in Sink's id), its screen, and the overlay's drawing |
 | `present.js` | presentation mode: the `#b=` route, its controls, the camera schedule, the info panel |
