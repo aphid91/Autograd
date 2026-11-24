@@ -32,10 +32,13 @@ const LOOK_SPEC = [
 export const STATUS_COLOUR_DEFAULTS = {
   gateRunning: "#45a854", gateStarved: "#c7423d", gateBlocked: "#dbb82e",
   beltMoving: "#50a05c", beltEmpty: "#b04842", beltStalled: "#d6b43a",
+  // View > truthiness colours: what a falsy fire or push glows instead.
+  gateRunningF: "#4a7fd4", beltMovingF: "#4f86c9",
 };
 const STATUS_COLOUR_LABELS = [
   ["gateRunning", "gate running"], ["gateStarved", "gate starved"], ["gateBlocked", "gate blocked"],
   ["beltMoving", "belt moving"], ["beltEmpty", "belt empty"], ["beltStalled", "belt stalled"],
+  ["gateRunningF", "gate running (falsy)"], ["beltMovingF", "belt moving (falsy)"],
 ];
 
 function loadPrefs() {
@@ -52,7 +55,7 @@ function savePrefs(p) {
 export const PRESENT_DEFAULTS = {
   name: "presentation", rate: "30", rate1: "", rate2: "", rate3: "", rate4: "",
   ticks: 0, lerpStart: 0, lerpEnd: 1, fadeIn: 0.25, fadeOut: 0.25,
-  startCamera: null, endCamera: null, detail: null,
+  startCamera: null, endCamera: null, standard: null, detail: null,
 };
 function cleanPresent(p) {
   const out = { ...PRESENT_DEFAULTS };
@@ -107,11 +110,11 @@ export class Panel {
       board.addButton({ title: "Delete saved" }).on("click", () => this.local.saved && cb.onDeleteLocal(this.local.saved)),
     ];
 
-    this.view = { grid: false, ports: true, labels: true, seedTint: true, notes: true, momentum: true, items: true, belts: true, gates: true, gateStatus: true, sources: true, beltStatus: true, beltActive: true, fps: false, pixelAlpha: 0, pixelMax: 8, pixelTextBg: true, layers: false, ...LOOK_DEFAULTS, ...this.prefs.view };
+    this.view = { grid: false, ports: true, labels: true, seedTint: true, notes: true, momentum: true, items: true, belts: true, gates: true, gateStatus: true, sources: true, beltStatus: true, beltActive: true, statusGlow: 15, statusGlowTime: false, statusGlowS: 0.5, statusSluggish: 0, fps: false, pixelAlpha: 0, pixelMax: 8, pixelTextBg: true, layers: false, simpleView: false, truthiness: false, ...LOOK_DEFAULTS, ...this.prefs.view };
     if (!/^#[0-9a-f]{6}$/i.test(this.view.bg)) this.view.bg = LOOK_DEFAULTS.bg;
     const view = this.pane.addFolder({ title: "View", expanded: false });
     this.viewBindings = [];
-    for (const [key, label] of [["grid", "grid lines"], ["ports", "ports"], ["labels", "source values"], ["seedTint", "seed tint"], ["notes", "labels (notes)"], ["momentum", "pan momentum"], ["items", "items"], ["belts", "belts"], ["gates", "gates"], ["gateStatus", "gate status colours"], ["beltStatus", "belt status colours"], ["beltActive", "stalled but moving: green"], ["sources", "sources"], ["fps", "fps counter"], ["layers", "layers"]]) {
+    for (const [key, label] of [["grid", "grid lines"], ["ports", "ports"], ["labels", "source values"], ["seedTint", "seed tint"], ["notes", "labels (notes)"], ["momentum", "pan momentum"], ["items", "items"], ["belts", "belts"], ["gates", "gates"], ["gateStatus", "gate status colours"], ["beltStatus", "belt status colours"], ["beltActive", "stalled but moving: green"], ["truthiness", "truthiness colours"], ["sources", "sources"], ["fps", "fps counter"], ["layers", "layers"], ["simpleView", "simple view"]]) {
       this.viewBindings.push(view.addBinding(this.view, key, { label }).on("change", () => {
         if (this.applyingView) return;
         this.prefs.view = { ...this.view };
@@ -139,6 +142,24 @@ export class Panel {
       cb.onView({ ...this.view });
     }));
 
+    // View > presets (viewpresets.js): the whole view -- View, status
+    // colours, Dev dials, layers -- under a name, in this browser and as
+    // .json files. Loading one sets the view in front of the player, so
+    // "load preset, then Presentation > Set standard view" makes it that.
+    const vpre = view.addFolder({ title: "presets", expanded: false });
+    this.viewPresetFolder = vpre;
+    this.viewPreset = { name: "", saved: "" };
+    vpre.addBinding(this.viewPreset, "name", { label: "name" });
+    this.viewPresetSaveBtn = vpre.addButton({ title: "Save current view as preset" });
+    this.viewPresetSaveBtn.on("click", () => cb.onSaveViewPreset?.(this.viewPreset.name.trim()));
+    this.viewPresetBinding = null;
+    this.viewPresetActions = [
+      vpre.addButton({ title: "Load preset" }).on("click", () => this.viewPreset.saved && cb.onLoadViewPreset?.(this.viewPreset.saved)),
+      vpre.addButton({ title: "Export preset .json" }).on("click", () => this.viewPreset.saved && cb.onExportViewPreset?.(this.viewPreset.saved)),
+      vpre.addButton({ title: "Delete preset" }).on("click", () => this.viewPreset.saved && cb.onDeleteViewPreset?.(this.viewPreset.saved)),
+    ];
+    vpre.addButton({ title: "Import preset .json…" }).on("click", () => cb.onImportViewPreset?.());
+
     // View > look: the board's colour, rounded machine corners, chevron
     // opacity, and the bloom (bloom.js). Per player, with the panel's
     // preferences, and in a presentation's views like the rest of View.
@@ -158,6 +179,32 @@ export class Panel {
     const stored = Object.fromEntries(Object.entries(this.prefs.colours || {}).filter(([k, v]) => known.includes(k) && /^#[0-9a-f]{6}$/i.test(v)));
     this.colours = { ...STATUS_COLOUR_DEFAULTS, ...stored };
     const colours = view.addFolder({ title: "status colours", expanded: false });
+    // The afterglow (main.js gateStatus()): how long a machine or run takes
+    // to cool back to its resting colour after it last acted (0 is none) --
+    // in ticks, so a busy board is as bright at any rate, or with "afterglow
+    // by time" in seconds, so it fades at the same pace at any rate -- and
+    // glow sluggishness, which stretches a long run's glow and shortens a
+    // short one's, by (length / 10)^s. View, not colours: they ride
+    // presentations' views with the rest. Only the dial in use shows.
+    const glowDials = {};
+    const syncGlow = () => {
+      glowDials.statusGlow.hidden = !!this.view.statusGlowTime;
+      glowDials.statusGlowS.hidden = !this.view.statusGlowTime;
+    };
+    for (const [key, label, opts] of [["statusGlowTime", "afterglow by time", {}],
+                                      ["statusGlow", "afterglow (ticks)", { min: 0, max: 250, step: 1 }],
+                                      ["statusGlowS", "afterglow (s)", { min: 0, max: 5, step: 0.05 }],
+                                      ["statusSluggish", "glow sluggishness", { min: -2, max: 2, step: 0.05 }]]) {
+      const b = glowDials[key] = colours.addBinding(this.view, key, { label, ...opts }).on("change", () => {
+        if (key === "statusGlowTime") syncGlow();
+        if (this.applyingView) return;
+        this.prefs.view = { ...this.view };
+        savePrefs(this.prefs);
+        cb.onView({ ...this.view });
+      });
+      this.viewBindings.push(b);
+    }
+    syncGlow();
     const pushColours = () => {
       if (this.applyingView) return;
       this.prefs.colours = { ...this.colours };
@@ -167,6 +214,7 @@ export class Panel {
     const colourBindings = this.colourBindings = STATUS_COLOUR_LABELS.map(([key, label]) =>
       colours.addBinding(this.colours, key, { label, view: "color" }).on("change", pushColours));
     colours.addButton({ title: "Reset colours" }).on("click", () => {
+      if (!confirm("Reset all six status colours to their defaults?")) return;
       Object.assign(this.colours, STATUS_COLOUR_DEFAULTS);
       for (const b of colourBindings) b.refresh();
       pushColours();
@@ -191,12 +239,18 @@ export class Panel {
       savePrefs(this.prefs);
       // A refresh from applyAudio() fires change too (Tweakpane re-snaps
       // to the step): a load, not the player, so not reported.
+      if (this.advFolder) this.advFolder.hidden = !this.audio.advAudio;
       if (!this.applyingAudio) cb.onAudio({ ...this.audio });
     };
     const audioBindings = this.audioBindings = [];
     let agroup = audio;
     for (const [key, label, opts] of AUDIO_SPEC) {
-      if (key === "---") { agroup = audio.addFolder({ title: label, expanded: false }); continue; }
+      if (key === "---") {
+        agroup = audio.addFolder({ title: label, expanded: false });
+        // Audio > advanced shows only while its switch is on.
+        if (opts?.adv) { this.advFolder = agroup; agroup.hidden = !this.audio.advAudio; }
+        continue;
+      }
       audioBindings.push(agroup.addBinding(this.audio, key, { label, ...(opts || {}) }).on("change", pushAudio));
     }
     // The sound selection: the selected entities are the only ones heard
@@ -281,10 +335,23 @@ export class Panel {
     pcam.addButton({ title: "Clear end camera" }).on("click", () => cb.onPresent("clearEnd"));
     pb(pcam, "ticks", { label: "ticks", min: 0, max: 1000000, step: 1 });
     for (const [key, label, opts] of CAMERA_SPEC) pb(pcam, key, { label, ...opts });
-    pres.addButton({ title: "Set detail view" }).on("click", () => cb.onPresent("detail"));
-    pres.addButton({ title: "Clear detail view" }).on("click", () => cb.onPresent("clearDetail"));
+    // The two views the "i" button cycles. Set captures the view in front of
+    // the player (View, status colours, Dev dials, layers); Load puts a
+    // captured one back in front of the player, to change and Set again.
+    // With no standard view set, Export and Preview take the live view.
+    const pviews = pres.addFolder({ title: "views", expanded: true });
+    pviews.addButton({ title: "Set standard view" }).on("click", () => cb.onPresent("standard"));
+    this.loadStandardBtn = pviews.addButton({ title: "Load standard view" }).on("click", () => cb.onPresent("loadStandard"));
+    this.clearStandardBtn = pviews.addButton({ title: "Clear standard view" }).on("click", () => cb.onPresent("clearStandard"));
+    pviews.addButton({ title: "Set detail view" }).on("click", () => cb.onPresent("detail"));
+    this.loadDetailBtn = pviews.addButton({ title: "Load detail view" }).on("click", () => cb.onPresent("loadDetail"));
+    this.clearDetailBtn = pviews.addButton({ title: "Clear detail view" }).on("click", () => cb.onPresent("clearDetail"));
+
     this.presentText = { text: "" };
     pres.addBinding(this.presentText, "text", { label: "", readonly: true, multiline: true, rows: 3, interval: 250 });
+    // The presentation these settings describe, on this board, in this page;
+    // the hammer (or Esc) comes back with nothing lost (main.js enterPreview()).
+    pres.addButton({ title: "Preview presentation" }).on("click", () => cb.onPresent("preview"));
     pres.addButton({ title: "Export presentation (.zip)" }).on("click", () => cb.onPresent("export"));
     this.updatePresentText();
 
@@ -322,6 +389,19 @@ export class Panel {
 
     const dbg = this.pane.addFolder({ title: "Debug", expanded: false });
     dbg.addButton({ title: "Clear stamps" }).on("click", () => cb.onClearStamps());
+    // Frame profiling (prof.js): a per-part timing tree over the board.
+    // Not a preference -- off on every load.
+    this.profState = { profile: false, gpuSync: false };
+    // The simulation's wake list (sim.js), on unless switched off here to
+    // compare: the same ticks either way, only the cost differs.
+    this.wakeState = { wakeList: true };
+    dbg.addBinding(this.wakeState, "wakeList", { label: "wake list" }).on("change", () => cb.onWakeList?.(this.wakeState.wakeList));
+    // The tick on its own thread (simworker.js), on unless switched off here
+    // to compare: off, the main thread ticks within its frame budget.
+    this.wakeState.worker = true;
+    dbg.addBinding(this.wakeState, "worker", { label: "sim worker" }).on("change", () => cb.onWorker?.(this.wakeState.worker));
+    dbg.addBinding(this.profState, "profile", { label: "profile frames" }).on("change", () => cb.onProfile?.(this.profState));
+    dbg.addBinding(this.profState, "gpuSync", { label: "GPU sync" }).on("change", () => cb.onProfile?.(this.profState));
   }
 
   // --- view settings as one value -----------------------------------------------
@@ -361,6 +441,7 @@ export class Panel {
     Object.assign(this.audio, dials);
     this.applyingAudio = true;
     try { for (const b of this.audioBindings) b.refresh(); } finally { this.applyingAudio = false; }
+    if (this.advFolder) this.advFolder.hidden = !this.audio.advAudio;
     this.prefs.audio = { ...this.audio };
     savePrefs(this.prefs);
   }
@@ -393,7 +474,11 @@ export class Panel {
     const p = this.present;
     const box = (b) => (b ? `${b.cx.toFixed(1)},${b.cy.toFixed(1)} ±${b.hw.toFixed(1)}` : "–");
     this.presentText.text = `start ${p.startCamera ? box(p.startCamera) : "fit board"} · end ${box(p.endCamera)}\n` +
-      `detail view: ${p.detail ? "set" : "–"}` + (extra ? `\n${extra}` : "");
+      `standard view: ${p.standard ? "set" : "live"} · detail view: ${p.detail ? "set" : "–"}` + (extra ? `\n${extra}` : "");
+    if (this.loadStandardBtn) {
+      this.loadStandardBtn.disabled = this.clearStandardBtn.disabled = !p.standard;
+      this.loadDetailBtn.disabled = this.clearDetailBtn.disabled = !p.detail;
+    }
   }
   setVideoProgress(text) { this.videoStatus = text; this.updateVideoText(); }
   setVideoRecording(on) { this.recordBtn.title = on ? "Cancel recording" : "Begin recording"; }
@@ -411,13 +496,14 @@ export class Panel {
   // Read by the meter's monitor binding on its own interval.
   setAudioMeter(text) { this.audioMeter.text = text; }
 
-  // The bundled saves, as a dropdown at the top of the Board folder.
-  setSaves(names, current) {
+  // The bundled saves, as a dropdown at the top of the Board folder:
+  // `entries` are { label, value } (value is what onLoadSave gets).
+  setSaves(entries, current) {
     if (this.saveBinding) this.saveBinding.dispose();
     this.saveBinding = null;
-    if (!names.length) return;
-    this.saveState.save = current || names[0];
-    const options = Object.fromEntries(names.map(n => [n, n]));
+    if (!entries.length) return;
+    this.saveState.save = current || entries[0].value;
+    const options = Object.fromEntries(entries.map(e => [e.label, e.value]));
     this.saveBinding = this.saveFolder.addBinding(this.saveState, "save", { label: "save", options, index: 0 });
     this.saveBinding.on("change", (ev) => this.cb.onLoadSave(ev.value));
   }
@@ -460,6 +546,15 @@ export class Panel {
     const at = this.presetFolder.children.indexOf(this.presetSaveBtn) + 1;
     this.presetBinding = this.presetFolder.addBinding(this.preset, "saved", { label: "saved", options, index: at });
     for (const b of this.presetActions) b.disabled = !names.length;
+  }
+
+  setViewPresets(names, selected = this.viewPreset.saved) {
+    if (this.viewPresetBinding) this.viewPresetBinding.dispose();
+    this.viewPreset.saved = names.includes(selected) ? selected : (names[0] ?? "");
+    const options = names.length ? Object.fromEntries(names.map(n => [n, n])) : { "(none yet)": "" };
+    const at = this.viewPresetFolder.children.indexOf(this.viewPresetSaveBtn) + 1;
+    this.viewPresetBinding = this.viewPresetFolder.addBinding(this.viewPreset, "saved", { label: "saved", options, index: at });
+    for (const b of this.viewPresetActions) b.disabled = !names.length;
   }
 
   // Show `info` (from Board.describe) in the Status folder, or hide it.

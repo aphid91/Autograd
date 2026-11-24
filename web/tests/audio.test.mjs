@@ -572,3 +572,114 @@ test("at 1 tps every tick is played, one a second", () => {
     assert.ok(behind >= 1 && behind <= 3, `${rate} tps: ${s.ticksPlayed} of 14 ticks played`);
   }
 });
+
+// Realtime rendering by block (renderBlock()) against the old renderer,
+// which cut every block at every tick boundary and is kept as its
+// reference (`batch` false): a real save's ticks, streamed a frame at a
+// time as the page does, rendered both ways, from 30 to 100k ticks a
+// second. Bit for bit -- voices allocated and freed, refused runs, jittered
+// and detuned clicks -- since the walk applies the same ticks at the same
+// samples and only the order of the work differs. With a spatial weighting
+// the one deliberate difference shows: a voice's gain glides once a block,
+// not at each tick boundary inside it, so that run is held to within a
+// thousandth of the signal instead.
+async function renderBoth(rate, extra, space) {
+  const bytes = readFileSync(save);
+  const sim = new Sim(T, await Board.fromNpz(T, bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength)));
+  for (let i = 0; i < 300; i++) sim.step();
+  const params = { ...AUDIO_DEFAULTS, softClip: false, ...extra };
+  const msgs = [];
+  const rec = new Recorder({ postMessage: (m) => msgs.push(m) }, params);
+  rec.attach(sim);
+  const A = synth(params), B = synth(params);
+  B.batch = false;
+  const oa = new Float32Array(128), ob = new Float32Array(128);
+  let bank = 0, blocks = 0, voiced = 0, sig = 0, diff = 0, first = null;
+  for (let f = 0; f < 30; f++) {
+    bank += rate / 60;
+    const n = Math.floor(bank); bank -= n;
+    for (let i = 0; i < n; i++) sim.step();
+    rec.flush(rate);
+    if (space && f === 10) {   // the camera moves: a spatial weighting arrives mid-run
+      const gain = new Float32Array(A.n).map((_, i) => (i % 3) / 2), lp = new Float32Array(A.n).map((_, i) => (i % 2) * 2000);
+      msgs.push({ type: "space", on: true, gain, lp, norm: A.n / 2, groups: A.groups });
+    }
+    for (const m of msgs.splice(0)) { A.message(structuredClone(m)); B.message(structuredClone(m)); }
+    for (; blocks < Math.round((f + 1) * SR / 60 / 128); blocks++) {
+      A.render(oa, 128); B.render(ob, 128);
+      for (let s = 0; s < 128; s++) {
+        const d = oa[s] - ob[s];
+        if (d !== 0 && first === null) first = `block ${blocks} sample ${s}: ${oa[s]} vs ${ob[s]}`;
+        diff += d * d; sig += ob[s] * ob[s];
+      }
+      voiced = Math.max(voiced, B.nv);
+    }
+  }
+  assert.ok(sig > 1 && voiced > 10, `${rate} tps: something sounded (${voiced} voices)`);
+  return { first, ratio: Math.sqrt(diff / sig) };
+}
+
+test("realtime by block is the per-tick renderer to the bit, at any tick rate", { skip: !existsSync(save) }, async () => {
+  for (const [rate, extra] of [[30, {}], [1000, { clickDetune: 3, startTick: 450, fadeMs: 30 }], [5000, { clickJitter: 0 }],
+                               [20000, { voiceLimit: 64 }], [100000, { clickJitter: 2 }]]) {
+    const r = await renderBoth(rate, extra, false);
+    assert.equal(r.first, null, `${rate} tps: the two renderers differ at ${r.first}`);
+  }
+});
+
+test("realtime by block, with a spatial weighting: within a thousandth of the per-tick renderer", { skip: !existsSync(save) }, async (t) => {
+  for (const rate of [30, 20000]) {
+    const r = await renderBoth(rate, {}, true);
+    t.diagnostic(`${rate} tps: difference ${r.ratio.toExponential(2)} of the signal`);
+    assert.ok(r.first !== null, `${rate} tps: the glide is stepped differently, so some difference is expected`);
+    assert.ok(r.ratio < 1e-3, `${rate} tps: difference ${r.ratio.toExponential(2)} of the signal`);
+  }
+});
+
+// A block's clicks are all scheduled before any plays, so a busy one can
+// hold far more than the old renderer ever had pending: 300k ticks a second
+// of 64 fires each is 51k clicks a block. The pool grows to hold them, or
+// the overflow would all land on the block's first sample.
+test("realtime by block: a block of many thousands of clicks lands each where the per-tick renderer does", () => {
+  const A = synth({ clickJitter: 4 }), B = synth({ clickJitter: 4 });
+  B.batch = false;
+  for (const s of [A, B]) s.message({ type: "config", lengths: new Float64Array([10]), groups: [0, 64] });
+  const oa = new Float32Array(128), ob = new Float32Array(128), rate = 300000;
+  for (let f = 0; f < 12; f++) {
+    const n = rate / 60, m = { type: "ticks", n, words: 1, rate, bits: new Uint32Array(n), f0: new Uint16Array(n), f1: new Uint16Array(n).fill(64) };
+    A.message(structuredClone(m)); B.message(structuredClone(m));
+    for (let b = 0; b < 6; b++) {
+      A.render(oa, 128); B.render(ob, 128);
+      for (let s = 0; s < 128; s++) assert.equal(oa[s], ob[s], `frame ${f} block ${b} sample ${s}`);
+    }
+  }
+  assert.ok(A.evAt.length > 8192, `the pool grew (${A.evAt.length})`);
+});
+
+// Ticks can reach the synth by a second port, straight from the sim worker,
+// while configs come from the main thread: a batch from another recorder
+// generation is dropped, whatever its words.
+test("a tick batch from an older recorder configuration is dropped", () => {
+  const s = synth();
+  s.message({ type: "config", gen: 2, lengths: new Float64Array([10]), groups: [0, 0] });
+  const batch = (gen) => ({ type: "ticks", gen, n: 5, words: 1, rate: 100, bits: new Uint32Array(5).fill(1), f0: new Uint16Array(5), f1: new Uint16Array(5) });
+  s.message(batch(1));
+  assert.equal(s.queued, 0, "an older generation is dropped");
+  s.message(batch(2));
+  assert.equal(s.queued, 5, "this generation is queued");
+  s.message(batch(undefined));
+  assert.equal(s.queued, 10, "a batch with no generation (an older caller) is queued");
+});
+
+test("an underrun clears the refused runs with their count: it never goes below zero", () => {
+  const s = synth({ voiceLimit: 1 });
+  s.message({ type: "config", lengths: new Float64Array([10, 12, 14]), groups: [0, 0] });
+  for (const i of [0, 1, 2]) s.on(i);
+  assert.equal(s.refused, 2, "two runs refused with one voice");
+  s.gatesOff();                       // the queue ran dry: every run off, none refused
+  assert.equal(s.refused, 0);
+  for (const i of [1, 2]) s.on(i);    // on again, refused again...
+  assert.equal(s.refused, 2);
+  for (const i of [1, 2]) s.off(i);   // ...and off
+  assert.equal(s.refused, 0);
+});

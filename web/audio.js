@@ -34,9 +34,14 @@ export class Recorder {
     this.sim = null;
     this.rebuilds = -1;
     this.cands = [];
-    this.h = new Int32Array(0); this.t = new Int32Array(0); this.pos = new Float64Array(0);
     this.words = 0;
-    this.fires = new Float64Array(3);
+    // Audio > truthiness: fires[3..5] are the groups' falsy fires, and
+    // flip() lists runs whose truthiness changed (tf: 2 * candidate + bit;
+    // to[k]: how many of them by the end of tick k).
+    this.truth = !!params.truthAudio;
+    this.fires = new Float64Array(6);
+    this.f0F = new Float32Array(0); this.f1F = new Float32Array(0);
+    this.tf = []; this.to = new Uint32Array(0);
     this.n = 0;
     this.cap = 0;
     // Fire "counts" are sums of the firing gates' spatial gains (1 each
@@ -50,6 +55,9 @@ export class Recorder {
     this.sim = sim;
     this.rebuilds = -1;              // reconfigure on its first tick
     if (sim) sim.audio = this;
+    // A bake's or a video's copy records truthiness if this recorder hears it
+    // (the live sim's switch is main.js's, every frame).
+    if (sim && this.truth) sim.truthOn = true;
   }
   detach() { if (this.sim) this.sim.audio = null; this.sim = null; }
 
@@ -78,6 +86,7 @@ export class Recorder {
 
   // The weights for the current candidates and gates, to the synth.
   sendSpace(sim) {
+    this.gainGen = (this.gainGen || 0) + 1;     // the gates' gains, for a worker's tap
     const w = spaceWeights(sim, this.cands, this.gateList, this.space);
     const groups = [0, 0];
     this.gateList.forEach((g, i) => { g.again = w.gateGain[i]; groups[g.agroup] += g.again; });
@@ -91,6 +100,13 @@ export class Recorder {
     this.port.postMessage({ type: "space", on: !!this.space, gain: w.gain, lp: w.lp, norm: w.runSum, groups });
   }
 
+  // Truthiness on or off: the synth needs every run's bit afresh, so a
+  // reconfigure on the next tick.
+  setTruth(on) {
+    on = !!on;
+    if (on !== this.truth) { this.truth = on; this.rebuilds = -1; }
+  }
+
   // Which run lengths may sound; a change reconfigures on the next tick.
   setLengths(min, max) {
     if (min !== this.minLen || max !== this.cutoff) { this.minLen = min; this.cutoff = max; this.rebuilds = -1; }
@@ -101,12 +117,21 @@ export class Recorder {
   configure(sim) {
     this.flush(this.lastRate || 1);
     this.rebuilds = sim.stats.rebuilds;
+    // Which bit each run sets changes here: ticks recorded under an older
+    // configuration (a worker's, simhost.js) no longer fit and are dropped.
+    this.cfgGen = (this.cfgGen || 0) + 1;
+    this.gainGen = (this.gainGen || 0) + 1;
     const sel = this.selection, W = sim.board.width;
     const picked = (cells) => !sel || cells.some(([x, y]) => sel.has(y * W + x));
     // A run sounds if any of its cells is selected, underground ends included.
     this.cands = eligibleRuns(sim, this.minLen, this.cutoff, sel);
     const n = this.cands.length;
-    this.h = new Int32Array(n); this.t = new Int32Array(n); this.pos = new Float64Array(n);
+    // Each run's bit, for hit(): -1 for a run that does not sound.
+    for (const seg of sim.order) seg.aIdx = -1;
+    this.cands.forEach((seg, i) => { seg.aIdx = i; });
+    // The sim's wake list hears sleeping runs only from when it is told about
+    // them (Sim.tickAwake()), so a new recorder starts with every run awake.
+    sim.wakeAll?.();
     this.words = (n + 31) >>> 5;
     this.cap = 0;
     const groups = [0, 0];
@@ -126,41 +151,86 @@ export class Recorder {
     // Normalisation counts the selection only, so isolating part of a machine
     // fills the mix rather than playing it as quietly as it sits in the whole.
     this.selInfo = sel ? { runs: this.cands.length, gates: groups[0] + groups[1] } : null;
-    this.port.postMessage({ type: "config", lengths: Float64Array.from(this.cands, s => s.length), groups });
+    this.port.postMessage({ type: "config", gen: this.cfgGen, lengths: Float64Array.from(this.cands, s => s.length), groups,
+                            truth: this.truth ? Uint8Array.from(this.cands, s => s.truth ?? 1) : null });
     // With a space the synth weighs every candidate (and normalises by the
     // weights, not the count); without one a config alone is the old state.
     if (this.space) this.sendSpace(sim);
   }
 
-  // Called by Sim.step() after its sync, before the structure phase.
+  // Called by Sim.step() after its sync, before the structure phase: this
+  // tick's row of run bits, cleared. The sim then calls hit() for each run
+  // active on the tick -- it pushed or popped, or its newest item moved --
+  // since only the sim knows which runs it visited (Sim.tickHeard(), and its
+  // wake list's sleeping runs still sliding into place, Sim.hearMovers()).
+  // The recorder used to compare every candidate's newest item before and
+  // after the step itself, two positionOf() calls per run per tick: up to
+  // half the tick on a big board.
   pre(sim) {
     if (sim.stats.rebuilds !== this.rebuilds) this.configure(sim);
     if (this.spaceAt) this.setSpace(this.spaceAt(sim.tick));
     if (!this.n) this.tick0 = sim.tick;
-    const c = this.cands, h = this.h, t = this.t, pos = this.pos;
-    for (let i = 0; i < c.length; i++) {
-      const seg = c[i];
-      h[i] = seg.head; t[i] = seg.tail;
-      pos[i] = seg.tail > seg.head ? sim.positionOf(seg, seg.tail - 1, sim.tick) : -1;
+    if (this.n >= this.cap) this.grow();
+    const W = this.words, off = this.n * W, bits = this.bits;
+    for (let w = 0; w < W; w++) bits[off + w] = 0;
+    this.off = off;
+    this.fires.fill(0);
+  }
+
+  flip(i, bit) { this.tf.push(i * 2 + bit); }
+
+  hit(seg) {
+    const i = seg.aIdx;
+    if (i >= 0) this.bits[this.off + (i >>> 5)] |= 1 << (i & 31);
+  }
+
+  // --- with the simulation on a worker (simhost.js) ---------------------------
+
+  // Reconfigure after a rebuild, as pre() would, without a tick of our own.
+  ensure(sim) {
+    if (sim.stats.rebuilds !== this.rebuilds) this.configure(sim);
+  }
+
+  // What the worker's tap needs to fill the same bits and click counts: each
+  // run's bit (by its index in `order`) and each gate's group and gain (in
+  // `sim.gates` order), under this configuration's generation.
+  tapConfig(sim) {
+    return {
+      gen: this.cfgGen, words: this.words, runs: sim.order.length, gates: sim.gates.length,
+      aIdx: Int32Array.from(sim.order, s => s.aIdx ?? -1),
+      agroup: Int8Array.from(sim.gates, g => g.agroup ?? 2), truth: this.truth,
+      again: Float32Array.from(sim.gates, g => g.again ?? 1),
+    };
+  }
+
+  // A worker's recorded ticks, appended as if recorded here. A batch from an
+  // older configuration is dropped: its bits mean other runs.
+  ingest(a) {
+    if (!a || a.gen !== this.cfgGen || a.words !== this.words) return;
+    const W = this.words;
+    if (!this.n) this.tick0 = a.tick0;
+    while (this.n + a.n > this.cap) this.grow();
+    this.bits.set(a.bits.subarray(0, a.n * W), this.n * W);
+    this.f0.set(a.f0.subarray(0, a.n), this.n);
+    this.f1.set(a.f1.subarray(0, a.n), this.n);
+    if (this.truth && a.f0F) {
+      this.f0F.set(a.f0F, this.n); this.f1F.set(a.f1F, this.n);
+      const base = this.tf.length;
+      for (let k = 0; k < a.n; k++) this.to[this.n + k] = base + a.to[k];
+      for (const x of a.tf) this.tf.push(x);
+    } else if (this.truth) {
+      this.f0F.fill(0, this.n, this.n + a.n); this.f1F.fill(0, this.n, this.n + a.n);
+      this.to.fill(this.tf.length, this.n, this.n + a.n);
     }
-    this.fires[0] = this.fires[1] = 0;
+    this.n += a.n;
   }
 
   // Called by Sim.step() once the tick counter has moved.
   post(sim) {
-    const W = this.words;
-    if (this.n >= this.cap) this.grow();
-    const k = this.n++, off = k * W, bits = this.bits;
-    for (let w = 0; w < W; w++) bits[off + w] = 0;
-    const c = this.cands, h = this.h, t = this.t, pos = this.pos;
-    for (let i = 0; i < c.length; i++) {
-      const seg = c[i];
-      let on = seg.head !== h[i] || seg.tail !== t[i];
-      if (!on && t[i] > h[i]) on = sim.positionOf(seg, t[i] - 1, sim.tick) > pos[i];
-      if (on) bits[off + (i >>> 5)] |= 1 << (i & 31);
-    }
+    const k = this.n++;
     this.f0[k] = this.fires[0];
     this.f1[k] = this.fires[1];
+    if (this.truth) { this.f0F[k] = this.fires[3]; this.f1F[k] = this.fires[4]; this.to[k] = this.tf.length; }
   }
 
   grow() {
@@ -168,6 +238,11 @@ export class Recorder {
     const bits = new Uint32Array(cap * W), f0 = new Float32Array(cap), f1 = new Float32Array(cap);
     bits.set(this.bits.subarray(0, this.n * W)); f0.set(this.f0.subarray(0, this.n)); f1.set(this.f1.subarray(0, this.n));
     this.bits = bits; this.f0 = f0; this.f1 = f1; this.cap = cap;
+    if (this.truth) {
+      const a = new Float32Array(cap), b = new Float32Array(cap), t = new Uint32Array(cap);
+      a.set(this.f0F.subarray(0, this.n)); b.set(this.f1F.subarray(0, this.n)); t.set(this.to.subarray(0, this.n));
+      this.f0F = a; this.f1F = b; this.to = t;
+    }
   }
 
   // Post the ticks recorded since the last flush, played at `rate`.
@@ -176,15 +251,22 @@ export class Recorder {
     if (!this.n) return;
     this.stopped = false;
     const n = this.n, W = this.words;
-    const m = { type: "ticks", n, tick0: this.tick0, words: W, rate,
+    const m = { type: "ticks", gen: this.cfgGen, n, tick0: this.tick0, words: W, rate,
                 bits: this.bits.slice(0, n * W), f0: this.f0.slice(0, n), f1: this.f1.slice(0, n) };
-    this.port.postMessage(m, [m.bits.buffer, m.f0.buffer, m.f1.buffer]);
+    const transfer = [m.bits.buffer, m.f0.buffer, m.f1.buffer];
+    if (this.truth) {
+      Object.assign(m, { f0F: this.f0F.slice(0, n), f1F: this.f1F.slice(0, n), to: this.to.slice(0, n), tf: Int32Array.from(this.tf) });
+      transfer.push(m.f0F.buffer, m.f1F.buffer, m.to.buffer, m.tf.buffer);
+    }
+    this.tf.length = 0;
+    this.port.postMessage(m, transfer);
     this.n = 0;
   }
 
   // Paused: drop what is recorded and queued, and let every voice release.
   stop() {
     this.n = 0;
+    this.tf.length = 0;
     if (this.stopped) return;
     this.stopped = true;
     this.port.postMessage({ type: "stop" });
@@ -204,7 +286,7 @@ export async function startAudio(ctx, params, sim, onMeter) {
   rec.attach(sim);
   return {
     ctx, node, rec,
-    setParams(p) { node.port.postMessage({ type: "params", p }); rec.setLengths(p.beltMinLen, p.beltCutoff); },
+    setParams(p) { node.port.postMessage({ type: "params", p }); rec.setLengths(p.beltMinLen, p.beltCutoff); rec.setTruth(p.truthAudio); },
     // A bake's samples, as an AudioBuffer for this context.
     buffer(samples, sampleRate) {
       const b = ctx.createBuffer(1, samples.length, sampleRate);
@@ -227,6 +309,13 @@ export async function startAudio(ctx, params, sim, onMeter) {
       try { this.src.stop(); } catch { /* already ended */ }
       this.src.disconnect();
       this.src = null;
+    },
+    // A second port into the synth, for the sim worker to send its ticks
+    // straight down (simhost.js), with no main-thread frame in between.
+    tickPort() {
+      const ch = new MessageChannel();
+      node.port.postMessage({ type: "tickport", port: ch.port1 }, [ch.port1]);
+      return ch.port2;
     },
     async close() { this.stopBaked(); rec.detach(); node.port.onmessage = null; node.disconnect(); await ctx.close(); },
   };

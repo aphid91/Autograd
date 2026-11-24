@@ -1,0 +1,248 @@
+{
+ "version": 1,
+ "board": "test.npz",
+ "rate": 30,
+ "rates": [],
+ "startCamera": {
+  "cx": 223.3856720837145,
+  "cy": 192.74620423128556,
+  "hw": 109.33247389186997,
+  "hh": 179.26405662889755
+ },
+ "endCamera": null,
+ "schedule": {
+  "ticks": 0,
+  "lerpStart": 0,
+  "lerpEnd": 1,
+  "fadeIn": 0.25,
+  "fadeOut": 0.25
+ },
+ "views": [
+  {
+   "name": "default",
+   "view": {
+    "grid": false,
+    "ports": true,
+    "labels": true,
+    "seedTint": true,
+    "notes": false,
+    "momentum": true,
+    "items": true,
+    "belts": true,
+    "gates": true,
+    "gateStatus": true,
+    "sources": true,
+    "beltStatus": true,
+    "beltActive": true,
+    "fps": true,
+    "pixelAlpha": 1,
+    "pixelMax": 29,
+    "pixelTextBg": false,
+    "layers": false,
+    "bg": "#1e1e27",
+    "corner": 0.09000000000000001,
+    "chevronAlpha": 0.41,
+    "bloom": 0,
+    "bloomCutoff": 0.5199999999999999,
+    "bloomRadius": 1
+   },
+   "colours": {
+    "gateRunning": "#0067df",
+    "gateStarved": "#1d1650",
+    "gateBlocked": "#423812",
+    "beltMoving": "#22deff",
+    "beltEmpty": "#002a34",
+    "beltStalled": "#4c4119"
+   },
+   "dev": {
+    "forceBuild": false,
+    "beltWidth": 1,
+    "chevronSize": 1.2500000000000002,
+    "overlayWidth": 1,
+    "overlayEdge": 1,
+    "portScale": 1,
+    "portEdge": 1,
+    "glyphScale": 1,
+    "glyphWeight": 1,
+    "emitSize": 1,
+    "gridOpacity": 1,
+    "ghostAlpha": 0.6,
+    "tapMarginPx": 20,
+    "lodZoom": 0,
+    "lodBeltSolid": 0,
+    "lodGrid": 6,
+    "lodMarks": 5,
+    "lodPorts": 8,
+    "lodPortEdge": 14,
+    "lodChevrons": 10,
+    "itemTextMin": 6,
+    "itemTextGood": 10,
+    "noteTextMin": 6
+   },
+   "layers": [
+    {
+     "id": 0,
+     "visible": true,
+     "active": true,
+     "tint": 0,
+     "label": 0
+    },
+    {
+     "id": 4,
+     "visible": true,
+     "active": true,
+     "tint": 0,
+     "label": 1
+    },
+    {
+     "id": 5,
+     "visible": true,
+     "active": true,
+     "tint": 0,
+     "label": 1
+    },
+    {
+     "id": 6,
+     "visible": true,
+     "active": true,
+     "tint": 0,
+     "label": 1
+    },
+    {
+     "id": 7,
+     "visible": true,
+     "active": true,
+     "tint": 0,
+     "label": 1
+    },
+    {
+     "id": 13,
+     "visible": true,
+     "active": true,
+     "tint": 0,
+     "label": 3.5
+    },
+    {
+     "id": 14,
+     "visible": true,
+     "active": true,
+     "tint": 0,
+     "label": 3.5
+    },
+    {
+     "id": 15,
+     "visible": true,
+     "active": true,
+     "tint": 0,
+     "label": 0
+    },
+    {
+     "id": 16,
+     "visible": true,
+     "active": true,
+     "tint": 0,
+     "label": 1
+    },
+    {
+     "id": 17,
+     "visible": true,
+     "active": true,
+     "tint": 0,
+     "label": 3.5
+    },
+    {
+     "id": 18,
+     "visible": true,
+     "active": true,
+     "tint": 0,
+     "label": 3.5
+    },
+    {
+     "id": 21,
+     "visible": true,
+     "active": true,
+     "tint": 0,
+     "label": 0
+    },
+    {
+     "id": 22,
+     "visible": true,
+     "active": true,
+     "tint": 0,
+     "label": 3
+    },
+    {
+     "id": 23,
+     "visible": true,
+     "active": true,
+     "tint": 0,
+     "label": 3.5
+    },
+    {
+     "id": 24,
+     "visible": true,
+     "active": true,
+     "tint": 0,
+     "label": 3.5
+    },
+    {
+     "id": 25,
+     "visible": true,
+     "active": true,
+     "tint": 0,
+     "label": 3.5
+    },
+    {
+     "id": 26,
+     "visible": true,
+     "active": true,
+     "tint": 0,
+     "label": 0
+    },
+    {
+     "id": 27,
+     "visible": true,
+     "active": true,
+     "tint": 0,
+     "label": 3.5
+    },
+    {
+     "id": 28,
+     "visible": true,
+     "active": true,
+     "tint": 0,
+     "label": 3.5
+    },
+    {
+     "id": 29,
+     "visible": true,
+     "active": true,
+     "tint": 0,
+     "label": 3.5
+    },
+    {
+     "id": 30,
+     "visible": true,
+     "active": true,
+     "tint": 0,
+     "label": 3.5
+    },
+    {
+     "id": 31,
+     "visible": true,
+     "active": true,
+     "tint": 0,
+     "label": 4
+    },
+    {
+     "id": 32,
+     "visible": true,
+     "active": true,
+     "tint": 0,
+     "label": 0
+    }
+   ],
+   "showLabels": false
+  }
+ ]
+}

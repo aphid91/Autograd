@@ -7,7 +7,7 @@ import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
-import { Sim, Clock, evalOps, takeDir } from "../sim.js";
+import { Sim, Clock, evalOps, takeDir, RATE_MAX } from "../sim.js";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const T = JSON.parse(readFileSync(join(here, "..", "types.json"), "utf8"));
@@ -132,5 +132,57 @@ test("the clock spends banked time in whole ticks and keeps the remainder", () =
   assert.equal(c.advance(1 / 60), 166);
   assert.equal(c.advance(1000), 2500, "a stall at a fast rate is capped too");
   c.setRate(1e9);
-  assert.equal(c.rate, 10000, "the rate is clamped");
+  assert.equal(c.rate, RATE_MAX, "the rate is clamped");
+  assert.equal(RATE_MAX, 1000000);
+});
+
+// Sim.restTick(): when an item comes to rest if nothing more happens on its
+// run, read by the status colours' afterglow. Checked against the run
+// itself, ticked on with no producer and no consumer: if restTick says the
+// item rests from tick R, the steps before R move it and the steps from R
+// on do not. And between pops it must not change, since the afterglow reads
+// it at whatever frame happens to be drawn.
+test("restTick is when an item stops, if nothing more happens", () => {
+  let s = 7;
+  const rnd = () => ((s = (s * 1103515245 + 12345) % 2147483648) / 2147483648);
+  let checked = 0, future = 0;
+  for (let trial = 0; trial < 150; trial++) {
+    const length = 1 + Math.floor(rnd() * 8);
+    const speed = UNIT * [1, 1, 2, 3][Math.floor(rnd() * 4)];
+    const spacing = UNIT * [1, 1, 2, 3][Math.floor(rnd() * 4)];
+    const { sim, seg } = beltOnly(length, speed, spacing);
+    seg.lastPush = seg.lastPop = -(2 ** 30);
+    const pOffer = rnd(), pAccept = rnd();
+    let prev = new Map();   // k -> restTick after the previous step
+    for (let t = 0; t < 60; t++) {
+      sim.offer = () => (rnd() < pOffer ? 1 : null);
+      sim.took = () => {};
+      sim.accept = () => rnd() < pAccept;
+      const head0 = seg.head;
+      sim.tickSegment(seg, t);
+      const popped = seg.head !== head0;
+      const now = t + 1;
+      const R = new Map();
+      for (let k = seg.head; k < seg.tail; k++) {
+        R.set(k, sim.restTick(seg, k));
+        if (!popped && prev.has(k)) assert.equal(R.get(k), prev.get(k), `restTick moved without a pop (trial ${trial}, t ${t})`);
+      }
+      // Run a copy on with nothing offered or taken, and watch each item.
+      const fork = { ...seg };
+      sim.offer = () => null; sim.accept = () => false;
+      const last = new Map([...R.keys()].map(k => [k, sim.positionOf(fork, k, t)]));
+      for (let u = now; u < now + 40; u++) {
+        sim.tickSegment(fork, u);
+        for (const [k, r] of R) {
+          const q = sim.positionOf(fork, k, u);
+          assert.equal(q > last.get(k), u < r, `item ${k} at step ${u}: restTick ${r} (trial ${trial}, L ${length}, v ${speed / UNIT}, d ${spacing / UNIT})`);
+          if (u < r) future++;
+          last.set(k, q);
+          checked++;
+        }
+      }
+      prev = R;
+    }
+  }
+  assert.ok(checked > 10000 && future > 1000, `vacuous: ${checked} checks, ${future} still moving`);
 });

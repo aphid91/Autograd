@@ -36,6 +36,13 @@ the repo root are not shipped -- they are the desktop's and the tests'
 fixtures (`check_web_sim.py`, the web tests and the desktop's profiling
 tools load them by name), so they stay where they are.
 
+Each presentation's board is in the picker too, after the bundled saves, as
+`<name> (presentation)` (`build.sh` writes `presentations/index.json`;
+`loadBundled()` takes `presentations/<name>.npz`). It loads as a plain board
+to edit: the board only, none of the show's views. **`test`** is one: a
+large, long-running board (3.4k machines, 16.5k belts, 1.6k undergrounds)
+kept as the renderer's profiling load -- see "Profiling a frame".
+
 ## Installing it, and offline
 
 The site is a **PWA**: `manifest.webmanifest` (name, standalone display,
@@ -89,12 +96,20 @@ scale 1.15.
   play. It **starts paused**, and loading a save pauses it again. **Long
   press Play/Pause** (right-click on a mouse) for the rate panel, just above
   the Sim section: presets of 1, 5, 30 and 240 ticks a second, and Custom,
-  which opens a text box (0.1 to 10000). It stays open until the next long
+  which opens a text box (0.1 to 1,000,000). It stays open until the next long
   press or its × button, and shows the tick count. The rate (30 by default)
   and the panel's open state persist with the shell's localStorage. The
   panel is **open on a first visit**, so it is found; the first time it is
   ever closed, a hint over the Sim section says "long press play/pause for
   tick controls" for a couple of seconds (`simHinted`, kept, so once).
+  **With a custom rate** (not a preset), a vertical slider shows on the
+  board's right edge while the panel is open: the clock runs at the custom
+  rate times the slider (0..1, 1 by default -- the custom value is the
+  maximum), its readout the rate that gives. It hides when the panel closes
+  or a preset is picked, and keeps its value (`rateScale`, persisted with
+  the shell); hidden on a custom rate, it still applies. Presentations
+  ignore it (their rates are their own), and a bake's playback sets the
+  exact rate, putting it back to 1.
 - **Edit**: Undo, Redo and Checkpoint (ctrl+Z, ctrl+shift+Z / ctrl+Y on a
   keyboard). See "Undo" below. Turning lives on the **thumb pads** in the
   board's corners, which show whenever there is something to turn: a held
@@ -194,19 +209,114 @@ panel.js); a stored key this build does not know, or a value that is not a
 `#rrggbb`, is ignored.
 
 **Belt status colours** do the same for belts, per run (segment), in
-`beltStatus()`: **red** empty; **yellow** stalled -- the head item is at the
-run's end and will not leave on the coming tick (the forecast has no pop),
-so items are stuck on it; **green** carrying and moving. **Stalled but
-moving: green** (on by default) keeps a stalled run green while anything on
-it still moves -- an item is pushed on this tick, or its newest item is
-still closing up (items pack from the head, so if the newest has stopped
-they all have: one closed-form comparison per run). So yellow means
-static, and a run a gate takes from every other tick does not flicker.
-Traced on a sparse run hitting a dead end: yellow at the tick its head
-arrives without the check, at the tick the last item packs with it.
-Underground ends
-take their run's colour too, and the dots over a buried span a lighter wash
-of it. The seed tint still draws under.
+`beltStatus()`: **red** empty; **yellow** stalled -- holding items, none of
+them moving and nothing pushed or popped lately; **green** moving.
+**Stalled but moving: green** (on by default) counts the whole run: a push,
+a pop, or any item still closing up. Off, only the head counts -- a run is
+stalled once its head reaches the end and sits there, whatever is still
+packing behind it. Underground ends take their run's colour too, and the
+dots over a buried span a lighter wash of it. The seed tint still draws
+under.
+
+#### The afterglow
+
+View > status colours > **afterglow** (ticks, 0..250, 15 by default, 0
+off): a machine or run lights up the moment it acts and cools back to its
+resting colour over that many ticks -- for machines from RUNNING to blocked
+or starved, for runs from MOVING to stalled or empty. **Ticks, not
+seconds**, so the share of the time something spends lit -- how bright a
+busy board looks -- is the same at every tick rate; it **freezes while
+paused**. (It was seconds at first, stored as `statusFade`; the new key is
+`statusGlow`, so a stored seconds value is never read as ticks.)
+
+**Afterglow by time** (off by default) measures the fade in **seconds**
+instead (its own dial, 0..5 s, 0.5 by default; only the dial in use
+shows): the same pace on screen at any tick rate, where ticks keep the
+share of the time something is lit -- and so a busy board's brightness --
+the same at any rate. It is still a span of **sim** time: the seconds are
+turned into ticks at the current rate (`glowTicks()`), so the colour stays
+a function of the state on screen, it freezes while paused, a rate change
+rescales a glow already under way, and a video uses its own ticks/s. The
+two-tick hold below is in ticks either way. Both keys (`statusGlowTime`,
+`statusGlowS`) ride presentations' views; a view saved before them keeps
+whatever the player has.
+
+**Glow sluggishness** (-2..2, 0 by default) scales a **run's** fade by
+(length / 10)^s -- the sim's length, buried tiles included, the law and
+reference length Audio's sluggishness uses -- so at 1 a 20-tile run glows
+twice as long as a 10-tile one, and below 0 long runs cool faster.
+Machines are unaffected. One multiply per run per frame, the factor looked
+up per length: `beltStatus()` measured 0.20 ms a frame on `test` with it on
+and off. Both dials ride presentations' views. **Reset colours** asks
+before resetting, and leaves both dials alone.
+
+- **Activity is read back, not predicted.** The sim stamps the tick a gate
+  last fired (`Sim.fired[row]`) and a run last pushed or popped
+  (`seg.lastPush`, `seg.lastPop`) -- one write per event, never read by the
+  tick, skipped while forecasting, cleared on every rebuild, carried by
+  `clone()` and `restoreFrom()`. An item travelling down a run makes no
+  event, so a run is also hot until **`Sim.restTick()`**: when its newest
+  item (or its head, with the option off) comes to rest if nothing more
+  happens -- the later of its entry tick plus its packed place over the
+  speed, and the last pop plus spacing over speed (the anchor's way back
+  to the end). That is a constant between pops, so the colour is a pure
+  function of the state on screen and the time: no per-frame history, so
+  a gate that fired once between two frames at 5000 tps still lights, and
+  a video's copy colours as the screen does. `tests/sim.test.mjs` pins
+  `restTick()` against running the run on with nothing offered or taken
+  (150 random runs, speeds and spacings), and that it does not move
+  without a pop; mutation-tested (drop the anchor term, an off-by-one, the
+  wrong stamp, the wrong packed place: each fails).
+- **Two ticks of look-back replace the old look-ahead.** Anything that
+  acted in the last `AFTERGLOW_HOLD` (2) ticks is fully hot at any fade, so
+  a run a gate takes from every other tick does not flicker. The status
+  colours used to ask the forecast "will the head pop on the coming tick?"
+  for that; they no longer read the forecast at all. A machine that is
+  ready and unblocked (it fires on the coming tick) is RUNNING, as before.
+- **Heat is rounded to 16 levels**, and every (state, level) colour is
+  built once per colour change (`statusPalette()`), so a fading board is a
+  few dozen colours and render.js's batching by colour holds.
+- **Cost**: a gate's resting state is worked out once per sim version (at
+  most once a frame); heat is per frame, one stamp read per machine and run.
+  On `test`, both together about 0.5 ms a frame.
+
+### Truthiness
+
+One bit per gate and per run, saying which side of zero the thing it just
+did was, for the afterglow's colours and the audio. **Recorded only while
+something reads it** -- View > **truthiness colours** or Audio >
+**truthiness** (`Sim.truthOn`, set by `paint()` each frame) -- and off,
+nothing is written: one boolean test per fire and per push, measured as no
+change to the tick on `cpu.npz` and `test`. So turning it on starts from
+stale bits: 1 (truthy, today's colours) until each gate fires and each run
+pushes again.
+
+- **A gate's bit** (`Sim.truth[row]`, written by `fire()`) is 1 iff the
+  value `truthSource()` names is > 0 (NaN is not). That is read from the
+  machine's own exported data, not a table: a select rule (Merge) or a
+  conditional op (Swap's `OP_SEL`, Route's `OP_GATED`) gives the
+  **control** input; otherwise the first output that is not a plain copy
+  (`OP_IN`, the pass-throughs) -- Shear's sum, Mac's accumulator, Max,
+  Floor, 1/a, a Source's emitted value; a machine with no outputs (Pixel)
+  is always truthy.
+- **A run's bit** (`seg.truth`) is its newest item's sign, set on a push
+  (seeds included) and never on a pop.
+- Both ride the worker's deltas while on (`runTruth`, `rowTruth`), and
+  clones, bakes and `restoreFrom()`. A forecast writes neither.
+- **Colours**: a falsy fire or push glows from View > status colours'
+  **gate running (falsy)** / **belt moving (falsy)** (blue by default)
+  instead of the running / moving colour, cooling to the same resting
+  colours. Read per row only when the switch is on.
+- **Audio**: see "Truthiness in the audio" under Audio.
+
+`tests/truth.test.mjs`: what each machine reads; nothing written while off
+and the tick unchanged while on; every fire's bit against the forecast's
+values and every run's against its newest item on `cpu.npz`; the worker's
+mirror and the recorder's falsy fires and flips against a main-thread
+reference; truthy plus falsy fires is every fire; the synth's falsy clicks,
+transposition and crossfade time; and the block renderer against the
+per-tick reference. Mutation-tested: dropping the delta's run bits, or the
+synth applying no flips, each fails it.
 
 ### Pan momentum
 
@@ -343,6 +453,16 @@ on the current layer.
   is the only active layer and every **visible** layer is active again (a
   hidden one keeps its own flag). View, not an undo step. Right-click on a
   mouse; the hold swallows the click its release makes.
+  **On touch the hold is the panel's own timer, never the browser's
+  contextmenu** (`wirePress()`). Android Chrome fires one for the same long
+  press, with its haptic, a moment after the timer -- and the isolate has
+  by then rebuilt every row, so it lands on a *new* button that never saw
+  the press, and a per-button "already held" flag let it hold again: the
+  isolate undone a frame later, unless the finger lifted in the gap. So the
+  pointer kind and the swallowed click live on the panel, not the button.
+  Reproduced in Chromium as a Pixel 7 (a CDP touch hold, then a touch
+  contextmenu at whatever is under the finger 100 and 300 ms later):
+  undone before, kept after; a right-click still isolates.
 - **Double tap a layer's name to select all of it**: the first tap makes it
   current as usual, the second (within 350 ms) lifts every entity on it
   into the selection -- adding, as selecting always does. Selecting is a
@@ -409,10 +529,15 @@ panel's preferences; a stored key this build does not know is ignored.
 
 Below a divider, two sub-folders of **zoom thresholds**: the zoom (CSS px
 per cell) below which belts turn to solid squares (0 by default: never), and from which the grid,
-glyphs and Source values, ports, port edges and belt chevrons draw; and the
+glyphs and Source values, ports, port edges and belt chevrons draw, and
+from which items are ringed discs rather than plain squares (6); and the
 **text fades**, in px of text height (what legibility depends on) -- item
 numbers fading in between two values, and a label's text appearing from
 one. `render.js`'s `LOD` reads them live through getters.
+
+**View > simple view** is exactly override zoom 1, and wins over the Dev
+dial while ticked (unticked, the dial applies as usual). It is in View, so
+it rides presets and presentation views.
 
 **Override zoom** (first in the zoom thresholds; 0 is off): above 0, the
 thresholds decide as if the zoom were that value, whatever the real zoom
@@ -1032,11 +1157,12 @@ is harmless and removes double-tap arbitration.
 
 [sim.js](sim.js) is a port of the desktop's **CPU** tick --
 `core/segments.py`, `core/belts.py`, `core/gates.py`, `core/tick.py` and the
-tick half of `engine.py` -- with every scheduler left out: no wake lists, no
-gate sleep, no constant folding, no GPU. The two optimisations kept are the
-closed-form belt (a run ticks in O(1) however many items are on it) and the
-gate prefilter (an occupancy test rejects gates that cannot act before the
-full firing rule runs). One module, no DOM, so Node can run it.
+tick half of `engine.py` -- with the desktop's schedulers left out (no
+constant folding, no GPU) and **a wake list of its own** (below), exact
+where the desktop's gate sleep was a heuristic. The other optimisations are
+the closed-form belt (a run ticks in O(1) however many items are on it) and
+the gate prefilter (an occupancy test rejects gates that cannot act before
+the full firing rule runs). One module, no DOM, so Node can run it.
 
 **It matches the desktop tick for tick**, and
 [tools/check_web_sim.py](../tools/check_web_sim.py) is what says so: it runs
@@ -1065,6 +1191,213 @@ Matching forced three details that would otherwise look arbitrary:
 - **Values are float32 at the same points**: gate channels live in the
   save's own entity `Float32Array`, and ring payloads are `Float32Array`s.
 
+**What the tick costs, and the two fixes that took it 4-6x.** Measured in
+Node on `test` (3.4k machines, 2k runs): 0.74 ms a tick before, 0.13 after
+(`cpu.npz` 0.11 -> 0.028, `Ram2.npz` 0.074 -> 0.018, `GameOfLife_SLOW`
+2.0 -> 0.70); in the editor at 10000 tps with the whole board on screen,
+555 -> 2376 ticks a second reached. Both are exact -- `check_web_sim.py`
+passes on every save, `test` and `GameOfLife_SLOW` included:
+
+- **The prefilter tests the connected outputs.** It asked whether *any*
+  output was free, and a dangling output always is, so every Source with an
+  unconnected face passed and `fire()` ran ~1770 times a tick to fire about
+  once. It now asks `fire()`'s own question of `drains`: a generator needs
+  one free, anything else all of them.
+- **A run's ports are plain numbers** (`srcRow`/`srcCh`, `dstRow`/`dstCh`,
+  resolved in `buildGates()`). `offer()` and `accept()` re-ran `livePort()`
+  -- an alive flag and a grid read for the ghost bit -- on every run every
+  tick, ~2000 calls to learn what only an edit (a rebuild) can change.
+
+That left three scans over everything -- every gate, every run, every
+direct edge -- to find the few with work: on `test` 0.27% of runs and 0.08%
+of gates change in a tick. The wake list is what removed them.
+
+### The wake list
+
+`Sim.sleepStep()` visits only what can act; `Sim.fullStep()` is the old scan,
+kept for the forecast and as the reference. **They are the same tick** --
+every rule below only ever skips work that would change nothing -- and
+`check_web_sim.py` still passes on every save against the desktop. The
+reasoning is in the comment above `makeSched()`; in short:
+
+- **A gate's firing reads only its own row**, so it is asked again only
+  when one of its channels was written (`touch()`, from the four channel
+  setters). In row order: Pixels fired in one tick paint in that order, and
+  a spatial recorder sums float gains in it.
+- **A direct edge** is checked only when its source or target row changed
+  since the last hand-off. All decided, then all applied, as before.
+- **A run touches only its own two lanes** (each lane has exactly one run
+  or edge on it), so runs never see each other within the belt phase, in
+  any order. One that ticks with no pop, no push and its anchor at the end
+  sleeps until its producer fills the zone it takes from (`setOut()` wakes
+  it), its consumer empties the lane it pops into (`clearIn()`), or -- by
+  the closed form alone, with nobody ticking it -- its head reaches the end
+  or room opens behind its newest item: a **timed wake** at entry +
+  length / speed or entry + spacing / speed (`wakeAt`). That is the case
+  the desktop's belt sleep once got wrong (a seeded item sliding down a
+  sleeping run, never popped); here the arrival tick is computed. Asleep, a
+  run's anchor is always at the end, so its skipped ticks lose nothing.
+- **Anything structural wakes everything** -- an edit's rebuild, Reset, a
+  bake's restore, a clone, a new audio recorder (`makeSched()`) -- and
+  waking too much is always safe, so every rule errs that way.
+- **The forecast runs `fullStep()`** with the scheduler set aside, so it
+  has nothing of the wake list's to roll back.
+- **Audio rides on it.** The recorder no longer scans: the sim calls
+  `Recorder.hit(seg)` for each run active on the tick -- every run it
+  ticks, by the drone's rule as before, and every sleeping run whose newest
+  item is still sliding into place, by the closed form (`moveUntil`,
+  `movers`; with the anchor at the end it moves on every tick before entry
+  + its packed place / speed). The bits are identical to the scan's.
+
+**Measured** (Node, `step()` alone, best of 5):
+
+| board | full scan | wake list |
+|---|---|---|
+| `test` (3.4k gates, 2k runs) | 102 µs | **4.4 µs** -- 230k ticks/s |
+| `Ram2.npz` | 22 µs | **0.9 µs** |
+| `cpu.npz` | 21.5 µs | **6.1 µs** |
+| `GameOfLife_SLOW` (15% of runs active) | 690 µs | **265 µs** |
+
+**Debug > wake list** switches it off (and on, waking everything), for
+comparing: the same ticks either way, only the cost differs. Kept across
+board loads in the session, not stored.
+
+So the tick now costs what the board *does*, not what it *holds*: per tick
+on `cpu.npz` about 13 gates asked, 12 runs ticked, 12 edges checked. On the
+main thread, `GameOfLife_SLOW` reached only ~500 tps: its frame is 27 ms of
+rendering, and the step got its 12 ms budget per frame, so the frame rate
+capped the tick rate. Moving the tick to a worker (below) is what unhooked
+the two.
+
+**`tests/sleep.test.mjs` is the differential check**: a sleeping and a
+full timeline on six saves (and four more at belt constants other than
+the shipped ones), compared every tick -- every ring, counter and anchor,
+every gate channel, the activity stamps, the Pixel screen in paint order,
+and the audio recorder's bits and fire counts -- with a recorder attached
+partway and a Reset halfway. It also asserts the wake list actually slept
+(under 60% of the work visited) and fired timed wakes, so a run that never
+slept cannot pass it. **Mutation-tested, eleven ways**, every one caught:
+no timed wakes, no head-arrival wake, no room wake, no wake on a consumer
+emptying or a producer filling, a pop's input or a push's emptied zone not
+marking the gate, direct edges never checked, sleeping with the anchor
+short, sliding sleepers not heard, gates asked out of row order. Three of
+those passed at first: the room wake and the anchor rule cannot matter at
+the shipped constants (spacing == speed: a run with no room has just
+pushed, and one tick after a pop the anchor is back), hence the runs under
+other constants; and gate order shows only on the Pixel screen, hence
+comparing it.
+
+### The tick on a worker
+
+While the sim plays, the ticking happens on a **Web Worker**
+([simworker.js](simworker.js), driving a `SimHost` from
+[simhost.js](simhost.js)), so the tick rate is no longer capped by how long a
+frame takes to draw. The ceiling is `RATE_MAX`, a million tps.
+
+| board | main thread | worker |
+|---|---|---|
+| `test` | 100k (the ceiling) | 100k (the ceiling) |
+| `GameOfLife_SLOW` | ~500 | **~3,700** |
+
+(Headless Chromium, the whole board on screen.) At 3,700 tps Game of Life
+is the worker's own CPU: 265 µs a tick. The frame cost of the worker is
+applying its delta, 3.6 ms on Game of Life.
+
+**The main thread keeps its Sim as an exact mirror.** Each frame it asks the
+worker for a delta -- what changed since the last one, collected by a
+`Tracker` the worker's Sim calls from the same places the wake list hears of
+a change: the runs ticked, the ring slots pushed into, the gate rows whose
+channels were written, the Pixel fires in order, the audio recorder's bits.
+`applyDelta()` writes it into the mirror, so everything that reads the sim
+-- the renderer, the forecast, status colours, Status, bakes, video -- reads
+the mirror and needed no change. A delta is small because a tick changes
+little; that is the wake list paying twice.
+
+**Edits stay on the main thread**, which owns the Board. After the mirror
+rebuilds, `Sim.onRebuild` sends the board's arrays and the run-id
+allocator's state from just *before* that rebuild (`Sim.lastAlloc`, taken
+after the old runs' ids are released), and the worker rebuilds the same way
+(`allocOverride`) and so numbers every run the same -- deltas are keyed by a
+run's index and a gate's row. Taking the allocator before the release was
+the first version's bug, and broke every test from tick 1. Anything the
+worker ticked past the mirror on the old board is dropped: the board
+message carries the mirror's tick.
+
+**The main thread still steps the mirror itself** while a baked soundtrack
+plays (the audio clock decides each frame's tick), and whenever the worker
+is off. Taking over pauses the worker and bumps the **epoch**, so any delta
+already in flight is dropped; the next time the worker plays, it is sent the
+mirror's whole dynamic state first (`exportFull`/`applyFull`, with
+everything awake). A bake's restore does the same. Every board or state
+message bumps the epoch, and a delta carries the epoch it grew from, so a
+delta can never land on the wrong state. A Bake pauses and resets in one
+go, so a board message sent while the clock is paused but the worker is not
+yet told pauses the worker first -- otherwise it ticks the new board past
+where the mirror stands.
+
+Smaller parts:
+
+- **Audio.** The recorder no longer hears ticks it did not run: the worker
+  has an `AudioTap` filling the same bits and click counts from the
+  recorder's own configuration (`Recorder.tapConfig()`, sent whenever its
+  generation or the gains change). Measured identical to the main-thread
+  recorder: 244,083 run bits and 96,328 clicks either way over `test`'s
+  active stretch. With sound on, the tap's ticks go **straight to the
+  synth** down a port of their own, not through the deltas -- see
+  "Realtime at high tick rates" under Audio; without that line (the tests'
+  default) they ride the deltas and `Recorder.ingest()` appends them. A
+  new tap wakes the worker's Sim, as `Recorder.configure()` does: the wake
+  list hears a sleeping run still sliding into place only if it was told
+  of it, and without the wake those runs went unheard until something
+  woke them. The first worker test compared only ticks after a takeover
+  (which wakes everything), so it never saw this; the direct-line test
+  did, on its first run.
+- **Alpha.** Items glide between deltas: `clock.frac` is the worker's frac
+  when it answered, plus the time since times the rate, held below the next
+  tick, which the mirror does not have yet.
+- **A background tab.** The worker stops ticking when it has not been asked
+  for a delta in `IDLE_MS` (500 ms), and starts again without catching up at
+  the next request -- what the main thread did when a hidden tab's frames
+  stopped. Ticking on unseen would grow the delta and its audio without
+  bound.
+- **The loop** runs a slice of at most `SLICE_MS` (6 ms) at a time, so a
+  request or a pause is never kept waiting, and chains slices through a
+  `MessageChannel` post rather than `setTimeout`, which clamps to 4 ms. At a
+  slow rate it sleeps until the next tick is due.
+- **Debug > sim worker** switches it off, for comparing; off, `paint()`
+  steps the mirror within `STEP_BUDGET_MS` as before. If the worker fails to
+  start (or posts an error), it stays off for the session and the main
+  thread ticks.
+
+**`tests/worker.test.mjs` holds the mirror to a reference timeline** -- an
+ordinary Sim on its own copy of the board -- after every delta, on three
+saves: every ring, counter, anchor and channel, the activity stamps, the
+Pixel screen in paint order, and the recorder's bits and clicks. Both ends
+run in one process and every message goes through `structuredClone`, so
+anything that would not survive the trip to a real worker fails there too.
+The cases: deltas of 1 to 60 ticks; an edit and a Reset with the worker
+ticked ahead unseen; the main thread taking over with a stale delta in
+flight; a worker started late, after edits; audio recorded under a sound
+selection that changed while it was in flight; the loop's rate, pause and
+idle. **Mutation-tested, eleven ways**, ten caught: untracked pushes or
+ticked runs, the allocator or the rebuild's tick not carried, stale changes
+kept across a rebuild, Pixel fires not replayed, a full state without its
+rings, a board message keeping the old epoch, a worker that never idles, and
+stale audio ingested (which needed its own case: the selection reconfigures
+the recorder with no rebuild, so the epoch alone cannot drop it). The one
+survivor is equivalent: the fire stamp's row mark, since every fire also
+writes one of that row's channels, which marks it anyway -- kept so the
+stamp does not rely on that. In the browser the same comparison held
+through edits while playing, pause and resume, a Reset while playing, the
+wake list switched off mid-play, Pixels, and a bake's playback handing over
+to the worker at its end.
+
+One trap: a version of `deliverDirect()` over flat `Int32Array` offsets
+measured 25x *slower* in the step (0.38 ms) and was also wrong -- it ended
+`test` with 1922 items in flight where the real tick has 1696. Reverted; the
+check would have caught it, and the timing alone would have looked like a
+V8 oddity.
+
 **The arithmetic is data.** `types.json` now carries a `sim` record per
 machine -- firing rule, port-to-channel maps, the `OPS` opcode table and
 Merge's `SELECT_RULE` -- and `evalOps()` is a port of `Entity.eval_ops()`.
@@ -1087,7 +1420,8 @@ turned a whole tick into 0.9999 of one; the unit test caught it. A frame's
 dt is clamped to 0.25 s and the backlog to 240 ticks or a quarter second's
 worth at the rate, whichever is more, so a backgrounded tab never freezes to
 catch up -- a flat 240 would have capped 10000 tps at 240 ticks a frame.
-`paint()` also stops stepping after `STEP_BUDGET_MS` (12 ms) of a frame and
+When the main thread ticks (see "The tick on a worker"), `paint()` also
+stops stepping after `STEP_BUDGET_MS` (12 ms) of a frame and
 drops the rest, so a rate the board cannot sustain runs as fast as it can
 rather than starving frames into a growing backlog; the fps counter's tps is
 the rate actually reached. **Rendering loops only while playing**; paused,
@@ -1228,7 +1562,8 @@ What sounds:
 
 - **A belt run is active on a tick** if it pushed or popped, or its newest
   item moved (the belt status colours' "moving", with "stalled but moving:
-  green"). Two `positionOf()` calls per candidate per tick. Its drone has
+  green"). The sim reports it (`Recorder.hit()`, see "The wake list"), so
+  it costs nothing for a run that is asleep and still. Its drone has
   pitch **min-length Hz × min length / length** (the sim's length, buried
   underground tiles included): the dial is the pitch of the shortest run
   that sounds, so raising min length transposes everything up and the
@@ -1491,6 +1826,76 @@ ticks arrive, with no refill wait. A hold gives up after `HOLD_MAX_S`
 (0.5 s); a pause is still a stop. It is the realtime remedy for stutter at
 busy moments; baking is the thorough one.
 
+### Realtime at high tick rates
+
+Above about 20k tps the realtime sound hiccuped where a bake of the same
+ticks did not. Two causes, both fixed, and neither touches a bake:
+
+- **The synth's cost grew with the tick rate.** Realtime playback cut
+  every 128-sample block at every tick boundary and ran every voice's
+  setup for each piece -- at 20k tps a piece every 2.4 samples, at 100k
+  every sample -- so the voices' setup, not their samples, was the cost.
+  `renderBlock()` walks the block's ticks first, applying them at the
+  same samples and logging each voice's on/off changes with their
+  offsets, then renders each voice over the whole block, switching at its
+  own change points: O(voices + changes) a block instead of O(ticks x
+  voices). In Node, per 128-sample block (budget 2.67 ms):
+
+  | board | rate | per tick | by block |
+  |---|---|---|---|
+  | `cpu.npz` | 20k | 0.32 ms | **0.21** |
+  | `cpu.npz` | 100k | 0.79 ms (worst 2.64) | **0.30** (worst 0.46) |
+  | `test` | 20k | 0.34 ms | **0.20** |
+  | `GameOfLife_SLOW` | 20k | 0.62 ms | **0.48** |
+
+  What remains on Game of Life is real work a bake does too: applying
+  6,386 runs' bits a tick, and scheduling each jittered click.
+- **Ticks reached the synth once a frame.** The worker's ticks went to the
+  main thread in each frame's delta and on to the synth from there, so a
+  frame's gap plus the audio thread's own bursts (3-4 blocks at a time in
+  Chromium) had to fit in the latency. They did not always: `test`
+  carries a 20 ms latency in its save, and with frames 17-48 ms apart it
+  ran dry about three times a second, at **any** tick rate. Now the main
+  thread hands the worker a port into the synth (`audio.js tickPort()`,
+  the worklet's `tickport` message) and the worker posts its tap's ticks
+  down it every `AUDIO_POST_MS` (5 ms) and on every delta request; a
+  pause sends the last ticks and then `stop` down the same line, so
+  nothing arrives after it. In the browser, `test` went from 14-54
+  underruns per 5 s to **none**, at 1k, 20k, 100k and 1M tps. Configs
+  still come from the main thread, on the worklet's own port, so the two
+  are not ordered: configs and tick batches both carry the recorder's
+  generation, and the synth drops a batch from another one.
+
+**The meter shows "ran dry n · skipped m"** once either happens: the
+queue running out of ticks (an underrun: they came late, so raise the
+latency or lighten the frame) or a backlog skipped. Counted since sound
+was switched on. Its "refused" count could also read -1 after an underrun,
+since `gatesOff()` zeroed the count and left each run's refused flag set;
+it clears both now.
+
+**It is the same sound, to the bit**: the per-tick renderer is kept as the
+reference (`synth.batch = false`), and `tests/audio.test.mjs` renders a
+real save's ticks both ways from 30 to 100k tps and compares every sample.
+That took moving one thing in the reference: realtime now frees finished
+voices at the end of each render call rather than at tick boundaries
+inside it, so a refused run waits up to a block for a voice. (A bake still
+frees on tick edges; its exactness is about chunking, not this.) Three
+more details the walk needed: a voice allocated mid-block runs silent from
+the block's start with its phase wound back to 0 at its offset; a click
+due "now" lands at its tick's sample, not the block's first; and the click
+pool **grows** (to 2^20), since a block schedules all its ticks' clicks
+before any play -- 300k tps of 64 fires a tick is 51k clicks a block. One
+deliberate difference: with a space, a voice's gain glides once a block,
+not at each tick boundary, which the test holds to under 0.1% of the
+signal. Mutation-tested eight ways (a change logged a sample early, a
+run's off not logged, the phase not wound back, either kind of click at
+the block's start, the start tick ignored, voices never switching
+mid-block, the pool not growing): each fails it -- three only once cases
+for unjittered clicks, a start tick and a click burst were added. The
+direct line is mutation-tested in `tests/worker.test.mjs`: the new tap's
+wake, audio left in the deltas, no send on a request, the stop before the
+last ticks, the synth ignoring the generation.
+
 ### Baking
 
 **Bake audio…** (Audio folder) opens a sheet: seconds (default 30, at most
@@ -1564,6 +1969,80 @@ does not write the key back, and is deliberately left that way.
   clamped to the panel's ranges; a bad entry costs that dial, a corrupt
   blob costs the settings, never the board.
 - The baked audio itself is not saved: memory only, and tens of MB.
+
+### Truthiness in the audio
+
+Audio > **truthiness** splits the sound by the bits above (Sim.truthOn is
+on while it is). Off, none of it runs and the synth renders exactly as
+before (every existing audio test, the bit-identical bakes included, is
+untouched). The falsy dials (Audio > **falsy (truthiness)**) default to
+copies of the truthy ones, so switching on changes nothing until they are
+tuned; the truthy half is the existing dials. All of them ride saves,
+audio presets and bakes like any dial.
+
+- **Clicks**: Audio > click timing > **resonators** (1-16, 5 by default)
+  is each group's total. Off, all of them are the group's, as before (at 5
+  the layout, the detune spread `detuneAt()` and the hash salts are
+  exactly the old ones). On, the truthy half gets `ceil(n / 2)` and the
+  falsy half the rest, at least one; each half has its own gain, tone,
+  decay and detune, and its own hash salt. The recorder counts a falsy
+  fire in `fires[group + 3]`, sent as `f0F`/`f1F` beside `f0`/`f1`.
+- **Belts: no extra voices.** A run's voice switches settings when its
+  bit changes: falsy gain, waveform, **transpose** (semitones) and
+  **brightness** (a low-pass closing up to 7 octaves, on top of the
+  distance low-pass). A change crossfades over **belt crossfade ms**
+  (0: a cut) between the two oscillators, each computed only while
+  heard (`truthRun()`). A newly voiced run starts straight in its state.
+- **Only changes cross threads**: the recorder lists flips (`tf`, 2 x
+  candidate + bit, with per-tick ends `to`) rather than a second bitset per
+  tick, so the busiest stream does not double at high tick rates; the
+  config carries every candidate's bit to start from. Ticks dropped or
+  skipped still apply their flips. The worker's tap records the same.
+- In the block renderer a flip is a change point like on/off (log values
+  2/3). It matches the per-tick reference to the bit with brightness open;
+  closed, a voice allocated mid-block warms its filter over the block's
+  silent start, as the distance low-pass does (under 1%).
+
+### Advanced audio
+
+Audio > **advanced audio** (a switch beside truthiness) shows Audio >
+**advanced** and turns on four timbre features. Off, the folder is hidden
+and the synth reads none of its dials: every advanced branch is behind a
+flag set in `applyParams()`, and `tests/advaudio.test.mjs` asserts the
+output is **bit-identical** whatever the advanced dials hold, and also with
+the switch on at its defaults. Each feature has a truthy dial set (applied
+to everything) and a falsy one (only with truthiness on). The dials ride
+saves, audio presets and bakes like any dial.
+
+- **Falsy envelope** (`attackMsF`, `releaseMsF`): a falsy run's own attack
+  and release, sluggishness included. The envelope runs at the pace of the
+  half it is heading for (`vAtkF`/`vRelF`, equal to the truthy ones
+  otherwise), so e.g. truthy runs sustain while falsy ones pluck.
+- **Pulse wave** (`beltPulse`, `beltPW`): blends the sine/tri/saw table
+  toward a mean-zero pulse of the given width -- a square at 0.5, nasal
+  below. Only the table changes (rebuilt when the dials move), so it costs
+  nothing per sample.
+- **Tremolo and vibrato** (`trem*`, `vib*`: Hz, and depth -- a share of
+  the gain, or semitones): per-sample gain and pitch factors for each half,
+  computed once per span (`lfo()`) as a function of the **absolute sample
+  clock**, so how the rendering is split never changes them; then every
+  voice multiplies by them. With either on, voices take the two-oscillator
+  path (`truthRun()`) even with truthiness off. A voice allocated mid-block
+  winds its phase back by the pitch it would actually have advanced, or
+  the block renderer drifts from the per-tick reference under vibrato.
+- **Noise exciter** (`clickNoise`, `clickNoiseMs`): a share of each click
+  becomes a burst of noise into its resonator, decaying over the dial's
+  time, scaled to about the impulse's loudness -- a "tsk" rather than a
+  ping, and with a long burst a snare-like wash. Each resonator has its
+  own noise generator, so a bake is the same however it is chunked;
+  resonators with no noise take the old loop.
+
+`tests/advaudio.test.mjs`: off and at defaults bit-identical; with every
+feature on, a bake chunked two ways identical and the block renderer equal
+to the per-tick reference; the pulse's duty cycle; tremolo's dip and
+vibrato's spread of periods; a noise burst still ringing where an impulse
+has died; and a falsy run's own attack. Mutation-tested: the noise read
+while off, and the vibrato wind-back dropped, each fail it.
 
 **Presets** (Audio > presets; [audiopresets.js](audiopresets.js)) carry a
 sound between saves: the same record a save holds (every dial, the scale
@@ -1731,18 +2210,45 @@ them: the panel's **Presentation** folder, and **Export presentation
   the default. A view is the panel's View, status colours and Dev dials
   (`Panel.captureView()` / `applyView()`) plus each layer's visible, active,
   tint and label size and the labels' master switch (`captureViewState()`
-  / `applyViewState()` in main.js; layers are matched by id).
+  / `applyViewState()` in main.js; layers are matched by name, below).
 - **Export** takes the board as it stands -- a selection put down first;
-  audio settings and labels ride in the save -- the view in front of the
-  player as "default", the captured detail view if set, and the folder's
+  audio settings and labels ride in the save -- the stored standard view as
+  "default" (the view in front of the player if none is set), the captured
+  detail view if set, and the folder's
   draft: name, start rate and four rate boxes (blank or 0 unused), the
   cameras (no start camera: the whole board) and the schedule. The draft
   persists with the panel's preferences.
+- **The views** (Presentation > views): **Set standard view** and **Set
+  detail view** capture the view in front of the player into the draft;
+  **Load** puts one back in front of the player, so changing one setting
+  of a view is Load, change, Set -- not rebuilding it from memory; **Clear**
+  drops it (Load and Clear are disabled while it is unset). A cleared
+  standard view means "the live view at Export", as before it existed, so
+  a draft from before keeps its behaviour. `#edit=` fills both from the
+  record.
+- **View presets** (View > presets, beside the settings they hold;
+  [viewpresets.js](viewpresets.js)): a view -- the same record
+  `captureViewState()` makes, minus its name -- kept under a name in this
+  browser (`gates.web.viewPresets.v1`) and exported or imported as a tagged
+  `.json` (`gates-view-preset`, so an audio preset is refused). Loading one
+  sets the view in front of the player through `applyViewState()`, from
+  where Set standard / detail view makes it either view. Cleaning on read
+  is structural only (scalars, layer entries with an integer id);
+  `applyViewState()` already takes only keys the panel knows, of the right
+  type.
+- **Layers in a view are matched by name** (`layerKey()`: case and end
+  spaces ignored, as a paste's are), presets and presentation views alike,
+  so a view carries to another board: a layer whose name the view does not
+  mention, or a name the board lacks, is left alone; two layers of one name
+  both take it. A view recorded before names were (an older presentation
+  JSON) has none, and matches by id as it always did.
+  `tests/viewpresets.test.mjs`.
 - **The page** shows the board, the sound button, Reset and Play/Pause
   (bottom middle), an **i** button cycling the views (hidden with only
-  one), and the **speed** panel (bottom left, above the button row so five
-  rates never reach the centred buttons), the starting rate lit -- no
-  panel at all without other rates. Everything else is hidden by
+  one), and the **speed** panel (bottom left, level with the buttons: the
+  rates wrap to two rows of three, and a rate of 1000 or more reads as
+  "1k" -- a million as "1M" -- so five never reach the centred buttons), the starting rate lit --
+  no panel at all without other rates. Everything else is hidden by
   `body.presenting`. It writes **nothing** to the browser's storage:
   `freezePersist()` runs before the shell and the panel are built, and
   every store (panel prefs, the shell's, the layer panel size, saves and
@@ -1763,9 +2269,34 @@ them: the panel's **Presentation** folder, and **Export presentation
   on if it was playing. Long press, selection drags and editing keys are
   all off.
 
+- **The hammer** (bottom right, over the tap-to-begin cover) goes to the
+  editor: `#edit=<name>`, which loads that presentation's board, applies
+  its default view, fills the Presentation folder from its record (name,
+  rates, cameras, schedule, detail view) and sets the start camera -- so a
+  deployed show can be changed and exported again. The hash is dropped once
+  read, so a reload resumes as usual. Loading it is not an edit, so no save
+  is written until something changes.
+- **Preview** (Presentation > Preview presentation) shows the presentation
+  the folder describes -- the record Export would write -- on the board in
+  front of the player, **in the page**, with no reload: the hammer or Esc
+  comes back with the undo history, stamps, tool bar and board untouched
+  (`enterPreview()` / `exitPreview()` in main.js). The preview starts from
+  Reset, as a viewer's would. On the way out the view (View, colours, Dev
+  dials, layer visibility), camera, rate and play state are put back, all
+  while the stores are still frozen (`unfreezePersist()` comes last), so
+  localStorage is byte-identical after a preview. `startPresentation()`
+  takes the record directly (`opts.rec`, no board load) and returns before
+  the cover is tapped, so its `close()` can take everything it made back
+  off the page at any point.
+
 `tests/present.test.mjs` covers the hash, the record, the speed panel and
-the schedule. Driven in Chromium as a Pixel 7: export, unzip, open; the
-cover's drag leaves the camera; the schedule zooms with the ticks and Reset
+the schedule. Preview and the hammer, driven as a Pixel 7: an edit, a
+preview, a tap to begin, the hammer back -- undo still there, view, camera
+and board restored, no presentation element left, localStorage
+byte-identical; the hammer straight off the cover and Esc likewise; and
+`#b=test`'s hammer opening it in the editor with its settings. The show
+itself, also as a Pixel 7: export, unzip, open; the cover's drag leaves the
+camera; the schedule zooms with the ticks and Reset
 returns it; i cycles; a machine tap pauses and the dismiss resumes; a pan
 and a rate change each end the schedule; localStorage byte-identical after.
 
@@ -1825,6 +2356,72 @@ replaces the board in front of you. Saving over an existing name asks first.
 reads them here, and loads them through the desktop's `persistence.load()`,
 asserting every array matches and exactly the edited value differs.
 
+## Profiling a frame
+
+**Debug > profile frames** shows a timing tree under the fps counter, a
+mean per frame over one-second windows ([prof.js](prof.js), after the
+desktop's `core/tick_profile.py`): `begin()`/`end()`/`span()` name nested
+spans (`paint/render/structs/ports`), and off they cost one boolean test.
+`window.gates.setProfiling(true)` and `gates.profText()` do the same from
+the console or a headless test.
+
+**These are main-thread CPU times.** Canvas 2D *records* draw calls there
+and rasterises them later, so a fill's pixel cost is in no span: `frame`
+(paint to paint) minus `paint` is idle, raster and compositing. **GPU sync**
+ends each render by reading one pixel back, which waits for the raster, and
+reports the wait as `render/gpu sync` -- honest, and it slows the frame, so
+it is its own switch.
+
+Measured on `test` (above), whole board on screen, playing at 30 tps,
+headless Chromium (software raster, so the raster numbers are not a
+phone's):
+
+| | before | after |
+|---|---|---|
+| 1280×800, DPR 1 | 50.7 ms/frame (JS 30) | **19.2** (JS 7.5) |
+| 412×915, DPR 2.6 | 58.4 (JS 31) | **34.5** (JS 8) |
+| zoomed in (19 px/cell) | 16.7 (JS 4.2) | 16.7 (JS 1.6) |
+
+What it took, each found by the tree:
+
+- **`closePath()` is quadratic in Chrome.** Its cost grows with the length
+  of the path it is called on, so n polygons closed with it cost O(n²):
+  3200 triangles took 40 ms against 2.4 ms closed with a `lineTo` back to
+  the start. The underground funnels alone were 17 ms of a whole-board
+  frame. **Never call it** on a batched path: `closePoly()` in render.js
+  (a `lineTo` to the first vertex and on to the second, so a stroke still
+  joins the corner). `arc()`, `rect()` and SVG `Z` in a `Path2D` string
+  are all linear.
+- **Status colours at most once per frame.** They are worked out in
+  `paint()` after the frame's ticks, for the state on screen only, and
+  cached on that state and the time, so a frame with no new tick (a slow
+  rate, or panning while paused) reuses them. (Now the afterglow's; see
+  "Gate status colours".)
+- **The forecast rolls back with an undo log**, not a copy of the entity
+  table: `setF()` logs each value it replaces while a forecast runs. The
+  copy was 3.6 MB on a 32k-row board and three quarters of the forecast.
+- **Belts are culled before they are grouped by tint**, so a zoomed-in view
+  asks the tint about what is on screen, not all 16k belts.
+- **Machine bodies are one path per colour** (fill, then edge), not a
+  `fillRect` + `strokeRect` and two style changes per machine.
+- **Items below Dev > `item rings from` (6 px/cell) are plain squares** in
+  the ring's colour: a disc there is a pixel or two, and rects are far
+  cheaper than arcs to build and to rasterise.
+
+Tried and not kept: filling belt spines as rects instead of stroking them
+with round joins -- slower in this rasteriser, and unmeasurable on a phone
+from here. Solid-square belts (`solid belts below`) are slower too.
+
+What is left, zoomed out on a phone, is mostly **raster**: tens of
+thousands of sub-pixel shapes. The next steps, cheapest first: a
+far-zoom tier drawing the board as a bitmap at a few texels per cell
+(written from the grid, redrawn on an edit or a tick's status change, then
+one `drawImage`); and past that, the board in WebGL2 the way the desktop
+draws it -- the grid as an integer texture and one fragment pass, O(pixels)
+whatever the entity count -- with Canvas 2D kept on top for text, ghosts
+and editing marks. `itemPoints()` (flow.js, ~2 ms whole-board) is the
+largest JS span left.
+
 ## Rules
 
 - **No build step, no npm, no framework.** Plain ES modules and Canvas 2D
@@ -1847,11 +2444,16 @@ asserting every array matches and exactly the edited value differs.
   `redraw()`, which coalesces into one `requestAnimationFrame`; the only
   continuous frames are the ones advancing the clock. Every draw pass is one
   batched path per family, culled to the viewport, with detail gated on zoom
-  (`LOD` in `render.js`).
-- **The tick stays the desktop's CPU tick.** The closed-form belt transport
-  and the simple gate prefilter are the only optimisations wanted. No wake
-  lists, no folding, no GPU. A change to the desktop's tick semantics needs
-  the same change in `sim.js`, and `tools/check_web_sim.py` must still pass.
+  (`LOD` in `render.js`). No `closePath()` on a batched path (see
+  "Profiling a frame").
+- **The tick stays the desktop's CPU tick.** The closed-form belt transport,
+  the gate prefilter and the wake list are its optimisations, all exact:
+  `tools/check_web_sim.py` must still pass, and so must
+  `tests/sleep.test.mjs` (sleeping against full, every tick), and
+  `tests/worker.test.mjs` (the main thread's mirror against a reference).
+  No folding, no GPU yet. A change to the desktop's tick semantics needs the same
+  change in `sim.js` -- and any new way a gate's channels or a run's state
+  can change needs a wake, or the sleeping tick drifts from the full one.
 
 ## Files
 
@@ -1859,7 +2461,9 @@ asserting every array matches and exactly the edited value differs.
 |---|---|
 | `index.html`, `style.css` | the shell: board, controls row, swatch bar, picker sheet |
 | `main.js` | wiring: applies the shell's and panel's requests to the board; resize, redraw, the play loop |
-| `sim.js` | the simulation: segment index, closed-form belts, gates, the clock -- the desktop's CPU tick; `forecast()` |
+| `sim.js` | the simulation: segment index, closed-form belts, gates, the wake list, the clock -- the desktop's CPU tick; `forecast()` |
+| `simhost.js` | the sim on a worker: the deltas, the board and state messages, the epoch, `SimHost` and its loop's slices; pure, no DOM |
+| `simworker.js` | the worker itself: a `SimHost` and the loop that runs it |
 | `flow.js` | where items are drawn: belt paths, the machines' internal links and wait points, the tick animated from the forecast |
 | `ui.js` | the shell's state and DOM: modes, sim and turn buttons, thumb pads, swatches, long press, picker |
 | `tools.js` | the tool catalog (from `types.json`) and the swatch drawings |
@@ -1871,9 +2475,11 @@ asserting every array matches and exactly the edited value differs.
 | `space.js` | spatial audio: distance to the region or screen box, the falloff and low-pass curves, per-run and per-gate weights |
 | `scale.js` | belt scales: the formula language, presets, tables, the wavelength table the synth reads |
 | `audiopresets.js` | audio presets: the dials under a name, in the browser and as `.json` files |
+| `viewpresets.js` | view presets: a presentation view (View, colours, Dev, layers) under a name, in the browser and as `.json` files |
 | `audio-bake.js` | baking: a stretch of ticks rendered offline, and the WAV writer; loaded on demand |
 | `pixel.js` | the Pixel machine (web-only, in Sink's id), its screen, and the overlay's drawing |
 | `present.js` | presentation mode: the `#b=` route, its controls, the camera schedule, the info panel |
+| `prof.js` | Debug > profile frames: named spans, the per-frame timing tree |
 | `persist.js` | the one switch that stops every localStorage write (presentation mode) |
 | `presentations/` | presentation pairs, `<name>.json` + `<name>.npz`, copied into the site |
 | `video-params.js` | video export: the settings and the camera move; loaded always |
@@ -1924,7 +2530,8 @@ node --test web/tests/*.test.mjs
 
 Pure-JS tests (the planner, the placer, the stamp transforms, the run
 tracer, the closed form against the naive oracle, the opcodes, the clock,
-the `.npz` writer, audio settings in a save) run in Node, with no npm and no browser. The whole tick against the
+the `.npz` writer, audio settings in a save, the wake list against the
+full tick, and the worker's mirror against a reference) run in Node, with no npm and no browser. The whole tick against the
 desktop's is a separate, slower check (about 25 s for every save):
 
 ```bash

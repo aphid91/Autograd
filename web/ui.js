@@ -106,6 +106,10 @@ export class Shell {
       // Whether the "long press" hint has been shown (on the first close).
       simHinted: saved.simHinted === true,
       customOpen: false,   // the Custom entry row is showing
+      // With a custom rate, the slider on the board's right edge scales it:
+      // the clock runs at rate x rateScale (0..1, the custom value its
+      // maximum). Persisted, and kept when the slider hides.
+      rateScale: Number.isFinite(saved.rateScale) && saved.rateScale >= 0 && saved.rateScale <= 1 ? saved.rateScale : 1,
       // While main.js is planning something, what the bar should show:
       //   { kind: "belt", routeName, routeIcon }   a belt run
       //   { kind: "place", values }                a machine or raw belt;
@@ -143,7 +147,7 @@ export class Shell {
 
   changed() {
     const s = this.state;
-    store({ mode: s.mode, slots: s.slots, selected: s.selected, rate: s.rate, simPanel: s.simPanel, simHinted: s.simHinted });
+    store({ mode: s.mode, slots: s.slots, selected: s.selected, rate: s.rate, rateScale: s.rateScale, simPanel: s.simPanel, simHinted: s.simHinted });
     this.render();
     this.cb.onChange?.(s);
   }
@@ -347,10 +351,55 @@ export class Shell {
     this.render();
   }
 
-  setRate(rate) {
+  // `exact`: run at exactly this rate (a bake's playback, a preview's
+  // restore), so the slider goes back to 1 if the rate is custom.
+  setRate(rate, exact = false) {
     this.state.rate = rate;
+    if (exact) this.state.rateScale = 1;
     this.changed();
-    this.cb.onRate?.(rate);
+    this.cb.onRate?.(this.effectiveRate());
+  }
+
+  // A custom rate (not one of the presets) is scaled by the slider.
+  get customRate() { return !RATE_PRESETS.includes(this.state.rate); }
+  effectiveRate() {
+    const s = this.state;
+    return this.customRate ? Math.min(RATE_MAX, Math.max(RATE_MIN, s.rate * s.rateScale)) : s.rate;
+  }
+  setRateScale(v) {
+    this.state.rateScale = Math.min(1, Math.max(0, v));
+    this.changed();
+    this.cb.onRate?.(this.effectiveRate());
+  }
+
+  // The slider: on the board's right edge while the rate panel is open on a
+  // custom rate. Its value is the scale; the readout the rate it gives.
+  buildRateSlider() {
+    const stage = document.getElementById("stage");
+    if (!stage) return;
+    const wrap = document.createElement("div");
+    wrap.className = "rate-slider";
+    wrap.dataset.show = "false";
+    wrap.innerHTML = `<div class="rate-slider-val"></div>
+      <input type="range" min="0" max="1" step="0.001" aria-label="Tick rate, as a share of the custom rate">`;
+    const input = wrap.querySelector("input");
+    input.addEventListener("input", () => this.setRateScale(Number(input.value)));
+    // The board must not see the slider's gestures.
+    for (const ev of ["pointerdown", "pointermove", "pointerup", "wheel", "touchstart", "touchmove"]) {
+      wrap.addEventListener(ev, (e) => e.stopPropagation(), { passive: true });
+    }
+    stage.append(wrap);
+    this.rateSlider = wrap;
+  }
+  renderRateSlider() {
+    const w = this.rateSlider;
+    if (!w) return;
+    const s = this.state, show = s.simPanel && this.customRate;
+    w.dataset.show = String(show);
+    if (!show) return;
+    const input = w.querySelector("input");
+    if (document.activeElement !== input || Number(input.value) !== s.rateScale) input.value = String(s.rateScale);
+    w.querySelector(".rate-slider-val").textContent = `${fmtRate(this.effectiveRate())}/s`;
   }
 
   toggleSimPanel(open = !this.state.simPanel) {
@@ -423,6 +472,7 @@ export class Shell {
     });
     input.addEventListener("input", () => input.removeAttribute("aria-invalid"));
     c.querySelector("#sim-close").addEventListener("click", () => this.toggleSimPanel(false));
+    this.buildRateSlider();
   }
 
   // The tick counter in the panel's header. Cheap enough to call every frame:
@@ -465,6 +515,7 @@ export class Shell {
     customBtn.dataset.selected = String(!preset || s.customOpen);
     customBtn.textContent = preset ? "Custom" : `${fmtRate(s.rate)}`;
     panel.querySelector("#sim-custom").dataset.open = String(s.customOpen);
+    this.renderRateSlider();
 
     const planning = !!s.planning;
     const beltRun = s.planning?.kind === "belt";

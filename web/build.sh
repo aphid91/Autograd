@@ -21,6 +21,14 @@ cp "$ROOT"/web/saves/*.npz "$OUT/saves/"
 # editor's Presentation > Export zips them, unzipped into web/presentations/.
 mkdir -p "$OUT/presentations"
 find "$ROOT/web/presentations" -maxdepth 1 \( -name '*.json' -o -name '*.npz' \) -exec cp {} "$OUT/presentations/" \; 2>/dev/null || true
+# ...and their boards, listed for the editor's save picker beside the
+# bundled saves: each name whose .json and .npz are both there.
+python3 - "$OUT/presentations" <<'PY2'
+import json, pathlib, sys
+d = pathlib.Path(sys.argv[1])
+names = sorted(p.stem for p in d.glob("*.json") if p.stem != "index" and (d / f"{p.stem}.npz").exists())
+(d / "index.json").write_text(json.dumps(names))
+PY2
 # The service worker's precache list and version: every file in the site,
 # and a hash of all their contents (see web/sw.js).
 python3 - "$OUT" <<'PY'

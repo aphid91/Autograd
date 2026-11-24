@@ -13,7 +13,7 @@ import { render, BASE_COLOURS } from "./render.js";
 import { LayerPanel } from "./layerpanel.js";
 import { SCALE_PRESETS, SCALE_NAMES, compileScale, parseLut, scaleTable, scaleHz, noteName } from "./scale.js";
 import { BACKGROUND, byId, addLayer, removeLayer, renameLayer, setCurrent, isVisible, isActive,
-         setForActive, layerStats, mix, parseCss, rgbCss, isolate, tagLayers, resolveLayers } from "./layers.js";
+         setForActive, layerStats, mix, parseCss, rgbCss, isolate, tagLayers, resolveLayers, layerKey } from "./layers.js";
 import { Shell } from "./ui.js";
 import { Panel, STATUS_COLOUR_DEFAULTS } from "./panel.js";
 import { ROUTE_NAMES, ROUTE_H_FIRST, ROUTE_V_FIRST, chooseRoute, planRun, routeWorks, turnTip } from "./planner.js";
@@ -31,10 +31,13 @@ import { openAssembler, isAssemblerOpen } from "./assembler.js";
 import { toast } from "./toast.js";
 import { entrySize, typeByName } from "./stamp.js";
 import { installPixel, Screen } from "./pixel.js";
-import { cropBox, evenDim, frameBox, frameCount, viewBox } from "./video-params.js";
-import { presentationName, startPresentation, presentationRecord, safeName } from "./present.js";
-import { freezePersist, persistEnabled } from "./persist.js";
+import { cropBox, evenDim, fitBox, frameBox, frameCount, viewBox } from "./video-params.js";
+import { presentationName, editName, startPresentation, fetchPresentation, presentationRecord, safeName } from "./present.js";
+import * as P from "./prof.js";
+import { applyDelta, exportFull, boardMessage } from "./simhost.js";
+import { freezePersist, unfreezePersist, persistEnabled } from "./persist.js";
 import { presetNames, readPresets, putPreset, deletePreset, presetFile, parsePresetFile } from "./audiopresets.js";
+import { viewPresetNames, readViewPresets, putViewPreset, deleteViewPreset, viewPresetFile, parseViewPresetFile } from "./viewpresets.js";
 import { writeZip } from "./npz.js";
 import { spaceWeights, spaceKey, fringeOf } from "./space.js";
 import { noteAt, gripAt, isText, newRect, MIN_W, MIN_H } from "./notes.js";
@@ -131,7 +134,9 @@ function setPickV(v) { if (vec.picking === "select") vec.sv = v; else vec.v = v;
 
 // Presentation mode (present.js): `#b=<name>` in the URL. Decided once, at
 // load; a change of hash reloads the page.
-const presenting = presentationName();
+// The editor's own preview (Presentation > Preview) sets it too, in the
+// page, and clears it on the way back (enterPreview()).
+let presenting = presentationName();
 let presenter = null;
 
 // A handle for the console and for headless tests. Not an API.
@@ -155,6 +160,11 @@ const debug = window.gates = {
   captureViewState: () => captureViewState(),
   placement: () => currentPlacement(),
   plan: () => currentPlan(),
+  prof: P.prof,
+  setProfiling: (on, gpuSync) => setProfiling(on, gpuSync),
+  profText: () => P.formatReport(P.prof.last),
+  get worker() { return W; },
+  setWorker: (on) => { workerWanted = on; redraw(); },
 };
 
 // --- the pixel overlay --------------------------------------------------------
@@ -259,6 +269,7 @@ function meterText(m) {
     `runs active ${m.active} of ${m.candidates}\n` +
     `peak ${m.peak.toFixed(2)} (${db} dB)` + (m.clipped ? `  clipped ${m.clipped}` : "") + "\n" +
     `lag ${Math.round(m.lagMs)} ms · speed ${m.speed.toFixed(2)}` +
+    (m.underruns || m.skips ? `\nran dry ${m.underruns || 0} · skipped ${m.skips || 0}` : "") +
     (bakedPlay ? "  (baked)" : "") + "\n" + bakeStatus() +
     (audioNote && performance.now() < audioNote.until ? `\n${audioNote.text}` : "") +
     (audio?.rec.selInfo ? `\n${panel.audio.camAudio ? "in earshot of the screen" : soundSel?.region ? "in earshot of the region" : "sound selection"}: ` +
@@ -369,6 +380,76 @@ const presetActions = {
   },
 };
 
+// View presets (viewpresets.js): everything a presentation view holds -- the
+// panel's View, status colours and Dev dials, each layer's view and the
+// labels' switch -- under a name, in this browser or a .json file. Loading
+// one sets the view in front of the player (applyViewState(), layers matched
+// by id), from where Set standard / detail view captures it.
+const viewPresetStore = () => (persistEnabled() ? localStorage : null);
+function refreshViewPresets(selected) {
+  const st = viewPresetStore();
+  panel.setViewPresets(st ? viewPresetNames(st) : [], selected);
+}
+function applyViewPreset(record) {
+  applyViewState(record);
+  redraw();
+}
+const viewPresetActions = {
+  onSaveViewPreset: (name) => {
+    const st = viewPresetStore();
+    if (!st || !board) return;
+    if (!name) { alert("Give the preset a name first."); return; }
+    if (name in readViewPresets(st) && !confirm(`Replace the view preset "${name}"?`)) return;
+    try { refreshViewPresets(putViewPreset(st, name, captureViewState())); toast(`Saved view preset "${name}".`); }
+    catch (err) { alert(`Could not save the preset: ${err.message}`); }
+  },
+  onLoadViewPreset: (name) => {
+    const st = viewPresetStore();
+    const r = st && readViewPresets(st)[name];
+    if (!r) { refreshViewPresets(); return; }
+    applyViewPreset(r);
+    toast(`Loaded view preset "${name}".`);
+  },
+  onDeleteViewPreset: (name) => {
+    const st = viewPresetStore();
+    if (!st || !confirm(`Delete the view preset "${name}"?`)) return;
+    deleteViewPreset(st, name);
+    refreshViewPresets();
+  },
+  onExportViewPreset: (name) => {
+    const st = viewPresetStore();
+    const r = st && readViewPresets(st)[name];
+    if (!r) return;
+    const a = document.createElement("a");
+    a.href = URL.createObjectURL(new Blob([viewPresetFile(name, r)], { type: "application/json" }));
+    a.download = `${name.replace(/[^\w.-]+/g, "_")}.view.json`;
+    a.click();
+    setTimeout(() => URL.revokeObjectURL(a.href), 10000);
+  },
+  // Applied at once and kept in the list under its own name, as an audio
+  // preset's import is.
+  onImportViewPreset: () => {
+    const input = document.createElement("input");
+    input.type = "file";
+    input.accept = ".json,application/json";
+    input.onchange = async () => {
+      const f = input.files?.[0];
+      if (!f) return;
+      let got;
+      try { got = parseViewPresetFile(await f.text(), f.name.replace(/(\.view)?\.json$/i, "")); }
+      catch (err) { alert(`Could not import "${f.name}": ${err.message}`); return; }
+      applyViewPreset(got.record);
+      const st = viewPresetStore();
+      if (st && (!(got.name in readViewPresets(st)) || confirm(`Replace the view preset "${got.name}" with the imported one?`))) {
+        try { putViewPreset(st, got.name, got.record); } catch (err) { alert(`Could not keep the preset: ${err.message}`); }
+      }
+      refreshViewPresets(got.name);
+      toast(`Imported view preset "${got.name}".`);
+    };
+    input.click();
+  },
+};
+
 // --- video export ---------------------------------------------------------------
 //
 // Video (panel) renders a stretch of the simulation offline into an MP4
@@ -402,7 +483,9 @@ let recLayers = null;
 function drawVideoFrame(ctx, s, vcam, alpha) {
   render(ctx, s.board, vcam, 1, {
     ...view, sim: s, alpha, ghosts: [],
-    ...layerOpts(recLayers, view.gateStatus ? gateStatus(s) : null, view.beltStatus ? beltStatus(s) : null, true),
+    // The afterglow at the video's own time.
+    ...layerOpts(recLayers, view.gateStatus ? gateStatus(s, s.tick + alpha, panel.video.tps) : null,
+                 view.beltStatus ? beltStatus(s, s.tick + alpha, panel.video.tps) : null, true),
     pixels: s.screen ? { screen: s.screen, alpha: view.pixelAlpha, max: view.pixelMax, textBg: view.pixelTextBg } : null,
     onWorld: bloomHook("video"),
   });
@@ -1015,7 +1098,7 @@ async function runBake(seconds, rate, show) {
   baking = null;
   if (!res) { show(res === null ? "Bake cancelled (or the board changed)." : undefined); return; }
   bake = { snap, sim: startSim, revision, rebuilds, rate, key, sel, ...res, buf: null };
-  shell.setRate(rate);     // play it at the rate it was baked at
+  shell.setRate(rate, true);   // play it at the rate it was baked at
   show(`Baked ${seconds} s at ${rate} tps in ${((performance.now() - t) / 1000).toFixed(1)} s. Press play.\n` + bakeStatus());
   redraw();
 }
@@ -1077,6 +1160,158 @@ function bloomHook(key) {
   };
 }
 
+// Debug > profile frames (prof.js): the timing tree over the board, a
+// report a second. Paused, nothing paints on its own, so a report needs
+// the sim playing or the board being moved.
+const profEl = document.getElementById("prof");
+// Debug > wake list (sim.js): kept across board loads, not across sessions.
+let wakeList = true;
+P.prof.onReport = (r) => { profEl.textContent = P.formatReport(r); };
+function setProfiling(on, gpuSync = false) {
+  P.prof.on = on;
+  P.prof.gpuSync = gpuSync;
+  profEl.hidden = !on;
+  profEl.textContent = P.formatReport(null);
+  redraw();
+}
+
+// --- the simulation's worker (simhost.js, simworker.js) ----------------------
+//
+// While the sim plays, the ticking happens on a worker thread, so the tick
+// rate is not capped by how long a frame takes to draw, and `sim` here is
+// its MIRROR: each frame applies the worker's delta to it, and everything
+// that reads the sim -- the renderer, the forecast, status colours, Status,
+// bakes, video -- reads the mirror. simhost.js has the protocol and why it
+// is exact; tests/worker.test.mjs holds the mirror to a reference timeline.
+//
+// The main thread still steps the mirror itself while a baked soundtrack
+// plays (the audio clock decides the tick, frame by frame), and whenever the
+// worker is off (Debug > sim worker) or failed to start. Taking over drops
+// anything the worker sent since (a new epoch); handing back sends the
+// mirror's whole state first (`ahead`).
+const W = {
+  worker: null, ready: false, failed: false,
+  epoch: 0,          // bumped by every board or state message; a delta from another is dropped
+  running: false,    // told to play
+  pulling: false,    // a delta asked for and not yet back
+  delta: null,       // the latest delta, applied at the top of the next paint
+  ahead: false,      // the mirror moved on without the worker: send it the state before it runs
+  rate: 0, pixels: null, sleeping: null, audioGen: null, gainGen: null,
+  audioLink: null,   // the audio engine whose synth the worker sends ticks to directly
+};
+let workerWanted = true;   // Debug > sim worker
+function startWorker() {
+  if (W.worker || W.failed || typeof Worker === "undefined") return;
+  try {
+    W.worker = new Worker("simworker.js", { type: "module" });
+  } catch (e) { workerFailed(e); return; }
+  W.worker.onmessage = (e) => {
+    const m = e.data;
+    if (m.type === "ready") { W.ready = true; if (sim) workerBoard(true); redraw(); }
+    else if (m.type === "error") workerFailed(new Error(m.message));
+    else if (m.type === "delta") { W.pulling = false; if (m.epoch === W.epoch) { W.delta = m; redraw(); } }
+  };
+  W.worker.onerror = (e) => workerFailed(e);
+}
+function workerFailed(e) {
+  console.warn("sim worker off:", e?.message || e);
+  W.failed = true; W.ready = false; W.running = false; W.delta = null;
+  W.worker?.terminate();
+  W.worker = null;
+}
+const workerUsable = () => W.ready && !W.failed && workerWanted;
+function wpost(m) {
+  const { transfer, ...rest } = m;
+  W.worker.postMessage(rest, transfer || []);
+}
+// The board, after a rebuild here: the worker rebuilds the same way. A new
+// board (or a worker just started) also gets the mirror's whole state and
+// every setting afresh.
+function workerBoard(fresh, alloc = sim.lastAlloc) {
+  if (!W.ready || W.failed) return;
+  // Paused here but not yet told (a Bake pauses and resets in one go): it
+  // stops before the board, or it would tick the new one past where the
+  // mirror stands. Its reply carries the old epoch and is dropped.
+  if (fresh || (W.running && clock.paused)) { wpost({ type: "pause" }); W.running = false; }
+  wpost({ ...boardMessage(sim, alloc, fresh), epoch: ++W.epoch });
+  if (fresh) wpost({ ...exportFull(sim), epoch: W.epoch });
+  W.delta = null; W.pulling = false; W.ahead = false;
+  if (fresh) W.pixels = W.sleeping = W.truth = W.audioGen = W.gainGen = null;
+}
+// The main thread changed the sim's state itself (stepped it, restored a
+// bake's state): anything the worker sends from before is stale, and it
+// needs this state before it next runs.
+function mirrorMoved() {
+  if (!W.ready) return;
+  W.epoch++;
+  W.delta = null;
+  W.ahead = true;
+}
+// The worker's view of the settings the tick depends on: the Pixel screen,
+// the wake list, the audio recorder's configuration.
+function workerSettings() {
+  const px = !!sim.screen;
+  if (W.pixels !== px) { wpost({ type: "pixels", on: px }); W.pixels = px; }
+  if (W.sleeping !== wakeList) { wpost({ type: "sleeping", on: wakeList }); W.sleeping = wakeList; }
+  if (W.truth !== sim.truthOn) { wpost({ type: "truth", on: sim.truthOn }); W.truth = sim.truthOn; }
+  // A line from the worker straight into the synth (audio.js tickPort()),
+  // so ticks reach it every few ms rather than once a frame through here.
+  if ((audio || null) !== W.audioLink) {
+    if (audio) {
+      const port = audio.tickPort();
+      W.worker.postMessage({ type: "audioport", port }, [port]);
+    } else wpost({ type: "audioport", port: null });
+    W.audioLink = audio || null;
+  }
+  const rec = audio && !bakedPlay ? audio.rec : null;
+  if (rec) {
+    rec.ensure(sim);
+    if (rec.cfgGen !== W.audioGen || rec.gainGen !== W.gainGen) {
+      wpost({ type: "audio", cfg: rec.tapConfig(sim) });
+      W.audioGen = rec.cfgGen; W.gainGen = rec.gainGen;
+    }
+  } else if (W.audioGen !== null) {
+    wpost({ type: "audio", cfg: null });
+    W.audioGen = W.gainGen = null;
+  }
+}
+// One frame with the worker: apply what it sent, keep it playing at the
+// clock's rate (or paused), ask for the next delta. Returns the ticks the
+// mirror moved on by.
+function workerFrame() {
+  let ran = 0;
+  workerSettings();
+  const d = W.delta;
+  if (d) {
+    W.delta = null;
+    const t0 = sim.tick;
+    applyDelta(sim, d, sim.screen);
+    if (audio && !bakedPlay) audio.rec.ingest(d.audio);
+    ran = Math.max(0, sim.tick - t0);
+    W.at = d.at; W.frac = d.frac;
+  }
+  if (!clock.paused) {
+    if (!W.running) {
+      if (W.ahead) { wpost({ ...exportFull(sim), epoch: ++W.epoch }); W.ahead = false; }
+      wpost({ type: "play", rate: clock.rate, frac: clock.frac });
+      W.running = true; W.rate = clock.rate; W.at = null;
+    } else if (W.rate !== clock.rate) {
+      wpost({ type: "rate", rate: clock.rate });
+      W.rate = clock.rate;
+    }
+    if (!W.pulling) { wpost({ type: "pull" }); W.pulling = true; }
+    // Alpha: how far into the next tick the worker had banked when it
+    // answered, plus the time since -- so items glide between deltas rather
+    // than stepping by a frame's worth -- and never past that next tick,
+    // which the mirror does not have yet.
+    if (W.at) clock.frac = Math.min(1, W.frac + Math.max(0, performance.timeOrigin + performance.now() - W.at) / 1000 * clock.rate);
+  } else if (W.running) {
+    wpost({ type: "pause" });    // its last delta comes back and is applied
+    W.running = false;
+  }
+  return ran;
+}
+
 function redraw() {
   if (queued) return;
   queued = true;
@@ -1085,12 +1320,29 @@ function redraw() {
 
 function paint(now) {
   queued = false;
+  P.frameStart(now);
+  P.begin("paint");
   let ran = 0;
   if (sim) {
     // An edit since the last frame re-derives the runs and starts fresh --
     // here rather than at each edit site, so no edit path can forget it.
-    sim.sync();
-    if (!clock.paused && bakePlayable()) {
+    P.span("sync", () => sim.sync());
+    // Truthiness is recorded only while something reads it: View's colours
+    // or Audio's split (Sim.truthOn).
+    sim.truthOn = !!view.truthiness || !!(audio && panel.audio.truthAudio);
+    P.begin("step");
+    const viaWorker = workerUsable() && !(!clock.paused && bakePlayable());
+    if (!viaWorker && W.running) {
+      // The main thread takes over: the worker pauses, and whatever it had
+      // done since its last delta is dropped.
+      wpost({ type: "pause" });
+      W.running = false;
+      mirrorMoved();
+    }
+    if (viaWorker) {
+      ran = workerFrame();
+      if (bakedPlay) stopBakedPlay();
+    } else if (!clock.paused && bakePlayable()) {
       // Baked: step to the tick being heard. The buffer runs on its own
       // clock, so falling behind costs frames, never sync.
       if (!bakedPlay) startBakedPlay();
@@ -1098,6 +1350,7 @@ function paint(now) {
       const t0 = performance.now();
       while (sim.tick < Math.floor(target) && performance.now() - t0 < BAKED_BUDGET_MS) { sim.step(); ran++; }
       clock.frac = Math.min(1, Math.max(0, target - sim.tick));
+      if (ran) mirrorMoved();
     } else if (!clock.paused) {
       if (bakedPlay) stopBakedPlay();   // out of the baked stretch: realtime from here
       // A stalled frame (a backgrounded tab) is clamped, and the clock caps
@@ -1109,10 +1362,13 @@ function paint(now) {
         if (ran > 0 && performance.now() - t0 > STEP_BUDGET_MS) { clock.dropped += n - ran; break; }
         sim.step();
       }
+      if (ran) mirrorMoved();
     }
+    P.end();
     shell.setTick(sim.tick);
-    if (inspectRow >= 0) panel.setLive(liveText(inspectRow));
+    if (inspectRow >= 0) P.span("liveText", () => panel.setLive(liveText(inspectRow)));
   }
+  P.begin("misc");
   driveDryRun();
   presenter?.frame();
   checkSoundSel();
@@ -1125,9 +1381,11 @@ function paint(now) {
   }
   lastNow = sim && !clock.paused ? now : null;
   countFrame(now, ran);
-  recordStep();
-  syncSpace();
+  P.end();
+  P.span("recordStep", recordStep);
+  P.span("syncSpace", syncSpace);
   const t0 = performance.now();
+  P.begin("prep");
   const info = board ? board.describe(inspectRow) : null;
   const ghosts = [
     selGhost(),
@@ -1138,9 +1396,11 @@ function paint(now) {
   ];
   // The belt a run starts on draws only as the run's ghost, at its new facing.
   const hide = run ? runCopies().copies.filter(c => c.over).map(c => c.start) : null;
-  const lv = layerView();
-  const gTint = view.gateStatus ? gateStatus() : null;
-  const bTint = view.beltStatus ? beltStatus() : null;
+  P.end();
+  const lv = P.span("layerView", layerView);
+  const gTint = view.gateStatus ? P.span("gateStatus", () => gateStatus()) : null;
+  const bTint = view.beltStatus ? P.span("beltStatus", () => beltStatus()) : null;
+  P.begin("render");
   render(ctx, board, cam, dpr, { ...view, selected: info, ghosts, sim, alpha: clock.alpha, hide, vector: vectorMarks(),
                                 indexLabels: indexLabels(), noteSel: noteEdit, noteGrips: labelHeld(),
                                 ghostNotes: ghostNotes(),
@@ -1150,8 +1410,13 @@ function paint(now) {
                                 ...layerOpts(lv, gTint, bTint),
                                 layerLabelHits: labelHits = [], layerLabelSel: labelSel,
                                 onWorld: bloomHook("screen") });
-  syncLayerPanel(lv);
+  // Debug > GPU sync: wait for the canvas to finish rasterising, so the
+  // pixel cost shows up as a number (prof.js).
+  if (P.prof.on && P.prof.gpuSync) P.span("gpu sync", () => ctx.getImageData(0, 0, 1, 1));
+  P.end();
+  P.span("layerPanel", () => syncLayerPanel(lv));
   debug.renderMs = performance.now() - t0;
+  P.end();
   if (sim && !clock.paused) redraw();
 }
 
@@ -1309,12 +1574,16 @@ function layerView() {
     dim = { rects, rows, cells };
   }
   let plainGate = null;     // the machines' map with no status colours, built once
+  let tintedGate = null;    // [status map, its tinted copy], for the status map of this tick
   const lv = {
     lists, labels, stats, dim, hidden: stats.hidden,
     // `status`: View > gate status colours' row -> rgb map, or null.
     gateTint(status) {
       if (!tints.size) return status;
       if (!status && plainGate) return plainGate;
+      // The status map is the same object for a whole tick (gateStatus()),
+      // so its tinted copy is too.
+      if (status && tintedGate?.[0] === status) return tintedGate[1];
       const out = new Map(status || []);
       for (const st of board.structs) {
         const tt = tints.get(board.layerOf(st.row));
@@ -1322,7 +1591,7 @@ function layerView() {
         const base = status?.get(st.row) || T.types[st.type].colour || [0.5, 0.5, 0.5];
         out.set(st.row, mix(base, tt.rgb, tt.k));
       }
-      if (!status) plainGate = out;
+      if (!status) plainGate = out; else tintedGate = [status, out];
       return out;
     },
     // `status`: View > belt status colours' (x, y) -> css, or null.
@@ -1498,59 +1767,164 @@ const layerActions = {
   },
 };
 
-// View > gate status colours: each machine's body coloured by what it is
-// doing in the state on screen. BLOCKED (yellow) when an output with
-// somewhere to go is holding a result it could not hand on -- that wins,
-// since the gate made something that cannot leave; STARVED (red) when it
-// does not have what its own firing rule needs (a Merge needs its control
-// and the lane that selects, a Sink any one lane; a Source never starves);
-// RUNNING (green) otherwise. Dangling outputs discard and never block.
-// The colours are the player's (View > status colours, panel.js).
+// View > gate and belt status colours: each machine and run coloured by
+// what it is doing, plus an AFTERGLOW (View > status colours > afterglow):
+// it lights up the moment it acts and cools back to its resting colour
+// over that many TICKS -- ticks, not seconds, so the share of the time a
+// machine spends lit, and so how bright a busy board looks, is the same at
+// every tick rate. Glow sluggishness stretches a run's glow by its length
+// (as Audio's sluggishness does a drone's envelope).
+//
+// Machines rest at BLOCKED (an output with somewhere to go holds a result
+// it could not hand on -- that wins, since the gate made something that
+// cannot leave), STARVED (it does not have what its own firing rule needs:
+// a Merge its control and the selected lane, a Sink any one lane; a Source
+// never starves) or RUNNING (neither: it fires on the coming tick).
+// Dangling outputs discard and never block. Runs rest at EMPTY or STALLED
+// (holding items, none moving). The hot colour is RUNNING for machines and
+// MOVING for runs. The colours are the player's (panel.js).
+//
+// Activity is read back, not predicted: the sim stamps the tick a gate
+// last fired and a run last pushed or popped (sim.js flush()), and an item
+// still travelling down a run, which makes no event, is covered by
+// Sim.restTick() -- when the run's newest item comes to rest if nothing
+// more happens, a constant between events. So a colour is a function of the
+// state on screen and the time, whatever frames were or were not drawn
+// between: at 5000 tps a gate that fired once between two frames still
+// lights, and a video's copy of the sim colours the same as the screen.
+//
+// Anything that acted in the last AFTERGLOW_HOLD ticks reads fully hot,
+// at any fade: a run a gate takes from every other tick would otherwise
+// flicker between stalled and moving. (Before the afterglow this was a
+// look-ahead -- "will the head pop on the coming tick?" -- from the
+// forecast; looking back two ticks does the same job.)
+//
+// Heat is rounded to HEAT_LEVELS steps, so a whole board fading still
+// draws as a few dozen colours (render.js batches by colour).
 const hexRgb = (h) => [1, 3, 5].map(i => parseInt(h.slice(i, i + 2), 16) / 255);
-// `s` is the sim to read (the live one, or a video's copy).
-function gateStatus(s = sim) {
+const AFTERGLOW_HOLD = 2;
+const HEAT_LEVELS = 16;
+const GATE_RUNNING = 0, GATE_STARVED = 1, GATE_BLOCKED = 2;
+const BELT_EMPTY = 0, BELT_STALLED = 1;
+
+// How hot something is, 0..HEAT_LEVELS, from the tick it last acted
+// (`end`; still acting if in the future), the time on screen and the fade
+// in ticks.
+function heatLevel(end, at, fadeTicks) {   // fadeTicks: glowTicks()
+  const since = at - end;
+  if (since < AFTERGLOW_HOLD) return HEAT_LEVELS;
+  if (!(fadeTicks > 0)) return 0;
+  return Math.max(0, Math.round(HEAT_LEVELS * (1 - (since - AFTERGLOW_HOLD) / fadeTicks)));
+}
+
+// The afterglow's length in ticks at `rate` ticks a second: the dial
+// itself, or with View > status colours > "afterglow by time" its seconds
+// at that rate -- the same fade on screen whatever the rate, where ticks
+// keep the share of the time something is lit, and so a busy board's
+// brightness. Either way it is a span of sim time, so it freezes while
+// paused; by time, a rate change rescales a glow already under way.
+function glowTicks(rate) {
+  return view.statusGlowTime ? (view.statusGlowS || 0) * rate : (view.statusGlow || 0);
+}
+
+// The colours for every resting state at every heat level, rebuilt only
+// when the player changes a colour: the same array (gates) or string
+// (belts) object for the same colour, frame after frame.
+let palette = null;
+function statusPalette() {
+  const key = JSON.stringify(statusColours);
+  if (palette?.key === key) return palette;
+  const c = statusColours;
+  const ramp = (cool, hot) => Array.from({ length: HEAT_LEVELS + 1 }, (_, l) => mix(cool, hot, l / HEAT_LEVELS));
+  // The hot colour is the running / moving one; with View > truthiness
+  // colours a falsy fire or push glows from its own (gateF, beltF).
+  const gateOf = (run) => [ramp(run, run), ramp(hexRgb(c.gateStarved), run), ramp(hexRgb(c.gateBlocked), run)];
+  const beltOf = (moving) => [ramp(hexRgb(c.beltEmpty), moving), ramp(hexRgb(c.beltStalled), moving)].map(r => r.map(rgbCss));
+  palette = { key, gate: gateOf(hexRgb(c.gateRunning)), belt: beltOf(hexRgb(c.beltMoving)),
+              gateF: gateOf(hexRgb(c.gateRunningF)), beltF: beltOf(hexRgb(c.beltMovingF)) };
+  return palette;
+}
+
+// Each machine's resting state is a function of the sim's state alone, so
+// it is worked out once per tick at most (Sim.version moves on every step
+// and rebuild) -- in practice at most once per frame, for the state on
+// screen, since nothing asks in between. The heat is per frame.
+const statusCache = new WeakMap();   // sim -> { gateState: [version, Map], gate: [key, Map], belt: [key, fn] }
+function cacheOf(s) {
+  let c = statusCache.get(s);
+  if (!c) statusCache.set(s, c = {});
+  return c;
+}
+
+// `s` is the sim to read (the live one, or a video's copy), `at` the time
+// on screen in ticks, `rate` its ticks a second (a video's own).
+function gateStatus(s = sim, at = s ? s.tick + clock.alpha : 0, rate = clock.rate) {
+  if (!s) return new Map();
+  s.sync();   // may rebuild, which moves the version
+  const pal = statusPalette(), fade = glowTicks(rate), c = cacheOf(s);
+  const truth = !!view.truthiness;
+  const key = `${s.version}|${at}|${fade}|${pal.key}|${truth}`;
+  if (c.gate?.[0] === key) return c.gate[1];
+  if (c.gateState?.[0] !== s.version) c.gateState = [s.version, gateStateOf(s)];
   const out = new Map();
-  if (!s) return out;
-  s.sync();
-  const STATUS_COL = { blocked: hexRgb(statusColours.gateBlocked), starved: hexRgb(statusColours.gateStarved), running: hexRgb(statusColours.gateRunning) };
+  if (truth) {
+    const T = s.truth;
+    for (const [row, st] of c.gateState[1]) {
+      out.set(row, (T[row] ? pal.gate : pal.gateF)[st][st === GATE_RUNNING ? HEAT_LEVELS : heatLevel(s.fired[row], at, fade)]);
+    }
+  } else for (const [row, st] of c.gateState[1]) {
+    out.set(row, pal.gate[st][st === GATE_RUNNING ? HEAT_LEVELS : heatLevel(s.fired[row], at, fade)]);
+  }
+  c.gate = [key, out];
+  return out;
+}
+function gateStateOf(s) {
+  const out = new Map();
   for (const g of s.gates) {
-    const blocked = g.drains.some(c => s.outHeld(g.row, c));
+    const blocked = g.drains.some(ch => s.outHeld(g.row, ch));
     const starved = g.sim.n_in > 0 && !s.inputsReady(g);
-    out.set(g.row, blocked ? STATUS_COL.blocked : starved ? STATUS_COL.starved : STATUS_COL.running);
+    out.set(g.row, blocked ? GATE_BLOCKED : starved ? GATE_STARVED : GATE_RUNNING);
   }
   return out;
 }
 
-// View > belt status colours, per run (segment), in the state on screen:
-// RED empty; YELLOW stalled -- its head item is at the end and will not
-// leave on the coming tick (the forecast has no pop), so items are stuck on
-// it (and, by default, nothing on it is moving either -- see below); GREEN
-// otherwise (carrying, and moving). Returns (x, y) -> colour.
-function beltStatus(s = sim) {
+// Per run: hot while anything on it moves or it pushed or popped lately.
+// With View > "stalled but moving: green" off, only the head counts: a run
+// is stalled once its head reaches the end and sits there, whatever is
+// still closing up behind it, and pushes do not warm it. Returns
+// (x, y) -> css.
+//
+// Glow sluggishness s scales a run's fade by (length / 10)^s -- the sim's
+// length, buried tiles included, the same law and reference length as
+// Audio's sluggishness -- so at 1 a 20-tile run glows twice as long as a
+// 10-tile one. One multiply per run per frame: the factor is looked up per
+// length, and lengths repeat.
+const GLOW_REF_LENGTH = 10;
+function beltStatus(s = sim, at = s ? s.tick + clock.alpha : 0, rate = clock.rate) {
   if (!s) return null;
-  const BELT_STATUS_COL = { empty: statusColours.beltEmpty, stalled: statusColours.beltStalled, moving: statusColours.beltMoving };
   s.sync();
-  const F = s.forecast();
+  const pal = statusPalette(), fade = glowTicks(rate), slug = view.statusSluggish || 0, c = cacheOf(s);
+  const whole = view.beltActive !== false;
+  const truth = !!view.truthiness;
+  const key = `${s.version}|${at}|${fade}|${slug}|${pal.key}|${whole}|${truth}`;
+  if (c.belt?.[0] === key) return c.belt[1];
+  const byLength = new Map();   // length -> its fade, in ticks
+  const fadeFor = (n) => {
+    let f = byLength.get(n);
+    if (f === undefined) byLength.set(n, f = slug ? fade * (n / GLOW_REF_LENGTH) ** slug : fade);
+    return f;
+  };
   const bySid = new Map();
   for (const seg of s.segments.values()) {
-    let st = "moving";
-    if (seg.head === seg.tail) st = "empty";
-    else if (s.positionOf(seg, seg.head, s.tick) >= seg.length * s.UNIT && !F.pops.has(seg)) {
-      st = "stalled";
-      // View > "stalled but moving: green": a stalled run whose items are
-      // still moving -- one is pushed on this tick, or the newest is still
-      // closing up (items pack from the head, so if the newest has stopped
-      // they all have) -- is not static, and reads green. O(1) per run.
-      if (view.beltActive !== false) {
-        const k = seg.tail - 1;
-        const moving = s.positionOf(seg, k, s.tick, 1) > s.positionOf(seg, k, s.tick, 0);
-        if (moving || F.pushes.has(seg)) st = "moving";
-      }
-    }
-    bySid.set(seg.sid, BELT_STATUS_COL[st]);
+    const empty = seg.head === seg.tail;
+    let end = whole ? Math.max(seg.lastPush, seg.lastPop) : seg.lastPop;
+    if (!empty) end = Math.max(end, s.restTick(seg, whole ? seg.tail - 1 : seg.head));
+    bySid.set(seg.sid, (truth && !seg.truth ? pal.beltF : pal.belt)[empty ? BELT_EMPTY : BELT_STALLED][heatLevel(end, at, fadeFor(seg.length))]);
   }
   const W = s.board.width;
-  return (x, y) => bySid.get(s.segAt[y * W + x]) || null;
+  const fn = (x, y) => bySid.get(s.segAt[y * W + x]) || null;
+  c.belt = [key, fn];
+  return fn;
 }
 
 // What the Status pane's live readout says about a row: a gate's channels,
@@ -2847,6 +3221,10 @@ async function show(name, bytes) {
     panel.setBoardName(name.replace(/\.npz$/i, ""));
     loadAudioSettings();
     sim = new Sim(T, board);
+    if (!wakeList) sim.setSleeping(false);
+    // Every later rebuild (an edit, a Reset) is the worker's too.
+    sim.onRebuild = (alloc) => workerBoard(false, alloc);
+    workerBoard(true);
     syncScreen();
     stopBakedPlay();
     if (audio) audio.rec.attach(sim);
@@ -3015,17 +3393,21 @@ function deleteLocal(name) {
   panel.setLocalSaves(listSaves());
 }
 
+// A bundled save is a file in saves/, or a presentation's board, named
+// `presentations/<name>.npz` (the picker lists both; see init()).
 async function loadBundled(name) {
-  const res = await fetch(`saves/${encodeURIComponent(name)}`);
+  const pres = /^presentations\/(.+)$/.exec(name);
+  const url = pres ? `presentations/${encodeURIComponent(pres[1])}` : `saves/${encodeURIComponent(name)}`;
+  const res = await fetch(url);
   if (!res.ok) throw new Error(`${name}: HTTP ${res.status}`);
-  await show(name, await res.arrayBuffer());
+  await show(pres ? pres[1] : name, await res.arrayBuffer());
 }
 
 function resetSim() {
   endDryRun();
   if (sim) {
     stopBakedPlay();
-    if (bakeLive()) sim.restoreFrom(bake.snap); else sim.reset();
+    if (bakeLive()) { sim.restoreFrom(bake.snap); mirrorMoved(); } else sim.reset();   // a reset rebuilds: onRebuild tells the worker
     clock.reset();
     if (audio) audio.rec.stop();
   }
@@ -3040,23 +3422,36 @@ function captureViewState(name = "default") {
   const t = board.layers;
   return {
     name, ...panel.captureView(),
-    layers: t.list.map(l => ({ id: l.id, visible: l.visible, active: l.active, tint: l.tint, label: l.label })),
+    layers: t.list.map(l => ({ id: l.id, name: l.name, visible: l.visible, active: l.active, tint: l.tint, label: l.label })),
     showLabels: t.showLabels !== false,
   };
+}
+function applyLayerView(l, s) {
+  if (typeof s.visible === "boolean") l.visible = s.visible;
+  if (typeof s.active === "boolean") l.active = s.active;
+  if (l.id !== BACKGROUND && Number.isFinite(s.tint)) l.tint = s.tint;
+  if (l.id !== BACKGROUND && Number.isFinite(s.label)) l.label = s.label;
 }
 function applyViewState(v) {
   panel.applyView(v);
   if (board && Array.isArray(v.layers)) {
     const t = board.layers;
+    // Matched by name (case and end spaces ignored, as a paste's layers
+    // are), so a view carries to another board; a layer the view does not
+    // name, or a name the board lacks, is left alone. Every layer of that
+    // name takes it. A view from before names were recorded matches by id.
+    const byName = new Map();
+    for (const l of t.list) {
+      const k = layerKey(l.name);
+      if (!byName.has(k)) byName.set(k, []);
+      byName.get(k).push(l);
+    }
     for (const s of v.layers) {
-      const l = byId(t, s.id);
-      if (!l) continue;
-      if (typeof s.visible === "boolean") l.visible = s.visible;
-      if (typeof s.active === "boolean") l.active = s.active;
-      if (l.id !== BACKGROUND && Number.isFinite(s.tint)) l.tint = s.tint;
-      if (l.id !== BACKGROUND && Number.isFinite(s.label)) l.label = s.label;
+      const ls = typeof s.name === "string" ? byName.get(layerKey(s.name)) || [] : [byId(t, s.id)].filter(Boolean);
+      for (const l of ls) applyLayerView(l, s);
     }
     if (typeof v.showLabels === "boolean") t.showLabels = v.showLabels;
+
     // The current layer is always visible and active; a view hiding it moves
     // "current" to the first layer it leaves showing.
     const cur = byId(t, t.current);
@@ -3076,31 +3471,47 @@ async function presentAction(kind) {
   if (kind === "start") panel.setPresent({ startCamera: box() });
   else if (kind === "end") panel.setPresent({ endCamera: box() });
   else if (kind === "clearEnd") panel.setPresent({ endCamera: null });
-  else if (kind === "detail") panel.setPresent({ detail: captureViewState("detail") });
+  else if (kind === "standard") { panel.setPresent({ standard: captureViewState("default") }); toast("Standard view set."); }
+  else if (kind === "clearStandard") panel.setPresent({ standard: null });
+  else if (kind === "loadStandard") { if (panel.present.standard) { applyViewState(panel.present.standard); toast("Standard view loaded."); } }
+  else if (kind === "detail") { panel.setPresent({ detail: captureViewState("detail") }); toast("Detail view set."); }
   else if (kind === "clearDetail") panel.setPresent({ detail: null });
+  else if (kind === "loadDetail") { if (panel.present.detail) { applyViewState(panel.present.detail); toast("Detail view loaded."); } }
   else if (kind === "export") await exportPresentation();
+  else if (kind === "preview") { await enterPreview(); return; }
   redraw();
 }
 
-// The board as it stands (audio settings and labels ride in the save), the
-// view in front of the player as "default", the captured detail view, and
-// the draft's rates and camera schedule, zipped as <name>.json + <name>.npz.
-async function exportPresentation() {
+// The presentation the editor's settings describe: the view in front of the
+// player as "default", the captured detail view, and the draft's rates and
+// camera schedule. Puts a selection down first (null if the player then
+// declines to go on without what does not fit).
+function presentationNow(verb) {
   const d = panel.present;
   const name = safeName(d.name) || "presentation";
   dropAll();
   const lifted = sel ? sel.stamp.entries.length : 0;
-  if (lifted && !confirm(`${lifted} selected ${lifted === 1 ? "entity does" : "entities do"} not fit back on the board and will not be in the presentation. Export anyway?`)) return;
+  if (lifted && !confirm(`${lifted} selected ${lifted === 1 ? "entity does" : "entities do"} not fit back on the board and will not be in the presentation. ${verb} anyway?`)) return null;
   const b = board.bounds;
   const fit = b ? { cx: (b.minX + b.maxX) / 2, cy: (b.minY + b.maxY) / 2,
                     hw: Math.max(1, b.maxX - b.minX) * 0.575, hh: Math.max(1, b.maxY - b.minY) * 0.575 }
                 : viewBox(cam);
-  const views = [captureViewState("default")];
+  // The stored standard view if one is set, else the view in front of the player.
+  const views = [d.standard ? { ...d.standard, name: "default" } : captureViewState("default")];
   if (d.detail) views.push({ ...d.detail, name: "detail" });
   const rec = presentationRecord(name, {
     ...d, rates: [d.rate1, d.rate2, d.rate3, d.rate4],
     startCamera: d.startCamera || fit,
   }, views);
+  return { name, rec };
+}
+
+// The board as it stands (audio settings and labels ride in the save) and
+// the record, zipped as <name>.json + <name>.npz.
+async function exportPresentation() {
+  const p = presentationNow("Export");
+  if (!p) return;
+  const { name, rec } = p;
   try {
     const npz = new Uint8Array(await board.toNpz());
     const json = new TextEncoder().encode(JSON.stringify(rec, null, 1));
@@ -3117,6 +3528,86 @@ async function exportPresentation() {
   } catch (err) {
     alert(`Could not export: ${err.message}`);
   }
+}
+
+// --- previewing a presentation in the editor -------------------------------
+//
+// Presentation > Preview shows the presentation the folder describes -- the
+// same record Export would write -- on the board in front of the player,
+// in this page, and the hammer (bottom right) or Esc comes back. Nothing is
+// reloaded, so the undo history, the stamps and the tool bar are all still
+// there after. What the preview changes is put back on the way out: the
+// view (View, status colours, Dev dials, layer visibility -- applied by the
+// presentation's views), the camera, the tick rate and play state. The
+// stores are frozen meanwhile (persist.js), as in presentation mode, so
+// none of that reaches the player's preferences. The simulation starts
+// from Reset, as a viewer's would, and is left where the preview got it.
+let previewSaved = null;
+async function enterPreview() {
+  if (!board || presenting) return;
+  const p = presentationNow("Preview");
+  if (!p) return;
+  // Whatever was in progress belongs to editing, not to the show.
+  run = null; place = null; grab = null; boxRect = null;
+  if (shell.state.pasteStamp !== null) exitPaste();
+  if (vec.picking) closePicker(true);
+  inspect(-1);
+  endDryRun();
+  previewSaved = { view: captureViewState("editor"), cam: { cx: cam.cx, cy: cam.cy, zoom: cam.zoom },
+                   rate: shell.state.rate, rateScale: shell.state.rateScale, paused: clock.paused };
+  freezePersist();
+  document.body.classList.add("presenting");
+  presenting = p.name;
+  resize();
+  resetSim();
+  presenter = await startPresentation(p.name, presentApi, { rec: p.rec, onEdit: exitPreview });
+}
+
+function exitPreview() {
+  if (!previewSaved) return;
+  const s = previewSaved;
+  previewSaved = null;
+  presenter?.close();
+  presenter = null;
+  presenting = null;
+  document.body.classList.remove("presenting");
+  // All of it put back while still frozen: the preferences were never
+  // touched, so the restored state needs no writing either.
+  applyViewState(s.view);
+  shell.state.rateScale = s.rateScale;
+  shell.setRate(s.rate);
+  shell.setPaused(s.paused);
+  unfreezePersist();
+  resize();
+  cam.cx = s.cam.cx; cam.cy = s.cam.cy; cam.zoom = s.cam.zoom;
+  syncBar();
+  redraw();
+}
+
+// A deployed presentation's hammer leads here (`#edit=<name>`): its board,
+// its default view, and its settings in the Presentation folder, ready to
+// change and preview or export again. Not an edit, so no save is written
+// until the player changes something.
+async function openForEditing(name) {
+  const { rec, bytes } = await fetchPresentation(name);
+  await show(name, bytes);
+  applyViewState(rec.views[0]);
+  const rates = rec.rates || [];
+  const sch = rec.schedule || {};
+  panel.setPresent({
+    name, rate: String(rec.rate ?? 30),
+    rate1: String(rates[0] ?? ""), rate2: String(rates[1] ?? ""), rate3: String(rates[2] ?? ""), rate4: String(rates[3] ?? ""),
+    ticks: sch.ticks ?? 0, lerpStart: sch.lerpStart ?? 0, lerpEnd: sch.lerpEnd ?? 1, fadeIn: sch.fadeIn ?? 0.25, fadeOut: sch.fadeOut ?? 0.25,
+    startCamera: rec.startCamera || null, endCamera: rec.endCamera || null,
+    standard: { ...rec.views[0], name: "default" },
+    detail: rec.views[1] ? { ...rec.views[1], name: "detail" } : null,
+  });
+  if (Number(rec.rate) > 0) shell.setRate(Math.min(RATE_MAX, Math.max(RATE_MIN, Number(rec.rate))));
+  if (rec.startCamera) {
+    const f = fitBox(rec.startCamera, cam.w, cam.h);
+    cam.cx = f.cx; cam.cy = f.cy; cam.zoom = f.zoom;
+  }
+  redraw();
 }
 
 // The presentation page's handle on the app: everything present.js needs,
@@ -3139,6 +3630,7 @@ async function init() {
   // shell and the panel read (and would otherwise rewrite) their stores.
   if (presenting) { freezePersist(); document.body.classList.add("presenting"); }
   T = installPixel(await (await fetch("types.json")).json());
+  startWorker();
 
   let lastMode = null;
   shell = new Shell(T, {
@@ -3192,7 +3684,9 @@ async function init() {
       if (paused) endDryRun(); else { startDryRun(); stopPreview(); }
       redraw();
     },
-    onRate: (rate) => { clock.setRate(rate); redraw(); },
+    // The shell's rate, scaled by its slider -- except in a presentation,
+    // whose rates are its own.
+    onRate: (rate) => { clock.setRate(presenting ? shell.state.rate : rate); redraw(); },
     onBuildTap: () => {
       if (vec.picking === "build") closePicker(true);
       else if (!vec.picking) openBuildPicker();
@@ -3216,13 +3710,16 @@ async function init() {
     onCheckpoint: () => checkpoint(),
   });
   lastMode = shell.state.mode;
-  clock.setRate(shell.state.rate);
+  clock.setRate(presenting ? shell.state.rate : shell.effectiveRate());
   clock.paused = shell.state.paused;
 
   panel = new Panel(document.getElementById("pane-host"), {
     onLoadSave: (name) => loadBundled(name).catch(e => alert(e.message)),
     onOpenFile: () => fileInput.click(),
     onFit: () => { if (board) cam.frame(board.bounds); redraw(); },
+    onProfile: ({ profile, gpuSync }) => setProfiling(profile, gpuSync),
+    onWakeList: (on) => { wakeList = on; sim?.setSleeping(on); redraw(); },
+    onWorker: (on) => { workerWanted = on; redraw(); },
     onView: (v) => { view = v; syncScreen(); layersChanged(false); },
     onColours: (c) => { statusColours = c; redraw(); },
     onAudioEnable: (on) => setAudio(on),
@@ -3240,6 +3737,7 @@ async function init() {
     onTune: (t) => { setTune(t); redraw(); },
     onClearStamps: () => shell.clearStamps(),
     ...presetActions,
+    ...viewPresetActions,
     onCloseStatus: () => inspect(-1),
     // An inactive layer's entity is read only: the edit is refused and the
     // pane shows the value it still holds.
@@ -3254,6 +3752,7 @@ async function init() {
   });
   panel.setLocalSaves(listSaves());
   refreshPresets();
+  refreshViewPresets();
   view = { ...panel.view };
   syncScreen();
 
@@ -3283,6 +3782,7 @@ async function init() {
     if (e.target instanceof HTMLInputElement || e.target instanceof HTMLTextAreaElement) return;
     if (presenting) {
       if (e.code === "Space") { e.preventDefault(); presenter?.togglePlay(); }
+      if (e.code === "Escape" && previewSaved) { e.preventDefault(); exitPreview(); }
       return;
     }
     if (e.code === "Space") { e.preventDefault(); document.getElementById("btn-play").click(); }
@@ -3293,7 +3793,9 @@ async function init() {
 
   if (presenting) {
     window.addEventListener("hashchange", () => location.reload());
-    presenter = await startPresentation(presenting, presentApi);
+    // The hammer opens this presentation in the editor (openForEditing()).
+    presenter = await startPresentation(presenting, presentApi,
+      { onEdit: () => { location.hash = `#edit=${encodeURIComponent(presenting)}`; } });
     return;
   }
 
@@ -3305,10 +3807,24 @@ async function init() {
     if (res.ok) saves = await res.json();
   } catch { /* no bundled saves */ }
   const first = saves.includes(DEFAULT_SAVE) ? DEFAULT_SAVE : saves[0];
-  panel.setSaves(saves, first);
-  // Pick up where the last session left off, if it saved anything.
+  // Presentations' boards too (web/presentations/, listed by build.sh), as
+  // plain boards to edit: the board only, none of the show's views.
+  let shows = [];
+  try {
+    const res = await fetch("presentations/index.json");
+    if (res.ok) shows = await res.json();
+  } catch { /* none */ }
+  panel.setSaves([...saves.map(n => ({ label: n, value: n })),
+                  ...shows.map(n => ({ label: `${n} (presentation)`, value: `presentations/${n}.npz` }))], first);
+  // `#edit=<name>` (a presentation's hammer) opens that presentation;
+  // otherwise pick up where the last session left off, if it saved anything.
+  // The hash is dropped once read, so a reload does not open it again over
+  // the player's edits.
+  const editing = editName();
+  if (editing) window.history.replaceState(null, "", location.pathname + location.search);
   const resume = resumeSave();
-  if (resume) await loadLocal(resume.name);
+  if (editing) await openForEditing(editing).catch(e => { alert(`Could not open “${editing}”: ${e.message}`); });
+  else if (resume) await loadLocal(resume.name);
   else if (first) await loadBundled(first).catch(e => alert(e.message));
 
   for (const tier of AUTOSAVES) setInterval(() => autosave(tier), tier.ms);

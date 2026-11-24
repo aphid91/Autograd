@@ -28,6 +28,7 @@ export const TUNE_DEFAULTS = {
   lodPorts: 8,           // port arrows
   lodPortEdge: 14,       // the ports' outline
   lodChevrons: 10,       // belt chevrons
+  lodItemDots: 6,        // items are ringed discs from here; below, plain squares
   // Text fades, in px of text height rather than zoom (legibility is what
   // they are about): item numbers fade in between min and good; a label's
   // text is hidden below its min.
@@ -61,6 +62,7 @@ export const TUNE_SPEC = [
   ["lodPorts", "ports from", { min: 0, max: 40, step: 0.5 }],
   ["lodPortEdge", "port edges from", { min: 0, max: 60, step: 0.5 }],
   ["lodChevrons", "chevrons from", { min: 0, max: 60, step: 0.5 }],
+  ["lodItemDots", "item rings from", { min: 0, max: 40, step: 0.5 }],
   ["---", "text fades (px of text)"],
   ["itemTextMin", "item numbers start", { min: 0, max: 30, step: 0.5 }],
   ["itemTextGood", "item numbers full", { min: 0.5, max: 40, step: 0.5 }],

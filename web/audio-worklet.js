@@ -10,7 +10,17 @@ class GatesAudio extends AudioWorkletProcessor {
     super();
     this.synth = new GatesSynth(sampleRate);
     this.since = 0;
-    this.port.onmessage = (e) => this.synth.message(e.data);
+    this.port.onmessage = (e) => {
+      // The sim worker's own line in (audio.js tickPort()): its ticks arrive
+      // there, the rest -- config, space, params, stop -- here.
+      if (e.data?.type === "tickport") {
+        this.ticks?.close();
+        this.ticks = e.data.port;
+        this.ticks.onmessage = (ev) => this.synth.message(ev.data);
+        return;
+      }
+      this.synth.message(e.data);
+    };
   }
   process(_inputs, outputs) {
     const out = outputs[0], L = out[0];

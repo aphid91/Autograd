@@ -41,6 +41,13 @@ export class LayerPanel {
     this.cb = cb;
     this.sig = null;
     this.root = el("div", "layerpanel", { "data-open": "false", role: "region", "aria-label": "Layers" });
+    // What wirePress() needs to know across a rebuild (see there): the kind
+    // of pointer that last pressed anywhere on the panel, and whether a hold
+    // has just happened, whose release must not also count as a tap.
+    // Captured, so it is up to date before any button hears the press.
+    this.lastPointer = "mouse";
+    this.swallowClick = false;
+    this.root.addEventListener("pointerdown", (e) => { this.lastPointer = e.pointerType; this.swallowClick = false; }, true);
 
     const head = el("button", "ly-head", { type: "button", "aria-expanded": "true" });
     head.innerHTML = `${icon("layers")}<span>Layers</span><span class="ly-fold"></span>`;
@@ -216,22 +223,40 @@ export class LayerPanel {
 
   // A tap, or a long press (right-click on a mouse) -- which then swallows
   // the click its own release makes, so a hold never also selects.
+  //
+  // On touch the hold is our own timer, and the browser's contextmenu is
+  // ignored: Android Chrome fires one for the same long press (with its
+  // haptic), a moment after the timer. The hold usually rebuilds the rows
+  // (isolating a layer changes every row's state), so that contextmenu
+  // lands on a NEW button under the finger, one that never saw the press --
+  // a per-button "already held" flag cannot stop it, and it ran the hold a
+  // second time: an isolate undone a frame later, unless the finger lifted
+  // in the gap between the two. So the kind of pointer and the swallowed
+  // click are the panel's (constructor), not the button's: contextmenu acts
+  // only after a mouse press, and the click after a hold is swallowed
+  // whichever element it lands on. The shell's wireHold() learnt the same.
   wirePress(b, onTap, onHold) {
-    let timer = null, held = false, x0 = 0, y0 = 0;
+    let timer = null, x0 = 0, y0 = 0;
     const cancel = () => { if (timer !== null) clearTimeout(timer); timer = null; };
+    const hold = () => { this.swallowClick = true; onHold(); };
     b.addEventListener("pointerdown", (e) => {
-      held = false;
       if (e.pointerType === "mouse") return;
       x0 = e.clientX; y0 = e.clientY;
       cancel();
-      timer = setTimeout(() => { timer = null; held = true; onHold(); }, HOLD_MS);
+      timer = setTimeout(() => { timer = null; hold(); }, HOLD_MS);
     });
     b.addEventListener("pointermove", (e) => {
       if (timer !== null && Math.hypot(e.clientX - x0, e.clientY - y0) > HOLD_SLOP) cancel();
     });
     for (const ev of ["pointerup", "pointercancel", "pointerleave"]) b.addEventListener(ev, cancel);
-    b.addEventListener("contextmenu", (e) => { e.preventDefault(); if (!held) onHold(); held = true; });
-    b.addEventListener("click", () => { if (held) { held = false; return; } onTap(); });
+    b.addEventListener("contextmenu", (e) => {
+      e.preventDefault();
+      if (this.lastPointer === "mouse") hold();
+    });
+    b.addEventListener("click", () => {
+      if (this.swallowClick) { this.swallowClick = false; return; }
+      onTap();
+    });
   }
 
   toggle(cls, art, on, disabled, label, onTap) {

@@ -16,8 +16,8 @@ one item per tick. See "Deferred" for what is still missing.
 
 **Web editor:** the `Web` branch carries a phone-first board editor in
 [web/](web/) — plain JS, reads and writes the same `.npz` saves, and runs a
-port of the CPU tick that `tools/check_web_sim.py` holds to this one tick for
-tick. See [web/CLAUDE.md](web/CLAUDE.md).
+port of the CPU tick, on a Web Worker, that `tools/check_web_sim.py` holds to
+this one tick for tick. See [web/CLAUDE.md](web/CLAUDE.md).
 
 ## Commands
 
