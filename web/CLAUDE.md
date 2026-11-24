@@ -395,6 +395,16 @@ on the current layer.
   is the only active layer and every **visible** layer is active again (a
   hidden one keeps its own flag). View, not an undo step. Right-click on a
   mouse; the hold swallows the click its release makes.
+  **On touch the hold is the panel's own timer, never the browser's
+  contextmenu** (`wirePress()`). Android Chrome fires one for the same long
+  press, with its haptic, a moment after the timer -- and the isolate has
+  by then rebuilt every row, so it lands on a *new* button that never saw
+  the press, and a per-button "already held" flag let it hold again: the
+  isolate undone a frame later, unless the finger lifted in the gap. So the
+  pointer kind and the swallowed click live on the panel, not the button.
+  Reproduced in Chromium as a Pixel 7 (a CDP touch hold, then a touch
+  contextmenu at whatever is under the finger 100 and 300 ms later):
+  undone before, kept after; a right-click still isolates.
 - **Double tap a layer's name to select all of it**: the first tap makes it
   current as usual, the second (within 350 ms) lifts every entity on it
   into the selection -- adding, as selecting always does. Selecting is a
