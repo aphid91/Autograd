@@ -2462,6 +2462,7 @@ largest JS span left.
 | `index.html`, `style.css` | the shell: board, controls row, swatch bar, picker sheet |
 | `main.js` | wiring: applies the shell's and panel's requests to the board; resize, redraw, the play loop |
 | `sim.js` | the simulation: segment index, closed-form belts, gates, the wake list, the clock -- the desktop's CPU tick; `forecast()` |
+| `rate.js` | `RATE_MIN`/`RATE_MAX`, the tick-rate bounds: the one place the cap is stated. The clock, the speed box, video ticks/s and audio's reference rate all read it; import-free so the AudioWorklet can load it |
 | `simhost.js` | the sim on a worker: the deltas, the board and state messages, the epoch, `SimHost` and its loop's slices; pure, no DOM |
 | `simworker.js` | the worker itself: a `SimHost` and the loop that runs it |
 | `flow.js` | where items are drawn: belt paths, the machines' internal links and wait points, the tick animated from the forecast |

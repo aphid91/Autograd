@@ -1,6 +1,9 @@
-// The Audio dials: defaults and the panel's spec. Tiny and dependency-free,
-// so the panel can show them without loading any audio code -- audio.js and
-// the worklet are only fetched when the player switches audio on.
+// The Audio dials: defaults and the panel's spec. Tiny, importing only
+// rate.js (one constant), so the panel can show them without loading any
+// audio code -- audio.js and the worklet are only fetched when the player
+// switches audio on.
+
+import { RATE_MAX } from "./rate.js";
 
 export const AUDIO_DEFAULTS = {
   master: 0.5,          // output gain, before the soft clipper
@@ -105,7 +108,7 @@ export const AUDIO_SPEC = [
   ["releaseMs", "release ms", { min: 1, max: 1000, step: 1 }],
   ["sluggish", "sluggishness", { min: -2, max: 2, step: 0.05 }],
   ["beltTrack", "follow tick rate", { min: 0, max: 1, step: 0.05 }],
-  ["trackRef", "at tick rate", { min: 1, max: 10000, step: 1 }],
+  ["trackRef", "at tick rate", { min: 1, max: RATE_MAX, step: 1 }],
   ["voiceLimit", "voice limit", { min: 8, max: VOICE_LIMIT_MAX, step: 8 }],
   ["---", "tone"],
   ["lenGain1", "length 1", { min: 0, max: 2, step: 0.01 }],

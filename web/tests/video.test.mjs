@@ -11,6 +11,7 @@ import { bakeAudio } from "../audio-bake.js";
 import { AUDIO_DEFAULTS } from "../audio-params.js";
 import { Board } from "../board.js";
 import { Sim } from "../sim.js";
+import { RATE_MAX } from "../rate.js";
 
 const near = (a, b, e = 1e-9) => Math.abs(a - b) < e;
 
@@ -67,7 +68,7 @@ test("settings: cleaned on load, even sizes, counts", () => {
   assert.deepEqual(cleanVideo(null), VIDEO_DEFAULTS);
   const c = cleanVideo({ width: 99999, height: 0, duration: -3, tps: 1e9, quality: "ultra", lerpEnd: 2, fadeIn: "x" });
   assert.equal(c.width, 3840); assert.equal(c.height, 0, "0 means 'the screen's size'");
-  assert.equal(c.duration, 1); assert.equal(c.tps, 10000); assert.equal(c.quality, VIDEO_DEFAULTS.quality);
+  assert.equal(c.duration, 1); assert.equal(c.tps, RATE_MAX, "video ticks/s is capped at the sim's own cap"); assert.equal(c.quality, VIDEO_DEFAULTS.quality);
   assert.equal(c.lerpEnd, 1); assert.equal(c.fadeIn, VIDEO_DEFAULTS.fadeIn);
   assert.equal(evenDim(1081), 1080); assert.equal(evenDim(5), 128);
   assert.equal(frameCount({ duration: 10 }), 600);

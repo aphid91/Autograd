@@ -34,6 +34,8 @@
 // edit of any kind counts. The tick counter is not reset -- that is Reset's
 // job, as ctrl+R's on the desktop.
 
+import { RATE_MIN, RATE_MAX } from "./rate.js";
+
 const BELT = 1, UNDER = 7, EMPTY = 0;
 const NEVER = -(2 ** 30);   // an activity stamp for "never" (see flush())
 
@@ -1229,8 +1231,8 @@ export class Sim {
 // the renderer feeds to the closed form so items glide between ticks.
 
 export const RATE_PRESETS = [1, 5, 30, 240];
-export const RATE_MIN = 0.1;
-export const RATE_MAX = 1000000;
+// The tick-rate bounds live in rate.js (see there); re-exported for callers.
+export { RATE_MIN, RATE_MAX };
 // A frame that arrives after a long stall (a backgrounded tab) runs at most
 // this many ticks -- or a quarter second's worth at the current rate, if that
 // is more -- and drops the rest, rather than freezing to catch up. A flat 240

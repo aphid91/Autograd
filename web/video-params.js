@@ -3,6 +3,8 @@
 // without loading video.js (which pulls in mediabunny, only when a recording
 // starts).
 
+import { RATE_MAX } from "./rate.js";
+
 export const VIDEO_FPS = 60;          // the file's frame rate, not a rate anything keeps up with
 export const MIN_DIM = 128, MAX_DIM = 3840;
 export const MAX_DURATION = 120;
@@ -22,7 +24,7 @@ export const VIDEO_SPEC = [
   ["width", "width", { min: MIN_DIM, max: MAX_DIM, step: 2 }],
   ["height", "height", { min: MIN_DIM, max: MAX_DIM, step: 2 }],
   ["duration", "duration (s)", { min: 1, max: MAX_DURATION, step: 1 }],
-  ["tps", "ticks / s", { min: 1, max: 10000, step: 1 }],
+  ["tps", "ticks / s", { min: 1, max: RATE_MAX, step: 1 }],
   ["quality", "quality", { options: Object.fromEntries(QUALITIES.map(q => [q, q])) }],
 ];
 export const CAMERA_SPEC = [
