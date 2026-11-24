@@ -65,6 +65,9 @@ export function speedRates(rec) {
   return [...new Set([rec.rate, ...others])].sort((a, b) => a - b);
 }
 
+// A rate as its button shows it: 10000 as "10k", so five fit two rows.
+export const rateLabel = (r) => (r >= 1000 && r % 100 === 0 ? `${r / 1000}k` : String(r));
+
 // The camera schedule as a value: where it puts the camera at a tick, or
 // null when there is none (no end camera, or 0 ticks).
 export function schedulePose(rec, tick) {
@@ -151,7 +154,7 @@ export async function startPresentation(name, api, opts = {}) {
   if (rates.length) {
     speed = el("div", "pr-speed", `<div class="pr-speed-label">speed</div><div class="pr-speed-row"></div>`);
     for (const r of rates) {
-      const b = el("button", "pr-rate", String(r));
+      const b = el("button", "pr-rate", rateLabel(r));
       b.dataset.rate = String(r);
       b.onclick = () => {
         if (api.rate() === r) return;

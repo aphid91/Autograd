@@ -1089,6 +1089,8 @@ function bloomHook(key) {
 // report a second. Paused, nothing paints on its own, so a report needs
 // the sim playing or the board being moved.
 const profEl = document.getElementById("prof");
+// Debug > wake list (sim.js): kept across board loads, not across sessions.
+let wakeList = true;
 P.prof.onReport = (r) => { profEl.textContent = P.formatReport(r); };
 function setProfiling(on, gpuSync = false) {
   P.prof.on = on;
@@ -2972,6 +2974,7 @@ async function show(name, bytes) {
     panel.setBoardName(name.replace(/\.npz$/i, ""));
     loadAudioSettings();
     sim = new Sim(T, board);
+    if (!wakeList) sim.setSleeping(false);
     syncScreen();
     stopBakedPlay();
     if (audio) audio.rec.attach(sim);
@@ -3442,6 +3445,7 @@ async function init() {
     onOpenFile: () => fileInput.click(),
     onFit: () => { if (board) cam.frame(board.bounds); redraw(); },
     onProfile: ({ profile, gpuSync }) => setProfiling(profile, gpuSync),
+    onWakeList: (on) => { wakeList = on; sim?.setSleeping(on); redraw(); },
     onView: (v) => { view = v; syncScreen(); layersChanged(false); },
     onColours: (c) => { statusColours = c; redraw(); },
     onAudioEnable: (on) => setAudio(on),

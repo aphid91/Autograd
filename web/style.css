@@ -1164,20 +1164,20 @@ html, body {
   color: var(--ink);
 }
 .pr-edit[hidden] { display: none; }
-/* Above the button row, so up to five rates never reach the centred buttons
-   on a phone. */
+/* Bottom left, level with the button row: the rates wrap to two rows of
+   three, so five of them stay clear of the centred buttons on a phone. */
 .pr-speed {
   pointer-events: auto;
   position: absolute;
   left: calc(10 * var(--u));
-  bottom: calc(56 * var(--u));
+  bottom: calc(10 * var(--u));
   padding: calc(4 * var(--u)) calc(6 * var(--u));
   border-radius: calc(8 * var(--u));
   border: var(--border) solid var(--edge);
   background: rgba(0, 0, 0, 0.55);
 }
 .pr-speed-label { font-size: calc(8 * var(--u)); color: var(--ink-dim); text-transform: uppercase; letter-spacing: 0.08em; margin-bottom: calc(3 * var(--u)); }
-.pr-speed-row { display: flex; gap: calc(4 * var(--u)); }
+.pr-speed-row { display: grid; grid-template-columns: repeat(3, auto); gap: calc(4 * var(--u)); }
 .pr-rate {
   min-width: calc(30 * var(--u));
   height: calc(26 * var(--u));

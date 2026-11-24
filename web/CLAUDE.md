@@ -96,7 +96,7 @@ scale 1.15.
   play. It **starts paused**, and loading a save pauses it again. **Long
   press Play/Pause** (right-click on a mouse) for the rate panel, just above
   the Sim section: presets of 1, 5, 30 and 240 ticks a second, and Custom,
-  which opens a text box (0.1 to 10000). It stays open until the next long
+  which opens a text box (0.1 to 100000). It stays open until the next long
   press or its × button, and shows the tick count. The rate (30 by default)
   and the panel's open state persist with the shell's localStorage. The
   panel is **open on a first visit**, so it is found; the first time it is
@@ -1196,6 +1196,10 @@ reasoning is in the comment above `makeSched()`; in short:
 | `cpu.npz` | 21.5 µs | **6.1 µs** |
 | `GameOfLife_SLOW` (15% of runs active) | 690 µs | **265 µs** |
 
+**Debug > wake list** switches it off (and on, waking everything), for
+comparing: the same ticks either way, only the cost differs. Kept across
+board loads in the session, not stored.
+
 So the tick now costs what the board *does*, not what it *holds*: per tick
 on `cpu.npz` about 13 gates asked, 12 runs ticked, 12 edges checked. In the
 editor, `test` reaches the 10000 tps ceiling with the step at ~1 ms of a
@@ -1904,9 +1908,10 @@ them: the panel's **Presentation** folder, and **Export presentation
   persists with the panel's preferences.
 - **The page** shows the board, the sound button, Reset and Play/Pause
   (bottom middle), an **i** button cycling the views (hidden with only
-  one), and the **speed** panel (bottom left, above the button row so five
-  rates never reach the centred buttons), the starting rate lit -- no
-  panel at all without other rates. Everything else is hidden by
+  one), and the **speed** panel (bottom left, level with the buttons: the
+  rates wrap to two rows of three, and a rate of 1000 or more reads as
+  "1k", so five never reach the centred buttons), the starting rate lit --
+  no panel at all without other rates. Everything else is hidden by
   `body.presenting`. It writes **nothing** to the browser's storage:
   `freezePersist()` runs before the shell and the panel are built, and
   every store (panel prefs, the shell's, the layer panel size, saves and

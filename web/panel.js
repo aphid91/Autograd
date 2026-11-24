@@ -343,6 +343,10 @@ export class Panel {
     // Frame profiling (prof.js): a per-part timing tree over the board.
     // Not a preference -- off on every load.
     this.profState = { profile: false, gpuSync: false };
+    // The simulation's wake list (sim.js), on unless switched off here to
+    // compare: the same ticks either way, only the cost differs.
+    this.wakeState = { wakeList: true };
+    dbg.addBinding(this.wakeState, "wakeList", { label: "wake list" }).on("change", () => cb.onWakeList?.(this.wakeState.wakeList));
     dbg.addBinding(this.profState, "profile", { label: "profile frames" }).on("change", () => cb.onProfile?.(this.profState));
     dbg.addBinding(this.profState, "gpuSync", { label: "GPU sync" }).on("change", () => cb.onProfile?.(this.profState));
   }

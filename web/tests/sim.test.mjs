@@ -7,7 +7,7 @@ import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
-import { Sim, Clock, evalOps, takeDir } from "../sim.js";
+import { Sim, Clock, evalOps, takeDir, RATE_MAX } from "../sim.js";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const T = JSON.parse(readFileSync(join(here, "..", "types.json"), "utf8"));
@@ -124,7 +124,8 @@ test("the clock spends banked time in whole ticks and keeps the remainder", () =
   assert.equal(c.advance(1 / 60), 166);
   assert.equal(c.advance(1000), 2500, "a stall at a fast rate is capped too");
   c.setRate(1e9);
-  assert.equal(c.rate, 10000, "the rate is clamped");
+  assert.equal(c.rate, RATE_MAX, "the rate is clamped");
+  assert.equal(RATE_MAX, 100000);
 });
 
 // Sim.restTick(): when an item comes to rest if nothing more happens on its
