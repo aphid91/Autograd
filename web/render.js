@@ -94,8 +94,15 @@ import { css as noteCss, isText, sizeOf, wrap, PAD, LINE } from "./notes.js";
 const css = (c) => `rgb(${(c[0] * 255) | 0},${(c[1] * 255) | 0},${(c[2] * 255) | 0})`;
 const shade = (c, k) => css(c.map(v => v * k));
 
-function fmtNumber(v) {
-  if (Number.isInteger(v)) return String(v);
+// A whole number prints in full only up to 2^24, the last point where float32
+// integers are contiguous; past it the trailing digits are rounding noise, so
+// it goes to scientific notation like any other large value. (Every float32
+// past 2^23 is whole, so without the bound the style depended on whether a
+// value happened to have a fraction rather than on how big it was.)
+const FULL_INT_LIMIT = 2 ** 24;
+
+export function fmtNumber(v) {
+  if (Number.isInteger(v) && Math.abs(v) <= FULL_INT_LIMIT) return String(v);
   if (Math.abs(v) >= 1e4 || Math.abs(v) < 1e-3) return v.toExponential(1);
   return String(parseFloat(v.toPrecision(3)));
 }
