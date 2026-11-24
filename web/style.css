@@ -1120,7 +1120,7 @@ html, body {
 /* --- presentation mode (present.js): `#b=<name>` ------------------------- */
 /* Only the board, the sound button and the presentation's own controls. */
 .presenting #controls, .presenting #bar, .presenting #pane-host, .presenting .thumbpad,
-.presenting #fps, .presenting .layerpanel { display: none !important; }
+.presenting #fps, .presenting .layerpanel, .presenting .rate-slider { display: none !important; }
 .pr-ui { position: absolute; inset: 0; pointer-events: none; }
 .pr-btn {
   pointer-events: auto;
@@ -1230,3 +1230,20 @@ html, body {
   transition: opacity 0.4s;
 }
 .pr-toast[data-show="true"] { opacity: 1; }
+
+/* The custom rate's slider (ui.js renderRateSlider): on the board's right
+   edge, between the panel above and the thumb pad below, while the rate
+   panel is open on a custom rate. Top is 100% of the custom rate. */
+.rate-slider {
+  position: absolute; right: 6px; top: 50%; transform: translateY(-50%);
+  z-index: 6; display: none; flex-direction: column; align-items: center; gap: 6px;
+  padding: 8px 4px; border-radius: 10px;
+  background: rgba(20, 22, 28, 0.72); color: #e6e8ee;
+  font: 600 11px/1.2 system-ui, sans-serif; touch-action: none;
+}
+.rate-slider[data-show="true"] { display: flex; }
+.rate-slider input {
+  writing-mode: vertical-lr; direction: rtl;
+  height: 38vh; width: 28px; margin: 0; accent-color: #8fb4ff; touch-action: none;
+}
+.rate-slider-val { min-width: 44px; text-align: center; font-variant-numeric: tabular-nums; }

@@ -1098,7 +1098,7 @@ async function runBake(seconds, rate, show) {
   baking = null;
   if (!res) { show(res === null ? "Bake cancelled (or the board changed)." : undefined); return; }
   bake = { snap, sim: startSim, revision, rebuilds, rate, key, sel, ...res, buf: null };
-  shell.setRate(rate);     // play it at the rate it was baked at
+  shell.setRate(rate, true);   // play it at the rate it was baked at
   show(`Baked ${seconds} s at ${rate} tps in ${((performance.now() - t) / 1000).toFixed(1)} s. Press play.\n` + bakeStatus());
   redraw();
 }
@@ -3554,7 +3554,7 @@ async function enterPreview() {
   inspect(-1);
   endDryRun();
   previewSaved = { view: captureViewState("editor"), cam: { cx: cam.cx, cy: cam.cy, zoom: cam.zoom },
-                   rate: clock.rate, paused: clock.paused };
+                   rate: shell.state.rate, rateScale: shell.state.rateScale, paused: clock.paused };
   freezePersist();
   document.body.classList.add("presenting");
   presenting = p.name;
@@ -3574,6 +3574,7 @@ function exitPreview() {
   // All of it put back while still frozen: the preferences were never
   // touched, so the restored state needs no writing either.
   applyViewState(s.view);
+  shell.state.rateScale = s.rateScale;
   shell.setRate(s.rate);
   shell.setPaused(s.paused);
   unfreezePersist();
@@ -3683,7 +3684,9 @@ async function init() {
       if (paused) endDryRun(); else { startDryRun(); stopPreview(); }
       redraw();
     },
-    onRate: (rate) => { clock.setRate(rate); redraw(); },
+    // The shell's rate, scaled by its slider -- except in a presentation,
+    // whose rates are its own.
+    onRate: (rate) => { clock.setRate(presenting ? shell.state.rate : rate); redraw(); },
     onBuildTap: () => {
       if (vec.picking === "build") closePicker(true);
       else if (!vec.picking) openBuildPicker();
@@ -3707,7 +3710,7 @@ async function init() {
     onCheckpoint: () => checkpoint(),
   });
   lastMode = shell.state.mode;
-  clock.setRate(shell.state.rate);
+  clock.setRate(presenting ? shell.state.rate : shell.effectiveRate());
   clock.paused = shell.state.paused;
 
   panel = new Panel(document.getElementById("pane-host"), {

@@ -102,6 +102,14 @@ scale 1.15.
   panel is **open on a first visit**, so it is found; the first time it is
   ever closed, a hint over the Sim section says "long press play/pause for
   tick controls" for a couple of seconds (`simHinted`, kept, so once).
+  **With a custom rate** (not a preset), a vertical slider shows on the
+  board's right edge while the panel is open: the clock runs at the custom
+  rate times the slider (0..1, 1 by default -- the custom value is the
+  maximum), its readout the rate that gives. It hides when the panel closes
+  or a preset is picked, and keeps its value (`rateScale`, persisted with
+  the shell); hidden on a custom rate, it still applies. Presentations
+  ignore it (their rates are their own), and a bake's playback sets the
+  exact rate, putting it back to 1.
 - **Edit**: Undo, Redo and Checkpoint (ctrl+Z, ctrl+shift+Z / ctrl+Y on a
   keyboard). See "Undo" below. Turning lives on the **thumb pads** in the
   board's corners, which show whenever there is something to turn: a held
