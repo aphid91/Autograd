@@ -221,6 +221,18 @@ busy board looks -- is the same at every tick rate; it **freezes while
 paused**. (It was seconds at first, stored as `statusFade`; the new key is
 `statusGlow`, so a stored seconds value is never read as ticks.)
 
+**Afterglow by time** (off by default) measures the fade in **seconds**
+instead (its own dial, 0..5 s, 0.5 by default; only the dial in use
+shows): the same pace on screen at any tick rate, where ticks keep the
+share of the time something is lit -- and so a busy board's brightness --
+the same at any rate. It is still a span of **sim** time: the seconds are
+turned into ticks at the current rate (`glowTicks()`), so the colour stays
+a function of the state on screen, it freezes while paused, a rate change
+rescales a glow already under way, and a video uses its own ticks/s. The
+two-tick hold below is in ticks either way. Both keys (`statusGlowTime`,
+`statusGlowS`) ride presentations' views; a view saved before them keeps
+whatever the player has.
+
 **Glow sluggishness** (-2..2, 0 by default) scales a **run's** fade by
 (length / 10)^s -- the sim's length, buried tiles included, the law and
 reference length Audio's sluggishness uses -- so at 1 a 20-tile run glows

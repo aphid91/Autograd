@@ -107,7 +107,7 @@ export class Panel {
       board.addButton({ title: "Delete saved" }).on("click", () => this.local.saved && cb.onDeleteLocal(this.local.saved)),
     ];
 
-    this.view = { grid: false, ports: true, labels: true, seedTint: true, notes: true, momentum: true, items: true, belts: true, gates: true, gateStatus: true, sources: true, beltStatus: true, beltActive: true, statusGlow: 15, statusSluggish: 0, fps: false, pixelAlpha: 0, pixelMax: 8, pixelTextBg: true, layers: false, ...LOOK_DEFAULTS, ...this.prefs.view };
+    this.view = { grid: false, ports: true, labels: true, seedTint: true, notes: true, momentum: true, items: true, belts: true, gates: true, gateStatus: true, sources: true, beltStatus: true, beltActive: true, statusGlow: 15, statusGlowTime: false, statusGlowS: 0.5, statusSluggish: 0, fps: false, pixelAlpha: 0, pixelMax: 8, pixelTextBg: true, layers: false, ...LOOK_DEFAULTS, ...this.prefs.view };
     if (!/^#[0-9a-f]{6}$/i.test(this.view.bg)) this.view.bg = LOOK_DEFAULTS.bg;
     const view = this.pane.addFolder({ title: "View", expanded: false });
     this.viewBindings = [];
@@ -158,20 +158,32 @@ export class Panel {
     const stored = Object.fromEntries(Object.entries(this.prefs.colours || {}).filter(([k, v]) => known.includes(k) && /^#[0-9a-f]{6}$/i.test(v)));
     this.colours = { ...STATUS_COLOUR_DEFAULTS, ...stored };
     const colours = view.addFolder({ title: "status colours", expanded: false });
-    // The afterglow (main.js gateStatus()): the ticks a machine or run takes
-    // to cool back to its resting colour after it last acted (0 is none),
-    // and glow sluggishness, which stretches a long run's glow and shortens
-    // a short one's, by (length / 10)^s. View, not colours: they ride
-    // presentations' views with the rest.
-    for (const [key, label, opts] of [["statusGlow", "afterglow (ticks)", { min: 0, max: 250, step: 1 }],
+    // The afterglow (main.js gateStatus()): how long a machine or run takes
+    // to cool back to its resting colour after it last acted (0 is none) --
+    // in ticks, so a busy board is as bright at any rate, or with "afterglow
+    // by time" in seconds, so it fades at the same pace at any rate -- and
+    // glow sluggishness, which stretches a long run's glow and shortens a
+    // short one's, by (length / 10)^s. View, not colours: they ride
+    // presentations' views with the rest. Only the dial in use shows.
+    const glowDials = {};
+    const syncGlow = () => {
+      glowDials.statusGlow.hidden = !!this.view.statusGlowTime;
+      glowDials.statusGlowS.hidden = !this.view.statusGlowTime;
+    };
+    for (const [key, label, opts] of [["statusGlowTime", "afterglow by time", {}],
+                                      ["statusGlow", "afterglow (ticks)", { min: 0, max: 250, step: 1 }],
+                                      ["statusGlowS", "afterglow (s)", { min: 0, max: 5, step: 0.05 }],
                                       ["statusSluggish", "glow sluggishness", { min: -2, max: 2, step: 0.05 }]]) {
-      this.viewBindings.push(colours.addBinding(this.view, key, { label, ...opts }).on("change", () => {
+      const b = glowDials[key] = colours.addBinding(this.view, key, { label, ...opts }).on("change", () => {
+        if (key === "statusGlowTime") syncGlow();
         if (this.applyingView) return;
         this.prefs.view = { ...this.view };
         savePrefs(this.prefs);
         cb.onView({ ...this.view });
-      }));
+      });
+      this.viewBindings.push(b);
     }
+    syncGlow();
     const pushColours = () => {
       if (this.applyingView) return;
       this.prefs.colours = { ...this.colours };

@@ -413,8 +413,8 @@ function drawVideoFrame(ctx, s, vcam, alpha) {
   render(ctx, s.board, vcam, 1, {
     ...view, sim: s, alpha, ghosts: [],
     // The afterglow at the video's own time.
-    ...layerOpts(recLayers, view.gateStatus ? gateStatus(s, s.tick + alpha) : null,
-                 view.beltStatus ? beltStatus(s, s.tick + alpha) : null, true),
+    ...layerOpts(recLayers, view.gateStatus ? gateStatus(s, s.tick + alpha, panel.video.tps) : null,
+                 view.beltStatus ? beltStatus(s, s.tick + alpha, panel.video.tps) : null, true),
     pixels: s.screen ? { screen: s.screen, alpha: view.pixelAlpha, max: view.pixelMax, textBg: view.pixelTextBg } : null,
     onWorld: bloomHook("video"),
   });
@@ -1735,11 +1735,21 @@ const BELT_EMPTY = 0, BELT_STALLED = 1;
 // How hot something is, 0..HEAT_LEVELS, from the tick it last acted
 // (`end`; still acting if in the future), the time on screen and the fade
 // in ticks.
-function heatLevel(end, at, fadeTicks) {
+function heatLevel(end, at, fadeTicks) {   // fadeTicks: glowTicks()
   const since = at - end;
   if (since < AFTERGLOW_HOLD) return HEAT_LEVELS;
   if (!(fadeTicks > 0)) return 0;
   return Math.max(0, Math.round(HEAT_LEVELS * (1 - (since - AFTERGLOW_HOLD) / fadeTicks)));
+}
+
+// The afterglow's length in ticks at `rate` ticks a second: the dial
+// itself, or with View > status colours > "afterglow by time" its seconds
+// at that rate -- the same fade on screen whatever the rate, where ticks
+// keep the share of the time something is lit, and so a busy board's
+// brightness. Either way it is a span of sim time, so it freezes while
+// paused; by time, a rate change rescales a glow already under way.
+function glowTicks(rate) {
+  return view.statusGlowTime ? (view.statusGlowS || 0) * rate : (view.statusGlow || 0);
 }
 
 // The colours for every resting state at every heat level, rebuilt only
@@ -1770,11 +1780,11 @@ function cacheOf(s) {
 }
 
 // `s` is the sim to read (the live one, or a video's copy), `at` the time
-// on screen in ticks.
-function gateStatus(s = sim, at = s ? s.tick + clock.alpha : 0) {
+// on screen in ticks, `rate` its ticks a second (a video's own).
+function gateStatus(s = sim, at = s ? s.tick + clock.alpha : 0, rate = clock.rate) {
   if (!s) return new Map();
   s.sync();   // may rebuild, which moves the version
-  const pal = statusPalette(), fade = view.statusGlow || 0, c = cacheOf(s);
+  const pal = statusPalette(), fade = glowTicks(rate), c = cacheOf(s);
   const key = `${s.version}|${at}|${fade}|${pal.key}`;
   if (c.gate?.[0] === key) return c.gate[1];
   if (c.gateState?.[0] !== s.version) c.gateState = [s.version, gateStateOf(s)];
@@ -1807,10 +1817,10 @@ function gateStateOf(s) {
 // 10-tile one. One multiply per run per frame: the factor is looked up per
 // length, and lengths repeat.
 const GLOW_REF_LENGTH = 10;
-function beltStatus(s = sim, at = s ? s.tick + clock.alpha : 0) {
+function beltStatus(s = sim, at = s ? s.tick + clock.alpha : 0, rate = clock.rate) {
   if (!s) return null;
   s.sync();
-  const pal = statusPalette(), fade = view.statusGlow || 0, slug = view.statusSluggish || 0, c = cacheOf(s);
+  const pal = statusPalette(), fade = glowTicks(rate), slug = view.statusSluggish || 0, c = cacheOf(s);
   const whole = view.beltActive !== false;
   const key = `${s.version}|${at}|${fade}|${slug}|${pal.key}|${whole}`;
   if (c.belt?.[0] === key) return c.belt[1];
