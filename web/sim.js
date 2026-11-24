@@ -87,6 +87,14 @@ export class Sim {
     // rebuild, given the run-id allocator as it stood before it. Both null
     // here.
     this.track = null;
+    // Truthiness (View > truthiness colours, Audio > truthiness): when on, a
+    // gate's fire records whether what it produced was > 0 (`truth[row]`,
+    // see truthSource()) and a push records its item's sign (`seg.truth`).
+    // Off, nothing is written -- one boolean test per fire and per push --
+    // so turning it on starts from stale bits (1, truthy, until the next
+    // fire or push).
+    this.truthOn = false;
+    this.truth = new Uint8Array(0);
     this.onRebuild = null;
     this.allocOverride = null;      // simhost.js: the allocator a rebuild must start from
     this.sync();
@@ -366,6 +374,7 @@ export class Sim {
       sid, cells, length,
       head: 0, tail: 0, anchor: length * this.UNIT,
       lastPush: NEVER, lastPop: NEVER,   // activity stamps (see flush())
+      truth: 1,                          // the newest push's sign, while truthOn
       cap, enter: new Float64Array(cap), payload: new Float32Array(cap),
       offs: new Int32Array(cells.length),
       src: this.nodeBehind(cells[0]), dst: this.nodeAhead(cells[cells.length - 1]),
@@ -421,6 +430,7 @@ export class Sim {
         outFaces: o.outputs.map(([lx, ly, face], i) => ({ x: ox + lx, y: oy + ly, face, ch: td.sim.out_ch[i] })),
         inFaces: o.inputs.map(([lx, ly, face], i) => ({ x: ox + lx, y: oy + ly, face, ch: td.sim.in_ch[i] })),
         drains: null,
+        ...truthSource(td.sim, this.T.sim.OPS),
       };
       this.gates.push(gate);
       this.gateOf.set(row, gate);
@@ -569,8 +579,10 @@ export class Sim {
       seg.head = seg.tail = 0;
       seg.anchor = seg.length * this.UNIT;
       seg.lastPush = seg.lastPop = NEVER;
+      seg.truth = 1;
     }
     this.fired = new Int32Array(this.board.rows).fill(NEVER);
+    this.truth = new Uint8Array(this.board.rows).fill(1);
     for (const g of this.gates) {
       for (let c = 0; c < g.sim.n_in; c++) this.clearIn(g.row, c);
       for (let c = 0; c < g.sim.n_out; c++) this.clearOut(g.row, c);
@@ -654,6 +666,14 @@ export class Sim {
     seg.enter[slot] = tick;
     seg.payload[slot] = payload;
     seg.tail++;
+    if (this.truthOn && !this.rec) {
+      const t = payload > 0 ? 1 : 0;
+      if (t !== seg.truth) {
+        seg.truth = t;
+        const A = this.audio;
+        if (A && A.truth && seg.aIdx >= 0) A.flip(seg.aIdx, t);
+      }
+    }
     if (this.track) this.track.push(seg.oi, slot);
     this.stats.pushed++;
   }
@@ -775,7 +795,9 @@ export class Sim {
       if (this.fire(g, P)) {
         this.stats.fired++;
         if (!this.rec) { this.fired[row] = this.tick + 1; if (this.track) this.track.row(row); }
-        if (A) A.fires[g.agroup] += g.again ?? 1;   // a far gate (space.js) counts for less
+        // A far gate (space.js) counts for less; with Audio > truthiness a
+        // falsy fire counts in its group's falsy half (fires[group + 3]).
+        if (A) A.fires[A.truth && this.truthOn && !this.truth[row] ? g.agroup + 3 : g.agroup] += g.again ?? 1;
       }
     }
   }
@@ -797,6 +819,7 @@ export class Sim {
         produced.push(c);
       }
       if (this.rec && produced.length) this.rec.fires.set(row, { values: [], results, consumed: [], produced });
+      if (this.truthOn && !this.rec && produced.length) this.truth[row] = truthOf(g, null, results);
       return produced.length > 0;
     }
     for (const c of drains) if (this.outHeld(row, c)) return false;   // back pressure
@@ -814,6 +837,7 @@ export class Sim {
       produced.push(c);
     });
     if (this.rec) this.rec.fires.set(row, { values, results, consumed, produced });
+    if (this.truthOn && !this.rec) this.truth[row] = truthOf(g, values, results);
     return true;
   }
 
@@ -1153,6 +1177,7 @@ export class Sim {
     c.stats = { ...this.stats };
     c.audio = null; c.rec = null; c.fc = null; c.screen = null; c.undoLog = null;
     c.fired = this.fired.slice();
+    c.truth = this.truth.slice();
     c.sched = this.sched ? c.makeSched() : null;   // its own, everything awake
     return c;
   }
@@ -1166,11 +1191,12 @@ export class Sim {
     for (const seg of this.order) {
       const s = snap.segments.get(seg.sid);
       seg.head = s.head; seg.tail = s.tail; seg.anchor = s.anchor;
-      seg.lastPush = s.lastPush; seg.lastPop = s.lastPop;
+      seg.lastPush = s.lastPush; seg.lastPop = s.lastPop; seg.truth = s.truth;
       seg.enter.set(s.enter); seg.payload.set(s.payload);
     }
     this.tick = snap.tick;
     this.fired.set(snap.fired);
+    this.truth.set(snap.truth);
     Object.assign(this.stats, snap.stats);
     this.version++;
     this.fc = null;
@@ -1271,6 +1297,32 @@ const clampValue = (v, L) => (v !== v ? v : v > L ? L : v < -L ? -L : v);
 // Entity.eval_ops(): a machine's arithmetic, from its exported opcode table.
 // One entry per output channel; null means "emit nothing". `values` are the
 // input channels (null when unfed), `konst` the Source's emit value.
+// Which value a gate's truthiness reads, from its own declared data:
+//   - a select rule (Merge), or a conditional op (Swap's OP_SEL, Route's
+//     OP_GATED): the control input;
+//   - otherwise the first output that is not a plain copy of an input (the
+//     pass-throughs): Shear's sum, Mac's accumulator, Max, Floor, 1/a, and
+//     a Source's emitted constant;
+//   - no outputs at all (Pixel, Sink): always truthy.
+// `tKind` 0 always, 1 an input channel, 2 an output channel; `tCh` which.
+export function truthSource(s, O) {
+  if (s.select) return { tKind: 1, tCh: s.select[0] };
+  const ops = s.ops || [];
+  for (const [op, ...a] of ops) if (op === O.OP_SEL || op === O.OP_GATED) return { tKind: 1, tCh: a[0] };
+  for (let c = 0; c < ops.length; c++) {
+    const op = ops[c][0];
+    if (op !== O.OP_IN && op !== O.OP_NONE) return { tKind: 2, tCh: c };
+  }
+  return { tKind: 0, tCh: 0 };
+}
+
+// A fire's truthiness: 1 iff the value truthSource() names is > 0 (NaN is not).
+export function truthOf(g, values, results) {
+  if (g.tKind === 1) return values && values[g.tCh] > 0 ? 1 : 0;
+  if (g.tKind === 2) return results[g.tCh] > 0 ? 1 : 0;
+  return 1;
+}
+
 export function evalOps(T, ops, values, konst) {
   const O = T.sim.OPS, L = T.sim.VALUE_LIMIT;
   const val = (i) => (values[i] === null || values[i] === undefined ? 0 : values[i]);

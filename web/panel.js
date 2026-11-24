@@ -32,10 +32,13 @@ const LOOK_SPEC = [
 export const STATUS_COLOUR_DEFAULTS = {
   gateRunning: "#45a854", gateStarved: "#c7423d", gateBlocked: "#dbb82e",
   beltMoving: "#50a05c", beltEmpty: "#b04842", beltStalled: "#d6b43a",
+  // View > truthiness colours: what a falsy fire or push glows instead.
+  gateRunningF: "#4a7fd4", beltMovingF: "#4f86c9",
 };
 const STATUS_COLOUR_LABELS = [
   ["gateRunning", "gate running"], ["gateStarved", "gate starved"], ["gateBlocked", "gate blocked"],
   ["beltMoving", "belt moving"], ["beltEmpty", "belt empty"], ["beltStalled", "belt stalled"],
+  ["gateRunningF", "gate running (falsy)"], ["beltMovingF", "belt moving (falsy)"],
 ];
 
 function loadPrefs() {
@@ -107,11 +110,11 @@ export class Panel {
       board.addButton({ title: "Delete saved" }).on("click", () => this.local.saved && cb.onDeleteLocal(this.local.saved)),
     ];
 
-    this.view = { grid: false, ports: true, labels: true, seedTint: true, notes: true, momentum: true, items: true, belts: true, gates: true, gateStatus: true, sources: true, beltStatus: true, beltActive: true, statusGlow: 15, statusGlowTime: false, statusGlowS: 0.5, statusSluggish: 0, fps: false, pixelAlpha: 0, pixelMax: 8, pixelTextBg: true, layers: false, simpleView: false, ...LOOK_DEFAULTS, ...this.prefs.view };
+    this.view = { grid: false, ports: true, labels: true, seedTint: true, notes: true, momentum: true, items: true, belts: true, gates: true, gateStatus: true, sources: true, beltStatus: true, beltActive: true, statusGlow: 15, statusGlowTime: false, statusGlowS: 0.5, statusSluggish: 0, fps: false, pixelAlpha: 0, pixelMax: 8, pixelTextBg: true, layers: false, simpleView: false, truthiness: false, ...LOOK_DEFAULTS, ...this.prefs.view };
     if (!/^#[0-9a-f]{6}$/i.test(this.view.bg)) this.view.bg = LOOK_DEFAULTS.bg;
     const view = this.pane.addFolder({ title: "View", expanded: false });
     this.viewBindings = [];
-    for (const [key, label] of [["grid", "grid lines"], ["ports", "ports"], ["labels", "source values"], ["seedTint", "seed tint"], ["notes", "labels (notes)"], ["momentum", "pan momentum"], ["items", "items"], ["belts", "belts"], ["gates", "gates"], ["gateStatus", "gate status colours"], ["beltStatus", "belt status colours"], ["beltActive", "stalled but moving: green"], ["sources", "sources"], ["fps", "fps counter"], ["layers", "layers"], ["simpleView", "simple view"]]) {
+    for (const [key, label] of [["grid", "grid lines"], ["ports", "ports"], ["labels", "source values"], ["seedTint", "seed tint"], ["notes", "labels (notes)"], ["momentum", "pan momentum"], ["items", "items"], ["belts", "belts"], ["gates", "gates"], ["gateStatus", "gate status colours"], ["beltStatus", "belt status colours"], ["beltActive", "stalled but moving: green"], ["truthiness", "truthiness colours"], ["sources", "sources"], ["fps", "fps counter"], ["layers", "layers"], ["simpleView", "simple view"]]) {
       this.viewBindings.push(view.addBinding(this.view, key, { label }).on("change", () => {
         if (this.applyingView) return;
         this.prefs.view = { ...this.view };

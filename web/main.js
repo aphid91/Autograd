@@ -1236,7 +1236,7 @@ function workerBoard(fresh, alloc = sim.lastAlloc) {
   wpost({ ...boardMessage(sim, alloc, fresh), epoch: ++W.epoch });
   if (fresh) wpost({ ...exportFull(sim), epoch: W.epoch });
   W.delta = null; W.pulling = false; W.ahead = false;
-  if (fresh) W.pixels = W.sleeping = W.audioGen = W.gainGen = null;
+  if (fresh) W.pixels = W.sleeping = W.truth = W.audioGen = W.gainGen = null;
 }
 // The main thread changed the sim's state itself (stepped it, restored a
 // bake's state): anything the worker sends from before is stale, and it
@@ -1253,6 +1253,7 @@ function workerSettings() {
   const px = !!sim.screen;
   if (W.pixels !== px) { wpost({ type: "pixels", on: px }); W.pixels = px; }
   if (W.sleeping !== wakeList) { wpost({ type: "sleeping", on: wakeList }); W.sleeping = wakeList; }
+  if (W.truth !== sim.truthOn) { wpost({ type: "truth", on: sim.truthOn }); W.truth = sim.truthOn; }
   // A line from the worker straight into the synth (audio.js tickPort()),
   // so ticks reach it every few ms rather than once a frame through here.
   if ((audio || null) !== W.audioLink) {
@@ -1326,6 +1327,9 @@ function paint(now) {
     // An edit since the last frame re-derives the runs and starts fresh --
     // here rather than at each edit site, so no edit path can forget it.
     P.span("sync", () => sim.sync());
+    // Truthiness is recorded only while something reads it: View's colours
+    // or Audio's split (Sim.truthOn).
+    sim.truthOn = !!view.truthiness || !!(audio && panel.audio.truthAudio);
     P.begin("step");
     const viaWorker = workerUsable() && !(!clock.paused && bakePlayable());
     if (!viaWorker && W.running) {
@@ -1832,10 +1836,12 @@ function statusPalette() {
   if (palette?.key === key) return palette;
   const c = statusColours;
   const ramp = (cool, hot) => Array.from({ length: HEAT_LEVELS + 1 }, (_, l) => mix(cool, hot, l / HEAT_LEVELS));
-  const run = hexRgb(c.gateRunning), moving = hexRgb(c.beltMoving);
-  const gate = [ramp(run, run), ramp(hexRgb(c.gateStarved), run), ramp(hexRgb(c.gateBlocked), run)];
-  const belt = [ramp(hexRgb(c.beltEmpty), moving), ramp(hexRgb(c.beltStalled), moving)].map(r => r.map(rgbCss));
-  palette = { key, gate, belt };
+  // The hot colour is the running / moving one; with View > truthiness
+  // colours a falsy fire or push glows from its own (gateF, beltF).
+  const gateOf = (run) => [ramp(run, run), ramp(hexRgb(c.gateStarved), run), ramp(hexRgb(c.gateBlocked), run)];
+  const beltOf = (moving) => [ramp(hexRgb(c.beltEmpty), moving), ramp(hexRgb(c.beltStalled), moving)].map(r => r.map(rgbCss));
+  palette = { key, gate: gateOf(hexRgb(c.gateRunning)), belt: beltOf(hexRgb(c.beltMoving)),
+              gateF: gateOf(hexRgb(c.gateRunningF)), beltF: beltOf(hexRgb(c.beltMovingF)) };
   return palette;
 }
 
@@ -1856,11 +1862,17 @@ function gateStatus(s = sim, at = s ? s.tick + clock.alpha : 0, rate = clock.rat
   if (!s) return new Map();
   s.sync();   // may rebuild, which moves the version
   const pal = statusPalette(), fade = glowTicks(rate), c = cacheOf(s);
-  const key = `${s.version}|${at}|${fade}|${pal.key}`;
+  const truth = !!view.truthiness;
+  const key = `${s.version}|${at}|${fade}|${pal.key}|${truth}`;
   if (c.gate?.[0] === key) return c.gate[1];
   if (c.gateState?.[0] !== s.version) c.gateState = [s.version, gateStateOf(s)];
   const out = new Map();
-  for (const [row, st] of c.gateState[1]) {
+  if (truth) {
+    const T = s.truth;
+    for (const [row, st] of c.gateState[1]) {
+      out.set(row, (T[row] ? pal.gate : pal.gateF)[st][st === GATE_RUNNING ? HEAT_LEVELS : heatLevel(s.fired[row], at, fade)]);
+    }
+  } else for (const [row, st] of c.gateState[1]) {
     out.set(row, pal.gate[st][st === GATE_RUNNING ? HEAT_LEVELS : heatLevel(s.fired[row], at, fade)]);
   }
   c.gate = [key, out];
@@ -1893,7 +1905,8 @@ function beltStatus(s = sim, at = s ? s.tick + clock.alpha : 0, rate = clock.rat
   s.sync();
   const pal = statusPalette(), fade = glowTicks(rate), slug = view.statusSluggish || 0, c = cacheOf(s);
   const whole = view.beltActive !== false;
-  const key = `${s.version}|${at}|${fade}|${slug}|${pal.key}|${whole}`;
+  const truth = !!view.truthiness;
+  const key = `${s.version}|${at}|${fade}|${slug}|${pal.key}|${whole}|${truth}`;
   if (c.belt?.[0] === key) return c.belt[1];
   const byLength = new Map();   // length -> its fade, in ticks
   const fadeFor = (n) => {
@@ -1906,7 +1919,7 @@ function beltStatus(s = sim, at = s ? s.tick + clock.alpha : 0, rate = clock.rat
     const empty = seg.head === seg.tail;
     let end = whole ? Math.max(seg.lastPush, seg.lastPop) : seg.lastPop;
     if (!empty) end = Math.max(end, s.restTick(seg, whole ? seg.tail - 1 : seg.head));
-    bySid.set(seg.sid, pal.belt[empty ? BELT_EMPTY : BELT_STALLED][heatLevel(end, at, fadeFor(seg.length))]);
+    bySid.set(seg.sid, (truth && !seg.truth ? pal.beltF : pal.belt)[empty ? BELT_EMPTY : BELT_STALLED][heatLevel(end, at, fadeFor(seg.length))]);
   }
   const W = s.board.width;
   const fn = (x, y) => bySid.get(s.segAt[y * W + x]) || null;

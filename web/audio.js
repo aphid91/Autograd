@@ -35,7 +35,13 @@ export class Recorder {
     this.rebuilds = -1;
     this.cands = [];
     this.words = 0;
-    this.fires = new Float64Array(3);
+    // Audio > truthiness: fires[3..5] are the groups' falsy fires, and
+    // flip() lists runs whose truthiness changed (tf: 2 * candidate + bit;
+    // to[k]: how many of them by the end of tick k).
+    this.truth = !!params.truthAudio;
+    this.fires = new Float64Array(6);
+    this.f0F = new Float32Array(0); this.f1F = new Float32Array(0);
+    this.tf = []; this.to = new Uint32Array(0);
     this.n = 0;
     this.cap = 0;
     // Fire "counts" are sums of the firing gates' spatial gains (1 each
@@ -49,6 +55,9 @@ export class Recorder {
     this.sim = sim;
     this.rebuilds = -1;              // reconfigure on its first tick
     if (sim) sim.audio = this;
+    // A bake's or a video's copy records truthiness if this recorder hears it
+    // (the live sim's switch is main.js's, every frame).
+    if (sim && this.truth) sim.truthOn = true;
   }
   detach() { if (this.sim) this.sim.audio = null; this.sim = null; }
 
@@ -89,6 +98,13 @@ export class Recorder {
       this.selInfo = { runs, gates };
     }
     this.port.postMessage({ type: "space", on: !!this.space, gain: w.gain, lp: w.lp, norm: w.runSum, groups });
+  }
+
+  // Truthiness on or off: the synth needs every run's bit afresh, so a
+  // reconfigure on the next tick.
+  setTruth(on) {
+    on = !!on;
+    if (on !== this.truth) { this.truth = on; this.rebuilds = -1; }
   }
 
   // Which run lengths may sound; a change reconfigures on the next tick.
@@ -135,7 +151,8 @@ export class Recorder {
     // Normalisation counts the selection only, so isolating part of a machine
     // fills the mix rather than playing it as quietly as it sits in the whole.
     this.selInfo = sel ? { runs: this.cands.length, gates: groups[0] + groups[1] } : null;
-    this.port.postMessage({ type: "config", gen: this.cfgGen, lengths: Float64Array.from(this.cands, s => s.length), groups });
+    this.port.postMessage({ type: "config", gen: this.cfgGen, lengths: Float64Array.from(this.cands, s => s.length), groups,
+                            truth: this.truth ? Uint8Array.from(this.cands, s => s.truth ?? 1) : null });
     // With a space the synth weighs every candidate (and normalises by the
     // weights, not the count); without one a config alone is the old state.
     if (this.space) this.sendSpace(sim);
@@ -157,8 +174,10 @@ export class Recorder {
     const W = this.words, off = this.n * W, bits = this.bits;
     for (let w = 0; w < W; w++) bits[off + w] = 0;
     this.off = off;
-    this.fires[0] = this.fires[1] = 0;
+    this.fires.fill(0);
   }
+
+  flip(i, bit) { this.tf.push(i * 2 + bit); }
 
   hit(seg) {
     const i = seg.aIdx;
@@ -179,7 +198,7 @@ export class Recorder {
     return {
       gen: this.cfgGen, words: this.words, runs: sim.order.length, gates: sim.gates.length,
       aIdx: Int32Array.from(sim.order, s => s.aIdx ?? -1),
-      agroup: Int8Array.from(sim.gates, g => g.agroup ?? 2),
+      agroup: Int8Array.from(sim.gates, g => g.agroup ?? 2), truth: this.truth,
       again: Float32Array.from(sim.gates, g => g.again ?? 1),
     };
   }
@@ -194,6 +213,15 @@ export class Recorder {
     this.bits.set(a.bits.subarray(0, a.n * W), this.n * W);
     this.f0.set(a.f0.subarray(0, a.n), this.n);
     this.f1.set(a.f1.subarray(0, a.n), this.n);
+    if (this.truth && a.f0F) {
+      this.f0F.set(a.f0F, this.n); this.f1F.set(a.f1F, this.n);
+      const base = this.tf.length;
+      for (let k = 0; k < a.n; k++) this.to[this.n + k] = base + a.to[k];
+      for (const x of a.tf) this.tf.push(x);
+    } else if (this.truth) {
+      this.f0F.fill(0, this.n, this.n + a.n); this.f1F.fill(0, this.n, this.n + a.n);
+      this.to.fill(this.tf.length, this.n, this.n + a.n);
+    }
     this.n += a.n;
   }
 
@@ -202,6 +230,7 @@ export class Recorder {
     const k = this.n++;
     this.f0[k] = this.fires[0];
     this.f1[k] = this.fires[1];
+    if (this.truth) { this.f0F[k] = this.fires[3]; this.f1F[k] = this.fires[4]; this.to[k] = this.tf.length; }
   }
 
   grow() {
@@ -209,6 +238,11 @@ export class Recorder {
     const bits = new Uint32Array(cap * W), f0 = new Float32Array(cap), f1 = new Float32Array(cap);
     bits.set(this.bits.subarray(0, this.n * W)); f0.set(this.f0.subarray(0, this.n)); f1.set(this.f1.subarray(0, this.n));
     this.bits = bits; this.f0 = f0; this.f1 = f1; this.cap = cap;
+    if (this.truth) {
+      const a = new Float32Array(cap), b = new Float32Array(cap), t = new Uint32Array(cap);
+      a.set(this.f0F.subarray(0, this.n)); b.set(this.f1F.subarray(0, this.n)); t.set(this.to.subarray(0, this.n));
+      this.f0F = a; this.f1F = b; this.to = t;
+    }
   }
 
   // Post the ticks recorded since the last flush, played at `rate`.
@@ -219,13 +253,20 @@ export class Recorder {
     const n = this.n, W = this.words;
     const m = { type: "ticks", gen: this.cfgGen, n, tick0: this.tick0, words: W, rate,
                 bits: this.bits.slice(0, n * W), f0: this.f0.slice(0, n), f1: this.f1.slice(0, n) };
-    this.port.postMessage(m, [m.bits.buffer, m.f0.buffer, m.f1.buffer]);
+    const transfer = [m.bits.buffer, m.f0.buffer, m.f1.buffer];
+    if (this.truth) {
+      Object.assign(m, { f0F: this.f0F.slice(0, n), f1F: this.f1F.slice(0, n), to: this.to.slice(0, n), tf: Int32Array.from(this.tf) });
+      transfer.push(m.f0F.buffer, m.f1F.buffer, m.to.buffer, m.tf.buffer);
+    }
+    this.tf.length = 0;
+    this.port.postMessage(m, transfer);
     this.n = 0;
   }
 
   // Paused: drop what is recorded and queued, and let every voice release.
   stop() {
     this.n = 0;
+    this.tf.length = 0;
     if (this.stopped) return;
     this.stopped = true;
     this.port.postMessage({ type: "stop" });
@@ -245,7 +286,7 @@ export async function startAudio(ctx, params, sim, onMeter) {
   rec.attach(sim);
   return {
     ctx, node, rec,
-    setParams(p) { node.port.postMessage({ type: "params", p }); rec.setLengths(p.beltMinLen, p.beltCutoff); },
+    setParams(p) { node.port.postMessage({ type: "params", p }); rec.setLengths(p.beltMinLen, p.beltCutoff); rec.setTruth(p.truthAudio); },
     // A bake's samples, as an AudioBuffer for this context.
     buffer(samples, sampleRate) {
       const b = ctx.createBuffer(1, samples.length, sampleRate);

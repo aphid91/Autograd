@@ -40,11 +40,23 @@ const SKIP_AT = 3;          // a backlog this many latencies deep is skipped, no
 const HOLD_MAX_S = 0.5;     // holding through an underrun gives up after this long
 const TILT_CAP = Math.pow(10, 24 / 20);   // +24 dB
 const SPACE_GLIDE_S = 0.04; // how fast a voice's spatial gain follows the camera
-// Clicks. Each group has CLICK_RES resonators: the first at the dial's
-// tone, the rest spread across +-clickDetune semitones. At detune 0 every
-// fire goes to the first, which is exactly the one resonator of before.
-const CLICK_RES = 5;
-const DETUNE_AT = [0, -1, 1, -0.5, 0.5];   // each resonator's share of the spread
+// Clicks. Each group has `clickRes` resonators (5 by default): the first at
+// the dial's tone, the rest spread across +-clickDetune semitones. At detune
+// 0 every fire goes to the first, which is exactly the one resonator of
+// before. With Audio > truthiness a group's resonators are split, the
+// truthy half the larger (ceil(n / 2)) and the falsy half at least one,
+// each with its own tone, decay, gain and detune.
+const RES_MAX = 16;
+const RES_SLOTS = 2 * (RES_MAX + 1);       // both groups, at most
+// Resonator j of n's share of the spread: 0, then -1, +1, then evenly
+// smaller pairs -- for n = 5 exactly [0, -1, 1, -0.5, 0.5], as always.
+function detuneAt(j, n) {
+  if (j === 0) return 0;
+  const pairs = Math.ceil((n - 1) / 2), q = (j - 1) >> 1;
+  const mag = (pairs - q) / pairs;
+  return (j - 1) & 1 ? mag : -mag;
+}
+const BRIGHT_HZ = 18000;    // a falsy run's brightness: open, closing 7 octaves below this at 0
 const MAX_EVENTS = 64;      // a group's fires in one tick become at most this many clicks
 const EVENT_POOL = 8192;    // clicks scheduled ahead: the pool's starting size...
 // ...which grows to this. A realtime block schedules all its ticks' clicks
@@ -93,6 +105,16 @@ export class GatesSynth {
     this.vS = new Float64Array(V);
     this.vLpA = new Float64Array(V).fill(1);
     this.vLpY = new Float64Array(V);
+    // Truthiness (truthAudio): per voice, its falsy target (vFT, and at the
+    // block's start vFT0), the crossfade position (0 truthy .. 1 falsy), the
+    // falsy oscillator's phase and low-pass (its coefficient and state).
+    this.vFT = new Uint8Array(V); this.vFT0 = new Uint8Array(V);
+    this.vX = new Float64Array(V); this.vPhF = new Float64Array(V);
+    this.vLpAF = new Float64Array(V).fill(1); this.vLpYF = new Float64Array(V);
+    this.cTruth = new Uint8Array(0);     // per candidate: its run's truthiness (1 truthy)
+    this.tableF = new Float32Array(TABLE + 1);
+    this.shapeF = -1;
+    this.ampSF = -1;
     // Per candidate: its spatial gain and cutoff (Hz, 0 = none), whether it
     // is waiting for a voice (refused), and whether a space is in force.
     this.sGain = new Float32Array(0);
@@ -117,9 +139,11 @@ export class GatesSynth {
     this.heldS = 0;
     this.curTick = -1;                   // the tick being played, absolute
     this.fade = 0;                       // 0..1, the fade in from startTick
-    // Click resonators, CLICK_RES per group (group g's are g*CLICK_RES..):
-    // y = c1*y1 + c2*y2 + x.
-    const R = 2 * CLICK_RES;
+    // Click resonators: group g's are g*resS.. (truthy, then falsy):
+    // y = c1*y1 + c2*y2 + x. Sized for the most there can be.
+    const R = RES_SLOTS;
+    this.R = 0; this.resS = 0; this.resT = 0; this.resF = 0;
+    this.rowHas = new Uint8Array(R);
     this.ry1 = new Float64Array(R); this.ry2 = new Float64Array(R);
     this.rc1 = new Float64Array(R); this.rc2 = new Float64Array(R); this.rx = new Float64Array(R);
     this.hx1 = this.hx2 = this.hy1 = this.hy2 = 0;   // the low cut's state
@@ -154,7 +178,7 @@ export class GatesSynth {
 
   message(m) {
     if (m.type === "ticks") this.push(m);
-    else if (m.type === "config") this.configure(m.lengths, m.groups, m.gen);
+    else if (m.type === "config") this.configure(m.lengths, m.groups, m.gen, m.truth);
     else if (m.type === "space") this.setSpace(m);
     else if (m.type === "params") { Object.assign(this.p, m.p); this.applyParams(); }
     else if (m.type === "stop") this.stop();
@@ -167,15 +191,33 @@ export class GatesSynth {
     const sk = `${p.scaleMode}|${p.scaleExpr}|${p.scaleLut}|${p.beltMinLen}`;
     if (sk !== this.scaleKey) { this.scaleKey = sk; this.scale = scaleTable(p).f; }
     if (p.beltShape !== this.shape) this.buildTable(p.beltShape);
-    for (let g = 0; g < 2; g++) {
-      const decay = p[`g${g}DecayMs`], r = Math.exp(-1 / Math.max(1, sr * decay / 1000));
-      for (let j = 0; j < CLICK_RES; j++) {
-        const k = g * CLICK_RES + j;
-        const tone = Math.min(p[`g${g}Tone`] * Math.pow(2, (p.clickDetune || 0) * DETUNE_AT[j] / 12), sr * 0.45);
+    // The resonators' layout; a new one drops whatever was ringing.
+    const N = Math.min(RES_MAX, Math.max(1, Math.round(p.clickRes) || 5)), tr = !!p.truthAudio;
+    const nT = tr ? Math.ceil(N / 2) : N, nF = tr ? Math.max(1, N - nT) : 0;
+    if (nT !== this.resT || nF !== this.resF) {
+      this.resT = nT; this.resF = nF; this.resS = nT + nF; this.R = 2 * this.resS;
+      this.ry1.fill(0); this.ry2.fill(0); this.imp.fill(0); this.evN = 0;
+    }
+    const tune = (g, base, n, tone0, decay, detune) => {
+      const r = Math.exp(-1 / Math.max(1, sr * decay / 1000));
+      for (let j = 0; j < n; j++) {
+        const k = base + j;
+        const tone = Math.min(tone0 * Math.pow(2, (detune || 0) * detuneAt(j, n) / 12), sr * 0.45);
         const w = 2 * Math.PI * tone / sr;
         this.rc1[k] = 2 * r * Math.cos(w); this.rc2[k] = -r * r;
         this.rx[k] = Math.sin(w);        // impulse scale: the response peaks near 1
       }
+    };
+    for (let g = 0; g < 2; g++) {
+      tune(g, g * this.resS, nT, p[`g${g}Tone`], p[`g${g}DecayMs`], p.clickDetune);
+      if (nF) tune(g, g * this.resS + nT, nF, p[`g${g}ToneF`], p[`g${g}DecayMsF`], p.clickDetuneF);
+    }
+    // The falsy drone: its waveform, transposition, low-pass and crossfade.
+    if (tr) {
+      if (p.beltShapeF !== this.shapeF) { this.shapeF = p.beltShapeF; this.fillTable(this.tableF, p.beltShapeF); }
+      this.trF = Math.pow(2, (p.beltTransposeF || 0) / 12);
+      this.xStep = p.truthXfadeMs > 0 ? 1000 / (p.truthXfadeMs * sr) : 1;
+      for (let v = 0; v < this.nv; v++) if (this.vSeg[v] >= 0) this.vLpAF[v] = this.lpCoefF(this.vSeg[v]);
     }
     this.trackRate = -1;                 // re-pitch every voice on the next tick
     for (let v = 0; v < this.nv; v++) if (this.vSeg[v] >= 0) { this.vGain[v] = this.lenGain(this.vSeg[v]); this.envFor(v, this.vSeg[v]); }
@@ -214,16 +256,19 @@ export class GatesSynth {
   // One cycle, blended sine -> triangle -> saw, with a guard sample.
   buildTable(s) {
     this.shape = s;
+    this.fillTable(this.table, s);
+  }
+  fillTable(table, s) {
     for (let i = 0; i <= TABLE; i++) {
       const x = (i % TABLE) / TABLE;
       const sine = Math.sin(2 * Math.PI * x);
       const tri = x < 0.25 ? 4 * x : x < 0.75 ? 2 - 4 * x : 4 * x - 4;
       const saw = x < 0.5 ? 2 * x : 2 * x - 2;
-      this.table[i] = s < 0.5 ? sine + (tri - sine) * s * 2 : tri + (saw - tri) * (s - 0.5) * 2;
+      table[i] = s < 0.5 ? sine + (tri - sine) * s * 2 : tri + (saw - tri) * (s - 0.5) * 2;
     }
   }
 
-  configure(lengths, groups, gen = null) {
+  configure(lengths, groups, gen = null, truth = null) {
     // The recorder's generation: a tick batch from another one is dropped.
     // Ticks can come straight from the sim worker (a second port) while
     // configs come from the main thread, so the two are not ordered.
@@ -241,6 +286,7 @@ export class GatesSynth {
     this.sGain = new Float32Array(this.n).fill(1);
     this.sLp = new Float32Array(this.n);
     this.isRef = new Uint8Array(this.n);
+    this.cTruth = truth && truth.length === this.n ? Uint8Array.from(truth) : new Uint8Array(this.n).fill(1);
     this.spaced = false;
     // Ticks already queued were recorded against the old candidates.
     this.queue = []; this.qi = 0; this.queued = 0;
@@ -260,6 +306,7 @@ export class GatesSynth {
     const cap = Math.max(MAX_QUEUE_S, (SKIP_AT + 1) * 1.5 / rate);
     while (this.queue.length > 1 && this.queued / rate > cap) {
       const old = this.queue.shift();
+      this.flips(old, this.qi, old.n);   // its truthiness changes still hold
       this.queued -= old.n - this.qi;
       this.qi = 0;
     }
@@ -274,6 +321,7 @@ export class GatesSynth {
     while (drop > 0 && this.queue.length) {
       const b = this.queue[0], left = b.n - this.qi, d = Math.min(drop, left);
       if (d === left && this.queue.length === 1) break;   // keep the newest tick
+      this.flips(b, this.qi, this.qi + d);
       this.qi += d; this.queued -= d; drop -= d;
       if (this.qi >= b.n) { this.queue.shift(); this.qi = 0; }
     }
@@ -335,7 +383,10 @@ export class GatesSynth {
     this.sLp = Float32Array.from(m.lp);
     this.bNorm = m.norm;
     this.groups = [Number(m.groups[0]) || 0, Number(m.groups[1]) || 0];
-    for (let v = 0; v < this.nv; v++) if (this.vSeg[v] >= 0) this.vLpA[v] = this.lpCoef(this.sLp[this.vSeg[v]]);
+    for (let v = 0; v < this.nv; v++) if (this.vSeg[v] >= 0) {
+      this.vLpA[v] = this.lpCoef(this.sLp[this.vSeg[v]]);
+      if (this.p.truthAudio) this.vLpAF[v] = this.lpCoefF(this.vSeg[v]);
+    }
     for (let w = 0; w < this.words; w++) {
       let bits = this.prev[w];
       while (bits) {
@@ -351,6 +402,27 @@ export class GatesSynth {
   }
 
   lpCoef(hz) { return hz > 0 ? 1 - Math.exp(-2 * Math.PI * Math.min(hz, this.sr * 0.45) / this.sr) : 1; }
+  // A falsy drone's low-pass: the distance cutoff, closed further by the
+  // brightness dial (7 octaves at 0), from 18 kHz where there is none.
+  lpCoefF(i) {
+    const b = this.p.beltBrightF, hz = this.sLp[i];
+    if (!(b < 1)) return this.lpCoef(hz);
+    return this.lpCoef((hz > 0 ? hz : BRIGHT_HZ) * Math.pow(2, -7 * (1 - Math.max(0, b))));
+  }
+
+  // Ticks [k0, k1) of batch b's truthiness changes, onto the candidates and
+  // their voices (logged when inside a block walk).
+  flips(b, k0, k1) {
+    if (!b.tf || !this.p.truthAudio || k1 <= k0) return;
+    const to = b.to, tf = b.tf, a = k0 > 0 ? to[k0 - 1] : 0, e = to[k1 - 1];
+    for (let q = a; q < e; q++) {
+      const i = tf[q] >> 1, bit = tf[q] & 1;
+      if (i >= this.n) continue;
+      this.cTruth[i] = bit;
+      const v = this.voiceOf[i], f = 1 - bit;
+      if (v >= 0 && this.vFT[v] !== f) { if (this.logging) this.logOn(v, 2 + f); this.vFT[v] = f; }
+    }
+  }
 
   alloc(i) {
     const v = this.nv++;
@@ -367,6 +439,13 @@ export class GatesSynth {
     this.vGain[v] = this.lenGain(i);
     this.vS[v] = this.sGain[i];
     this.vLpA[v] = this.lpCoef(this.sLp[i]); this.vLpY[v] = 0;
+    // Truthiness: straight into its run's state, no crossfade.
+    this.vFT[v] = this.vFT0[v] = this.vX[v] = this.cTruth[i] ? 0 : 1;
+    // The falsy oscillator is wound back as the truthy one is, at its own
+    // rate, so both are at 0 where the voice starts.
+    const phF = this.logging && this.p.truthAudio ? -this.logAt * Math.min(this.vInc[v] * this.trF, 0.45) : 0;
+    this.vPhF[v] = phF - Math.floor(phF); this.vLpYF[v] = 0;
+    if (this.p.truthAudio) this.vLpAF[v] = this.lpCoefF(i);
     this.envFor(v, i);
     this.voiceOf[i] = v;
     if (this.isRef[i]) { this.isRef[i] = 0; this.refused--; }
@@ -386,6 +465,8 @@ export class GatesSynth {
       this.vPhase[v] = this.vPhase[last]; this.vInc[v] = this.vInc[last]; this.vGain[v] = this.vGain[last];
       this.vAtk[v] = this.vAtk[last]; this.vRel[v] = this.vRel[last];
       this.vS[v] = this.vS[last]; this.vLpA[v] = this.vLpA[last]; this.vLpY[v] = this.vLpY[last];
+      this.vFT[v] = this.vFT[last]; this.vFT0[v] = this.vFT0[last]; this.vX[v] = this.vX[last];
+      this.vPhF[v] = this.vPhF[last]; this.vLpAF[v] = this.vLpAF[last]; this.vLpYF[v] = this.vLpYF[last];
       if (this.vSeg[v] >= 0) this.voiceOf[this.vSeg[v]] = v;
     }
     // A run refused a voice earlier takes the one just freed.
@@ -415,6 +496,11 @@ export class GatesSynth {
     const p = this.p, norm = p.norm;
     this.clicks(0, b.f0[k] * p.g0Gain / Math.pow(Math.max(1, this.groups[0]), norm), b.f0[k]);
     this.clicks(1, b.f1[k] * p.g1Gain / Math.pow(Math.max(1, this.groups[1]), norm), b.f1[k]);
+    if (p.truthAudio && b.f0F) {
+      this.clicks(0, b.f0F[k] * p.g0GainF / Math.pow(Math.max(1, this.groups[0]), norm), b.f0F[k], 1);
+      this.clicks(1, b.f1F[k] * p.g1GainF / Math.pow(Math.max(1, this.groups[1]), norm), b.f1F[k], 1);
+      this.flips(b, k, k + 1);
+    }
     const W = this.words, off = k * W, prev = this.prev, bits = b.bits;
     for (let w = 0; w < W; w++) {
       const now = bits[off + w];
@@ -445,10 +531,12 @@ export class GatesSynth {
   // times are a hash of (tick, group, fire), so a bake renders the same.
   // Many fires add in power rather than amplitude, so a busy tick is
   // denser but quieter than at 0 -- deliberately.
-  clicks(g, amp, count) {
+  clicks(g, amp, count, half = 0) {
     if (!(amp > 0)) return;
-    const p = this.p, J = p.clickJitter || 0, spread = (p.clickDetune || 0) > 0;
-    const base = g * CLICK_RES;
+    const p = this.p, J = p.clickJitter || 0, spread = ((half ? p.clickDetuneF : p.clickDetune) || 0) > 0;
+    // This half's resonators, and its own salt for the hash (the truthy
+    // half's is the one clicks always had).
+    const base = g * this.resS + (half ? this.resT : 0), NR = half ? this.resF : this.resT, salt = 2 * g + 4 * half;
     // In a block walk the tick starts logAt samples into the block, so
     // "now" is an event there rather than the block's first sample.
     const at = this.logging ? this.logAt : 0;
@@ -467,8 +555,8 @@ export class GatesSynth {
     const k0 = exact ? Math.round(k * sr / rate) : 0;
     const tps = this.tps > 0 ? this.tps : rate / sr;
     for (let j = 0; j < n; j++) {
-      const r = base + (spread ? Math.min(CLICK_RES - 1, Math.floor(unit(t, 2 * g + 1, j) * CLICK_RES)) : 0);
-      const o = J > 0 ? unit(t, 2 * g, j) * J : 0;
+      const r = base + (spread ? Math.min(NR - 1, Math.floor(unit(t, salt + 1, j) * NR)) : 0);
+      const o = J > 0 ? unit(t, salt, j) * J : 0;
       const d0 = exact ? Math.round((k + o) * sr / rate) - k0 : Math.round((o - this.tickPos) / tps);
       const d = Math.max(0, d0) + at;
       if (d <= 0) { this.imp[r] += a; continue; }
@@ -607,6 +695,8 @@ export class GatesSynth {
   renderBlock(out, n) {
     const sr = this.sr, nv0 = this.nv;
     for (let v = 0; v < nv0; v++) this.vTgt0[v] = this.vOn[v];
+    const truth = !!this.p.truthAudio;
+    if (truth) for (let v = 0; v < nv0; v++) this.vFT0[v] = this.vFT[v];
     this.lgN = 0; this.segN = 0;
     this.pushSeg(0);
     this.logging = true; this.logAt = 0;
@@ -649,7 +739,22 @@ export class GatesSynth {
       this.ampS = this.ampS < 0 ? want : this.ampS + (want - this.ampS) * glide;
       amp = this.ampS;
     } else this.ampS = -1;
-    for (let v = 0; v < nv; v++) {
+    if (truth) {
+      const ampF = this.ampFalsy(glide);
+      for (let v = 0; v < nv; v++) {
+        if (this.spaced && this.vSeg[v] >= 0) this.vS[v] += (this.sGain[this.vSeg[v]] - this.vS[v]) * glide;
+        const sg = this.vGain[v] * (this.spaced ? this.vS[v] : 1);
+        let tgt = this.vTgt0[v], ft = this.vFT0[v], s = 0, k = head[v];
+        for (;;) {
+          const e = k >= 0 ? off[k] : n;
+          this.truthRun(out, v, s, e, tgt, ft, amp * sg, ampF * sg);
+          s = e;
+          if (k < 0) break;
+          if (val[k] >= 2) ft = val[k] - 2; else tgt = val[k];
+          k = next[k];
+        }
+      }
+    } else for (let v = 0; v < nv; v++) {
       let env = this.vEnv[v], ph = this.vPhase[v];
       if (this.spaced && this.vSeg[v] >= 0) this.vS[v] += (this.sGain[this.vSeg[v]] - this.vS[v]) * glide;
       const inc = this.vInc[v], atk = this.vAtk[v], rel = this.vRel[v];
@@ -697,6 +802,49 @@ export class GatesSynth {
     }
   }
 
+  // The falsy drones' normalised gain: as the truthy one (amp), from
+  // beltGainF, glided under a space as ampS is.
+  ampFalsy(glide) {
+    const p = this.p;
+    if (!this.spaced) { this.ampSF = -1; return p.beltGainF / Math.pow(Math.max(1, this.n), p.norm); }
+    const want = p.beltGainF / Math.pow(Math.max(1, this.bNorm), p.norm);
+    this.ampSF = this.ampSF < 0 ? want : this.ampSF + (want - this.ampSF) * glide;
+    return this.ampSF;
+  }
+
+  // Truthiness: voice v over out[s..e), its envelope heading for `tgt` and
+  // its crossfade for `ft` (1 falsy) at the dial's pace. Two oscillators --
+  // the truthy one as ever, the falsy one with its own waveform, pitch and
+  // low-pass -- each computed only while it is heard.
+  truthRun(out, v, s, e, tgt, ft, gT, gF) {
+    if (s >= e) return;
+    const T = this.table, TF = this.tableF, xs = this.xStep;
+    const inc = this.vInc[v], incF = Math.min(inc * this.trF, 0.45), coef = tgt ? this.vAtk[v] : this.vRel[v];
+    const aT = this.vLpA[v], aF = this.vLpAF[v];
+    let env = this.vEnv[v], ph = this.vPhase[v], phF = this.vPhF[v], x = this.vX[v], yT = this.vLpY[v], yF = this.vLpYF[v];
+    for (; s < e; s++) {
+      if (x !== ft) x = ft > x ? Math.min(ft, x + xs) : Math.max(ft, x - xs);
+      env += (tgt - env) * coef;
+      let o = 0;
+      if (x < 1) {
+        const fi = ph * TABLE, j = fi | 0;
+        let w = T[j] + (T[j + 1] - T[j]) * (fi - j);
+        if (aT < 1) { yT += aT * (w - yT); w = yT; }
+        o += (1 - x) * gT * w;
+      }
+      if (x > 0) {
+        const fi = phF * TABLE, j = fi | 0;
+        let w = TF[j] + (TF[j + 1] - TF[j]) * (fi - j);
+        if (aF < 1) { yF += aF * (w - yF); w = yF; }
+        o += x * gF * w;
+      }
+      out[s] += env * o;
+      ph += inc; if (ph >= 1) ph -= 1;
+      phF += incF; if (phF >= 1) phF -= 1;
+    }
+    this.vEnv[v] = env; this.vPhase[v] = ph; this.vPhF[v] = phF; this.vX[v] = x; this.vLpY[v] = yT; this.vLpYF[v] = yF;
+  }
+
   // A voice's target changed during the walk, `logAt` samples into the block.
   logOn(v, on) {
     if (this.lgN >= this.lgOff.length) {
@@ -722,9 +870,8 @@ export class GatesSynth {
   // scheduled inside the span injected at their samples. Writes (not adds):
   // it clears the span first.
   resonate(out, at, len) {
-    const end = at + len, R = 2 * CLICK_RES;
+    const end = at + len, R = this.R, rowHas = this.rowHas;
     // Clicks scheduled inside this span, onto each resonator's scratch row.
-    let rows = 0;
     if (this.evN) {
       const lim = this.abs + len;
       if (this.inj.length < R * len) this.inj = new Float64Array(R * Math.max(len, 128));
@@ -732,7 +879,7 @@ export class GatesSynth {
         if (this.evAt[e] < lim) {
           const r = this.evR[e], o = Math.max(0, this.evAt[e] - this.abs);
           this.inj[r * len + o] += this.evA[e];
-          rows |= 1 << r;
+          rowHas[r] = 1;
           const l = --this.evN;
           this.evAt[e] = this.evAt[l]; this.evR[e] = this.evR[l]; this.evA[e] = this.evA[l];
         } else e++;
@@ -741,7 +888,8 @@ export class GatesSynth {
     out.fill(0, at, end);
     for (let r = 0; r < R; r++) {
       let y1 = this.ry1[r], y2 = this.ry2[r];
-      const has = (rows >>> r) & 1;
+      const has = rowHas[r];
+      rowHas[r] = 0;
       if (y1 === 0 && y2 === 0 && this.imp[r] === 0 && !has) continue;   // silent
       const c1 = this.rc1[r], c2 = this.rc2[r], rx = this.rx[r];
       let x = this.imp[r] * rx;
@@ -790,7 +938,14 @@ export class GatesSynth {
       this.ampS = this.ampS < 0 ? want : this.ampS + (want - this.ampS) * glide;
       amp = this.ampS;
     } else this.ampS = -1;
-    for (let v = 0; v < this.nv; v++) {
+    if (this.p.truthAudio) {
+      const ampF = this.ampFalsy(glide);
+      for (let v = 0; v < this.nv; v++) {
+        if (this.spaced && this.vSeg[v] >= 0) this.vS[v] += (this.sGain[this.vSeg[v]] - this.vS[v]) * glide;
+        const sg = this.vGain[v] * (this.spaced ? this.vS[v] : 1);
+        this.truthRun(out, v, at, end, this.vOn[v], this.vFT[v], amp * sg, ampF * sg);
+      }
+    } else for (let v = 0; v < this.nv; v++) {
       let env = this.vEnv[v], ph = this.vPhase[v];
       if (this.spaced && this.vSeg[v] >= 0) this.vS[v] += (this.sGain[this.vSeg[v]] - this.vS[v]) * glide;
       const inc = this.vInc[v], tgt = this.vOn[v], coef = tgt ? this.vAtk[v] : this.vRel[v];

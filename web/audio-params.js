@@ -43,7 +43,22 @@ export const AUDIO_DEFAULTS = {
   // Both groups: when in its tick a fire clicks, and how many tones it may
   // click at (audio-dsp.js, clicks()).
   clickJitter: 1,       // 0: a tick's fires are one click at its start; 1: each at a random time in its tick; more: blurred across ticks
-  clickDetune: 0,       // semitones: fires pick at random from 5 resonators spread +-this about the tone; 0 is one resonator
+  clickDetune: 0,       // semitones: fires pick at random from the resonators spread +-this about the tone; 0 is one resonator
+  clickRes: 5,          // resonators per group (with truthiness: the truthy half gets the larger share)
+  // Truthiness (Sim.truthOn): a falsy fire (its result, or Swap/Route/Merge's
+  // control, <= 0) clicks on its group's falsy resonators, and a run whose
+  // newest item is <= 0 plays its drone with the falsy settings, crossfaded
+  // on a change. Off, none of it runs. The falsy dials start as copies of
+  // the truthy ones; the truthy half is the existing dials.
+  truthAudio: false,
+  beltGainF: 1,
+  beltShapeF: 0.3,
+  beltTransposeF: 0,    // semitones, against the run's own pitch
+  beltBrightF: 1,       // 1 open; below, a low-pass closing by up to 7 octaves
+  truthXfadeMs: 20,     // a sounding run's crossfade when its truthiness changes
+  g0GainF: 1, g0ToneF: 1800, g0DecayMsF: 3,
+  g1GainF: 1, g1ToneF: 1800, g1DecayMsF: 3,
+  clickDetuneF: 0,
   // Space (space.js): camera-aware audio hears the screen, scaled about its
   // centre; the fringe and low-pass soften the screen's edge and the audio
   // region's alike. 0 and 0 is a hard edge, as the region always was.
@@ -65,6 +80,7 @@ export const AUDIO_SPEC = [
   ["holdUnderrun", "hold on underrun"],
   ["startTick", "audio from tick", { min: 0, max: 5000, step: 1 }],
   ["fadeMs", "fade in ms", { min: 0, max: 10000, step: 10 }],
+  ["truthAudio", "truthiness"],
   ["---", "belts"],
   ["beltGain", "gain", { min: 0, max: 4, step: 0.01 }],
   ["beltMaxHz", "min-length Hz", { min: 50, max: 8000, step: 10 }],
@@ -97,6 +113,20 @@ export const AUDIO_SPEC = [
   ["---", "click timing"],
   ["clickJitter", "jitter (ticks)", { min: 0, max: 4, step: 0.05 }],
   ["clickDetune", "detune (semis)", { min: 0, max: 12, step: 0.05 }],
+  ["clickRes", "resonators", { min: 1, max: 16, step: 1 }],
+  ["---", "falsy (truthiness)"],
+  ["beltGainF", "belt gain", { min: 0, max: 4, step: 0.01 }],
+  ["beltShapeF", "belt sine→tri→saw", { min: 0, max: 1, step: 0.01 }],
+  ["beltTransposeF", "belt transpose (semis)", { min: -24, max: 24, step: 0.5 }],
+  ["beltBrightF", "belt brightness", { min: 0, max: 1, step: 0.01 }],
+  ["truthXfadeMs", "belt crossfade ms", { min: 0, max: 500, step: 1 }],
+  ["g0GainF", "s/r/m gain", { min: 0, max: 4, step: 0.01 }],
+  ["g0ToneF", "s/r/m tone Hz", { min: 50, max: 12000, step: 10 }],
+  ["g0DecayMsF", "s/r/m decay ms", { min: 0.2, max: 100, step: 0.1 }],
+  ["g1GainF", "gates gain", { min: 0, max: 4, step: 0.01 }],
+  ["g1ToneF", "gates tone Hz", { min: 50, max: 12000, step: 10 }],
+  ["g1DecayMsF", "gates decay ms", { min: 0.2, max: 100, step: 0.1 }],
+  ["clickDetuneF", "click detune (semis)", { min: 0, max: 12, step: 0.05 }],
   ["---", "space"],
   ["camAudio", "camera-aware"],
   ["camScale", "screen scale", { min: 0.1, max: 3, step: 0.05 }],

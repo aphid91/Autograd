@@ -75,7 +75,10 @@ class AudioTap {
   constructor(cfg) {
     this.gen = cfg.gen;
     this.words = cfg.words;
-    this.fires = new Float64Array(3);
+    this.truth = !!cfg.truth;        // Audio > truthiness: falsy fires and run flips too
+    this.fires = new Float64Array(6);
+    this.f0F = new Float32Array(0); this.f1F = new Float32Array(0);
+    this.tf = []; this.to = new Uint32Array(0);
     this.n = 0; this.cap = 0; this.tick0 = 0; this.off = 0;
     this.bits = new Uint32Array(0); this.f0 = new Float32Array(0); this.f1 = new Float32Array(0);
   }
@@ -95,11 +98,17 @@ class AudioTap {
       const bits = new Uint32Array(cap * W), f0 = new Float32Array(cap), f1 = new Float32Array(cap);
       bits.set(this.bits.subarray(0, this.n * W)); f0.set(this.f0.subarray(0, this.n)); f1.set(this.f1.subarray(0, this.n));
       this.bits = bits; this.f0 = f0; this.f1 = f1; this.cap = cap;
+      if (this.truth) {
+        const a = new Float32Array(cap), b = new Float32Array(cap), t = new Uint32Array(cap);
+        a.set(this.f0F.subarray(0, this.n)); b.set(this.f1F.subarray(0, this.n)); t.set(this.to.subarray(0, this.n));
+        this.f0F = a; this.f1F = b; this.to = t;
+      }
     }
     this.off = this.n * this.words;
     this.bits.fill(0, this.off, this.off + this.words);
-    this.fires[0] = this.fires[1] = 0;
+    this.fires.fill(0);
   }
+  flip(i, bit) { this.tf.push(i * 2 + bit); }
   hit(seg) {
     const i = seg.aIdx;
     if (i >= 0) this.bits[this.off + (i >>> 5)] |= 1 << (i & 31);
@@ -107,6 +116,7 @@ class AudioTap {
   post() {
     this.f0[this.n] = this.fires[0];
     this.f1[this.n] = this.fires[1];
+    if (this.truth) { this.f0F[this.n] = this.fires[3]; this.f1F[this.n] = this.fires[4]; this.to[this.n] = this.tf.length; }
     this.n++;
   }
   take() {
@@ -114,10 +124,17 @@ class AudioTap {
     const n = this.n, W = this.words;
     const out = { gen: this.gen, words: W, n, tick0: this.tick0,
                   bits: this.bits.slice(0, n * W), f0: this.f0.slice(0, n), f1: this.f1.slice(0, n) };
+    if (this.truth) {
+      Object.assign(out, { f0F: this.f0F.slice(0, n), f1F: this.f1F.slice(0, n), to: this.to.slice(0, n), tf: Int32Array.from(this.tf) });
+      this.tf.length = 0;
+    }
     this.n = 0;
     return out;
   }
 }
+
+// The buffers an audio batch (a tap's take(), or Recorder.flush()) can carry.
+export const audioBuffers = (a) => [a.bits, a.f0, a.f1, a.f0F, a.f1F, a.to, a.tf].filter(Boolean).map(x => x.buffer);
 
 // --- the dynamic state, as messages -------------------------------------------
 
@@ -156,6 +173,12 @@ export function takeDelta(sim, tr, extra = {}) {
               rows, chans, fired, pixels, ...extra };
   d.transfer = [runs.buffer, runVals.buffer, pushes.buffer, enter.buffer, payload.buffer,
                 rows.buffer, chans.buffer, fired.buffer, pixels.buffer];
+  // Truthiness, only while it is on (Sim.truthOn): each run's and row's bit.
+  if (sim.truthOn) {
+    d.runTruth = Uint8Array.from(runs, oi => sim.order[oi].truth);
+    d.rowTruth = Uint8Array.from(rows, r => sim.truth[r]);
+    d.transfer.push(d.runTruth.buffer, d.rowTruth.buffer);
+  }
   return d;
 }
 
@@ -169,6 +192,7 @@ export function applyDelta(sim, d, screen = null) {
     if (!s) continue;
     s.head = d.runVals[o]; s.tail = d.runVals[o + 1]; s.anchor = d.runVals[o + 2];
     s.lastPush = d.runVals[o + 3]; s.lastPop = d.runVals[o + 4];
+    if (d.runTruth) s.truth = d.runTruth[j];
   }
   for (let j = 0; j < d.enter.length; j++) {
     const s = sim.order[d.pushes[2 * j]], slot = d.pushes[2 * j + 1];
@@ -179,6 +203,7 @@ export function applyDelta(sim, d, screen = null) {
     const r = d.rows[j];
     E.set(d.chans.subarray(j * G, (j + 1) * G), r * ST + base);
     sim.fired[r] = d.fired[j];
+    if (d.rowTruth) sim.truth[r] = d.rowTruth[j];
   }
   if (screen) {
     const p = d.pixels;
@@ -296,6 +321,7 @@ export class SimHost {
       case "pull": this.pulled = this.now(); this.reply(); return;
       case "pixels": this.pixelsOn = m.on; this.wire(); return;
       case "sleeping": this.sleeping = m.on; this.sim?.setSleeping(m.on); return;
+      case "truth": this.truthOn = m.on; if (this.sim) this.sim.truthOn = m.on; return;
       case "audio": this.tapCfg = m.cfg; this.wire(); return;
       case "audioport": this.audioPort?.close?.(); this.audioPort = m.port || null; return;
     }
@@ -326,6 +352,7 @@ export class SimHost {
     this.sim.sync();
     this.sim.tick = m.tick;
     this.sim.setSleeping(this.sleeping);
+    this.sim.truthOn = !!this.truthOn;
     this.wire();
   }
 
@@ -364,7 +391,7 @@ export class SimHost {
     this.sendAudio();
     const transfer = d.transfer;
     delete d.transfer;
-    if (d.audio) transfer.push(d.audio.bits.buffer, d.audio.f0.buffer, d.audio.f1.buffer);
+    if (d.audio) transfer.push(...audioBuffers(d.audio));
     this.post(d, transfer);
   }
 
@@ -375,7 +402,7 @@ export class SimHost {
     if (!this.audioPort || !this.tap) return;
     const a = this.tap.take();
     if (!a) return;
-    this.audioPort.postMessage({ type: "ticks", ...a, rate: this.clock.rate }, [a.bits.buffer, a.f0.buffer, a.f1.buffer]);
+    this.audioPort.postMessage({ type: "ticks", ...a, rate: this.clock.rate }, audioBuffers(a));
   }
 
   // One run of the loop: the ticks the clock says are due, for at most

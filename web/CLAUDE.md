@@ -272,6 +272,44 @@ before resetting, and leaves both dials alone.
   most once a frame); heat is per frame, one stamp read per machine and run.
   On `test`, both together about 0.5 ms a frame.
 
+### Truthiness
+
+One bit per gate and per run, saying which side of zero the thing it just
+did was, for the afterglow's colours and the audio. **Recorded only while
+something reads it** -- View > **truthiness colours** or Audio >
+**truthiness** (`Sim.truthOn`, set by `paint()` each frame) -- and off,
+nothing is written: one boolean test per fire and per push, measured as no
+change to the tick on `cpu.npz` and `test`. So turning it on starts from
+stale bits: 1 (truthy, today's colours) until each gate fires and each run
+pushes again.
+
+- **A gate's bit** (`Sim.truth[row]`, written by `fire()`) is 1 iff the
+  value `truthSource()` names is > 0 (NaN is not). That is read from the
+  machine's own exported data, not a table: a select rule (Merge) or a
+  conditional op (Swap's `OP_SEL`, Route's `OP_GATED`) gives the
+  **control** input; otherwise the first output that is not a plain copy
+  (`OP_IN`, the pass-throughs) -- Shear's sum, Mac's accumulator, Max,
+  Floor, 1/a, a Source's emitted value; a machine with no outputs (Pixel)
+  is always truthy.
+- **A run's bit** (`seg.truth`) is its newest item's sign, set on a push
+  (seeds included) and never on a pop.
+- Both ride the worker's deltas while on (`runTruth`, `rowTruth`), and
+  clones, bakes and `restoreFrom()`. A forecast writes neither.
+- **Colours**: a falsy fire or push glows from View > status colours'
+  **gate running (falsy)** / **belt moving (falsy)** (blue by default)
+  instead of the running / moving colour, cooling to the same resting
+  colours. Read per row only when the switch is on.
+- **Audio**: see "Truthiness in the audio" under Audio.
+
+`tests/truth.test.mjs`: what each machine reads; nothing written while off
+and the tick unchanged while on; every fire's bit against the forecast's
+values and every run's against its newest item on `cpu.npz`; the worker's
+mirror and the recorder's falsy fires and flips against a main-thread
+reference; truthy plus falsy fires is every fire; the synth's falsy clicks,
+transposition and crossfade time; and the block renderer against the
+per-tick reference. Mutation-tested: dropping the delta's run bits, or the
+synth applying no flips, each fails it.
+
 ### Pan momentum
 
 A one-finger pan released while moving keeps gliding, slowing exponentially
@@ -1923,6 +1961,39 @@ does not write the key back, and is deliberately left that way.
   clamped to the panel's ranges; a bad entry costs that dial, a corrupt
   blob costs the settings, never the board.
 - The baked audio itself is not saved: memory only, and tens of MB.
+
+### Truthiness in the audio
+
+Audio > **truthiness** splits the sound by the bits above (Sim.truthOn is
+on while it is). Off, none of it runs and the synth renders exactly as
+before (every existing audio test, the bit-identical bakes included, is
+untouched). The falsy dials (Audio > **falsy (truthiness)**) default to
+copies of the truthy ones, so switching on changes nothing until they are
+tuned; the truthy half is the existing dials. All of them ride saves,
+audio presets and bakes like any dial.
+
+- **Clicks**: Audio > click timing > **resonators** (1-16, 5 by default)
+  is each group's total. Off, all of them are the group's, as before (at 5
+  the layout, the detune spread `detuneAt()` and the hash salts are
+  exactly the old ones). On, the truthy half gets `ceil(n / 2)` and the
+  falsy half the rest, at least one; each half has its own gain, tone,
+  decay and detune, and its own hash salt. The recorder counts a falsy
+  fire in `fires[group + 3]`, sent as `f0F`/`f1F` beside `f0`/`f1`.
+- **Belts: no extra voices.** A run's voice switches settings when its
+  bit changes: falsy gain, waveform, **transpose** (semitones) and
+  **brightness** (a low-pass closing up to 7 octaves, on top of the
+  distance low-pass). A change crossfades over **belt crossfade ms**
+  (0: a cut) between the two oscillators, each computed only while
+  heard (`truthRun()`). A newly voiced run starts straight in its state.
+- **Only changes cross threads**: the recorder lists flips (`tf`, 2 x
+  candidate + bit, with per-tick ends `to`) rather than a second bitset per
+  tick, so the busiest stream does not double at high tick rates; the
+  config carries every candidate's bit to start from. Ticks dropped or
+  skipped still apply their flips. The worker's tap records the same.
+- In the block renderer a flip is a change point like on/off (log values
+  2/3). It matches the per-tick reference to the bit with brightness open;
+  closed, a voice allocated mid-block warms its filter over the block's
+  silent start, as the distance low-pass does (under 1%).
 
 **Presets** (Audio > presets; [audiopresets.js](audiopresets.js)) carry a
 sound between saves: the same record a save holds (every dial, the scale
