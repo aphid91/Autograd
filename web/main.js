@@ -34,6 +34,7 @@ import { installPixel, Screen } from "./pixel.js";
 import { cropBox, evenDim, fitBox, frameBox, frameCount, viewBox } from "./video-params.js";
 import { presentationName, editName, startPresentation, fetchPresentation, presentationRecord, safeName } from "./present.js";
 import * as P from "./prof.js";
+import { applyDelta, exportFull, boardMessage } from "./simhost.js";
 import { freezePersist, unfreezePersist, persistEnabled } from "./persist.js";
 import { presetNames, readPresets, putPreset, deletePreset, presetFile, parsePresetFile } from "./audiopresets.js";
 import { writeZip } from "./npz.js";
@@ -161,6 +162,8 @@ const debug = window.gates = {
   prof: P.prof,
   setProfiling: (on, gpuSync) => setProfiling(on, gpuSync),
   profText: () => P.formatReport(P.prof.last),
+  get worker() { return W; },
+  setWorker: (on) => { workerWanted = on; redraw(); },
 };
 
 // --- the pixel overlay --------------------------------------------------------
@@ -1100,6 +1103,132 @@ function setProfiling(on, gpuSync = false) {
   redraw();
 }
 
+// --- the simulation's worker (simhost.js, simworker.js) ----------------------
+//
+// While the sim plays, the ticking happens on a worker thread, so the tick
+// rate is not capped by how long a frame takes to draw, and `sim` here is
+// its MIRROR: each frame applies the worker's delta to it, and everything
+// that reads the sim -- the renderer, the forecast, status colours, Status,
+// bakes, video -- reads the mirror. simhost.js has the protocol and why it
+// is exact; tests/worker.test.mjs holds the mirror to a reference timeline.
+//
+// The main thread still steps the mirror itself while a baked soundtrack
+// plays (the audio clock decides the tick, frame by frame), and whenever the
+// worker is off (Debug > sim worker) or failed to start. Taking over drops
+// anything the worker sent since (a new epoch); handing back sends the
+// mirror's whole state first (`ahead`).
+const W = {
+  worker: null, ready: false, failed: false,
+  epoch: 0,          // bumped by every board or state message; a delta from another is dropped
+  running: false,    // told to play
+  pulling: false,    // a delta asked for and not yet back
+  delta: null,       // the latest delta, applied at the top of the next paint
+  ahead: false,      // the mirror moved on without the worker: send it the state before it runs
+  rate: 0, pixels: null, sleeping: null, audioGen: null, gainGen: null,
+};
+let workerWanted = true;   // Debug > sim worker
+function startWorker() {
+  if (W.worker || W.failed || typeof Worker === "undefined") return;
+  try {
+    W.worker = new Worker("simworker.js", { type: "module" });
+  } catch (e) { workerFailed(e); return; }
+  W.worker.onmessage = (e) => {
+    const m = e.data;
+    if (m.type === "ready") { W.ready = true; if (sim) workerBoard(true); redraw(); }
+    else if (m.type === "error") workerFailed(new Error(m.message));
+    else if (m.type === "delta") { W.pulling = false; if (m.epoch === W.epoch) { W.delta = m; redraw(); } }
+  };
+  W.worker.onerror = (e) => workerFailed(e);
+}
+function workerFailed(e) {
+  console.warn("sim worker off:", e?.message || e);
+  W.failed = true; W.ready = false; W.running = false; W.delta = null;
+  W.worker?.terminate();
+  W.worker = null;
+}
+const workerUsable = () => W.ready && !W.failed && workerWanted;
+function wpost(m) {
+  const { transfer, ...rest } = m;
+  W.worker.postMessage(rest, transfer || []);
+}
+// The board, after a rebuild here: the worker rebuilds the same way. A new
+// board (or a worker just started) also gets the mirror's whole state and
+// every setting afresh.
+function workerBoard(fresh, alloc = sim.lastAlloc) {
+  if (!W.ready || W.failed) return;
+  // Paused here but not yet told (a Bake pauses and resets in one go): it
+  // stops before the board, or it would tick the new one past where the
+  // mirror stands. Its reply carries the old epoch and is dropped.
+  if (fresh || (W.running && clock.paused)) { wpost({ type: "pause" }); W.running = false; }
+  wpost({ ...boardMessage(sim, alloc, fresh), epoch: ++W.epoch });
+  if (fresh) wpost({ ...exportFull(sim), epoch: W.epoch });
+  W.delta = null; W.pulling = false; W.ahead = false;
+  if (fresh) W.pixels = W.sleeping = W.audioGen = W.gainGen = null;
+}
+// The main thread changed the sim's state itself (stepped it, restored a
+// bake's state): anything the worker sends from before is stale, and it
+// needs this state before it next runs.
+function mirrorMoved() {
+  if (!W.ready) return;
+  W.epoch++;
+  W.delta = null;
+  W.ahead = true;
+}
+// The worker's view of the settings the tick depends on: the Pixel screen,
+// the wake list, the audio recorder's configuration.
+function workerSettings() {
+  const px = !!sim.screen;
+  if (W.pixels !== px) { wpost({ type: "pixels", on: px }); W.pixels = px; }
+  if (W.sleeping !== wakeList) { wpost({ type: "sleeping", on: wakeList }); W.sleeping = wakeList; }
+  const rec = audio && !bakedPlay ? audio.rec : null;
+  if (rec) {
+    rec.ensure(sim);
+    if (rec.cfgGen !== W.audioGen || rec.gainGen !== W.gainGen) {
+      wpost({ type: "audio", cfg: rec.tapConfig(sim) });
+      W.audioGen = rec.cfgGen; W.gainGen = rec.gainGen;
+    }
+  } else if (W.audioGen !== null) {
+    wpost({ type: "audio", cfg: null });
+    W.audioGen = W.gainGen = null;
+  }
+}
+// One frame with the worker: apply what it sent, keep it playing at the
+// clock's rate (or paused), ask for the next delta. Returns the ticks the
+// mirror moved on by.
+function workerFrame() {
+  let ran = 0;
+  workerSettings();
+  const d = W.delta;
+  if (d) {
+    W.delta = null;
+    const t0 = sim.tick;
+    applyDelta(sim, d, sim.screen);
+    if (audio && !bakedPlay) audio.rec.ingest(d.audio);
+    ran = Math.max(0, sim.tick - t0);
+    W.at = d.at; W.frac = d.frac;
+  }
+  if (!clock.paused) {
+    if (!W.running) {
+      if (W.ahead) { wpost({ ...exportFull(sim), epoch: ++W.epoch }); W.ahead = false; }
+      wpost({ type: "play", rate: clock.rate, frac: clock.frac });
+      W.running = true; W.rate = clock.rate; W.at = null;
+    } else if (W.rate !== clock.rate) {
+      wpost({ type: "rate", rate: clock.rate });
+      W.rate = clock.rate;
+    }
+    if (!W.pulling) { wpost({ type: "pull" }); W.pulling = true; }
+    // Alpha: how far into the next tick the worker had banked when it
+    // answered, plus the time since -- so items glide between deltas rather
+    // than stepping by a frame's worth -- and never past that next tick,
+    // which the mirror does not have yet.
+    if (W.at) clock.frac = Math.min(1, W.frac + Math.max(0, performance.timeOrigin + performance.now() - W.at) / 1000 * clock.rate);
+  } else if (W.running) {
+    wpost({ type: "pause" });    // its last delta comes back and is applied
+    W.running = false;
+  }
+  return ran;
+}
+
 function redraw() {
   if (queued) return;
   queued = true;
@@ -1116,7 +1245,18 @@ function paint(now) {
     // here rather than at each edit site, so no edit path can forget it.
     P.span("sync", () => sim.sync());
     P.begin("step");
-    if (!clock.paused && bakePlayable()) {
+    const viaWorker = workerUsable() && !(!clock.paused && bakePlayable());
+    if (!viaWorker && W.running) {
+      // The main thread takes over: the worker pauses, and whatever it had
+      // done since its last delta is dropped.
+      wpost({ type: "pause" });
+      W.running = false;
+      mirrorMoved();
+    }
+    if (viaWorker) {
+      ran = workerFrame();
+      if (bakedPlay) stopBakedPlay();
+    } else if (!clock.paused && bakePlayable()) {
       // Baked: step to the tick being heard. The buffer runs on its own
       // clock, so falling behind costs frames, never sync.
       if (!bakedPlay) startBakedPlay();
@@ -1124,6 +1264,7 @@ function paint(now) {
       const t0 = performance.now();
       while (sim.tick < Math.floor(target) && performance.now() - t0 < BAKED_BUDGET_MS) { sim.step(); ran++; }
       clock.frac = Math.min(1, Math.max(0, target - sim.tick));
+      if (ran) mirrorMoved();
     } else if (!clock.paused) {
       if (bakedPlay) stopBakedPlay();   // out of the baked stretch: realtime from here
       // A stalled frame (a backgrounded tab) is clamped, and the clock caps
@@ -1135,6 +1276,7 @@ function paint(now) {
         if (ran > 0 && performance.now() - t0 > STEP_BUDGET_MS) { clock.dropped += n - ran; break; }
         sim.step();
       }
+      if (ran) mirrorMoved();
     }
     P.end();
     shell.setTick(sim.tick);
@@ -2975,6 +3117,9 @@ async function show(name, bytes) {
     loadAudioSettings();
     sim = new Sim(T, board);
     if (!wakeList) sim.setSleeping(false);
+    // Every later rebuild (an edit, a Reset) is the worker's too.
+    sim.onRebuild = (alloc) => workerBoard(false, alloc);
+    workerBoard(true);
     syncScreen();
     stopBakedPlay();
     if (audio) audio.rec.attach(sim);
@@ -3157,7 +3302,7 @@ function resetSim() {
   endDryRun();
   if (sim) {
     stopBakedPlay();
-    if (bakeLive()) sim.restoreFrom(bake.snap); else sim.reset();
+    if (bakeLive()) { sim.restoreFrom(bake.snap); mirrorMoved(); } else sim.reset();   // a reset rebuilds: onRebuild tells the worker
     clock.reset();
     if (audio) audio.rec.stop();
   }
@@ -3360,6 +3505,7 @@ async function init() {
   // shell and the panel read (and would otherwise rewrite) their stores.
   if (presenting) { freezePersist(); document.body.classList.add("presenting"); }
   T = installPixel(await (await fetch("types.json")).json());
+  startWorker();
 
   let lastMode = null;
   shell = new Shell(T, {
@@ -3446,6 +3592,7 @@ async function init() {
     onFit: () => { if (board) cam.frame(board.bounds); redraw(); },
     onProfile: ({ profile, gpuSync }) => setProfiling(profile, gpuSync),
     onWakeList: (on) => { wakeList = on; sim?.setSleeping(on); redraw(); },
+    onWorker: (on) => { workerWanted = on; redraw(); },
     onView: (v) => { view = v; syncScreen(); layersChanged(false); },
     onColours: (c) => { statusColours = c; redraw(); },
     onAudioEnable: (on) => setAudio(on),

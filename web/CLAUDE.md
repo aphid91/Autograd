@@ -1201,12 +1201,11 @@ comparing: the same ticks either way, only the cost differs. Kept across
 board loads in the session, not stored.
 
 So the tick now costs what the board *does*, not what it *holds*: per tick
-on `cpu.npz` about 13 gates asked, 12 runs ticked, 12 edges checked. In the
-editor, `test` reaches the 10000 tps ceiling with the step at ~1 ms of a
-frame -- rendering is the frame now. On `GameOfLife_SLOW` the editor
-reaches ~555 tps: its frame is 27 ms of rendering, and the step gets only
-its 12 ms budget per frame, so the frame rate caps the tick rate. Moving
-the tick to a worker is what unhooks the two.
+on `cpu.npz` about 13 gates asked, 12 runs ticked, 12 edges checked. On the
+main thread, `GameOfLife_SLOW` reached only ~500 tps: its frame is 27 ms of
+rendering, and the step got its 12 ms budget per frame, so the frame rate
+capped the tick rate. Moving the tick to a worker (below) is what unhooked
+the two.
 
 **`tests/sleep.test.mjs` is the differential check**: a sleeping and a
 full timeline on six saves (and four more at belt constants other than
@@ -1225,6 +1224,103 @@ the shipped constants (spacing == speed: a run with no room has just
 pushed, and one tick after a pop the anchor is back), hence the runs under
 other constants; and gate order shows only on the Pixel screen, hence
 comparing it.
+
+### The tick on a worker
+
+While the sim plays, the ticking happens on a **Web Worker**
+([simworker.js](simworker.js), driving a `SimHost` from
+[simhost.js](simhost.js)), so the tick rate is no longer capped by how long a
+frame takes to draw. The ceiling is `RATE_MAX`, 100000 tps.
+
+| board | main thread | worker |
+|---|---|---|
+| `test` | 100k (the ceiling) | 100k (the ceiling) |
+| `GameOfLife_SLOW` | ~500 | **~3,700** |
+
+(Headless Chromium, the whole board on screen.) At 3,700 tps Game of Life
+is the worker's own CPU: 265 µs a tick. The frame cost of the worker is
+applying its delta, 3.6 ms on Game of Life.
+
+**The main thread keeps its Sim as an exact mirror.** Each frame it asks the
+worker for a delta -- what changed since the last one, collected by a
+`Tracker` the worker's Sim calls from the same places the wake list hears of
+a change: the runs ticked, the ring slots pushed into, the gate rows whose
+channels were written, the Pixel fires in order, the audio recorder's bits.
+`applyDelta()` writes it into the mirror, so everything that reads the sim
+-- the renderer, the forecast, status colours, Status, bakes, video -- reads
+the mirror and needed no change. A delta is small because a tick changes
+little; that is the wake list paying twice.
+
+**Edits stay on the main thread**, which owns the Board. After the mirror
+rebuilds, `Sim.onRebuild` sends the board's arrays and the run-id
+allocator's state from just *before* that rebuild (`Sim.lastAlloc`, taken
+after the old runs' ids are released), and the worker rebuilds the same way
+(`allocOverride`) and so numbers every run the same -- deltas are keyed by a
+run's index and a gate's row. Taking the allocator before the release was
+the first version's bug, and broke every test from tick 1. Anything the
+worker ticked past the mirror on the old board is dropped: the board
+message carries the mirror's tick.
+
+**The main thread still steps the mirror itself** while a baked soundtrack
+plays (the audio clock decides each frame's tick), and whenever the worker
+is off. Taking over pauses the worker and bumps the **epoch**, so any delta
+already in flight is dropped; the next time the worker plays, it is sent the
+mirror's whole dynamic state first (`exportFull`/`applyFull`, with
+everything awake). A bake's restore does the same. Every board or state
+message bumps the epoch, and a delta carries the epoch it grew from, so a
+delta can never land on the wrong state. A Bake pauses and resets in one
+go, so a board message sent while the clock is paused but the worker is not
+yet told pauses the worker first -- otherwise it ticks the new board past
+where the mirror stands.
+
+Smaller parts:
+
+- **Audio.** The recorder no longer hears ticks it did not run: the worker
+  has an `AudioTap` filling the same bits and click counts from the
+  recorder's own configuration (`Recorder.tapConfig()`, sent whenever its
+  generation or the gains change), and `Recorder.ingest()` appends them. A
+  batch from an older configuration is dropped. Measured identical to the
+  main-thread recorder: 244,083 run bits and 96,328 clicks either way over
+  `test`'s active stretch.
+- **Alpha.** Items glide between deltas: `clock.frac` is the worker's frac
+  when it answered, plus the time since times the rate, held below the next
+  tick, which the mirror does not have yet.
+- **A background tab.** The worker stops ticking when it has not been asked
+  for a delta in `IDLE_MS` (500 ms), and starts again without catching up at
+  the next request -- what the main thread did when a hidden tab's frames
+  stopped. Ticking on unseen would grow the delta and its audio without
+  bound.
+- **The loop** runs a slice of at most `SLICE_MS` (6 ms) at a time, so a
+  request or a pause is never kept waiting, and chains slices through a
+  `MessageChannel` post rather than `setTimeout`, which clamps to 4 ms. At a
+  slow rate it sleeps until the next tick is due.
+- **Debug > sim worker** switches it off, for comparing; off, `paint()`
+  steps the mirror within `STEP_BUDGET_MS` as before. If the worker fails to
+  start (or posts an error), it stays off for the session and the main
+  thread ticks.
+
+**`tests/worker.test.mjs` holds the mirror to a reference timeline** -- an
+ordinary Sim on its own copy of the board -- after every delta, on three
+saves: every ring, counter, anchor and channel, the activity stamps, the
+Pixel screen in paint order, and the recorder's bits and clicks. Both ends
+run in one process and every message goes through `structuredClone`, so
+anything that would not survive the trip to a real worker fails there too.
+The cases: deltas of 1 to 60 ticks; an edit and a Reset with the worker
+ticked ahead unseen; the main thread taking over with a stale delta in
+flight; a worker started late, after edits; audio recorded under a sound
+selection that changed while it was in flight; the loop's rate, pause and
+idle. **Mutation-tested, eleven ways**, ten caught: untracked pushes or
+ticked runs, the allocator or the rebuild's tick not carried, stale changes
+kept across a rebuild, Pixel fires not replayed, a full state without its
+rings, a board message keeping the old epoch, a worker that never idles, and
+stale audio ingested (which needed its own case: the selection reconfigures
+the recorder with no rebuild, so the epoch alone cannot drop it). The one
+survivor is equivalent: the fire stamp's row mark, since every fire also
+writes one of that row's channels, which marks it anyway -- kept so the
+stamp does not rely on that. In the browser the same comparison held
+through edits while playing, pause and resume, a Reset while playing, the
+wake list switched off mid-play, Pixels, and a bake's playback handing over
+to the worker at its end.
 
 One trap: a version of `deliverDirect()` over flat `Int32Array` offsets
 measured 25x *slower* in the step (0.38 ms) and was also wrong -- it ended
@@ -1254,7 +1350,8 @@ turned a whole tick into 0.9999 of one; the unit test caught it. A frame's
 dt is clamped to 0.25 s and the backlog to 240 ticks or a quarter second's
 worth at the rate, whichever is more, so a backgrounded tab never freezes to
 catch up -- a flat 240 would have capped 10000 tps at 240 ticks a frame.
-`paint()` also stops stepping after `STEP_BUDGET_MS` (12 ms) of a frame and
+When the main thread ticks (see "The tick on a worker"), `paint()` also
+stops stepping after `STEP_BUDGET_MS` (12 ms) of a frame and
 drops the rest, so a rate the board cannot sustain runs as fast as it can
 rather than starving frames into a growing backlog; the fps counter's tps is
 the rate actually reached. **Rendering loops only while playing**; paused,
@@ -2112,8 +2209,9 @@ largest JS span left.
 - **The tick stays the desktop's CPU tick.** The closed-form belt transport,
   the gate prefilter and the wake list are its optimisations, all exact:
   `tools/check_web_sim.py` must still pass, and so must
-  `tests/sleep.test.mjs` (sleeping against full, every tick). No folding,
-  no GPU yet. A change to the desktop's tick semantics needs the same
+  `tests/sleep.test.mjs` (sleeping against full, every tick), and
+  `tests/worker.test.mjs` (the main thread's mirror against a reference).
+  No folding, no GPU yet. A change to the desktop's tick semantics needs the same
   change in `sim.js` -- and any new way a gate's channels or a run's state
   can change needs a wake, or the sleeping tick drifts from the full one.
 
@@ -2124,6 +2222,8 @@ largest JS span left.
 | `index.html`, `style.css` | the shell: board, controls row, swatch bar, picker sheet |
 | `main.js` | wiring: applies the shell's and panel's requests to the board; resize, redraw, the play loop |
 | `sim.js` | the simulation: segment index, closed-form belts, gates, the wake list, the clock -- the desktop's CPU tick; `forecast()` |
+| `simhost.js` | the sim on a worker: the deltas, the board and state messages, the epoch, `SimHost` and its loop's slices; pure, no DOM |
+| `simworker.js` | the worker itself: a `SimHost` and the loop that runs it |
 | `flow.js` | where items are drawn: belt paths, the machines' internal links and wait points, the tick animated from the forecast |
 | `ui.js` | the shell's state and DOM: modes, sim and turn buttons, thumb pads, swatches, long press, picker |
 | `tools.js` | the tool catalog (from `types.json`) and the swatch drawings |
@@ -2189,8 +2289,8 @@ node --test web/tests/*.test.mjs
 
 Pure-JS tests (the planner, the placer, the stamp transforms, the run
 tracer, the closed form against the naive oracle, the opcodes, the clock,
-the `.npz` writer, audio settings in a save, and the wake list against the
-full tick) run in Node, with no npm and no browser. The whole tick against the
+the `.npz` writer, audio settings in a save, the wake list against the
+full tick, and the worker's mirror against a reference) run in Node, with no npm and no browser. The whole tick against the
 desktop's is a separate, slower check (about 25 s for every save):
 
 ```bash

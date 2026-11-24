@@ -347,6 +347,10 @@ export class Panel {
     // compare: the same ticks either way, only the cost differs.
     this.wakeState = { wakeList: true };
     dbg.addBinding(this.wakeState, "wakeList", { label: "wake list" }).on("change", () => cb.onWakeList?.(this.wakeState.wakeList));
+    // The tick on its own thread (simworker.js), on unless switched off here
+    // to compare: off, the main thread ticks within its frame budget.
+    this.wakeState.worker = true;
+    dbg.addBinding(this.wakeState, "worker", { label: "sim worker" }).on("change", () => cb.onWorker?.(this.wakeState.worker));
     dbg.addBinding(this.profState, "profile", { label: "profile frames" }).on("change", () => cb.onProfile?.(this.profState));
     dbg.addBinding(this.profState, "gpuSync", { label: "GPU sync" }).on("change", () => cb.onProfile?.(this.profState));
   }

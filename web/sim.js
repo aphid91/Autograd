@@ -81,6 +81,14 @@ export class Sim {
     // while off and while a forecast runs.
     this.sleeping = true;
     this.sched = null;
+    // simhost.js: on the worker, a Tracker told of every change a tick makes
+    // (the rows written, the runs ticked, the ring slots pushed), for the
+    // main thread's mirror; on the main thread, a callback after every
+    // rebuild, given the run-id allocator as it stood before it. Both null
+    // here.
+    this.track = null;
+    this.onRebuild = null;
+    this.allocOverride = null;      // simhost.js: the allocator a rebuild must start from
     this.sync();
   }
 
@@ -289,11 +297,12 @@ export class Sim {
     this.seen = this.board.revision;
     this.version++;
     this.sched = null;          // built for the new runs below, everything awake
-    this.rebuild();
+    this.rebuild();               // records `lastAlloc`, for a worker's rebuild (simhost.js)
     this.flush();
     this.seed();
     this.screen?.clear();      // an edit, a Reset: the screen starts blank
     if (this.sleeping) this.sched = this.makeSched();
+    if (this.onRebuild) this.onRebuild(this.lastAlloc);
     return true;
   }
 
@@ -307,6 +316,16 @@ export class Sim {
       }
     }
     this.segments.clear();
+    // The allocator as it now stands -- old runs released, none yet taken --
+    // is what decides every new run's id. A worker (simhost.js) rebuilding
+    // the same board takes this one's (`allocOverride`) instead of its own,
+    // whose released runs were its own: then both number every run alike.
+    if (this.allocOverride) {
+      this.freeSids = this.allocOverride.free.slice();
+      this.nextSid = this.allocOverride.next;
+      this.allocOverride = null;
+    }
+    this.lastAlloc = { free: this.freeSids.slice(), next: this.nextSid, tick: this.tick };
 
     const { width: W, height: H } = this.board;
     const g = this.board.grid, C = this.T.cell;
@@ -334,6 +353,7 @@ export class Sim {
     for (const k of cands) if (!claimed[k]) make(k % W, (k / W) | 0);
 
     this.order = [...this.segments.values()].sort((a, b) => a.sid - b.sid);
+    this.order.forEach((seg, i) => { seg.oi = i; });   // a run's index, which deltas and the wake list key on
     this.stats.rebuilds++;
     this.buildGates();
   }
@@ -521,18 +541,20 @@ export class Sim {
   // again next structure phase, its direct edges next hand-off, and a run
   // that can now act is woken -- the one an output feeds when the output
   // fills, the one feeding an input when the input empties.
-  setIn(row, c, v) { this.setF(row, this.F_IN_VALUE + c, v); this.setF(row, this.F_IN_HELD + c, 1); if (this.sched) this.touch(row); }
+  setIn(row, c, v) { this.setF(row, this.F_IN_VALUE + c, v); this.setF(row, this.F_IN_HELD + c, 1); if (this.sched) this.touch(row); if (this.track) this.track.row(row); }
   clearIn(row, c) {
     this.setF(row, this.F_IN_VALUE + c, 0); this.setF(row, this.F_IN_HELD + c, 0);
     const S = this.sched;
     if (S) { this.touch(row); this.wakeRun(S.runIn[row * S.C + c]); }
+    if (this.track) this.track.row(row);
   }
   setOut(row, c, v) {
     this.setF(row, this.F_OUT_VALUE + c, v); this.setF(row, this.F_OUT_HELD + c, 1);
     const S = this.sched;
     if (S) { this.touch(row); this.wakeRun(S.runOut[row * S.C + c]); }
+    if (this.track) this.track.row(row);
   }
-  clearOut(row, c) { this.setF(row, this.F_OUT_VALUE + c, 0); this.setF(row, this.F_OUT_HELD + c, 0); if (this.sched) this.touch(row); }
+  clearOut(row, c) { this.setF(row, this.F_OUT_VALUE + c, 0); this.setF(row, this.F_OUT_HELD + c, 0); if (this.sched) this.touch(row); if (this.track) this.track.row(row); }
 
   // Engine.flush_material(): every item off every belt and out of every gate.
   //
@@ -632,6 +654,7 @@ export class Sim {
     seg.enter[slot] = tick;
     seg.payload[slot] = payload;
     seg.tail++;
+    if (this.track) this.track.push(seg.oi, slot);
     this.stats.pushed++;
   }
 
@@ -639,6 +662,7 @@ export class Sim {
   // the report's pop argument depends on. The gate work happens inside it,
   // through offer/accept, not in passes around it (see core/gates.py).
   tickSegment(seg, tick) {
+    if (this.track) this.track.run(seg.oi);
     const length = seg.length * this.UNIT;
     seg.anchor = Math.min(seg.anchor + this.speed, length);
     if (seg.head !== seg.tail && this.positionOf(seg, seg.head, tick) === length) {
@@ -688,6 +712,9 @@ export class Sim {
   // same tick: tests/sleep.test.mjs runs them side by side.
   step() {
     this.sync();
+    // A mirror whose state came from the worker (simhost.js) has no wake
+    // list; stepped itself, it starts one with everything awake.
+    if (!this.sched && this.sleeping && !this.rec) this.sched = this.makeSched();
     if (this.sched && !this.rec) return this.sleepStep();
     this.fullStep();
   }
@@ -747,7 +774,7 @@ export class Sim {
       }
       if (this.fire(g, P)) {
         this.stats.fired++;
-        if (!this.rec) this.fired[row] = this.tick + 1;
+        if (!this.rec) { this.fired[row] = this.tick + 1; if (this.track) this.track.row(row); }
         if (A) A.fires[g.agroup] += g.again ?? 1;   // a far gate (space.js) counts for less
       }
     }
@@ -894,7 +921,6 @@ export class Sim {
       stats: { ticks: 0, gates: 0, runs: 0, edges: 0, timed: 0 },
     };
     this.order.forEach((seg, i) => {
-      seg.oi = i;
       if (seg.srcRow) S.runOut[seg.srcRow * C + seg.srcCh] = i;
       if (seg.dstRow) S.runIn[seg.dstRow * C + seg.dstCh] = i;
     });
@@ -915,7 +941,7 @@ export class Sim {
   }
 
   // Everything awake: the next tick visits all of it, then lets it sleep.
-  wakeAll() { if (this.sched) this.sched = this.makeSched(); }
+  wakeAll() { if (this.sleeping) this.sched = this.makeSched(); }
 
   // The wake list on or off (a checker's reference timeline, or to measure).
   setSleeping(on) {

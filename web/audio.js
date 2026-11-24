@@ -77,6 +77,7 @@ export class Recorder {
 
   // The weights for the current candidates and gates, to the synth.
   sendSpace(sim) {
+    this.gainGen = (this.gainGen || 0) + 1;     // the gates' gains, for a worker's tap
     const w = spaceWeights(sim, this.cands, this.gateList, this.space);
     const groups = [0, 0];
     this.gateList.forEach((g, i) => { g.again = w.gateGain[i]; groups[g.agroup] += g.again; });
@@ -100,6 +101,10 @@ export class Recorder {
   configure(sim) {
     this.flush(this.lastRate || 1);
     this.rebuilds = sim.stats.rebuilds;
+    // Which bit each run sets changes here: ticks recorded under an older
+    // configuration (a worker's, simhost.js) no longer fit and are dropped.
+    this.cfgGen = (this.cfgGen || 0) + 1;
+    this.gainGen = (this.gainGen || 0) + 1;
     const sel = this.selection, W = sim.board.width;
     const picked = (cells) => !sel || cells.some(([x, y]) => sel.has(y * W + x));
     // A run sounds if any of its cells is selected, underground ends included.
@@ -158,6 +163,38 @@ export class Recorder {
   hit(seg) {
     const i = seg.aIdx;
     if (i >= 0) this.bits[this.off + (i >>> 5)] |= 1 << (i & 31);
+  }
+
+  // --- with the simulation on a worker (simhost.js) ---------------------------
+
+  // Reconfigure after a rebuild, as pre() would, without a tick of our own.
+  ensure(sim) {
+    if (sim.stats.rebuilds !== this.rebuilds) this.configure(sim);
+  }
+
+  // What the worker's tap needs to fill the same bits and click counts: each
+  // run's bit (by its index in `order`) and each gate's group and gain (in
+  // `sim.gates` order), under this configuration's generation.
+  tapConfig(sim) {
+    return {
+      gen: this.cfgGen, words: this.words, runs: sim.order.length, gates: sim.gates.length,
+      aIdx: Int32Array.from(sim.order, s => s.aIdx ?? -1),
+      agroup: Int8Array.from(sim.gates, g => g.agroup ?? 2),
+      again: Float32Array.from(sim.gates, g => g.again ?? 1),
+    };
+  }
+
+  // A worker's recorded ticks, appended as if recorded here. A batch from an
+  // older configuration is dropped: its bits mean other runs.
+  ingest(a) {
+    if (!a || a.gen !== this.cfgGen || a.words !== this.words) return;
+    const W = this.words;
+    if (!this.n) this.tick0 = a.tick0;
+    while (this.n + a.n > this.cap) this.grow();
+    this.bits.set(a.bits.subarray(0, a.n * W), this.n * W);
+    this.f0.set(a.f0.subarray(0, a.n), this.n);
+    this.f1.set(a.f1.subarray(0, a.n), this.n);
+    this.n += a.n;
   }
 
   // Called by Sim.step() once the tick counter has moved.
