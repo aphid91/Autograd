@@ -46,7 +46,11 @@ const SPACE_GLIDE_S = 0.04; // how fast a voice's spatial gain follows the camer
 const CLICK_RES = 5;
 const DETUNE_AT = [0, -1, 1, -0.5, 0.5];   // each resonator's share of the spread
 const MAX_EVENTS = 64;      // a group's fires in one tick become at most this many clicks
-const EVENT_POOL = 8192;    // clicks scheduled ahead, at most
+const EVENT_POOL = 8192;    // clicks scheduled ahead: the pool's starting size...
+// ...which grows to this. A realtime block schedules all its ticks' clicks
+// before playing any (renderBlock()): at 100k tps with jitter that passed
+// 8192 on cpu.npz, and the overflow played at the block's start.
+const EVENT_MAX = 1 << 20;
 
 // A 32-bit integer hash (lowbias32), for click times that are random but
 // the same in every render of the same ticks: a bake stays bit-identical.
@@ -127,14 +131,30 @@ export class GatesSynth {
     this.inj = new Float64Array(0);      // span() scratch: per resonator, per sample
     this.abs = 0;                        // samples rendered, ever: the clicks' clock
     this.tps = 0;                        // realtime: ticks per sample, as last played
+    // Realtime rendering by block (renderBlock()): the ticks due in a block
+    // are applied first, each voice change logged with its sample offset,
+    // then every voice renders the whole block switching at its own change
+    // points. `batch` false is the old per-tick renderer, kept as the
+    // reference tests/audio.test.mjs compares against.
+    this.batch = true;
+    this.logging = false;                // the walk is logging voice changes
+    this.logAt = 0;                      // ...at this offset into the block
+    this.lgN = 0;
+    this.lgOff = new Int32Array(1024); this.lgV = new Int32Array(1024); this.lgVal = new Uint8Array(1024);
+    this.lgNext = new Int32Array(1024);
+    this.vHead = new Int32Array(V); this.vTgt0 = new Uint8Array(V);
+    this.segOff = new Int32Array(64); this.segTick = new Float64Array(64); this.segN = 0;
     // Meter, since the last read.
     this.peak = 0; this.clipped = 0; this.ticksPlayed = 0;
+    // Since the start, for the meter: realtime playback ran out of ticks
+    // (an underrun: the ticks came late), or had a backlog skipped.
+    this.underruns = 0; this.skips = 0;
     this.applyParams();
   }
 
   message(m) {
     if (m.type === "ticks") this.push(m);
-    else if (m.type === "config") this.configure(m.lengths, m.groups);
+    else if (m.type === "config") this.configure(m.lengths, m.groups, m.gen);
     else if (m.type === "space") this.setSpace(m);
     else if (m.type === "params") { Object.assign(this.p, m.p); this.applyParams(); }
     else if (m.type === "stop") this.stop();
@@ -203,7 +223,11 @@ export class GatesSynth {
     }
   }
 
-  configure(lengths, groups) {
+  configure(lengths, groups, gen = null) {
+    // The recorder's generation: a tick batch from another one is dropped.
+    // Ticks can come straight from the sim worker (a second port) while
+    // configs come from the main thread, so the two are not ordered.
+    this.gen = gen;
     // Old voices keep sounding with their pitch and release out; they just
     // no longer belong to a candidate.
     for (let v = 0; v < this.nv; v++) { this.vSeg[v] = -1; this.vOn[v] = 0; }
@@ -224,6 +248,7 @@ export class GatesSynth {
 
   push(b) {
     if (b.words !== this.words || !b.n) return;   // from before the last config
+    if (b.gen != null && this.gen != null && b.gen !== this.gen) return;
     this.queue.push(b);
     this.queued += b.n;
     if (this.offline) return;
@@ -266,8 +291,11 @@ export class GatesSynth {
     this.playing = false;
     this.held = false; this.heldS = 0;
     this.tickPos = 0;
-    for (let v = 0; v < this.nv; v++) this.vOn[v] = 0;
+    for (let v = 0; v < this.nv; v++) { if (this.logging && this.vOn[v]) this.logOn(v, 0); this.vOn[v] = 0; }
     this.prev.fill(0);
+    // The flags with the count: left set, a later off() took the count
+    // below zero (the meter showed "-1 refused" after an underrun).
+    this.isRef.fill(0);
     this.active = 0; this.refused = 0;
   }
 
@@ -289,7 +317,7 @@ export class GatesSynth {
   on(i) {
     if (this.sGain[i] <= 0) return;
     const v = this.voiceOf[i];
-    if (v >= 0) { this.vOn[v] = 1; return; }
+    if (v >= 0) { if (this.logging && !this.vOn[v]) this.logOn(v, 1); this.vOn[v] = 1; return; }
     if (this.nv >= Math.min(this.p.voiceLimit, VOICE_LIMIT_MAX)) {
       if (!this.isRef[i]) { this.isRef[i] = 1; this.refused++; }
       return;
@@ -328,6 +356,14 @@ export class GatesSynth {
     const v = this.nv++;
     this.vSeg[v] = i; this.vOn[v] = 1; this.vEnv[v] = 0; this.vPhase[v] = 0;
     this.vInc[v] = this.pitch(i) / this.sr;
+    // Allocated mid-block: silent until its offset (target 0, envelope 0),
+    // and its phase wound back so it is 0 there, as if it started then.
+    if (this.logging) {
+      this.vTgt0[v] = 0;
+      this.logOn(v, 1);
+      const ph = -this.logAt * this.vInc[v];
+      this.vPhase[v] = ph - Math.floor(ph);
+    }
     this.vGain[v] = this.lenGain(i);
     this.vS[v] = this.sGain[i];
     this.vLpA[v] = this.lpCoef(this.sLp[i]); this.vLpY[v] = 0;
@@ -338,7 +374,7 @@ export class GatesSynth {
 
   off(i) {
     const v = this.voiceOf[i];
-    if (v >= 0) this.vOn[v] = 0;
+    if (v >= 0) { if (this.logging && this.vOn[v]) this.logOn(v, 0); this.vOn[v] = 0; }
     if (this.isRef[i]) { this.isRef[i] = 0; this.refused--; }
   }
 
@@ -413,7 +449,14 @@ export class GatesSynth {
     if (!(amp > 0)) return;
     const p = this.p, J = p.clickJitter || 0, spread = (p.clickDetune || 0) > 0;
     const base = g * CLICK_RES;
-    if (J <= 0 && !spread) { this.imp[base] += amp; return; }
+    // In a block walk the tick starts logAt samples into the block, so
+    // "now" is an event there rather than the block's first sample.
+    const at = this.logging ? this.logAt : 0;
+    if (J <= 0 && !spread) {
+      if (at > 0 && this.evRoom()) { const e = this.evN++; this.evAt[e] = this.abs + at; this.evR[e] = base; this.evA[e] = amp; }
+      else this.imp[base] += amp;
+      return;
+    }
     const n = Math.max(1, Math.min(MAX_EVENTS, Math.ceil(count - 1e-6))), a = amp / n;
     const t = this.curTick, sr = this.sr;
     // Where tick k (the one being applied) starts, and where an offset of
@@ -426,12 +469,23 @@ export class GatesSynth {
     for (let j = 0; j < n; j++) {
       const r = base + (spread ? Math.min(CLICK_RES - 1, Math.floor(unit(t, 2 * g + 1, j) * CLICK_RES)) : 0);
       const o = J > 0 ? unit(t, 2 * g, j) * J : 0;
-      const d = exact ? Math.round((k + o) * sr / rate) - k0 : Math.round((o - this.tickPos) / tps);
+      const d0 = exact ? Math.round((k + o) * sr / rate) - k0 : Math.round((o - this.tickPos) / tps);
+      const d = Math.max(0, d0) + at;
       if (d <= 0) { this.imp[r] += a; continue; }
-      if (this.evN >= EVENT_POOL) { this.imp[r] += a; continue; }   // full: play it now
+      if (!this.evRoom()) { this.imp[r] += a; continue; }   // full: play it now
       const e = this.evN++;
       this.evAt[e] = this.abs + d; this.evR[e] = r; this.evA[e] = a;
     }
+  }
+
+  // Room for one more scheduled click, growing the pool if need be.
+  evRoom() {
+    if (this.evN < this.evAt.length) return true;
+    const m = this.evAt.length * 2;
+    if (m > EVENT_MAX) return false;
+    const grow = (a, T) => { const b = new T(m); b.set(a); return b; };
+    this.evAt = grow(this.evAt, Float64Array); this.evR = grow(this.evR, Uint8Array); this.evA = grow(this.evA, Float64Array);
+    return true;
   }
 
   // --- rendering --------------------------------------------------------------------
@@ -466,14 +520,14 @@ export class GatesSynth {
     }
     if (this.offline) this.speed = 1;
     else {
-      if (this.playing && queuedS > SKIP_AT * target) this.skip(queuedS - target);
+      if (this.playing && queuedS > SKIP_AT * target) { this.skips++; this.skip(queuedS - target); }
       if (this.playing) {
         const want = Math.min(MAX_SPEED, Math.max(0.25, queuedS / target));
         this.speed += (want - this.speed) * Math.min(1, n / sr / SPEED_TAU_S);
       }
     }
-    let i = 0;
-    while (i < n) {
+    if (!this.offline && this.batch) this.renderBlock(out, n);
+    else for (let i = 0; i < n; ) {
       let span = n - i;
       if (this.offline && this.playing && !this.held) {
         // Exact: tick k begins at sample round(k * sr / rate), however the
@@ -493,13 +547,16 @@ export class GatesSynth {
       this.tps = tps;
       const moving = this.playing && !this.held;
       if (moving) span = Math.min(span, Math.max(1, Math.ceil((1 - this.tickPos) / tps)));
-      this.span(out, i, span, moving && this.tickPos + span * tps >= 1 || !moving);
+      // Realtime frees voices at the end of the call (below), as renderBlock()
+      // does, so this path is its exact reference; a bake frees on tick edges.
+      this.span(out, i, span, false);
       i += span;
       if (moving) {
         this.tickPos += span * tps;
         while (this.tickPos >= 1) {
           this.tickPos -= 1;
           if (!this.nextTick()) {
+            if (!this.offline) this.underruns++;
             if (this.offline || this.p.holdUnderrun) { this.held = true; this.heldS = 0; this.tickPos = 0; }
             else this.gatesOff();
             break;
@@ -507,6 +564,7 @@ export class GatesSynth {
         }
       }
     }
+    if (!this.offline && !this.batch) for (let v = this.nv - 1; v >= 0; v--) if (!this.vOn[v] && this.vEnv[v] < 1e-4) this.free(v);
     // The low cut, per sample (so a bake is the same however it is split).
     if (this.hpOn) {
       const b0 = this.hb0, b1 = this.hb1, b2 = this.hb2, a1 = this.ha1, a2 = this.ha2;
@@ -532,11 +590,138 @@ export class GatesSynth {
     this.peak = peak; this.clipped = clipped;
   }
 
-  // `len` samples at out[at..]: the clicks, then every voice over the span.
-  // `edge`: the span ends on a tick boundary (or nothing is playing), the
-  // only place a finished voice is freed, so where the caller splits the
-  // rendering never changes what is heard.
-  span(out, at, len, edge = true) {
+  // Realtime, one block at a time. The old way (`batch` false) cut the
+  // block at every tick boundary and ran every voice's setup per piece: at
+  // 20k tps that is a piece every 2.4 samples, so the cost grew with the
+  // tick rate until a phone missed its deadline. Here the block's ticks are
+  // applied first -- the same walk, the same boundaries, each voice's
+  // change logged with its sample offset -- and then each voice renders the
+  // whole block, switching its target at its own change points. The same
+  // sound, at a cost of O(voices + changes) per block rather than
+  // O(ticks x voices). Three small differences from the old way, none
+  // audible: a finished voice is freed at the block's end, not at a tick
+  // boundary inside it (so a refused run waits up to a block for its
+  // voice); a voice allocated mid-block runs silent from the block's start
+  // with its phase wound back to 0 at its offset; and the spatial glide
+  // steps once a block.
+  renderBlock(out, n) {
+    const sr = this.sr, nv0 = this.nv;
+    for (let v = 0; v < nv0; v++) this.vTgt0[v] = this.vOn[v];
+    this.lgN = 0; this.segN = 0;
+    this.pushSeg(0);
+    this.logging = true; this.logAt = 0;
+    try {
+      let i = 0;
+      while (i < n && this.playing && !this.held) {
+        const tps = this.rate * this.speed / sr;   // ticks per sample
+        this.tps = tps;
+        const span = Math.min(n - i, Math.max(1, Math.ceil((1 - this.tickPos) / tps)));
+        i += span;
+        this.tickPos += span * tps;
+        this.logAt = i;
+        let applied = false;
+        while (this.tickPos >= 1) {
+          this.tickPos -= 1;
+          if (!this.nextTick()) {
+            this.underruns++;
+            if (this.p.holdUnderrun) { this.held = true; this.heldS = 0; this.tickPos = 0; }
+            else this.gatesOff();
+            break;
+          }
+          applied = true;
+        }
+        if (applied) this.pushSeg(i);
+      }
+      if (!this.playing || this.held) this.tps = this.rate * this.speed / sr;
+    } finally { this.logging = false; }
+
+    this.resonate(out, 0, n);
+
+    // Each voice's changes, in order: a chain through the log.
+    const nv = this.nv, head = this.vHead, next = this.lgNext, lgV = this.lgV;
+    for (let v = 0; v < nv; v++) head[v] = -1;
+    for (let k = this.lgN - 1; k >= 0; k--) { const v = lgV[k]; next[k] = head[v]; head[v] = k; }
+    const T = this.table, off = this.lgOff, val = this.lgVal;
+    let amp = this.p.beltGain / Math.pow(Math.max(1, this.n), this.p.norm);
+    const glide = this.spaced ? 1 - Math.exp(-n / (sr * SPACE_GLIDE_S)) : 1;
+    if (this.spaced) {
+      const want = this.p.beltGain / Math.pow(Math.max(1, this.bNorm), this.p.norm);
+      this.ampS = this.ampS < 0 ? want : this.ampS + (want - this.ampS) * glide;
+      amp = this.ampS;
+    } else this.ampS = -1;
+    for (let v = 0; v < nv; v++) {
+      let env = this.vEnv[v], ph = this.vPhase[v];
+      if (this.spaced && this.vSeg[v] >= 0) this.vS[v] += (this.sGain[this.vSeg[v]] - this.vS[v]) * glide;
+      const inc = this.vInc[v], atk = this.vAtk[v], rel = this.vRel[v];
+      const g = amp * this.vGain[v] * (this.spaced ? this.vS[v] : 1), a = this.vLpA[v];
+      let y = this.vLpY[v], tgt = this.vTgt0[v], s = 0, k = head[v];
+      for (;;) {
+        const e = k >= 0 ? off[k] : n, coef = tgt ? atk : rel;
+        if (a >= 1) {
+          for (; s < e; s++) {
+            env += (tgt - env) * coef;
+            const fi = ph * TABLE, j = fi | 0;
+            out[s] += g * env * (T[j] + (T[j + 1] - T[j]) * (fi - j));
+            ph += inc;
+            if (ph >= 1) ph -= 1;
+          }
+        } else {
+          for (; s < e; s++) {
+            env += (tgt - env) * coef;
+            const fi = ph * TABLE, j = fi | 0;
+            y += a * ((T[j] + (T[j + 1] - T[j]) * (fi - j)) - y);
+            out[s] += g * env * y;
+            ph += inc;
+            if (ph >= 1) ph -= 1;
+          }
+        }
+        if (k < 0) break;
+        tgt = val[k]; k = next[k];
+      }
+      this.vEnv[v] = env; this.vPhase[v] = ph; this.vLpY[v] = y;
+    }
+    for (let v = this.nv - 1; v >= 0; v--) if (!this.vOn[v] && this.vEnv[v] < 1e-4) this.free(v);
+
+    // Silent before startTick, then the fade in, by the tick each stretch plays.
+    const p = this.p;
+    for (let j = 0; j < this.segN; j++) {
+      const a0 = this.segOff[j], a1 = j + 1 < this.segN ? this.segOff[j + 1] : n;
+      if (a1 <= a0) continue;
+      if (this.segTick[j] < p.startTick) { this.fade = 0; out.fill(0, a0, a1); }
+      else if (this.fade < 1) {
+        const inc = p.fadeMs > 0 ? 1000 / (p.fadeMs * sr) : 1;
+        let f = this.fade;
+        for (let q = a0; q < a1; q++) { f = Math.min(1, f + inc); out[q] *= f; }
+        this.fade = f;
+      }
+    }
+  }
+
+  // A voice's target changed during the walk, `logAt` samples into the block.
+  logOn(v, on) {
+    if (this.lgN >= this.lgOff.length) {
+      const m = this.lgOff.length * 2, grow = (a, T) => { const b = new T(m); b.set(a); return b; };
+      this.lgOff = grow(this.lgOff, Int32Array); this.lgV = grow(this.lgV, Int32Array);
+      this.lgVal = grow(this.lgVal, Uint8Array); this.lgNext = new Int32Array(m);
+    }
+    const k = this.lgN++;
+    this.lgOff[k] = this.logAt; this.lgV[k] = v; this.lgVal[k] = on;
+  }
+
+  // From `at` on, the block plays tick curTick (for startTick and the fade).
+  pushSeg(at) {
+    if (this.segN >= this.segOff.length) {
+      const m = this.segOff.length * 2;
+      const o = new Int32Array(m); o.set(this.segOff); this.segOff = o;
+      const t = new Float64Array(m); t.set(this.segTick); this.segTick = t;
+    }
+    this.segOff[this.segN] = at; this.segTick[this.segN] = this.curTick; this.segN++;
+  }
+
+  // The clicks over out[at..at+len): every resonator, with the events
+  // scheduled inside the span injected at their samples. Writes (not adds):
+  // it clears the span first.
+  resonate(out, at, len) {
     const end = at + len, R = 2 * CLICK_RES;
     // Clicks scheduled inside this span, onto each resonator's scratch row.
     let rows = 0;
@@ -585,6 +770,15 @@ export class GatesSynth {
       this.ry1[r] = y1; this.ry2[r] = y2;
     }
     this.abs += len;
+  }
+
+  // `len` samples at out[at..]: the clicks, then every voice over the span.
+  // `edge`: the span ends on a tick boundary (or nothing is playing), the
+  // only place a finished voice is freed, so where the caller splits the
+  // rendering never changes what is heard.
+  span(out, at, len, edge = true) {
+    const end = at + len;
+    this.resonate(out, at, len);
     const T = this.table;
     let amp = this.p.beltGain / Math.pow(Math.max(1, this.n), this.p.norm);
     // Spatial: normalised by the weights' sum rather than the count, so a
@@ -652,6 +846,7 @@ export class GatesSynth {
       active: this.active, refused: this.refused, candidates: this.n,
       peak: this.peak, clipped: this.clipped, ticks: this.ticksPlayed,
       lagMs: this.queued / Math.max(rate, 1e-3) * 1000, speed: this.playing ? this.speed : 0,
+      underruns: this.underruns, skips: this.skips,
     };
     this.peak = 0; this.clipped = 0; this.ticksPlayed = 0;
     return m;

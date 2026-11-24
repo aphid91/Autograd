@@ -249,6 +249,11 @@ export const SLICE_MS = 6;
 // hidden tab's frames, and so its ticks, simply stop; ticking on unseen
 // would pile up a delta (and its audio) without bound.
 export const IDLE_MS = 500;
+// With a direct line to the synth (`audioport`), the audio tap's ticks go
+// down it at least this often while playing, not once a frame: the synth
+// keeps 60 ms queued, and a frame's gap (50 ms and more on a phone) plus
+// the audio thread's own bursts was enough to run it dry.
+export const AUDIO_POST_MS = 5;
 
 export class SimHost {
   // `post(message, transfer)` sends to the main thread; `now()` is the clock.
@@ -267,6 +272,8 @@ export class SimHost {
     this.sleeping = true;
     this.tapCfg = null;          // the audio recorder's configuration, or null: no audio
     this.tap = null;
+    this.audioPort = null;       // a MessagePort into the synth, or null: audio rides the deltas
+    this.audioSent = 0;
   }
 
   message(m) {
@@ -279,12 +286,18 @@ export class SimHost {
         if (this.sim) { applyFull(this.sim, m); this.sim.wakeAll(); this.tr?.clear(); this.tap?.take(); }
         return;
       case "play": this.clock.setRate(m.rate); this.clock.frac = m.frac ?? this.clock.frac; this.clock.paused = false; this.playing = true; this.last = null; this.pulled = this.now(); return;
-      case "pause": this.playing = false; this.clock.paused = true; this.reply(); return;
+      case "pause":
+        this.playing = false; this.clock.paused = true; this.reply();
+        // The synth's last ticks, then its stop, down the same line, so
+        // nothing of ours can arrive after the stop.
+        this.audioPort?.postMessage({ type: "stop" });
+        return;
       case "rate": this.clock.setRate(m.rate); return;
       case "pull": this.pulled = this.now(); this.reply(); return;
       case "pixels": this.pixelsOn = m.on; this.wire(); return;
       case "sleeping": this.sleeping = m.on; this.sim?.setSleeping(m.on); return;
       case "audio": this.tapCfg = m.cfg; this.wire(); return;
+      case "audioport": this.audioPort?.close?.(); this.audioPort = m.port || null; return;
     }
   }
 
@@ -327,7 +340,14 @@ export class SimHost {
     sim.screen = this.pixelsOn ? new PixelLog(this.tr) : null;
     if (this.tapCfg && this.tapCfg.runs === sim.order.length && this.tapCfg.gates === sim.gates.length) {
       AudioTap.config(sim, this.tapCfg);
-      if (!this.tap || this.tap.gen !== this.tapCfg.gen) this.tap = new AudioTap(this.tapCfg);
+      if (!this.tap || this.tap.gen !== this.tapCfg.gen) {
+        this.tap = new AudioTap(this.tapCfg);
+        // As Recorder.configure() does: the wake list hears a sleeping run
+        // still sliding into place only if it was told of it, so a new
+        // recorder starts with everything awake. Without it, runs asleep
+        // when the configuration arrived went unheard while they slid.
+        sim.wakeAll();
+      }
       sim.audio = this.tap;
     } else {
       sim.audio = null;
@@ -339,12 +359,23 @@ export class SimHost {
     if (!this.sim) return;
     const d = takeDelta(this.sim, this.tr, {
       epoch: this.epoch, frac: this.clock.frac, at: performance.timeOrigin + this.now(),
-      dropped: this.clock.dropped, playing: this.playing, audio: this.tap?.take() ?? null,
+      dropped: this.clock.dropped, playing: this.playing, audio: this.audioPort ? null : this.tap?.take() ?? null,
     });
+    this.sendAudio();
     const transfer = d.transfer;
     delete d.transfer;
     if (d.audio) transfer.push(d.audio.bits.buffer, d.audio.f0.buffer, d.audio.f1.buffer);
     this.post(d, transfer);
+  }
+
+  // The audio tap's ticks so far, straight to the synth: the message the
+  // main thread's Recorder.flush() would post, at the worker's own rate.
+  sendAudio() {
+    this.audioSent = this.now();
+    if (!this.audioPort || !this.tap) return;
+    const a = this.tap.take();
+    if (!a) return;
+    this.audioPort.postMessage({ type: "ticks", ...a, rate: this.clock.rate }, [a.bits.buffer, a.f0.buffer, a.f1.buffer]);
   }
 
   // One run of the loop: the ticks the clock says are due, for at most
@@ -363,6 +394,7 @@ export class SimHost {
       if (i > 0 && this.now() - t0 > SLICE_MS) { this.clock.dropped += n - i; break; }
       this.sim.step();
     }
+    if (this.audioPort && this.now() - this.audioSent >= AUDIO_POST_MS) this.sendAudio();
     // The next tick's due time; run again at once when there is work.
     return n > 0 ? 0 : Math.max(1, ((1 - this.clock.frac) / this.clock.rate) * 1000);
   }

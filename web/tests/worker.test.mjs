@@ -42,6 +42,7 @@ const screenLine = (sim) => [...sim.screen.px].map(([r, p]) => `${r}:${p.css}:${
 function heard(log) {
   const bits = [], f0 = [], f1 = [];
   for (const b of log) {
+    if (b.type !== "ticks") continue;
     const W = b.words;
     for (let k = 0; k < b.n; k++) {
       bits.push(Array.from(b.bits.subarray(k * W, (k + 1) * W)).join(","));
@@ -54,7 +55,7 @@ function heard(log) {
 // The main thread and the worker, in one process. `mirror` is an existing
 // Sim to attach a (late-starting) worker to; by default a fresh one.
 class Pair {
-  constructor(board, mirror = null) {
+  constructor(board, mirror = null, direct = false) {
     this.epoch = 0;
     this.inbox = [];
     this.mirror = mirror || new Sim(T, board);
@@ -66,6 +67,10 @@ class Pair {
     if (mirror) this.send({ ...exportFull(this.mirror), epoch: this.epoch });
     this.send({ type: "pixels", on: true });
     this.log = [];
+    // A direct line into the synth (audio.js tickPort()): the worker's ticks
+    // land in the same log the recorder's own posts would.
+    this.direct = direct;
+    if (direct) this.host.message({ type: "audioport", port: { postMessage: (m) => this.log.push(structuredClone(m)) } });
     this.rec = new Recorder({ postMessage: (m) => { if (m.type === "ticks") this.log.push(m); } }, { ...AUDIO_DEFAULTS, beltCutoff: 512 });
     this.rec.attach(this.mirror);
     this.sentGen = -1;
@@ -87,6 +92,7 @@ class Pair {
     for (const d of this.inbox.splice(0)) {
       if (d.epoch !== this.epoch) { this.dropped++; continue; }
       applyDelta(this.mirror, d, this.mirror.screen);
+      if (this.direct) assert.equal(d.audio, null, "with a direct line, deltas carry no audio");
       this.rec.ingest(d.audio);
       this.applied++;
     }
@@ -266,4 +272,32 @@ test("audio recorded under an old configuration is dropped", { skip: !existsSync
   // recording carries on.
   for (let f = 0; f < 3; f++) { for (let i = 0; i < 10; i++) pair.host.sim.step(); pair.frame(); }
   assert.equal(heard(pair.log).bits.length, before + 20, "recording resumes under the new configuration");
+});
+
+// With a direct line into the synth, the worker's ticks go down it -- on
+// every delta request and every few ms of its loop -- and the deltas carry
+// none: the main thread's frames no longer pace the sound. The same ticks
+// are heard as by a recorder on the reference timeline, and a pause sends
+// the last of them and then the synth's stop, on the same line.
+test("audio straight from the worker: the reference's ticks, and a pause ends with stop", { skip: !existsSync(join(root, "cpu.npz")) }, async () => {
+  const path = join(root, "cpu.npz");
+  const pair = new Pair(await loadBoard(path), null, true), ref = reference(await loadBoard(path));
+  for (let f = 0; f < 12; f++) {
+    for (let i = 0; i < 25; i++) { pair.host.sim.step(); ref.sim.step(); }
+    pair.frame();
+    same(pair, ref, `frame ${f}`);
+  }
+  ref.rec.flush(30);
+  const a = heard(pair.log), b = heard(ref.log);
+  assert.ok(a.bits.length >= 250, `heard ${a.bits.length} ticks down the line`);
+  assert.ok(a.bits.some(x => /[1-9]/.test(x)), "some runs were heard");
+  assert.deepEqual(a.bits.slice(-250), b.bits.slice(-250), "run bits");
+  assert.deepEqual(a.f1.slice(-250), b.f1.slice(-250), "group 1 clicks");
+  assert.ok(pair.log.every(m => m.type !== "ticks" || m.gen === pair.rec.cfgGen), "every batch carries the recorder's generation");
+  // Ticks the worker runs between requests, then a pause.
+  for (let i = 0; i < 7; i++) pair.host.sim.step();
+  const before = heard(pair.log).bits.length;
+  pair.host.message({ type: "pause" });
+  assert.equal(pair.log.at(-1).type, "stop", "the stop comes last");
+  assert.equal(heard(pair.log).bits.length, before + 7, "the last ticks went first");
 });

@@ -96,7 +96,7 @@ scale 1.15.
   play. It **starts paused**, and loading a save pauses it again. **Long
   press Play/Pause** (right-click on a mouse) for the rate panel, just above
   the Sim section: presets of 1, 5, 30 and 240 ticks a second, and Custom,
-  which opens a text box (0.1 to 100000). It stays open until the next long
+  which opens a text box (0.1 to 1,000,000). It stays open until the next long
   press or its × button, and shows the tick count. The rate (30 by default)
   and the panel's open state persist with the shell's localStorage. The
   panel is **open on a first visit**, so it is found; the first time it is
@@ -1230,7 +1230,7 @@ comparing it.
 While the sim plays, the ticking happens on a **Web Worker**
 ([simworker.js](simworker.js), driving a `SimHost` from
 [simhost.js](simhost.js)), so the tick rate is no longer capped by how long a
-frame takes to draw. The ceiling is `RATE_MAX`, 100000 tps.
+frame takes to draw. The ceiling is `RATE_MAX`, a million tps.
 
 | board | main thread | worker |
 |---|---|---|
@@ -1278,10 +1278,18 @@ Smaller parts:
 - **Audio.** The recorder no longer hears ticks it did not run: the worker
   has an `AudioTap` filling the same bits and click counts from the
   recorder's own configuration (`Recorder.tapConfig()`, sent whenever its
-  generation or the gains change), and `Recorder.ingest()` appends them. A
-  batch from an older configuration is dropped. Measured identical to the
-  main-thread recorder: 244,083 run bits and 96,328 clicks either way over
-  `test`'s active stretch.
+  generation or the gains change). Measured identical to the main-thread
+  recorder: 244,083 run bits and 96,328 clicks either way over `test`'s
+  active stretch. With sound on, the tap's ticks go **straight to the
+  synth** down a port of their own, not through the deltas -- see
+  "Realtime at high tick rates" under Audio; without that line (the tests'
+  default) they ride the deltas and `Recorder.ingest()` appends them. A
+  new tap wakes the worker's Sim, as `Recorder.configure()` does: the wake
+  list hears a sleeping run still sliding into place only if it was told
+  of it, and without the wake those runs went unheard until something
+  woke them. The first worker test compared only ticks after a takeover
+  (which wakes everything), so it never saw this; the direct-line test
+  did, on its first run.
 - **Alpha.** Items glide between deltas: `clock.frac` is the worker's frac
   when it answered, plus the time since times the rate, held below the next
   tick, which the mirror does not have yet.
@@ -1756,6 +1764,76 @@ ticks arrive, with no refill wait. A hold gives up after `HOLD_MAX_S`
 (0.5 s); a pause is still a stop. It is the realtime remedy for stutter at
 busy moments; baking is the thorough one.
 
+### Realtime at high tick rates
+
+Above about 20k tps the realtime sound hiccuped where a bake of the same
+ticks did not. Two causes, both fixed, and neither touches a bake:
+
+- **The synth's cost grew with the tick rate.** Realtime playback cut
+  every 128-sample block at every tick boundary and ran every voice's
+  setup for each piece -- at 20k tps a piece every 2.4 samples, at 100k
+  every sample -- so the voices' setup, not their samples, was the cost.
+  `renderBlock()` walks the block's ticks first, applying them at the
+  same samples and logging each voice's on/off changes with their
+  offsets, then renders each voice over the whole block, switching at its
+  own change points: O(voices + changes) a block instead of O(ticks x
+  voices). In Node, per 128-sample block (budget 2.67 ms):
+
+  | board | rate | per tick | by block |
+  |---|---|---|---|
+  | `cpu.npz` | 20k | 0.32 ms | **0.21** |
+  | `cpu.npz` | 100k | 0.79 ms (worst 2.64) | **0.30** (worst 0.46) |
+  | `test` | 20k | 0.34 ms | **0.20** |
+  | `GameOfLife_SLOW` | 20k | 0.62 ms | **0.48** |
+
+  What remains on Game of Life is real work a bake does too: applying
+  6,386 runs' bits a tick, and scheduling each jittered click.
+- **Ticks reached the synth once a frame.** The worker's ticks went to the
+  main thread in each frame's delta and on to the synth from there, so a
+  frame's gap plus the audio thread's own bursts (3-4 blocks at a time in
+  Chromium) had to fit in the latency. They did not always: `test`
+  carries a 20 ms latency in its save, and with frames 17-48 ms apart it
+  ran dry about three times a second, at **any** tick rate. Now the main
+  thread hands the worker a port into the synth (`audio.js tickPort()`,
+  the worklet's `tickport` message) and the worker posts its tap's ticks
+  down it every `AUDIO_POST_MS` (5 ms) and on every delta request; a
+  pause sends the last ticks and then `stop` down the same line, so
+  nothing arrives after it. In the browser, `test` went from 14-54
+  underruns per 5 s to **none**, at 1k, 20k, 100k and 1M tps. Configs
+  still come from the main thread, on the worklet's own port, so the two
+  are not ordered: configs and tick batches both carry the recorder's
+  generation, and the synth drops a batch from another one.
+
+**The meter shows "ran dry n · skipped m"** once either happens: the
+queue running out of ticks (an underrun: they came late, so raise the
+latency or lighten the frame) or a backlog skipped. Counted since sound
+was switched on. Its "refused" count could also read -1 after an underrun,
+since `gatesOff()` zeroed the count and left each run's refused flag set;
+it clears both now.
+
+**It is the same sound, to the bit**: the per-tick renderer is kept as the
+reference (`synth.batch = false`), and `tests/audio.test.mjs` renders a
+real save's ticks both ways from 30 to 100k tps and compares every sample.
+That took moving one thing in the reference: realtime now frees finished
+voices at the end of each render call rather than at tick boundaries
+inside it, so a refused run waits up to a block for a voice. (A bake still
+frees on tick edges; its exactness is about chunking, not this.) Three
+more details the walk needed: a voice allocated mid-block runs silent from
+the block's start with its phase wound back to 0 at its offset; a click
+due "now" lands at its tick's sample, not the block's first; and the click
+pool **grows** (to 2^20), since a block schedules all its ticks' clicks
+before any play -- 300k tps of 64 fires a tick is 51k clicks a block. One
+deliberate difference: with a space, a voice's gain glides once a block,
+not at each tick boundary, which the test holds to under 0.1% of the
+signal. Mutation-tested eight ways (a change logged a sample early, a
+run's off not logged, the phase not wound back, either kind of click at
+the block's start, the start tick ignored, voices never switching
+mid-block, the pool not growing): each fails it -- three only once cases
+for unjittered clicks, a start tick and a click burst were added. The
+direct line is mutation-tested in `tests/worker.test.mjs`: the new tap's
+wake, audio left in the deltas, no send on a request, the stop before the
+last ticks, the synth ignoring the generation.
+
 ### Baking
 
 **Bake audio…** (Audio folder) opens a sheet: seconds (default 30, at most
@@ -2007,7 +2085,7 @@ them: the panel's **Presentation** folder, and **Export presentation
   (bottom middle), an **i** button cycling the views (hidden with only
   one), and the **speed** panel (bottom left, level with the buttons: the
   rates wrap to two rows of three, and a rate of 1000 or more reads as
-  "1k", so five never reach the centred buttons), the starting rate lit --
+  "1k" -- a million as "1M" -- so five never reach the centred buttons), the starting rate lit --
   no panel at all without other rates. Everything else is hidden by
   `body.presenting`. It writes **nothing** to the browser's storage:
   `freezePersist()` runs before the shell and the panel are built, and

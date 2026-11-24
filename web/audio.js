@@ -135,7 +135,7 @@ export class Recorder {
     // Normalisation counts the selection only, so isolating part of a machine
     // fills the mix rather than playing it as quietly as it sits in the whole.
     this.selInfo = sel ? { runs: this.cands.length, gates: groups[0] + groups[1] } : null;
-    this.port.postMessage({ type: "config", lengths: Float64Array.from(this.cands, s => s.length), groups });
+    this.port.postMessage({ type: "config", gen: this.cfgGen, lengths: Float64Array.from(this.cands, s => s.length), groups });
     // With a space the synth weighs every candidate (and normalises by the
     // weights, not the count); without one a config alone is the old state.
     if (this.space) this.sendSpace(sim);
@@ -217,7 +217,7 @@ export class Recorder {
     if (!this.n) return;
     this.stopped = false;
     const n = this.n, W = this.words;
-    const m = { type: "ticks", n, tick0: this.tick0, words: W, rate,
+    const m = { type: "ticks", gen: this.cfgGen, n, tick0: this.tick0, words: W, rate,
                 bits: this.bits.slice(0, n * W), f0: this.f0.slice(0, n), f1: this.f1.slice(0, n) };
     this.port.postMessage(m, [m.bits.buffer, m.f0.buffer, m.f1.buffer]);
     this.n = 0;
@@ -268,6 +268,13 @@ export async function startAudio(ctx, params, sim, onMeter) {
       try { this.src.stop(); } catch { /* already ended */ }
       this.src.disconnect();
       this.src = null;
+    },
+    // A second port into the synth, for the sim worker to send its ticks
+    // straight down (simhost.js), with no main-thread frame in between.
+    tickPort() {
+      const ch = new MessageChannel();
+      node.port.postMessage({ type: "tickport", port: ch.port1 }, [ch.port1]);
+      return ch.port2;
     },
     async close() { this.stopBaked(); rec.detach(); node.port.onmessage = null; node.disconnect(); await ctx.close(); },
   };

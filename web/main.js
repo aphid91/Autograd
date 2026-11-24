@@ -268,6 +268,7 @@ function meterText(m) {
     `runs active ${m.active} of ${m.candidates}\n` +
     `peak ${m.peak.toFixed(2)} (${db} dB)` + (m.clipped ? `  clipped ${m.clipped}` : "") + "\n" +
     `lag ${Math.round(m.lagMs)} ms · speed ${m.speed.toFixed(2)}` +
+    (m.underruns || m.skips ? `\nran dry ${m.underruns || 0} · skipped ${m.skips || 0}` : "") +
     (bakedPlay ? "  (baked)" : "") + "\n" + bakeStatus() +
     (audioNote && performance.now() < audioNote.until ? `\n${audioNote.text}` : "") +
     (audio?.rec.selInfo ? `\n${panel.audio.camAudio ? "in earshot of the screen" : soundSel?.region ? "in earshot of the region" : "sound selection"}: ` +
@@ -1125,6 +1126,7 @@ const W = {
   delta: null,       // the latest delta, applied at the top of the next paint
   ahead: false,      // the mirror moved on without the worker: send it the state before it runs
   rate: 0, pixels: null, sleeping: null, audioGen: null, gainGen: null,
+  audioLink: null,   // the audio engine whose synth the worker sends ticks to directly
 };
 let workerWanted = true;   // Debug > sim worker
 function startWorker() {
@@ -1180,6 +1182,15 @@ function workerSettings() {
   const px = !!sim.screen;
   if (W.pixels !== px) { wpost({ type: "pixels", on: px }); W.pixels = px; }
   if (W.sleeping !== wakeList) { wpost({ type: "sleeping", on: wakeList }); W.sleeping = wakeList; }
+  // A line from the worker straight into the synth (audio.js tickPort()),
+  // so ticks reach it every few ms rather than once a frame through here.
+  if ((audio || null) !== W.audioLink) {
+    if (audio) {
+      const port = audio.tickPort();
+      W.worker.postMessage({ type: "audioport", port }, [port]);
+    } else wpost({ type: "audioport", port: null });
+    W.audioLink = audio || null;
+  }
   const rec = audio && !bakedPlay ? audio.rec : null;
   if (rec) {
     rec.ensure(sim);

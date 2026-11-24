@@ -1204,7 +1204,7 @@ export class Sim {
 
 export const RATE_PRESETS = [1, 5, 30, 240];
 export const RATE_MIN = 0.1;
-export const RATE_MAX = 100000;
+export const RATE_MAX = 1000000;
 // A frame that arrives after a long stall (a backgrounded tab) runs at most
 // this many ticks -- or a quarter second's worth at the current rate, if that
 // is more -- and drops the rest, rather than freezing to catch up. A flat 240

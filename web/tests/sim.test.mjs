@@ -125,7 +125,7 @@ test("the clock spends banked time in whole ticks and keeps the remainder", () =
   assert.equal(c.advance(1000), 2500, "a stall at a fast rate is capped too");
   c.setRate(1e9);
   assert.equal(c.rate, RATE_MAX, "the rate is clamped");
-  assert.equal(RATE_MAX, 100000);
+  assert.equal(RATE_MAX, 1000000);
 });
 
 // Sim.restTick(): when an item comes to rest if nothing more happens on its
