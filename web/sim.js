@@ -45,6 +45,11 @@ export class Sim {
     this.speed = S.SPEED;
     this.spacing = S.SPACING;
     this.board = board;
+    // Field offsets, looked up once: the gate-state accessors below run
+    // thousands of times a tick, and each `this.T.sim.F_*` chain was a cost.
+    this.ST = T.entity.STRIDE;
+    this.F_IN_VALUE = S.F_IN_VALUE; this.F_IN_HELD = S.F_IN_HELD;
+    this.F_OUT_VALUE = S.F_OUT_VALUE; this.F_OUT_HELD = S.F_OUT_HELD;
     this.tick = 0;
     this.seen = -1;                 // board.revision the index was built from
     // The desktop's sid allocator, which outlives a rebuild.
@@ -80,11 +85,11 @@ export class Sim {
   word(x, y, c) { return this.board.grid[(y * this.board.width + x) * 4 + c]; }
   rowAt(x, y) { return this.inBounds(x, y) ? this.board.cellId(this.word(x, y, 0)) : 0; }
   alive(row) { return this.board.alive(row); }
-  f(row, field) { return this.board.entities[row * this.board.T.entity.STRIDE + field]; }
+  f(row, field) { return this.board.entities[row * this.ST + field]; }
   // While forecasting, every write logs the value it replaces (`undoLog`,
   // flat index/value pairs) so the rollback restores exactly those slots.
   setF(row, field, v) {
-    const i = row * this.board.T.entity.STRIDE + field, E = this.board.entities;
+    const i = row * this.ST + field, E = this.board.entities;
     if (this.undoLog) this.undoLog.push(i, E[i]);
     E[i] = v;
   }
@@ -413,6 +418,17 @@ export class Sim {
       }
     }
     for (const gate of this.gates) gate.drains = this.connectedChannels(gate);
+    // The ports again as plain numbers for the tick (`srcRow`/`srcCh`,
+    // `dstRow`/`dstCh`; row 0: none), validated here once. offer() and
+    // accept() used to re-run livePort() -- the row's alive flag and a grid
+    // read for its ghost bit -- on every run every tick, ~2000 calls a tick
+    // on a big board to learn what only an edit can change, and an edit is
+    // a rebuild.
+    for (const seg of this.segments.values()) {
+      const sp = this.livePort(seg.srcPort), dp = this.livePort(seg.dstPort);
+      seg.srcRow = sp ? sp[0] : 0; seg.srcCh = sp ? sp[1] : 0;
+      seg.dstRow = dp ? dp[0] : 0; seg.dstCh = dp ? dp[1] : 0;
+    }
     this.buildDirect();
   }
 
@@ -489,14 +505,14 @@ export class Sim {
 
   // --- gate state -------------------------------------------------------------
 
-  inHeld(row, c) { return this.f(row, this.T.sim.F_IN_HELD + c) > 0; }
-  inValue(row, c) { return this.f(row, this.T.sim.F_IN_VALUE + c); }
-  outHeld(row, c) { return this.f(row, this.T.sim.F_OUT_HELD + c) > 0; }
-  outValue(row, c) { return this.f(row, this.T.sim.F_OUT_VALUE + c); }
-  setIn(row, c, v) { this.setF(row, this.T.sim.F_IN_VALUE + c, v); this.setF(row, this.T.sim.F_IN_HELD + c, 1); }
-  clearIn(row, c) { this.setF(row, this.T.sim.F_IN_VALUE + c, 0); this.setF(row, this.T.sim.F_IN_HELD + c, 0); }
-  setOut(row, c, v) { this.setF(row, this.T.sim.F_OUT_VALUE + c, v); this.setF(row, this.T.sim.F_OUT_HELD + c, 1); }
-  clearOut(row, c) { this.setF(row, this.T.sim.F_OUT_VALUE + c, 0); this.setF(row, this.T.sim.F_OUT_HELD + c, 0); }
+  inHeld(row, c) { return this.board.entities[row * this.ST + this.F_IN_HELD + c] > 0; }
+  inValue(row, c) { return this.board.entities[row * this.ST + this.F_IN_VALUE + c]; }
+  outHeld(row, c) { return this.board.entities[row * this.ST + this.F_OUT_HELD + c] > 0; }
+  outValue(row, c) { return this.board.entities[row * this.ST + this.F_OUT_VALUE + c]; }
+  setIn(row, c, v) { this.setF(row, this.F_IN_VALUE + c, v); this.setF(row, this.F_IN_HELD + c, 1); }
+  clearIn(row, c) { this.setF(row, this.F_IN_VALUE + c, 0); this.setF(row, this.F_IN_HELD + c, 0); }
+  setOut(row, c, v) { this.setF(row, this.F_OUT_VALUE + c, v); this.setF(row, this.F_OUT_HELD + c, 1); }
+  clearOut(row, c) { this.setF(row, this.F_OUT_VALUE + c, 0); this.setF(row, this.F_OUT_HELD + c, 0); }
 
   // Engine.flush_material(): every item off every belt and out of every gate.
   //
@@ -628,20 +644,19 @@ export class Sim {
   // --- the port callbacks (GateSim.offer_to / took_from / accept_from) --------
 
   offer(seg) {
-    const p = this.livePort(seg.srcPort);
-    if (!p || !this.outHeld(p[0], p[1])) return null;
-    return this.outValue(p[0], p[1]);
+    const r = seg.srcRow;
+    if (!r || !this.outHeld(r, seg.srcCh)) return null;
+    return this.outValue(r, seg.srcCh);
   }
 
   took(seg) {
-    const p = this.livePort(seg.srcPort);
-    if (p) this.clearOut(p[0], p[1]);
+    if (seg.srcRow) this.clearOut(seg.srcRow, seg.srcCh);
   }
 
   accept(seg, payload) {
-    const p = this.livePort(seg.dstPort);
-    if (!p || this.inHeld(p[0], p[1])) return false;
-    this.setIn(p[0], p[1], payload);
+    const r = seg.dstRow;
+    if (!r || this.inHeld(r, seg.dstCh)) return false;
+    this.setIn(r, seg.dstCh, payload);
     return true;
   }
 
@@ -665,17 +680,28 @@ export class Sim {
   // The prefilter tests only necessary conditions that are pure row state --
   // the rule satisfiable by occupancy, a free output zone -- so it can admit
   // a gate that then does nothing but never rejects one that would fire.
+  //
+  // The output test is fire()'s own, on the CONNECTED outputs (`drains`): a
+  // generator needs one of them free, anything else all of them (a
+  // dangling output discards and never blocks). It used to ask whether any
+  // output at all was free, which a dangling one always is -- so every
+  // Source with an unconnected face passed, and fire() was called ~1770
+  // times a tick on `test` to fire about once.
   structurePhase(A = null, P = null) {
+    const E = this.board.entities, ST = this.ST, IH = this.F_IN_HELD, OH = this.F_OUT_HELD;
     for (const g of this.gates) {
-      const row = g.row, s = g.sim;
-      let fed = 0;
-      for (let c = 0; c < s.n_in; c++) if (this.inHeld(row, c)) fed++;
-      const ready = s.n_in === 0 || (g.strict ? fed === s.n_in : fed > 0);
-      if (!ready) continue;
-      if (s.n_out > 0) {
+      const row = g.row, s = g.sim, drains = g.drains, base = row * ST;
+      if (s.n_in === 0) {
         let free = false;
-        for (let c = 0; c < s.n_out && !free; c++) if (!this.outHeld(row, c)) free = true;
+        for (let i = 0; i < drains.length; i++) if (!(E[base + OH + drains[i]] > 0)) { free = true; break; }
         if (!free) continue;
+      } else {
+        let fed = 0;
+        for (let c = 0; c < s.n_in; c++) if (E[base + IH + c] > 0) fed++;
+        if (g.strict ? fed !== s.n_in : fed === 0) continue;
+        let blocked = false;
+        for (let i = 0; i < drains.length; i++) if (E[base + OH + drains[i]] > 0) { blocked = true; break; }
+        if (blocked) continue;
       }
       if (this.fire(g, P)) {
         this.stats.fired++;
@@ -935,6 +961,7 @@ export class Clock {
 }
 
 // --- pure helpers ----------------------------------------------------------------
+
 
 // core/segments.py take_dir(): straight through first, then counter-clockwise
 // from the receiving cell's own facing.

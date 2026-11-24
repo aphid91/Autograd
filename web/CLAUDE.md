@@ -1128,6 +1128,35 @@ Matching forced three details that would otherwise look arbitrary:
 - **Values are float32 at the same points**: gate channels live in the
   save's own entity `Float32Array`, and ring payloads are `Float32Array`s.
 
+**What the tick costs, and the two fixes that took it 4-6x.** Measured in
+Node on `test` (3.4k machines, 2k runs): 0.74 ms a tick before, 0.13 after
+(`cpu.npz` 0.11 -> 0.028, `Ram2.npz` 0.074 -> 0.018, `GameOfLife_SLOW`
+2.0 -> 0.70); in the editor at 10000 tps with the whole board on screen,
+555 -> 2376 ticks a second reached. Both are exact -- `check_web_sim.py`
+passes on every save, `test` and `GameOfLife_SLOW` included:
+
+- **The prefilter tests the connected outputs.** It asked whether *any*
+  output was free, and a dangling output always is, so every Source with an
+  unconnected face passed and `fire()` ran ~1770 times a tick to fire about
+  once. It now asks `fire()`'s own question of `drains`: a generator needs
+  one free, anything else all of them.
+- **A run's ports are plain numbers** (`srcRow`/`srcCh`, `dstRow`/`dstCh`,
+  resolved in `buildGates()`). `offer()` and `accept()` re-ran `livePort()`
+  -- an alive flag and a grid read for the ghost bit -- on every run every
+  tick, ~2000 calls to learn what only an edit (a rebuild) can change.
+
+What is left is three scans over everything -- every gate, every run, every
+direct edge -- to find the few with work: on `test` 0.27% of runs and 0.08%
+of gates change in a tick. That is a wake list's job, which "Rules" rules
+out for now. Audio adds 3-50% (the recorder's per-run position compare;
+`GameOfLife_SLOW` 0.70 -> 0.98 ms).
+
+One trap: a version of `deliverDirect()` over flat `Int32Array` offsets
+measured 25x *slower* in the step (0.38 ms) and was also wrong -- it ended
+`test` with 1922 items in flight where the real tick has 1696. Reverted; the
+check would have caught it, and the timing alone would have looked like a
+V8 oddity.
+
 **The arithmetic is data.** `types.json` now carries a `sim` record per
 machine -- firing rule, port-to-channel maps, the `OPS` opcode table and
 Merge's `SELECT_RULE` -- and `evalOps()` is a port of `Entity.eval_ops()`.
