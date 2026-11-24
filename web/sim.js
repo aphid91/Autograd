@@ -62,6 +62,7 @@ export class Sim {
     // so a forecast knows when it is stale.
     this.version = 0;
     this.rec = null;                // the forecast's event log, while one runs
+    this.undoLog = null;            // ...and its entity writes, to roll back (setF())
     // audio.js's Recorder while audio is on, else null: then the tick's whole
     // audio cost is this null check (step() and structurePhase()).
     this.audio = null;
@@ -79,7 +80,13 @@ export class Sim {
   rowAt(x, y) { return this.inBounds(x, y) ? this.board.cellId(this.word(x, y, 0)) : 0; }
   alive(row) { return this.board.alive(row); }
   f(row, field) { return this.board.entities[row * this.board.T.entity.STRIDE + field]; }
-  setF(row, field, v) { this.board.entities[row * this.board.T.entity.STRIDE + field] = v; }
+  // While forecasting, every write logs the value it replaces (`undoLog`,
+  // flat index/value pairs) so the rollback restores exactly those slots.
+  setF(row, field, v) {
+    const i = row * this.board.T.entity.STRIDE + field, E = this.board.entities;
+    if (this.undoLog) this.undoLog.push(i, E[i]);
+    E[i] = v;
+  }
   pending(x, y) { return (this.word(x, y, 2) & this.T.cell.GHOST_MASK) === this.T.sim.GHOST_PENDING; }
 
   // SegmentIndex._cell_at: a real belt-like cell as [type, dir, row], or null.
@@ -732,14 +739,16 @@ export class Sim {
   // It is the real step() run on the live state with an event log, then
   // rolled back -- not a second copy of the rules, so it cannot disagree
   // with the tick it predicts. Everything the step writes is restored: the
-  // entity table (every gate channel), each run's head/tail/anchor, the one
+  // entity slots it wrote (logged by setF(), so the rollback touches what
+  // changed rather than copying the whole table -- 3.6 MB on a 32k-row
+  // board, most of the forecast's cost), each run's head/tail/anchor, the one
   // ring slot each push writes (it may be the slot the popped head lived
   // in), the tick, the stats and the version. Cached on `version`, so it
   // costs one extra step per tick drawn, not per frame.
   forecast() {
     this.sync();
     if (this.fc && this.fc.version === this.version) return this.fc;
-    const ent = this.board.entities.slice();
+    const undo = this.undoLog = [];
     const segs = this.order.map(seg => [seg, seg.head, seg.tail, seg.anchor]);
     const tick = this.tick, version = this.version, stats = { ...this.stats };
     const rec = { pops: new Map(), pushes: new Map(), fires: new Map(), directs: [], slots: [] };
@@ -753,7 +762,9 @@ export class Sim {
       }
     } finally {
       this.rec = null;
-      this.board.entities.set(ent);
+      this.undoLog = null;
+      const E = this.board.entities;
+      for (let i = undo.length - 2; i >= 0; i -= 2) E[undo[i]] = undo[i + 1];
       for (const [seg, h, t, a] of segs) { seg.head = h; seg.tail = t; seg.anchor = a; }
       for (let i = rec.slots.length - 1; i >= 0; i--) {
         const [seg, slot, e, p] = rec.slots[i];
@@ -799,7 +810,7 @@ export class Sim {
     }
     c.order = this.order.map(seg => c.segments.get(seg.sid));
     c.stats = { ...this.stats };
-    c.audio = null; c.rec = null; c.fc = null; c.screen = null;
+    c.audio = null; c.rec = null; c.fc = null; c.screen = null; c.undoLog = null;
     return c;
   }
 

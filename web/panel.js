@@ -322,6 +322,11 @@ export class Panel {
 
     const dbg = this.pane.addFolder({ title: "Debug", expanded: false });
     dbg.addButton({ title: "Clear stamps" }).on("click", () => cb.onClearStamps());
+    // Frame profiling (prof.js): a per-part timing tree over the board.
+    // Not a preference -- off on every load.
+    this.profState = { profile: false, gpuSync: false };
+    dbg.addBinding(this.profState, "profile", { label: "profile frames" }).on("change", () => cb.onProfile?.(this.profState));
+    dbg.addBinding(this.profState, "gpuSync", { label: "GPU sync" }).on("change", () => cb.onProfile?.(this.profState));
   }
 
   // --- view settings as one value -----------------------------------------------
@@ -411,13 +416,14 @@ export class Panel {
   // Read by the meter's monitor binding on its own interval.
   setAudioMeter(text) { this.audioMeter.text = text; }
 
-  // The bundled saves, as a dropdown at the top of the Board folder.
-  setSaves(names, current) {
+  // The bundled saves, as a dropdown at the top of the Board folder:
+  // `entries` are { label, value } (value is what onLoadSave gets).
+  setSaves(entries, current) {
     if (this.saveBinding) this.saveBinding.dispose();
     this.saveBinding = null;
-    if (!names.length) return;
-    this.saveState.save = current || names[0];
-    const options = Object.fromEntries(names.map(n => [n, n]));
+    if (!entries.length) return;
+    this.saveState.save = current || entries[0].value;
+    const options = Object.fromEntries(entries.map(e => [e.label, e.value]));
     this.saveBinding = this.saveFolder.addBinding(this.saveState, "save", { label: "save", options, index: 0 });
     this.saveBinding.on("change", (ev) => this.cb.onLoadSave(ev.value));
   }

@@ -70,6 +70,7 @@ const LOD = {
   get ports() { return lod(TUNE.lodPorts); },
   get marks() { return lod(TUNE.lodMarks); },
   get portEdge() { return lod(TUNE.lodPortEdge); },
+  get itemDots() { return lod(TUNE.lodItemDots); },
 };
 
 // A Source's number, in CSS px: 1.75x the first cut, bounded by the body's
@@ -90,7 +91,13 @@ import { TUNE } from "./tune.js";
 import { itemPoints } from "./flow.js";
 import { drawPixels } from "./pixel.js";
 import { css as noteCss, isText, sizeOf, wrap, PAD, LINE } from "./notes.js";
+import { begin, end, span } from "./prof.js";
 
+const GREY = [0.5, 0.5, 0.5];
+// css() of a colour array, remembered per array (type and status colours
+// are the same arrays frame after frame).
+const cssMemo = new WeakMap();
+const cssOf = (c) => { let k = cssMemo.get(c); if (k === undefined) cssMemo.set(c, k = css(c)); return k; };
 const css = (c) => `rgb(${(c[0] * 255) | 0},${(c[1] * 255) | 0},${(c[2] * 255) | 0})`;
 const shade = (c, k) => css(c.map(v => v * k));
 
@@ -149,7 +156,7 @@ export function render(ctx, board, cam, dpr, opts = {}) {
   ctx.fillRect(0, 0, board.width, board.height);
 
   // Grid, under everything, so belts read as joined across cell edges.
-  if (view.grid && z >= LOD.gridLines) {
+  if (view.grid && z >= LOD.gridLines) span("grid", () => {
     const gx0 = Math.max(0, Math.floor(v.x0)), gx1 = Math.min(board.width, Math.ceil(v.x1));
     const gy0 = Math.max(0, Math.floor(v.y0)), gy1 = Math.min(board.height, Math.ceil(v.y1));
     for (const major of [false, true]) {
@@ -168,7 +175,7 @@ export function render(ctx, board, cam, dpr, opts = {}) {
       ctx.stroke();
       ctx.globalAlpha = 1;
     }
-  }
+  });
 
   // Placed belts a run (or its copies) will turn draw only as the ghost.
   const hide = view.hide?.length ? new Set(view.hide.map(([x, y]) => `${x},${y}`)) : null;
@@ -178,8 +185,8 @@ export function render(ctx, board, cam, dpr, opts = {}) {
   // (main.js filters them once per change, not per frame).
   const L = view.lists || board;
   if (view.belts !== false) {
-    drawBelts(ctx, hide ? L.belts.filter(b => !hide.has(`${b.x},${b.y}`)) : L.belts, z, on, S, view.seedTint, view.beltTint || null);
-    drawUnders(ctx, L.unders, z, on, S, view.underTint || view.beltTint || null);
+    span("belts", () => drawBelts(ctx, hide ? L.belts.filter(b => !hide.has(`${b.x},${b.y}`)) : L.belts, z, on, S, view.seedTint, view.beltTint || null));
+    span("unders", () => drawUnders(ctx, L.unders, z, on, S, view.underTint || view.beltTint || null));
   }
   // View > sources off: Sources are not drawn (there are hundreds on a
   // computer, and they hide the machines worth looking at). Still there.
@@ -187,7 +194,7 @@ export function render(ctx, board, cam, dpr, opts = {}) {
   // the belts underneath. Still there, and still tappable.
   const structs = view.gates === false ? []
     : view.sources === false ? L.structs.filter(s => board.T.types[s.type].name !== "source") : L.structs;
-  drawStructs(ctx, board.T, structs, z, px, on, S, view.ports, view.labels, view.gateTint || null);
+  span("structs", () => drawStructs(ctx, board.T, structs, z, px, on, S, view.ports, view.labels, view.gateTint || null));
 
   ctx.strokeStyle = COL.border;
   ctx.lineWidth = 2 * px;
@@ -196,22 +203,22 @@ export function render(ctx, board, cam, dpr, opts = {}) {
   // The planning ghosts go under the items -- or, while the pixel overlay
   // is on, over it, so what is being placed stays visible on the screen.
   const ghosts = (view.ghosts || [view.ghost]).filter(Boolean);
-  const drawGhosts = () => { for (const g of ghosts) drawGhost(ctx, board.T, g, z, px, on, S, view.ports, view.labels, view.seedTint); };
+  const drawGhosts = () => { if (ghosts.length) span("ghosts", () => { for (const g of ghosts) drawGhost(ctx, board.T, g, z, px, on, S, view.ports, view.labels, view.seedTint); }); };
   if (!view.pixels) drawGhosts();
 
   // Items last among the board's contents: cargo on a cell, over any tint,
   // so a red wash never changes the colour that says an item's sign.
   let cargo = null;
-  if (view.sim && view.items !== false) cargo = drawItems(ctx, view.sim, view.alpha || 0, z, on, S, view.hiddenCells, board.width, view.dim?.cells);
+  if (view.sim && view.items !== false) cargo = span("items", () => drawItems(ctx, view.sim, view.alpha || 0, z, on, S, view.hiddenCells, board.width, view.dim?.cells));
 
   // Layers: what an inactive layer holds is washed out -- colour drained,
   // then darkened -- body, glyph, ports and items alike, so what can be
   // touched stands out. Over the items, under the editing marks.
-  if (view.dim) drawDim(ctx, view.dim.rects, on, world);
+  if (view.dim) span("dim", () => drawDim(ctx, view.dim.rects, on, world));
 
   // The pixel overlay (pixel.js): over the board and its items.
   if (view.pixels) {
-    drawPixels(ctx, board, view.pixels.screen, view.pixels.alpha, view.pixels.max, on, view.pixels.textBg);
+    span("pixels", () => drawPixels(ctx, board, view.pixels.screen, view.pixels.alpha, view.pixels.max, on, view.pixels.textBg));
     drawGhosts();
   }
 
@@ -220,7 +227,7 @@ export function render(ctx, board, cam, dpr, opts = {}) {
   // a selection or a frame box never glows, and lays its glow over it.
   if (view.onWorld) {
     ctx.save();
-    view.onWorld(ctx);
+    span("bloom", () => view.onWorld(ctx));
     ctx.restore();
   }
 
@@ -269,7 +276,7 @@ export function render(ctx, board, cam, dpr, opts = {}) {
     ctx.strokeRect(sel.x - pad, sel.y - pad, sel.w + 2 * pad, sel.h + 2 * pad);
   }
 
-  if (cargo) drawItemLabels(ctx, cargo, cam, dpr);
+  if (cargo) span("itemLabels", () => drawItemLabels(ctx, cargo, cam, dpr));
   if (view.notes !== false && board.notes?.length) drawNotes(ctx, board.notes, cam, dpr, view.noteSel ?? -1, !!view.noteGrips);
   // Labels lifted into a selection, or about to be pasted: ghosted, and a
   // selected one outlined as a lifted entity is.
@@ -293,32 +300,40 @@ export function render(ctx, board, cam, dpr, opts = {}) {
   if (view.indexLabels?.length) drawIndexLabels(ctx, view.indexLabels, cam, dpr);
 
   if (view.labels && z >= LOD.marks) {
-    drawLabels(ctx, board.T, structs, cam, dpr, on, view.dim?.rows);
+    span("emitLabels", () => drawLabels(ctx, board.T, structs, cam, dpr, on, view.dim?.rows));
     ctx.globalAlpha = 0.7;
     for (const g of ghosts) if (g.structs?.length) drawLabels(ctx, board.T, g.structs, cam, dpr, on);
     ctx.globalAlpha = 1;
   }
   // Layer labels last of all, over the Source values too: they name whole
   // modules, and a value showing through one makes both unreadable.
-  if (view.layerLabels?.length) drawLayerLabels(ctx, view.layerLabels, cam, dpr, view.layerLabelHits, view.layerLabelSel);
+  if (view.layerLabels?.length) span("layerLabels", () => drawLayerLabels(ctx, view.layerLabels, cam, dpr, view.layerLabelHits, view.layerLabelSel));
 }
 
 // `tint`: View > belt status colours -- (x, y) -> a colour, or null for the
 // belt's own (main.js decides empty / stalled / moving, per run).
 function drawBelts(ctx, belts, z, on, S, seedTint = true, tint = null) {
-  // One batched path per colour, as before when there is one colour.
+  // One batched path per colour, as before when there is one colour. Culled
+  // here, once: everything below draws from the groups, and asking the tint
+  // about all 16k belts of a big board when a few hundred are on screen was
+  // most of this pass zoomed in.
+  begin("group");
   const groups = new Map();
+  const shown = [];
   for (const b of belts) {
+    if (!on(b.x, b.y)) continue;
+    shown.push(b);
     const c = tint?.(b.x, b.y) || COL.belt;
     if (!groups.has(c)) groups.set(c, []);
     groups.get(c).push(b);
   }
+  end();
 
   // Seeded cells are tinted by the seed's sign, under the belt itself --
   // unless the View folder's "seed tint" is off.
   for (const sign of seedTint ? [1, -1] : []) {
     ctx.beginPath();
-    for (const b of belts) if (b.seed === sign && on(b.x, b.y)) ctx.rect(b.x, b.y, 1, 1);
+    for (const b of shown) if (b.seed === sign) ctx.rect(b.x, b.y, 1, 1);
     ctx.fillStyle = sign > 0 ? COL.seedPos : COL.seedNeg;
     ctx.fill();
   }
@@ -328,7 +343,7 @@ function drawBelts(ctx, belts, z, on, S, seedTint = true, tint = null) {
     // than a hairline and costs one rect.
     for (const [col, list] of groups) {
       ctx.beginPath();
-      for (const b of list) if (on(b.x, b.y)) ctx.rect(b.x + 0.2, b.y + 0.2, 0.6, 0.6);
+      for (const b of list) ctx.rect(b.x + 0.2, b.y + 0.2, 0.6, 0.6);
       ctx.fillStyle = col;
       ctx.fill();
     }
@@ -337,13 +352,13 @@ function drawBelts(ctx, belts, z, on, S, seedTint = true, tint = null) {
 
   // The spine: in-edge -> centre -> out-edge. With no source the spine runs
   // straight through, so an isolated belt fills its cell.
+  begin("spine");
   ctx.lineWidth = 0.34 * TUNE.beltWidth;
   ctx.lineJoin = "round";
   ctx.lineCap = "butt";
   for (const [col, list] of groups) {
     ctx.beginPath();
     for (const b of list) {
-      if (!on(b.x, b.y)) continue;
       const cx = b.x + 0.5, cy = b.y + 0.5;
       const o = S[b.dir];
       const i = b.inDir >= 0 ? S[b.inDir] : [-o[0], -o[1]];
@@ -354,17 +369,19 @@ function drawBelts(ctx, belts, z, on, S, seedTint = true, tint = null) {
     ctx.strokeStyle = col;
     ctx.stroke();
   }
+  end();
 
   if (z < LOD.chevrons) return;
+  begin("chevrons");
   ctx.beginPath();
-  for (const b of belts) {
-    if (!on(b.x, b.y)) continue;
+  for (const b of shown) {
     chevron(ctx, b.x + 0.5, b.y + 0.5, S[b.dir], 0.1 * TUNE.chevronSize);
   }
   ctx.strokeStyle = COL.chevron;
   ctx.lineWidth = 0.06;
   ctx.lineJoin = "miter";
   strokeChevrons(ctx);
+  end();
 }
 
 // A ">" pointing along f, centred near (cx, cy).
@@ -400,6 +417,7 @@ function drawUnders(ctx, unders, z, on, S, tint = null) {
 // One colour's worth of underground ends and spans; `col` null is their own.
 function drawUnderGroup(ctx, unders, on, S, col) {
   // The span: dots on the buried cells between a paired entrance and exit.
+  begin("dots");
   ctx.beginPath();
   for (const u of unders) {
     if (!u.span) continue;
@@ -417,10 +435,12 @@ function drawUnderGroup(ctx, unders, on, S, col) {
   ctx.globalAlpha = col ? 0.7 : 1;
   ctx.fill();
   ctx.globalAlpha = 1;
+  end();
 
   // Each end: a funnel, full width on the surface side and narrowing toward
   // the buried side -- the front of an entrance (diving), the back of an
   // exit (surfacing) -- with a dark bar across the narrow mouth.
+  begin("funnels");
   ctx.beginPath();
   const bars = new Path2D();
   for (const u of unders) {
@@ -431,6 +451,19 @@ function drawUnderGroup(ctx, unders, on, S, col) {
   ctx.fill();
   ctx.fillStyle = COL.underDark;
   ctx.fill(bars);
+  end();
+}
+
+// Closing a polygon: back to its first vertex with a lineTo, then on to its
+// second so a stroke joins the corner as closePath() would (a stroke is one
+// coverage mask, so the doubled edge does not darken). Never closePath():
+// in Chrome its cost grows with the length of the path it is called on, so
+// a path of n polygons closed with it costs O(n^2) -- 3200 triangles took
+// 40 ms against 2.4 ms closed this way, and the underground funnels alone
+// were 17 ms of a whole-board frame. Fills are identical either way.
+function closePoly(path, x0, y0, x1, y1) {
+  path.lineTo(x0, y0);
+  path.lineTo(x1, y1);
 }
 
 // One underground end centred on (cx, cy). `f` is the travel direction and
@@ -445,11 +478,11 @@ function underFunnel(path, bars, cx, cy, f, s) {
   const q = [pt(-half, wide), pt(half, narrow), pt(half, -narrow), pt(-half, -wide)];
   path.moveTo(...q[0]);
   for (const p of q.slice(1)) path.lineTo(...p);
-  path.closePath();
+  path.lineTo(...q[0]);   // filled only: no join needed (closePoly())
   const b = [pt(half - 2 * bar, narrow + 0.03), pt(half, narrow), pt(half, -narrow), pt(half - 2 * bar, -narrow - 0.03)];
   bars.moveTo(...b[0]);
   for (const p of b.slice(1)) bars.lineTo(...p);
-  bars.closePath();
+  bars.lineTo(...b[0]);
 }
 
 // A planned run: the proposed belts and undergrounds translucent, cells the
@@ -519,23 +552,33 @@ function drawGhost(ctx, T, g, z, px, on, S, ports, labels, seedTint = true) {
 function drawStructs(ctx, T, structs, z, px, on, S, ports, labels, tint = null) {
   const types = T.types;
   const inset = 0.05;
+  // Bodies: one path per colour, filled then edged -- a fillRect and a
+  // strokeRect per machine was 3400 state changes on a big board. Bodies
+  // never overlap, so the order between colours does not show.
+  begin("bodies");
+  // Keyed by css string: a layer tint hands each machine a colour array of
+  // its own, and those must still land in one group per colour.
+  const byColour = new Map();   // css -> [colour, machines]
   for (const s of structs) {
     if (!on(s.x, s.y, s.w, s.h)) continue;
-    const c = (tint && s.row !== undefined && tint.get(s.row)) || types[s.type].colour || [0.5, 0.5, 0.5];
-    ctx.fillStyle = css(c);
-    ctx.strokeStyle = shade(c, 0.6);
-    ctx.lineWidth = Math.max(px, 0.04);
-    if (LOOK.corner > 0) {
-      ctx.beginPath();
-      bodyRect(ctx, s.x + inset, s.y + inset, s.w - 2 * inset, s.h - 2 * inset);
-      ctx.fill();
-      ctx.stroke();
-    } else {
-      ctx.fillRect(s.x + inset, s.y + inset, s.w - 2 * inset, s.h - 2 * inset);
-      ctx.strokeRect(s.x + inset, s.y + inset, s.w - 2 * inset, s.h - 2 * inset);
-    }
+    const c = (tint && s.row !== undefined && tint.get(s.row)) || types[s.type].colour || GREY;
+    const key = cssOf(c);
+    let g = byColour.get(key);
+    if (!g) byColour.set(key, g = [c, []]);
+    g[1].push(s);
   }
+  ctx.lineWidth = Math.max(px, 0.04);
+  for (const [key, [c, list]] of byColour) {
+    ctx.beginPath();
+    for (const s of list) bodyRect(ctx, s.x + inset, s.y + inset, s.w - 2 * inset, s.h - 2 * inset);
+    ctx.fillStyle = key;
+    ctx.fill();
+    ctx.strokeStyle = shade(c, 0.6);
+    ctx.stroke();
+  }
+  end();
   if (z < LOD.marks) return;
+  begin("overlay");
 
   // The control overlay: a faint belt straight through each cell a channel
   // passes unchanged (Entity.PASS_THROUGH), so which signal survives the
@@ -572,9 +615,11 @@ function drawStructs(ctx, T, structs, z, px, on, S, ports, labels, tint = null) 
   ctx.lineWidth = 0.06;
   ctx.lineJoin = "miter";
   strokeChevrons(ctx, chev);
+  end();
 
   // The glyph, centred on the footprint. A Source whose number is shown
   // wears the number instead.
+  begin("glyphs");
   let fills = "";
   const widths = new Map();   // stroke width -> path data: footprints differ
   for (const s of structs) {
@@ -591,8 +636,10 @@ function drawStructs(ctx, T, structs, z, px, on, S, ports, labels, tint = null) 
   for (const [w, d] of widths) { ctx.lineWidth = w; ctx.stroke(new Path2D(d)); }
   if (fills) ctx.fill(new Path2D(fills));
   ctx.lineCap = "butt";
+  end();
 
   if (!ports || z < LOD.ports) return;
+  begin("ports");
   // Ports: blue triangles pointing in at inputs, red pointing out at outputs.
   const ins = new Path2D(), outs = new Path2D();
   for (const s of structs) {
@@ -611,6 +658,7 @@ function drawStructs(ctx, T, structs, z, px, on, S, ports, labels, tint = null) 
     ctx.stroke(ins);
     ctx.stroke(outs);
   }
+  end();
 }
 
 function port(path, x, y, f, inward) {
@@ -627,7 +675,7 @@ function port(path, x, y, f, inward) {
   path.moveTo(base[0] + sx, base[1] + sy);
   path.lineTo(tip[0], tip[1]);
   path.lineTo(base[0] - sx, base[1] - sy);
-  path.closePath();
+  closePoly(path, base[0] + sx, base[1] + sy, tip[0], tip[1]);   // stroked too (the port edge)
 }
 
 // Text is drawn in screen space: under the world transform it would be
@@ -779,10 +827,13 @@ function drawVectorMarks(ctx, marks, px) {
 // one is not drawn (one byte read per item, and only while a layer is hidden).
 function drawItems(ctx, sim, alpha, z, on, S, hidden = null, W = 0, dimCells = null) {
   const text = textOpacity(z);
+  begin("itemPoints");
   const { pts } = itemPoints(sim, alpha, {
     visible: (x0, y0, x1, y1) => on(x0, y0, x1 - x0, y1 - y0),
     reach: 0.5 + ITEM.r,
   });
+  end();
+  begin("discs");
   const pos = [], neg = [], labels = [], dimLabels = [];
   for (let i = 0; i < pts.length; i += 3) {
     const x = pts[i], y = pts[i + 1], value = pts[i + 2];
@@ -792,8 +843,23 @@ function drawItems(ctx, sim, alpha, z, on, S, hidden = null, W = 0, dimCells = n
     (value > 0 ? pos : neg).push(x, y);
     if (text > 0) (dimCells && dimCells[k] ? dimLabels : labels).push(x, y, value);
   }
-  discs(ctx, pos, neg);
+  if (z < LOD.itemDots) dots(ctx, pos, neg); else discs(ctx, pos, neg);
+  end();
   return labels.length || dimLabels.length ? { labels, dimLabels, alpha: text } : null;
+}
+
+// Zoomed out, an item is a pixel or two: its ring colour as a square, with
+// no interior. Rects are far cheaper than arcs to build and to rasterise,
+// and at that size a disc and a square are the same blob.
+function dots(ctx, pos, neg) {
+  const h = ITEM.r * 0.8;
+  for (const [pts, col] of [[pos, COL.itemPos], [neg, COL.itemNeg]]) {
+    if (!pts.length) continue;
+    ctx.beginPath();
+    for (let i = 0; i < pts.length; i += 2) ctx.rect(pts[i] - h, pts[i + 1] - h, 2 * h, 2 * h);
+    ctx.fillStyle = col;
+    ctx.fill();
+  }
 }
 
 // Discs: the ring's colour as a full disc, then the dark interior over it.

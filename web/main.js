@@ -33,6 +33,7 @@ import { entrySize, typeByName } from "./stamp.js";
 import { installPixel, Screen } from "./pixel.js";
 import { cropBox, evenDim, frameBox, frameCount, viewBox } from "./video-params.js";
 import { presentationName, startPresentation, presentationRecord, safeName } from "./present.js";
+import * as P from "./prof.js";
 import { freezePersist, persistEnabled } from "./persist.js";
 import { presetNames, readPresets, putPreset, deletePreset, presetFile, parsePresetFile } from "./audiopresets.js";
 import { writeZip } from "./npz.js";
@@ -155,6 +156,9 @@ const debug = window.gates = {
   captureViewState: () => captureViewState(),
   placement: () => currentPlacement(),
   plan: () => currentPlan(),
+  prof: P.prof,
+  setProfiling: (on, gpuSync) => setProfiling(on, gpuSync),
+  profText: () => P.formatReport(P.prof.last),
 };
 
 // --- the pixel overlay --------------------------------------------------------
@@ -1077,6 +1081,19 @@ function bloomHook(key) {
   };
 }
 
+// Debug > profile frames (prof.js): the timing tree over the board, a
+// report a second. Paused, nothing paints on its own, so a report needs
+// the sim playing or the board being moved.
+const profEl = document.getElementById("prof");
+P.prof.onReport = (r) => { profEl.textContent = P.formatReport(r); };
+function setProfiling(on, gpuSync = false) {
+  P.prof.on = on;
+  P.prof.gpuSync = gpuSync;
+  profEl.hidden = !on;
+  profEl.textContent = P.formatReport(null);
+  redraw();
+}
+
 function redraw() {
   if (queued) return;
   queued = true;
@@ -1085,11 +1102,14 @@ function redraw() {
 
 function paint(now) {
   queued = false;
+  P.frameStart(now);
+  P.begin("paint");
   let ran = 0;
   if (sim) {
     // An edit since the last frame re-derives the runs and starts fresh --
     // here rather than at each edit site, so no edit path can forget it.
-    sim.sync();
+    P.span("sync", () => sim.sync());
+    P.begin("step");
     if (!clock.paused && bakePlayable()) {
       // Baked: step to the tick being heard. The buffer runs on its own
       // clock, so falling behind costs frames, never sync.
@@ -1110,9 +1130,11 @@ function paint(now) {
         sim.step();
       }
     }
+    P.end();
     shell.setTick(sim.tick);
-    if (inspectRow >= 0) panel.setLive(liveText(inspectRow));
+    if (inspectRow >= 0) P.span("liveText", () => panel.setLive(liveText(inspectRow)));
   }
+  P.begin("misc");
   driveDryRun();
   presenter?.frame();
   checkSoundSel();
@@ -1125,9 +1147,11 @@ function paint(now) {
   }
   lastNow = sim && !clock.paused ? now : null;
   countFrame(now, ran);
-  recordStep();
-  syncSpace();
+  P.end();
+  P.span("recordStep", recordStep);
+  P.span("syncSpace", syncSpace);
   const t0 = performance.now();
+  P.begin("prep");
   const info = board ? board.describe(inspectRow) : null;
   const ghosts = [
     selGhost(),
@@ -1138,9 +1162,11 @@ function paint(now) {
   ];
   // The belt a run starts on draws only as the run's ghost, at its new facing.
   const hide = run ? runCopies().copies.filter(c => c.over).map(c => c.start) : null;
-  const lv = layerView();
-  const gTint = view.gateStatus ? gateStatus() : null;
-  const bTint = view.beltStatus ? beltStatus() : null;
+  P.end();
+  const lv = P.span("layerView", layerView);
+  const gTint = view.gateStatus ? P.span("gateStatus", () => gateStatus()) : null;
+  const bTint = view.beltStatus ? P.span("beltStatus", () => beltStatus()) : null;
+  P.begin("render");
   render(ctx, board, cam, dpr, { ...view, selected: info, ghosts, sim, alpha: clock.alpha, hide, vector: vectorMarks(),
                                 indexLabels: indexLabels(), noteSel: noteEdit, noteGrips: labelHeld(),
                                 ghostNotes: ghostNotes(),
@@ -1150,8 +1176,13 @@ function paint(now) {
                                 ...layerOpts(lv, gTint, bTint),
                                 layerLabelHits: labelHits = [], layerLabelSel: labelSel,
                                 onWorld: bloomHook("screen") });
-  syncLayerPanel(lv);
+  // Debug > GPU sync: wait for the canvas to finish rasterising, so the
+  // pixel cost shows up as a number (prof.js).
+  if (P.prof.on && P.prof.gpuSync) P.span("gpu sync", () => ctx.getImageData(0, 0, 1, 1));
+  P.end();
+  P.span("layerPanel", () => syncLayerPanel(lv));
   debug.renderMs = performance.now() - t0;
+  P.end();
   if (sim && !clock.paused) redraw();
 }
 
@@ -1309,12 +1340,16 @@ function layerView() {
     dim = { rects, rows, cells };
   }
   let plainGate = null;     // the machines' map with no status colours, built once
+  let tintedGate = null;    // [status map, its tinted copy], for the status map of this tick
   const lv = {
     lists, labels, stats, dim, hidden: stats.hidden,
     // `status`: View > gate status colours' row -> rgb map, or null.
     gateTint(status) {
       if (!tints.size) return status;
       if (!status && plainGate) return plainGate;
+      // The status map is the same object for a whole tick (gateStatus()),
+      // so its tinted copy is too.
+      if (status && tintedGate?.[0] === status) return tintedGate[1];
       const out = new Map(status || []);
       for (const st of board.structs) {
         const tt = tints.get(board.layerOf(st.row));
@@ -1322,7 +1357,7 @@ function layerView() {
         const base = status?.get(st.row) || T.types[st.type].colour || [0.5, 0.5, 0.5];
         out.set(st.row, mix(base, tt.rgb, tt.k));
       }
-      if (!status) plainGate = out;
+      if (!status) plainGate = out; else tintedGate = [status, out];
       return out;
     },
     // `status`: View > belt status colours' (x, y) -> css, or null.
@@ -1507,11 +1542,25 @@ const layerActions = {
 // RUNNING (green) otherwise. Dangling outputs discard and never block.
 // The colours are the player's (View > status colours, panel.js).
 const hexRgb = (h) => [1, 3, 5].map(i => parseInt(h.slice(i, i + 2), 16) / 255);
+// Both are a function of the sim's state and the colours alone, so each is
+// worked out once per tick (Sim.version moves on every step and rebuild),
+// not once per frame: a whole-board pass, 2-3 ms a frame on a big board.
 // `s` is the sim to read (the live one, or a video's copy).
+const statusCache = new WeakMap();   // sim -> { gate: [key, value], belt: [key, value] }
+function cachedStatus(s, which, extra, make) {
+  s.sync();   // may rebuild, which moves the version
+  const key = `${s.version}|${JSON.stringify(statusColours)}|${extra}`;
+  let c = statusCache.get(s);
+  if (!c) statusCache.set(s, c = {});
+  if (c[which]?.[0] !== key) c[which] = [key, make()];
+  return c[which][1];
+}
 function gateStatus(s = sim) {
+  if (!s) return new Map();
+  return cachedStatus(s, "gate", "", () => gateStatusOf(s));
+}
+function gateStatusOf(s) {
   const out = new Map();
-  if (!s) return out;
-  s.sync();
   const STATUS_COL = { blocked: hexRgb(statusColours.gateBlocked), starved: hexRgb(statusColours.gateStarved), running: hexRgb(statusColours.gateRunning) };
   for (const g of s.gates) {
     const blocked = g.drains.some(c => s.outHeld(g.row, c));
@@ -1528,9 +1577,12 @@ function gateStatus(s = sim) {
 // otherwise (carrying, and moving). Returns (x, y) -> colour.
 function beltStatus(s = sim) {
   if (!s) return null;
+  return cachedStatus(s, "belt", view.beltActive !== false, () => beltStatusOf(s));
+}
+function beltStatusOf(s) {
   const BELT_STATUS_COL = { empty: statusColours.beltEmpty, stalled: statusColours.beltStalled, moving: statusColours.beltMoving };
   s.sync();
-  const F = s.forecast();
+  const F = P.span("forecast", () => s.forecast());   // shared with the items' animation (flow.js)
   const bySid = new Map();
   for (const seg of s.segments.values()) {
     let st = "moving";
@@ -3015,10 +3067,14 @@ function deleteLocal(name) {
   panel.setLocalSaves(listSaves());
 }
 
+// A bundled save is a file in saves/, or a presentation's board, named
+// `presentations/<name>.npz` (the picker lists both; see init()).
 async function loadBundled(name) {
-  const res = await fetch(`saves/${encodeURIComponent(name)}`);
+  const pres = /^presentations\/(.+)$/.exec(name);
+  const url = pres ? `presentations/${encodeURIComponent(pres[1])}` : `saves/${encodeURIComponent(name)}`;
+  const res = await fetch(url);
   if (!res.ok) throw new Error(`${name}: HTTP ${res.status}`);
-  await show(name, await res.arrayBuffer());
+  await show(pres ? pres[1] : name, await res.arrayBuffer());
 }
 
 function resetSim() {
@@ -3223,6 +3279,7 @@ async function init() {
     onLoadSave: (name) => loadBundled(name).catch(e => alert(e.message)),
     onOpenFile: () => fileInput.click(),
     onFit: () => { if (board) cam.frame(board.bounds); redraw(); },
+    onProfile: ({ profile, gpuSync }) => setProfiling(profile, gpuSync),
     onView: (v) => { view = v; syncScreen(); layersChanged(false); },
     onColours: (c) => { statusColours = c; redraw(); },
     onAudioEnable: (on) => setAudio(on),
@@ -3305,7 +3362,15 @@ async function init() {
     if (res.ok) saves = await res.json();
   } catch { /* no bundled saves */ }
   const first = saves.includes(DEFAULT_SAVE) ? DEFAULT_SAVE : saves[0];
-  panel.setSaves(saves, first);
+  // Presentations' boards too (web/presentations/, listed by build.sh), as
+  // plain boards to edit: the board only, none of the show's views.
+  let shows = [];
+  try {
+    const res = await fetch("presentations/index.json");
+    if (res.ok) shows = await res.json();
+  } catch { /* none */ }
+  panel.setSaves([...saves.map(n => ({ label: n, value: n })),
+                  ...shows.map(n => ({ label: `${n} (presentation)`, value: `presentations/${n}.npz` }))], first);
   // Pick up where the last session left off, if it saved anything.
   const resume = resumeSave();
   if (resume) await loadLocal(resume.name);

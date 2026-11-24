@@ -36,6 +36,13 @@ the repo root are not shipped -- they are the desktop's and the tests'
 fixtures (`check_web_sim.py`, the web tests and the desktop's profiling
 tools load them by name), so they stay where they are.
 
+Each presentation's board is in the picker too, after the bundled saves, as
+`<name> (presentation)` (`build.sh` writes `presentations/index.json`;
+`loadBundled()` takes `presentations/<name>.npz`). It loads as a plain board
+to edit: the board only, none of the show's views. **`test`** is one: a
+large, long-running board (3.4k machines, 16.5k belts, 1.6k undergrounds)
+kept as the renderer's profiling load -- see "Profiling a frame".
+
 ## Installing it, and offline
 
 The site is a **PWA**: `manifest.webmanifest` (name, standalone display,
@@ -409,7 +416,8 @@ panel's preferences; a stored key this build does not know is ignored.
 
 Below a divider, two sub-folders of **zoom thresholds**: the zoom (CSS px
 per cell) below which belts turn to solid squares (0 by default: never), and from which the grid,
-glyphs and Source values, ports, port edges and belt chevrons draw; and the
+glyphs and Source values, ports, port edges and belt chevrons draw, and
+from which items are ringed discs rather than plain squares (6); and the
 **text fades**, in px of text height (what legibility depends on) -- item
 numbers fading in between two values, and a label's text appearing from
 one. `render.js`'s `LOD` reads them live through getters.
@@ -1825,6 +1833,69 @@ replaces the board in front of you. Saving over an existing name asks first.
 reads them here, and loads them through the desktop's `persistence.load()`,
 asserting every array matches and exactly the edited value differs.
 
+## Profiling a frame
+
+**Debug > profile frames** shows a timing tree under the fps counter, a
+mean per frame over one-second windows ([prof.js](prof.js), after the
+desktop's `core/tick_profile.py`): `begin()`/`end()`/`span()` name nested
+spans (`paint/render/structs/ports`), and off they cost one boolean test.
+`window.gates.setProfiling(true)` and `gates.profText()` do the same from
+the console or a headless test.
+
+**These are main-thread CPU times.** Canvas 2D *records* draw calls there
+and rasterises them later, so a fill's pixel cost is in no span: `frame`
+(paint to paint) minus `paint` is idle, raster and compositing. **GPU sync**
+ends each render by reading one pixel back, which waits for the raster, and
+reports the wait as `render/gpu sync` -- honest, and it slows the frame, so
+it is its own switch.
+
+Measured on `test` (above), whole board on screen, playing at 30 tps,
+headless Chromium (software raster, so the raster numbers are not a
+phone's):
+
+| | before | after |
+|---|---|---|
+| 1280×800, DPR 1 | 50.7 ms/frame (JS 30) | **19.2** (JS 7.5) |
+| 412×915, DPR 2.6 | 58.4 (JS 31) | **34.5** (JS 8) |
+| zoomed in (19 px/cell) | 16.7 (JS 4.2) | 16.7 (JS 1.6) |
+
+What it took, each found by the tree:
+
+- **`closePath()` is quadratic in Chrome.** Its cost grows with the length
+  of the path it is called on, so n polygons closed with it cost O(n²):
+  3200 triangles took 40 ms against 2.4 ms closed with a `lineTo` back to
+  the start. The underground funnels alone were 17 ms of a whole-board
+  frame. **Never call it** on a batched path: `closePoly()` in render.js
+  (a `lineTo` to the first vertex and on to the second, so a stroke still
+  joins the corner). `arc()`, `rect()` and SVG `Z` in a `Path2D` string
+  are all linear.
+- **Status colours once per tick.** `gateStatus()` / `beltStatus()` are
+  cached on `Sim.version` and the colours, not recomputed per frame.
+- **The forecast rolls back with an undo log**, not a copy of the entity
+  table: `setF()` logs each value it replaces while a forecast runs. The
+  copy was 3.6 MB on a 32k-row board and three quarters of the forecast.
+- **Belts are culled before they are grouped by tint**, so a zoomed-in view
+  asks the tint about what is on screen, not all 16k belts.
+- **Machine bodies are one path per colour** (fill, then edge), not a
+  `fillRect` + `strokeRect` and two style changes per machine.
+- **Items below Dev > `item rings from` (6 px/cell) are plain squares** in
+  the ring's colour: a disc there is a pixel or two, and rects are far
+  cheaper than arcs to build and to rasterise.
+
+Tried and not kept: filling belt spines as rects instead of stroking them
+with round joins -- slower in this rasteriser, and unmeasurable on a phone
+from here. Solid-square belts (`solid belts below`) are slower too.
+
+What is left, zoomed out on a phone, is mostly **raster**: tens of
+thousands of sub-pixel shapes. The next steps, cheapest first: a
+far-zoom tier drawing the board as a bitmap at a few texels per cell
+(written from the grid, redrawn on an edit or a tick's status change, then
+one `drawImage`); and past that, the board in WebGL2 the way the desktop
+draws it -- the grid as an integer texture and one fragment pass, O(pixels)
+whatever the entity count -- with Canvas 2D kept on top for text, ghosts
+and editing marks. `itemPoints()` (flow.js, ~2 ms whole-board) is the
+largest JS span left.
+
 ## Rules
 
 - **No build step, no npm, no framework.** Plain ES modules and Canvas 2D
@@ -1847,7 +1918,8 @@ asserting every array matches and exactly the edited value differs.
   `redraw()`, which coalesces into one `requestAnimationFrame`; the only
   continuous frames are the ones advancing the clock. Every draw pass is one
   batched path per family, culled to the viewport, with detail gated on zoom
-  (`LOD` in `render.js`).
+  (`LOD` in `render.js`). No `closePath()` on a batched path (see
+  "Profiling a frame").
 - **The tick stays the desktop's CPU tick.** The closed-form belt transport
   and the simple gate prefilter are the only optimisations wanted. No wake
   lists, no folding, no GPU. A change to the desktop's tick semantics needs
@@ -1874,6 +1946,7 @@ asserting every array matches and exactly the edited value differs.
 | `audio-bake.js` | baking: a stretch of ticks rendered offline, and the WAV writer; loaded on demand |
 | `pixel.js` | the Pixel machine (web-only, in Sink's id), its screen, and the overlay's drawing |
 | `present.js` | presentation mode: the `#b=` route, its controls, the camera schedule, the info panel |
+| `prof.js` | Debug > profile frames: named spans, the per-frame timing tree |
 | `persist.js` | the one switch that stops every localStorage write (presentation mode) |
 | `presentations/` | presentation pairs, `<name>.json` + `<name>.npz`, copied into the site |
 | `video-params.js` | video export: the settings and the camera move; loaded always |
