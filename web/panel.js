@@ -110,29 +110,32 @@ export class Panel {
       board.addButton({ title: "Delete saved" }).on("click", () => this.local.saved && cb.onDeleteLocal(this.local.saved)),
     ];
 
-    this.view = { grid: false, ports: true, labels: true, seedTint: true, notes: true, momentum: true, items: true, belts: true, gates: true, gateStatus: true, sources: true, beltStatus: true, beltActive: true, statusGlow: 15, statusGlowTime: false, statusGlowS: 0.5, statusSluggish: 0, fps: false, pixelAlpha: 0, pixelMax: 8, pixelTextBg: true, layers: false, simpleView: false, truthiness: false, ...LOOK_DEFAULTS, ...this.prefs.view };
+    this.view = { grid: false, ports: true, labels: true, seedTint: true, notes: true, momentum: true, items: true, belts: true, gates: true, gateStatus: true, sources: true, beltStatus: true, beltActive: true, statusGlow: 15, statusGlowTime: false, statusGlowS: 0.5, statusSluggish: 0, fps: false, pixelAlpha: 0, pixelMax: 64, pixelTextBg: true, layers: false, simpleView: false, truthiness: false, ...LOOK_DEFAULTS, ...this.prefs.view };
     if (!/^#[0-9a-f]{6}$/i.test(this.view.bg)) this.view.bg = LOOK_DEFAULTS.bg;
     const view = this.pane.addFolder({ title: "View", expanded: false });
     this.viewBindings = [];
+    const pushView = () => {
+      if (this.applyingView) return;
+      this.prefs.view = { ...this.view };
+      savePrefs(this.prefs);
+      cb.onView({ ...this.view });
+    };
+    // Rarely changed, so they live in Dev > View instead (added there, below,
+    // in this order). Same keys and the same handler: only where they show.
+    const DEV_VIEW = new Set(["grid", "ports", "labels", "momentum", "beltActive", "pixelMax"]);
+    const devView = [];
     for (const [key, label] of [["grid", "grid lines"], ["ports", "ports"], ["labels", "source values"], ["seedTint", "seed tint"], ["notes", "labels (notes)"], ["momentum", "pan momentum"], ["items", "items"], ["belts", "belts"], ["gates", "gates"], ["gateStatus", "gate status colours"], ["beltStatus", "belt status colours"], ["beltActive", "stalled but moving: green"], ["truthiness", "truthiness colours"], ["sources", "sources"], ["fps", "fps counter"], ["layers", "layers"], ["simpleView", "simple view"]]) {
-      this.viewBindings.push(view.addBinding(this.view, key, { label }).on("change", () => {
-        if (this.applyingView) return;
-        this.prefs.view = { ...this.view };
-        savePrefs(this.prefs);
-        cb.onView({ ...this.view });
-      }));
+      if (DEV_VIEW.has(key)) { devView.push([key, label, {}]); continue; }
+      this.viewBindings.push(view.addBinding(this.view, key, { label }).on("change", pushView));
     }
     // The pixel overlay (pixel.js): how opaque the Pixels' screen is (0 is
     // off, and a Pixel's fire then records nothing), and the largest square
-    // a Pixel's Z may ask for, in cells each side of its centre.
+    // a Pixel's Z may ask for, in cells each side of its centre (64 by
+    // default: in practice a Pixel's own Z picks the size).
     for (const [key, label, opts] of [["pixelAlpha", "pixel overlay", { min: 0, max: 1, step: 0.01 }],
                                       ["pixelMax", "pixel max size", { min: 1, max: 64, step: 1 }]]) {
-      this.viewBindings.push(view.addBinding(this.view, key, { label, ...opts }).on("change", () => {
-        if (this.applyingView) return;
-        this.prefs.view = { ...this.view };
-        savePrefs(this.prefs);
-        cb.onView({ ...this.view });
-      }));
+      if (DEV_VIEW.has(key)) { devView.push([key, label, opts]); continue; }
+      this.viewBindings.push(view.addBinding(this.view, key, { label, ...opts }).on("change", pushView));
     }
     // A character pixel (V above 1) over a black square, or over the board.
     this.viewBindings.push(view.addBinding(this.view, "pixelTextBg", { label: "pixel text on black" }).on("change", () => {
@@ -243,9 +246,14 @@ export class Panel {
       if (!this.applyingAudio) cb.onAudio({ ...this.audio });
     };
     const audioBindings = this.audioBindings = [];
-    let agroup = audio;
+    // Rarely changed: shown in Dev > Audio > <their group> instead.
+    const DEV_AUDIO = new Set(["beltTrack", "trackRef"]);
+    const devAudio = [];   // [group title, key, label, opts]
+    let agroup = audio, agroupTitle = "";
     for (const [key, label, opts] of AUDIO_SPEC) {
+      if (DEV_AUDIO.has(key)) { devAudio.push([agroupTitle, key, label, opts]); continue; }
       if (key === "---") {
+        agroupTitle = label;
         agroup = audio.addFolder({ title: label, expanded: false });
         // Audio > advanced shows only while its switch is on.
         if (opts?.adv) { this.advFolder = agroup; agroup.hidden = !this.audio.advAudio; }
@@ -355,6 +363,11 @@ export class Panel {
     pres.addButton({ title: "Export presentation (.zip)" }).on("click", () => cb.onPresent("export"));
     this.updatePresentText();
 
+    // The Hack assembler: a full-screen editor (assembler.js). Its programs
+    // reach the board only through indexing's Hack… table.
+    const asm = this.pane.addFolder({ title: "Assembler", expanded: false });
+    asm.addButton({ title: "Open Hack editor" }).on("click", () => cb.onAssembler?.());
+
     // Dev: the tuned-by-eye numbers and the force-build switch. Persisted
     // with the rest of the panel's preferences.
     this.dev = { ...TUNE_DEFAULTS, ...(this.prefs.dev || {}) };
@@ -376,16 +389,26 @@ export class Panel {
       }
       devBindings.push(group.addBinding(this.dev, key, { label, ...(opts || {}) }).on("change", pushDev));
     }
+    // Controls moved here from other folders, kept under those folders'
+    // names. They are still View / Audio settings (presets, presentation
+    // views, Reset audio dials and saves treat them so); only the place
+    // they show is Dev's. Reset dials leaves them alone.
+    dev.addBlade({ view: "separator" });
+    const dview = dev.addFolder({ title: "View", expanded: false });
+    for (const [key, label, opts] of devView) {
+      this.viewBindings.push(dview.addBinding(this.view, key, { label, ...opts }).on("change", pushView));
+    }
+    const daudio = dev.addFolder({ title: "Audio", expanded: false });
+    const dgroups = {};
+    for (const [title, key, label, opts] of devAudio) {
+      const g = title ? (dgroups[title] ||= daudio.addFolder({ title, expanded: false })) : daudio;
+      audioBindings.push(g.addBinding(this.audio, key, { label, ...(opts || {}) }).on("change", pushAudio));
+    }
     dev.addButton({ title: "Reset dials" }).on("click", () => {
       Object.assign(this.dev, TUNE_DEFAULTS);
       for (const b of devBindings) b.refresh();
       pushDev();
     });
-
-    // The Hack assembler: a full-screen editor (assembler.js). Its programs
-    // reach the board only through indexing's Hack… table.
-    const asm = this.pane.addFolder({ title: "Assembler", expanded: false });
-    asm.addButton({ title: "Open Hack editor" }).on("click", () => cb.onAssembler?.());
 
     const dbg = this.pane.addFolder({ title: "Debug", expanded: false });
     dbg.addButton({ title: "Clear stamps" }).on("click", () => cb.onClearStamps());

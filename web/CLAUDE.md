@@ -136,18 +136,23 @@ Three things worth knowing:
   the desktop's panel/orchestrator split.
 
 The **Tweakpane** panel sits in the board's top-right corner, collapsed by
-default. It holds the saves, View toggles (grid -- off by default, ports, source values, seed
-tint -- the green/red wash on seeded belts, ghosts included -- labels, pan
-momentum, items, belts (placed belts and underground ends; a planned run's
+default. Top to bottom: Status, Board, View, Audio, Video, Presentation,
+Assembler, Dev, Debug. It holds the saves, View toggles (seed
+tint -- the green/red wash on seeded belts, ghosts included -- labels,
+items, belts (placed belts and underground ends; a planned run's
 ghost still draws), gates (every machine, Sources included -- for a brief
 look at the belts underneath; still there and still tappable, and items
 held inside a machine still draw: View > items hides those), sources
 (hidden, not removed), **gate status colours** and **belt status
-colours** (both on by default, belts with "stalled but moving: green"), a **status
+colours** (both on by default), a **status
 colours** folder of pickers for both, and an **fps counter** -- frames and
 ticks per second actually reached, over half-second windows, top-left of
-the board under the sound button), Debug, and
-the Status folder. Tweakpane is **vendored** (`vendor/`, MIT) rather than
+the board under the sound button), Dev, Debug, and
+the Status folder. **The rarely changed View and Audio controls live in
+Dev** -- grid lines (off by default), ports, source values, pan momentum,
+stalled but moving: green and pixel max size under **Dev > View**, and
+Audio's follow tick rate and at tick rate under **Dev > Audio > belts** --
+in sub-folders named after where they came from (see "The Dev folder"). Tweakpane is **vendored** (`vendor/`, MIT) rather than
 pulled from a CDN, which keeps the no-build, works-offline property. Status
 writes the same row fields the desktop's Status window does, plus the
 seed's `.z` bits, so a save edited here reads correctly there.
@@ -211,7 +216,7 @@ panel.js); a stored key this build does not know, or a value that is not a
 **Belt status colours** do the same for belts, per run (segment), in
 `beltStatus()`: **red** empty; **yellow** stalled -- holding items, none of
 them moving and nothing pushed or popped lately; **green** moving.
-**Stalled but moving: green** (on by default) counts the whole run: a push,
+**Stalled but moving: green** (Dev > View, on by default) counts the whole run: a push,
 a pop, or any item still closing up. Off, only the head counts -- a run is
 stalled once its head reaches the end and sits there, whatever is still
 packing behind it. Underground ends take their run's colour too, and the
@@ -323,7 +328,7 @@ synth applying no flips, each fails it.
 A one-finger pan released while moving keeps gliding, slowing exponentially
 (`camera.js`: time constant 325 ms, about iOS's own feel). The release
 velocity is measured over the pan's last 90 ms, so a finger that stopped
-before lifting does not fling; any touch catches the glide. View > **pan
+before lifting does not fling; any touch catches the glide. Dev > View > **pan
 momentum** turns it off.
 
 ### Labels
@@ -526,6 +531,17 @@ Source value's size, grid opacity, ghost opacity, and the tap margin round
 a ghost or a run's tip. Scales multiply the shipped value, so 1 is always
 "as shipped", and **Reset dials** puts them all back. They persist with the
 panel's preferences; a stored key this build does not know is ignored.
+
+**It also holds controls moved out of other folders because they are
+rarely changed**, under sub-folders named for where they came from, so
+their grouping reads the same: **Dev > View** (grid lines, ports, source
+values, pan momentum, stalled but moving: green, pixel max size) and **Dev
+> Audio > belts** (follow tick rate, at tick rate). Only where they show
+moved: they are still View and Audio settings, under the same keys, so
+presets, presentation views, saves and Reset audio dials treat them as
+before, and Reset dials leaves them alone. Moving another one is a
+line in panel.js (`DEV_VIEW` / `DEV_AUDIO`); its sub-folder is made from
+the group it was in. The Dev folder sits just above Debug.
 
 Below a divider, two sub-folders of **zoom thresholds**: the zoom (CSS px
 per cell) below which belts turn to solid squares (0 by default: never), and from which the grid,
@@ -847,7 +863,8 @@ stamps naming "sink" resolve through `T.aliases` (`typeByName()`).
   exported machine's ports from its authored ones.
 - **A fire sets its pixel**: hue H in turns (wrapping), saturation S and
   value V clamped to 0..1, NaN as 0. **Z is the size**: 0 or less draws
-  nothing; above 0, `round(Z)` clamped to 1..View > pixel max size, as half
+  nothing; above 0, `round(Z)` clamped to 1..Dev > View > pixel max size (64 by default: in practice
+  the Pixel's own Z sets the size), as half
   the side in cells -- Z = 1 covers exactly the machine (2x2), Z = 2 a 4x4,
   centred on the machine's centre, which is always a grid corner, so every
   square sits on the grid.
@@ -1577,7 +1594,8 @@ What sounds:
   default) scales them by (length / 10)^s, so at 1 a 20-tile run is twice
   as slow and a 5-tile one twice as quick. Per voice (`envFor()`), set on
   allocation and on any dial change, so a sounding voice follows it.
-  **Follow tick rate** scales the pitch by (rate / reference)^track; 0
+  **Follow tick rate** (Dev > Audio > belts, with its reference, **at
+  tick rate**) scales the pitch by (rate / reference)^track; 0
   (the default) keeps it fixed.
 - **A gate fire is a click**: an impulse into a two-pole resonator (tone,
   decay), per group -- **0: Swap, Route, Merge; 1: everything else**;
