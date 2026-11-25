@@ -29,7 +29,7 @@
 //   { type: "params", p }   the panel's dials
 //   { type: "stop" }        paused: drop the queue, release everything
 
-import { AUDIO_DEFAULTS, VOICE_LIMIT_MAX, beltsMuted } from "./audio-params.js";
+import { AUDIO_DEFAULTS, VOICE_LIMIT_MAX, GATE_REF_RATE, beltsMuted } from "./audio-params.js";
 import { scaleTable, scaleHz } from "./scale.js";
 
 const TABLE = 2048;
@@ -577,11 +577,16 @@ export class GatesSynth {
       for (let v = 0; v < this.nv; v++) if (this.vSeg[v] >= 0) this.vInc[v] = this.pitch(this.vSeg[v]) / this.sr;
     }
     const p = this.p, norm = p.norm;
-    this.clicks(0, b.f0[k] * p.g0Gain / Math.pow(Math.max(1, this.groups[0]), norm), b.f0[k]);
-    this.clicks(1, b.f1[k] * p.g1Gain / Math.pow(Math.max(1, this.groups[1]), norm), b.f1[k]);
+    // Gates at steady loudness: clicks land at random times, so their power
+    // adds and a gate's loudness (RMS) grows as the square root of the
+    // tick rate. Scaling by sqrt(GATE_REF_RATE / rate) holds it where it
+    // is at 30 tps (measured: tests/audio.test.mjs).
+    const st = p.gateSteady ? Math.sqrt(GATE_REF_RATE / Math.max(this.rate, 1e-3)) : 1;
+    this.clicks(0, st * b.f0[k] * p.g0Gain / Math.pow(Math.max(1, this.groups[0]), norm), b.f0[k]);
+    this.clicks(1, st * b.f1[k] * p.g1Gain / Math.pow(Math.max(1, this.groups[1]), norm), b.f1[k]);
     if (p.truthAudio && b.f0F) {
-      this.clicks(0, b.f0F[k] * p.g0GainF / Math.pow(Math.max(1, this.groups[0]), norm), b.f0F[k], 1);
-      this.clicks(1, b.f1F[k] * p.g1GainF / Math.pow(Math.max(1, this.groups[1]), norm), b.f1F[k], 1);
+      this.clicks(0, st * b.f0F[k] * p.g0GainF / Math.pow(Math.max(1, this.groups[0]), norm), b.f0F[k], 1);
+      this.clicks(1, st * b.f1F[k] * p.g1GainF / Math.pow(Math.max(1, this.groups[1]), norm), b.f1F[k], 1);
       this.flips(b, k, k + 1);
     }
     const W = this.beltsMuted ? 0 : this.words, off = k * this.words, prev = this.prev, bits = b.bits;

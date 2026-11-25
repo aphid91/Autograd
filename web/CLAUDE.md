@@ -1605,6 +1605,24 @@ What sounds:
   decay), per group -- **0: Swap, Route, Merge; 1: everything else**;
   Sources are silent (`audioGroupOf()`). Only the per-tick **count** per
   group crosses threads, so fires cost the same on any board.
+- **Gates: steady loudness** (a switch at the top of Audio, off by
+  default). Fires land at random times, so their power adds and the gates
+  get louder as the square root of the tick rate -- about +31 dB from 30
+  to 40k tps -- which buries the belts at high rates. On, both groups'
+  gain is scaled by `sqrt(GATE_REF_RATE / rate)` (`GATE_REF_RATE` = 30,
+  in audio-params.js), so **30 tps sounds exactly the same either way**
+  (tested sample for sample) and the clicks hold their level as the rate
+  climbs. Applied per tick in `nextTick()` from that tick's own rate, so
+  bakes and video soundtracks follow it too. Measured at the default dials
+  (jitter 1, 3 ms decay): within about ±1.3 dB from 30 to 3k tps, and -5
+  to +3 dB at 10k-100k. It is a law, not a meter, so it drifts where the
+  clicks stop behaving as random: many fires per tick at 40k tps (a tick
+  is then about one sample, and clicks on one sample add in amplitude: up
+  to +9 dB), a low tone or a long decay (a narrow resonator hears a dense
+  jittered stream less: up to -11 dB), and jitter 0 (a strictly periodic
+  buzz, whose loudness depends on how the rate lines up with the tone). A
+  correction from the jittered stream's spectrum (`1 - sinc^2`) was tried
+  and overcorrected badly at high rates, so the plain law stays.
 - **Click timing** (a sub-folder; `clicks()` in audio-dsp.js). **Jitter**
   (ticks, 0..4, default 1): at 0 a group's fires in one tick are a single
   impulse at the tick's start -- many fires only louder, and a buzz at the

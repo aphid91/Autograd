@@ -37,6 +37,10 @@ export const AUDIO_DEFAULTS = {
   voiceLimit: 256,      // belt voices at once
   // Gate fires, two groups (Sources are always silent): a click, a short
   // damped resonance per fire. Same sound for both until they diverge.
+  // Gates at steady loudness: their gain x sqrt(GATE_REF_RATE / tick rate),
+  // so a faster sim does not make the clicks louder (see audio-dsp.js
+  // nextTick()). At 30 tps it changes nothing.
+  gateSteady: false,
   g0Gain: 1,            // Swap, Route, Merge
   g0Tone: 1800,
   g0DecayMs: 3,
@@ -98,6 +102,7 @@ export const AUDIO_SPEC = [
   ["fadeMs", "fade in ms", { min: 0, max: 10000, step: 10 }],
   ["truthAudio", "truthiness"],
   ["advAudio", "advanced audio"],
+  ["gateSteady", "gates: steady loudness"],
   ["---", "belts"],
   ["beltGain", "gain", { min: 0, max: 4, step: 0.01 }],
   ["beltMaxHz", "min-length Hz", { min: 50, max: 8000, step: 10 }],
@@ -177,6 +182,9 @@ export const AUDIO_SPEC = [
 // Belts silent whatever happens: their gain is 0, and with truthiness on the
 // falsy one too. The recorder then records no run at all and the synth keeps
 // no voices -- each would only ever have added exactly 0.0.
+// The tick rate at which "gates: steady loudness" changes nothing.
+export const GATE_REF_RATE = 30;
+
 export const beltsMuted = (p) => !(p.beltGain > 0) && !(p.truthAudio && p.beltGainF > 0);
 
 export function eligibleRuns(sim, minLen, maxLen, selection = null) {

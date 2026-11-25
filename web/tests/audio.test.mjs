@@ -737,3 +737,37 @@ test("unmuting the belts voices the runs active at that moment", { skip: !exists
   assert.equal(back.s.active, ref.s.active, "the same runs active as a synth that was never muted");
   assert.equal([...back.s.prev].join(), [...ref.s.prev].join(), "the same bits");
 });
+
+// Audio > gates: steady loudness. Fires land at random times, so their power
+// adds and a gate's loudness grows as the square root of the tick rate; the
+// switch scales the gates' gain by sqrt(30 / rate), so 30 tps is unchanged.
+function gateRms(params, rate, fires) {
+  const s = new GatesSynth(SR, { offline: true });
+  s.message({ type: "params", p: { ...AUDIO_DEFAULTS, softClip: false, ...params } });
+  s.message({ type: "config", lengths: new Float64Array([]), groups: [0, 8] });
+  const out = new Float32Array(SR * 2), n = Math.round(rate * 2) + 2;
+  s.message({ type: "ticks", n, words: 0, rate, bits: new Uint32Array(0), f0: new Uint16Array(n), f1: new Uint16Array(n).fill(fires) });
+  for (let i = 0; i < out.length; i += 128) s.render(out.subarray(i, i + 128), 128);
+  let e = 0;
+  for (let i = SR / 2; i < out.length; i++) e += out[i] * out[i];
+  return Math.sqrt(e / (out.length - SR / 2));
+}
+const dB = (a, b) => 20 * Math.log10(a / b);
+
+test("gates: steady loudness changes nothing at 30 tps", { skip: !existsSync(save) }, async () => {
+  const on = await streamed({ ...AUDIO_DEFAULTS, gateSteady: true }, 30);
+  const off = await streamed({ ...AUDIO_DEFAULTS, gateSteady: false }, 30);
+  assert.ok(off.out.some(x => x !== 0), "something sounded");
+  assert.equal(on.out.findIndex((x, i) => x !== off.out[i]), -1, "the same samples at 30 tps");
+});
+
+test("gates: steady loudness holds the clicks' level as the tick rate climbs", () => {
+  const base = gateRms({ gateSteady: true }, 30, 2), raw = gateRms({}, 30, 2);
+  for (const rate of [100, 300, 1000, 3000, 10000, 40000]) {
+    const steady = dB(gateRms({ gateSteady: true }, rate, 2), base);
+    assert.ok(Math.abs(steady) < 6, `${rate} tps: ${steady.toFixed(1)} dB from 30 tps with the switch on`);
+  }
+  // ...where without it they climb (about +31 dB from 30 to 40k tps).
+  const loud = dB(gateRms({}, 40000, 2), raw);
+  assert.ok(loud > 20, `without the switch 40k tps is ${loud.toFixed(1)} dB louder`);
+});
