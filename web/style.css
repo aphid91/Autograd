@@ -697,9 +697,9 @@ html, body {
 .numsw.pos .swb { border-color: #4d9a58; }
 .numsw.neg .swb { border-color: #b2504a; }
 /* An ASCII source's swatches: characters, not numbers, in lime. */
-.numsw .num.chr { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; color: #b8f060; font-size: calc(11 * var(--u)); }
+.numsw .num.chr { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; color: #a9c47c; font-size: calc(11 * var(--u)); }
 /* The button that turns a Source into an ASCII source and back. */
-.convsrc .conv-art { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-weight: 700; font-size: calc(13 * var(--u)); color: #b8f060; line-height: 1; }
+.convsrc .conv-art { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-weight: 700; font-size: calc(13 * var(--u)); color: #a9c47c; line-height: 1; }
 
 /* ----------------------------------------------------------------------
    THE RATE PANEL: ticks per second, floated just above the Sim section.
@@ -1257,11 +1257,15 @@ html, body {
 .rate-slider-val { min-width: 44px; text-align: center; font-variant-numeric: tabular-nums; }
 
 /* Typing into a keyboard machine (keycapture.js): the field that takes the
-   keys is there to be focused, never seen. 16px so iOS does not zoom. */
+   keys is there to be focused, never seen. 16px so iOS does not zoom.
+   At the TOP of the screen: a phone scrolls the caret into view on the
+   first keystroke, and a field at the bottom sat behind its keyboard, so
+   the whole page panned up and the bar rose above the keyboard. Up here
+   the caret is always in view and nothing moves. */
 .keycap {
-  position: fixed; left: 0; bottom: 0; width: 1px; height: 1px;
+  position: fixed; left: 0; top: 0; width: 1px; height: 1px;
   opacity: 0; pointer-events: none; font-size: 16px; resize: none;
   border: 0; padding: 0; margin: 0; overflow: hidden;
 }
-.kbdtype[data-on="true"] { color: #e8d6a8; border-color: #c8b88a; }
+.kbdtype[data-on="true"] { color: #cbbd99; border-color: #a89b7c; }
 .kbdinfo { text-transform: none; letter-spacing: 0; }

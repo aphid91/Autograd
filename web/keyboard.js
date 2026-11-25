@@ -19,7 +19,7 @@ import { placePorts } from "./pixel.js";
 export const KEYBOARD_TYPE = 13;
 const FOOTPRINT = [5, 3];
 const OUT = [[2, 2, 1]];   // [lx, ly, face] at facing +X: north face, middle top cell
-export const KEYBOARD_COLOUR = [0.84, 0.77, 0.62];
+export const KEYBOARD_COLOUR = [0.62, 0.57, 0.46];
 // A press queued past this many waiting tokens is dropped.
 export const KEY_QUEUE_MAX = 256;
 

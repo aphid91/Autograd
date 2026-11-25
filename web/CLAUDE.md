@@ -934,7 +934,8 @@ board, the picker, the index preview and the keyboard; tested in
   `Board.setAscii()` patches the render list in place and bumps
   `board.styleRev` (part of the undo key, so an undo step and an autosave)
   -- no `derive()`, and the simulation runs on.
-- **Drawing**: lime (`ASCII_COLOUR`) where a Source is light blue, and the
+- **Drawing**: a muted lime (`ASCII_COLOUR`, at about the Source's own
+  saturation and brightness) where a Source is light blue, and the
   value's character where a Source shows its number: printable ones as
   themselves (a space as `␣`), control codes and DEL as their Unicode
   control pictures (`␊` a newline, `␈` backspace), and anything that is not
@@ -1021,7 +1022,18 @@ per tick at most, holding the rest under back pressure.
   backspace always has something to delete, and is reset after each press
   but never mid-composition. The app's shortcuts ignore keys in a text
   field, so Space types a space; a `mousedown` on any button is kept from
-  taking the focus, so Play or Reset does not drop the phone's keyboard.
+  taking the focus, so Play or Reset does not drop the phone's keyboard --
+  and so is one on the board canvas, which is what made the tap on the
+  keyboard work on a phone at all: the field was focused on touch-up and the
+  browser's synthesized mousedown on the canvas took the focus straight
+  back, so only the Type button raised the keyboard. A board tap still ends
+  typing, through the Hand (another entity or bare board blurs the field).
+  **The field sits at the top of the screen**, not the bottom: a phone
+  scrolls the caret into view on the first keystroke, and a field behind
+  its keyboard made the whole page pan up and the bar rise above the
+  keyboard. Up there nothing needs scrolling; a page scroll that happens
+  anyway is undone on each keystroke. The bar belongs behind the phone's
+  keyboard while typing; deselecting the keyboard closes it.
   The Hand's bar shows **Type / Typing** (tap to raise the keyboard again)
   and the last code and how many are waiting.
 

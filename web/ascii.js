@@ -124,8 +124,10 @@ export function keyCode(ev) {
   return c;
 }
 
-// An ASCII source's body: lime, where a plain Source is light blue.
-export const ASCII_COLOUR = [0.6, 0.86, 0.2];
+// An ASCII source's body: lime, where a plain Source is light blue -- at
+// about the Source's own saturation and brightness (0.3 and 0.6 there; 0.45
+// and 0.62 here), so it reads as a sibling rather than a highlight.
+export const ASCII_COLOUR = [0.5, 0.62, 0.34];
 
 // What a phone keyboard typed, from a text field's value before and after
 // one `input` event: phone keyboards report no usable keys (Android sends

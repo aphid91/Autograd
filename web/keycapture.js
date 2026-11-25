@@ -53,16 +53,22 @@ export class KeyCapture {
       for (const c of textDiff(this.prev, now)) this.onCode(c);
       this.prev = now;
       if (!this.composing) this.settle();
+      // Should a browser scroll the page for the caret anyway, put it back:
+      // the bar belongs behind the phone's keyboard while typing.
+      if (window.scrollX || window.scrollY) window.scrollTo(0, 0);
     });
     t.addEventListener("blur", () => { this.composing = false; this.reset(); onState(); });
     t.addEventListener("focus", () => onState());
     // A tap on a button -- Play, Reset, the rate, the Type button -- must
     // not take the keys away: on a phone that would also drop the on-screen
     // keyboard. The focus moves on mousedown, so that is what is stopped;
-    // the button still gets its click. A tap on the board does move it,
-    // and the Hand then decides (main.js inspect()).
+    // the button still gets its click. Nor a tap on the board: the Hand
+    // decides that one (main.js inspect(): another entity or bare board
+    // ends typing). On a phone this is what made tapping the keyboard work
+    // at all -- the tap focused the field on touch-up, and the browser's
+    // synthesized mousedown on the canvas that follows took it straight back.
     document.addEventListener("mousedown", (e) => {
-      if (this.active && e.target instanceof Element && e.target.closest("button")) e.preventDefault();
+      if (this.active && e.target instanceof Element && e.target.closest("button, canvas")) e.preventDefault();
     }, true);
     document.body.append(t);
   }
