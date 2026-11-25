@@ -16,7 +16,7 @@ import { assemble, asciiCodes } from "./hack.js";
 import { listPrograms, getProgram } from "./hackstore.js";
 import { PALETTE, SIZE_NAMES, css as noteCss } from "./notes.js";
 import { persistEnabled } from "./persist.js";
-import { loadRecent, saveRecent, pushRecent, parseValue, valueText, nameOf, isAscii } from "./ascii.js";
+import { loadRecent, saveRecent, pushRecent, parseValue, valueText, nameOf } from "./ascii.js";
 
 const STORE_KEY = "gates.web.shell.v1";
 const LONG_PRESS_MS = 500;   // as sand mode
@@ -957,7 +957,7 @@ export class Shell {
     grid.className = "numgrid";
     for (const v of values) {
       // An ASCII source's swatches show characters.
-      const shown = ascii && isAscii(v) && v === Math.floor(v) ? (v > 32 && v < 127 ? String.fromCharCode(v) : nameOf(v)) : String(v);
+      const shown = ascii ? valueText(v, true) : String(v);
       const esc = shown.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
       const sw = this.swatch({
         art: `<span class="num${ascii ? " chr" : ""}">${esc}</span>`, name: shown, cls: `numsw ${v > 0 ? "pos" : "neg"}`,

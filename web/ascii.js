@@ -39,6 +39,19 @@ export function glyphOf(v) {
 
 export const NULL_GLYPH = "□";
 
+// A negated character: a negative value whose magnitude is ASCII shows as
+// "-" and that character's glyph, so -70 is "-F" (and -70.5, by its whole
+// part, too). Anything else as glyphOf().
+export function signedGlyph(v) {
+  if (v < 0) { const g = glyphOf(-v); return g === null ? null : `-${g}`; }
+  return glyphOf(v);
+}
+
+// Is `v` a character or a negated one -- something an ASCII source can show?
+export function isSignedAscii(v) {
+  return isAscii(v) || (v < 0 && isAscii(-v));
+}
+
 // Readable text for a list or a preview: 'A', '\n', ' ', ...
 export function nameOf(v) {
   const c = codeOf(v);
@@ -51,9 +64,10 @@ export function nameOf(v) {
 
 // What the custom value box means by `text` (trimmed; "," read as "."):
 //   on an ASCII source, a single character is that character, so "5" is 53
-//   and "=" is 61, and anything longer is a number ("-1", "53");
+//   and "=" is 61, "-" and a character is that character negated ("-F" is
+//   -70, "-5" is -53), and anything longer is a number ("-12", "53");
 //   on a plain Source (or a belt), a number is a number, and a single
-//   character that is not one is its code, so "=" is 61.
+//   character that is not one is its code, so "=" is 61 and "-=" is -61.
 // Returns the number, or null when the text means nothing.
 export function parseValue(text, ascii) {
   const raw = String(text);
@@ -62,16 +76,21 @@ export function parseValue(text, ascii) {
   const t = raw.trim();
   if (!t) return null;
   const chars = Array.from(t);
+  // "-" before a character negates it ("- " is minus a space).
+  const neg = raw.trimStart().startsWith("-") && Array.from(raw.trimStart()).length === 2 ? Array.from(raw.trimStart())[1] : null;
+  if (ascii && neg !== null) return -neg.codePointAt(0);
   if (ascii && chars.length === 1) return chars[0].codePointAt(0);
   const v = Number(t.replace(",", "."));
   if (Number.isFinite(v)) return v;
   if (chars.length === 1) return chars[0].codePointAt(0);
+  if (neg !== null) return -neg.codePointAt(0);
   return null;
 }
 
 // The value as the box shows it: an ASCII source's character when it has
 // one (a control code by its name), otherwise the number.
 export function valueText(v, ascii, fmt = String) {
+  if (ascii && v < 0 && isAscii(-v) && v === Math.ceil(v)) return `-${valueText(-v, true, fmt)}`;
   if (ascii && isAscii(v) && v === codeOf(v)) {
     const c = codeOf(v);
     return c > 32 && c < 127 ? String.fromCharCode(c) : nameOf(c);

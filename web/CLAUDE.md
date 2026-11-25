@@ -938,9 +938,11 @@ board, the picker, the index preview and the keyboard; tested in
   saturation and brightness) where a Source is light blue, and the
   value's character where a Source shows its number: printable ones as
   themselves (a space as `␣`), control codes and DEL as their Unicode
-  control pictures (`␊` a newline, `␈` backspace), and anything that is not
-  ASCII -- -78.3584, say, which an ASCII source is allowed to emit -- as
-  the **null glyph**, a hollow box. With gate status colours on (the
+  control pictures (`␊` a newline, `␈` backspace), a **negated character**
+  -- a negative value whose magnitude is ASCII -- as `-` and that character
+  (`-70` is `-F`, `signedGlyph()`), and anything else -- -200.5, say,
+  which an ASCII source is allowed to emit -- as the **null glyph**, a
+  hollow box. With gate status colours on (the
   default) the status colour wins, as it does over every machine's own
   colour; the character still says which it is.
 - **While the Hand has an ASCII source inspected**, every value whose whole
@@ -952,10 +954,14 @@ board, the picker, the index preview and the keyboard; tested in
   `gates.web.asciiRecent.v1`; picks only -- indexing does not count),
   starting from space, `A`, `0`, `\n`, `.`, `-`; drawn as characters. The
   value box reads a single character as that character (`5` is 53, `=`
-  is 61) and longer text as a number (`-1`, `53`), and shows a character
-  value as the character. On a **plain** Source the box reads a number as a
+  is 61), **`-` and one character as that character negated** (`-F` is -70,
+  `-5` is -53, `- ` minus a space; a lone `-` is still the minus sign, 45),
+  and longer text as a number (`-12`, `53`), and shows a character value as
+  the character and a negated one as `-F`. So -1 .. -9 cannot be typed as
+  numbers on an ASCII source (`-1` is minus `'1'`, -49): convert it to a
+  plain Source for those. On a **plain** Source the box reads a number as a
   number and a lone non-number character as its code, so `=` gives 61 and
-  shows as 61. A **Number / ASCII** button converts the inspected Source to
+  shows as 61, and `-=` gives -61. A **Number / ASCII** button converts the inspected Source to
   the other kind. The placing bar has the same swatches, box and button for
   the tool.
 - **The tool**: "ASCII source" in the slot picker (a `structure` slot of
@@ -966,10 +972,10 @@ board, the picker, the index preview and the keyboard; tested in
   Sources: ticked, every indexed Source becomes an ASCII source; unticked,
   a plain one; a mixed set starts indeterminate, each keeping its kind
   until the box is touched. Ticking the Hack table's ASCII stream ticks it
-  too. With it on, values whose whole part is outside 0..127 are warned
-  about in the preview and in a toast on Apply -- allowed, shown as the
-  null glyph -- except the stream's end-of-stream -1s, which are
-  deliberate.
+  too. With it on, values that are neither a character (whole part 0..127)
+  nor a negated one are warned about in the preview and in a toast on
+  Apply -- allowed, shown as the null glyph. (The stream's end-of-stream
+  -1s are negated characters, so they pass.)
 
 ### The keyboard
 

@@ -88,7 +88,7 @@ function emitSize(s, z) {
 const emitShown = (s, z, labels) => s.emit !== null && labels && z >= LOD.marks;
 
 import { structGlyph } from "./glyphs.js";
-import { glyphOf, isPrintable, NULL_GLYPH, ASCII_COLOUR } from "./ascii.js";
+import { glyphOf, signedGlyph, isPrintable, NULL_GLYPH, ASCII_COLOUR } from "./ascii.js";
 import { wrapLabel } from "./layers.js";
 import { TUNE } from "./tune.js";
 import { itemPoints } from "./flow.js";
@@ -119,7 +119,7 @@ const FULL_INT_LIMIT = 2 ** 24;
 // Sources' values and the items' numbers alike.
 let charMode = false;
 function sourceText(s) {
-  if (s.ascii) return glyphOf(s.emit) ?? NULL_GLYPH;
+  if (s.ascii) return signedGlyph(s.emit) ?? NULL_GLYPH;
   return valueText(s.emit);
 }
 function valueText(v) {

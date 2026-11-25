@@ -2483,8 +2483,9 @@ function indexPreview(o) {
   const asciiOut = o.asciiSources ?? (sources.ascii && !sources.mixed);
   // ASCII: each code with the character it is, so the stream can be read.
   const stream = o.kind === "hack" && o.ascii;
+  const name = (v) => nameOf(v) ?? (v < 0 && nameOf(-v) ? `-${nameOf(-v)}` : null);
   const chr = (v, src) => (v === DEFAULT ? "" : stream && v === END_OF_STREAM ? "  end"
-    : (stream || (asciiOut && src)) && nameOf(v) ? `  ${nameOf(v)}` : "");
+    : (stream || (asciiOut && src)) && name(v) ? `  ${name(v)}` : "");
   const lines = list.slice(0, 12).map(({ e }, n) => `#${n}  ${e.type === "source" ? "Source" : "belt  "}  ${fmt(values[n])}${chr(values[n], e.type === "source")}`);
   if (list.length > 12) lines.push(`… and ${list.length - 12} more`);
   if (o.kind === "hack" && o.ascii) {
@@ -2505,7 +2506,7 @@ function indexPreview(o) {
   // but said. The stream's end-of-stream -1s are deliberate, so exempt.
   const bad = asciiOut ? nonAscii(list, values, stream) : 0;
   return { n: list.length, text: lines.join("\n"), sources,
-           warning: bad ? `${bad} Source${bad === 1 ? "" : "s"} would get a value that is not an ASCII character (0..127): ${bad === 1 ? "it shows" : "they show"} a hollow box.` : null };
+           warning: bad ? `${bad} Source${bad === 1 ? "" : "s"} would get a value that is not an ASCII character (0..127) or a negated one: ${bad === 1 ? "it shows" : "they show"} a hollow box.` : null };
 }
 
 // How many indexed Sources get a value whose whole part is outside 0..127,
@@ -2517,7 +2518,8 @@ function nonAscii(list, values, stream) {
     if (e.type !== "source") return;
     const x = v === DEFAULT ? 0 : v;
     if (stream && x === END_OF_STREAM) return;
-    if (!isAscii(x)) n++;
+    // A negated character shows as "-F": no hollow box, no warning.
+    if (!isAscii(x) && !isAscii(-x)) n++;
   });
   return n;
 }

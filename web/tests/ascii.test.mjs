@@ -9,7 +9,7 @@ import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 import { Board, F_ASCII } from "../board.js";
 import { Sim } from "../sim.js";
-import { isAscii, isPrintable, glyphOf, NULL_GLYPH, parseValue, valueText, pushRecent, keyCode, nameOf, textDiff } from "../ascii.js";
+import { isAscii, isPrintable, glyphOf, signedGlyph, NULL_GLYPH, parseValue, valueText, pushRecent, keyCode, nameOf, textDiff } from "../ascii.js";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const root = join(here, "..", "..");
@@ -37,7 +37,7 @@ test("the value box: a character on an ASCII source, a number elsewhere", () => 
   assert.equal(parseValue("=", true), 61);
   assert.equal(parseValue("5", true), 53);
   assert.equal(parseValue("53", true), 53);
-  assert.equal(parseValue("-1", true), -1);
+  assert.equal(parseValue("-1", true), -49, "minus the character '1' (a negated character beats a number)");
   assert.equal(parseValue(" ", true), 32, "a lone space is a space");
   // Plain Source: numbers are numbers, a lone non-number its code.
   assert.equal(parseValue("5", false), 5);
@@ -45,6 +45,20 @@ test("the value box: a character on an ASCII source, a number elsewhere", () => 
   assert.equal(parseValue("2,5", false), 2.5);
   assert.equal(parseValue("abc", false), null);
   assert.equal(parseValue("", false), null);
+  // "-" and a character: that character negated.
+  assert.equal(parseValue("-F", true), -70);
+  assert.equal(parseValue("-5", true), -53, "on an ASCII source, as 5 is 53");
+  assert.equal(parseValue("- ", true), -32, "minus a space");
+  assert.equal(parseValue("-", true), 45, "a lone minus is the minus sign");
+  assert.equal(parseValue("-12", true), -12, "longer is still a number");
+  assert.equal(parseValue("-=", false), -61, "on a plain Source too");
+  assert.equal(parseValue("-5", false), -5, "where a number stays a number");
+  assert.equal(signedGlyph(-70), "-F");
+  assert.equal(signedGlyph(-70.5), "-F", "by the whole part of the magnitude");
+  assert.equal(signedGlyph(-200), null, "not a negated character: the null glyph");
+  assert.equal(valueText(-70, true), "-F");
+  assert.equal(valueText(-10, true), "-\\n");
+  assert.equal(valueText(-70, false), "-70");
   // Shown back: the character on an ASCII source, the number otherwise.
   assert.equal(valueText(61, true), "=");
   assert.equal(valueText(61, false), "61");
