@@ -3,6 +3,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { DEFAULT, naturalOrder, parseTable, tableValues, finalValues } from "../indexer.js";
+import { asciiCodes, END_OF_STREAM } from "../hack.js";
 
 test("natural order is left to right, rows from the bottom up", () => {
   const items = [{ x: 5, y: 2 }, { x: 1, y: 2 }, { x: 9, y: 0 }, { x: 0, y: 7 }];
@@ -54,4 +55,14 @@ test("position order: transpose and the two reversals reach all eight readings",
 test("a hack program fills from the start, pads with 0 and is cut when long", () => {
   assert.deepEqual(tableValues("hack", 5, { file: [7, 64528] }), [7, 64528, 0, 0, 0]);
   assert.deepEqual(tableValues("hack", 2, { file: [1, 2, 3] }), [1, 2]);
+});
+
+test("ascii: the text's character codes, then -1 for ever", () => {
+  const codes = asciiCodes("Hi\r\n@1 // x\n");
+  assert.deepEqual(codes, [72, 105, 10, 64, 49, 32, 47, 47, 32, 120, 10], "raw text, CRLF as one newline, comments kept");
+  assert.deepEqual(asciiCodes("a\rb"), [97, 10, 98], "a lone CR is a newline too");
+  assert.deepEqual(asciiCodes("é😀"), [233, 0x1f600], "one code point per character");
+  assert.deepEqual(tableValues("hack", 6, { file: asciiCodes("ok"), pad: END_OF_STREAM }), [111, 107, -1, -1, -1, -1]);
+  assert.deepEqual(tableValues("hack", 1, { file: asciiCodes("ok"), pad: END_OF_STREAM }), [111], "cut when short");
+  assert.deepEqual(tableValues("hack", 3, { file: [5] }), [5, 0, 0], "machine code still pads with 0");
 });

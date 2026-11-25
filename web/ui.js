@@ -12,7 +12,7 @@ import { RATE_MAX, RATE_MIN, RATE_PRESETS } from "./sim.js";
 import { CW, CCW, canFlip, catalog, isKnown, labelFor, sameTool, stampArt, toolArt, toolValue } from "./tools.js";
 import { copyStamp, mirrored, rotated } from "./stamp.js";
 import { TABLES, TABLE_NAMES, parseTable } from "./indexer.js";
-import { assemble } from "./hack.js";
+import { assemble, asciiCodes } from "./hack.js";
 import { listPrograms, getProgram } from "./hackstore.js";
 import { PALETTE, SIZE_NAMES, css as noteCss } from "./notes.js";
 import { persistEnabled } from "./persist.js";
@@ -662,17 +662,20 @@ export class Shell {
   openIndexSheet() {
     const m = document.getElementById("indexsheet");
     if (!m) return;
-    const st = this.indexSheet || (this.indexSheet = { kind: "ascending", file: null, fileName: "", seed: 1, hack: "" });
+    const st = this.indexSheet || (this.indexSheet = { kind: "ascending", file: null, fileName: "", seed: 1, hack: "", ascii: false });
     const tables = m.querySelector("#index-tables"), extra = m.querySelector("#index-extra");
     const ain = m.querySelector("#index-a"), bin = m.querySelector("#index-b");
     const preview = m.querySelector("#index-preview"), apply = m.querySelector("#index-apply");
     const fileIn = document.getElementById("index-file");
     const num = (el, dflt) => { const v = Number(el.value.trim()); return el.value.trim() === "" ? dflt : v; };
     // A Hack program is re-read and re-assembled on every refresh, so an
-    // edit saved in the assembler shows here at once.
+    // edit saved in the assembler shows here at once. With ASCII ticked its
+    // text is the stream instead, character codes, and assembly errors do
+    // not matter: it need not be a program at all.
     const hackWords = () => {
       const text = st.hack ? getProgram(st.hack) : null;
       if (text === null) return { error: st.hack ? `"${st.hack}" is not saved any more.` : "No saved Hack programs: write one in the panel's Assembler." };
+      if (st.ascii) return { words: asciiCodes(text) };
       const res = assemble(text);
       if (res.errors.length) return { error: `"${st.hack}" has ${res.errors.length} error${res.errors.length === 1 ? "" : "s"} (line ${res.errors[0].line}: ${res.errors[0].msg}). Fix it in the Assembler.` };
       return { words: res.words };
@@ -680,7 +683,7 @@ export class Shell {
     const opts = () => {
       if (st.kind === "hack") {
         const h = hackWords();
-        return { kind: "hack", file: h.words || null, hackError: h.error || null, hackName: st.hack, a: 1, b: 0 };
+        return { kind: "hack", ascii: st.ascii, file: h.words || null, hackError: h.error || null, hackName: st.hack, a: 1, b: 0 };
       }
       return { kind: st.kind, file: st.file, seed: st.seed, a: num(ain, 1), b: num(bin, 0) };
     };
@@ -719,9 +722,21 @@ export class Shell {
             sel.append(o);
           }
           sel.onchange = () => { st.hack = sel.value; refresh(); };
+          // ASCII: the file's characters, not its machine code.
+          const lab = document.createElement("label");
+          lab.className = "idx-check";
+          const box = document.createElement("input");
+          box.type = "checkbox"; box.checked = st.ascii;
+          box.onchange = () => { st.ascii = box.checked; refresh(); };
+          lab.append(box, " ASCII");
           const note = document.createElement("span");
-          note.textContent = "machine code, 0 after the end";
-          extra.append(sel, note);
+          note.className = "idx-note";
+          const text = getProgram(st.hack);
+          const chars = text === null ? 0 : asciiCodes(text).length;
+          note.textContent = st.ascii
+            ? `${chars} char${chars === 1 ? "" : "s"}, then −1`
+            : `machine code, 0 after the end · ${chars} char${chars === 1 ? "" : "s"}`;
+          extra.append(sel, lab, note);
         }
       }
       // a and b do not apply to machine code.

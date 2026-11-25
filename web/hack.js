@@ -199,3 +199,16 @@ export function assemble(source) {
 
 // A word as its 16 binary digits.
 export const toBinary = (w) => w.toString(2).padStart(16, "0");
+
+// The text itself as a stream of character codes, for indexing's ASCII
+// option: the file exactly as written, before #define or comments, one code
+// per character. A Windows line ending counts as one "\n" (10), so a file
+// gives the same stream whichever editor saved it. Characters past ASCII
+// keep their Unicode code point, one per character (not per UTF-16 unit).
+export function asciiCodes(source) {
+  return Array.from(source.replace(/\r\n?/g, "\n"), (c) => c.codePointAt(0));
+}
+
+// Indexing's ASCII stream ends with this value, repeated over every entry
+// past the last character, so a reader can tell the file has ended.
+export const END_OF_STREAM = -1;

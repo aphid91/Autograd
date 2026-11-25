@@ -27,6 +27,7 @@ import { Sim, Clock, RATE_MIN, RATE_MAX } from "./sim.js";
 import { History } from "./history.js";
 import { icon } from "./icons.js";
 import { DEFAULT, naturalOrder, tableValues, finalValues } from "./indexer.js";
+import { END_OF_STREAM } from "./hack.js";
 import { openAssembler, isAssemblerOpen } from "./assembler.js";
 import { toast } from "./toast.js";
 import { entrySize, typeByName } from "./stamp.js";
@@ -2390,10 +2391,12 @@ function indexLabels() {
 }
 
 // A Hack program's words are machine code, written as they are: no a*x+b.
-// `cut` is how many words did not fit.
+// With ASCII they are its text's character codes, padded with -1 (end of
+// stream) rather than 0. `cut` is how many words did not fit.
 function indexValues(o) {
   const list = indexed();
-  const table = tableValues(o.kind, list.length, { file: o.file, seed: o.seed, limit: T.sim.VALUE_LIMIT });
+  const pad = o.kind === "hack" && o.ascii ? END_OF_STREAM : 0;
+  const table = tableValues(o.kind, list.length, { file: o.file, seed: o.seed, limit: T.sim.VALUE_LIMIT, pad });
   if (o.kind === "hack") return { list, values: table, cut: Math.max(0, (o.file?.length || 0) - list.length) };
   return { list, values: finalValues(table, o.a, o.b, T.sim.VALUE_LIMIT), cut: 0 };
 }
@@ -2402,9 +2405,20 @@ function indexPreview(o) {
   const { list, values, cut } = indexValues(o);
   if (!list.length) return { n: 0, error: "Nothing indexed: select some Sources or belts." };
   const fmt = (v) => (v === DEFAULT ? "default" : String(parseFloat(v.toPrecision(6))));
-  const lines = list.slice(0, 12).map(({ e }, n) => `#${n}  ${e.type === "source" ? "Source" : "belt  "}  ${fmt(values[n])}`);
+  // ASCII: each code with the character it is, so the stream can be read.
+  const chr = (v) => (!o.ascii || v === END_OF_STREAM ? (o.ascii ? "  end" : "")
+    : `  ${v === 10 ? "\\n" : v === 9 ? "\\t" : v === 13 ? "\\r" : v < 32 || v === 127 ? "·" : `'${String.fromCodePoint(v)}'`}`);
+  const lines = list.slice(0, 12).map(({ e }, n) => `#${n}  ${e.type === "source" ? "Source" : "belt  "}  ${fmt(values[n])}${chr(values[n])}`);
   if (list.length > 12) lines.push(`… and ${list.length - 12} more`);
-  if (o.kind === "hack") {
+  if (o.kind === "hack" && o.ascii) {
+    // The stream is complete once its last character and one -1 are in:
+    // len + 1 entities.
+    const len = o.file.length, need = len + 1;
+    lines.unshift(`"${o.hackName}": ${len} character${len === 1 ? "" : "s"} -- index ${need} for the whole file and its end-of-stream −1`,
+      cut ? `only the first ${list.length} fit -- ${cut} cut, and no end-of-stream`
+        : list.length < need ? `${list.length} indexed: every character, but no end-of-stream −1`
+        : `${list.length} indexed: every character, then ${list.length - len} × −1`, "");
+  } else if (o.kind === "hack") {
     const len = o.file.length;
     lines.unshift(cut ? `"${o.hackName}": ${len} instructions, only the first ${list.length} fit -- the rest are cut`
       : `"${o.hackName}": ${len} instructions${list.length > len ? `, then ${list.length - len} zeros` : ""}`, "");
@@ -2415,7 +2429,9 @@ function indexPreview(o) {
 function indexApply(o) {
   const { list, values, cut } = indexValues(o);
   if (!list.length) return;
-  if (cut) toast(`The program did not fit: ${cut} instruction${cut === 1 ? "" : "s"} cut (${list.length} indexed, ${o.file.length} needed).`, 5000);
+  if (cut && o.ascii) toast(`The text did not fit: ${cut} character${cut === 1 ? "" : "s"} cut (${list.length} indexed, ${o.file.length + 1} needed with the end-of-stream −1).`, 5000);
+  else if (cut) toast(`The program did not fit: ${cut} instruction${cut === 1 ? "" : "s"} cut (${list.length} indexed, ${o.file.length} needed).`, 5000);
+  else if (o.ascii && list.length === o.file.length) toast(`Every character is in, but there was no room for the end-of-stream −1 (${o.file.length + 1} needed).`, 5000);
   list.forEach(({ i, e }, n) => {
     const entry = sel.stamp.entries[i];
     const v = values[n];

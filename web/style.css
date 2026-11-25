@@ -500,6 +500,8 @@ html, body {
   border-radius: var(--r); font: inherit; font-size: 16px;
 }
 .idx-ab input:disabled { opacity: 0.4; }
+.idx-check { flex: 0 0 auto; display: flex; align-items: center; gap: calc(4 * var(--u)); color: var(--ink); }
+.idx-note { flex: 0 1 auto; min-width: 0; }
 .idx-tables .pick { justify-content: center; height: calc(36 * var(--u)); }
 .idx-row { display: flex; gap: calc(8 * var(--u)); align-items: center; font-size: calc(11 * var(--u)); color: var(--ink-dim); }
 .idx-row:empty { display: none; }
@@ -912,6 +914,7 @@ html, body {
   color: var(--ink-dim); padding: 0 calc(2 * var(--u));
 }
 .asm-status[data-error="true"] { color: var(--danger); }
+.asm-status .asm-chars { color: var(--ink-dim); }
 .asm-err { cursor: pointer; }
 .asm-err:hover { text-decoration: underline; }
 

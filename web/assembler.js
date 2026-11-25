@@ -12,7 +12,7 @@
 // as a draft on every keystroke, so closing the editor or the app loses
 // nothing; anything that would replace unsaved text asks first.
 
-import { assemble, preprocess, stripComment, toBinary } from "./hack.js";
+import { assemble, preprocess, stripComment, toBinary, asciiCodes } from "./hack.js";
 import { listPrograms, getProgram, putProgram, deleteProgram, getDraft, putDraft } from "./hackstore.js";
 import { toast } from "./toast.js";
 
@@ -300,16 +300,20 @@ function update() {
     `<span class="asm-num">${i + 1}</span><span class="asm-addr">${addr.has(i + 1) ? addr.get(i + 1) : ""}</span></div>`).join("");
   syncScroll();
 
-  // Status: the errors, or a summary.
+  // Status: the errors, or a summary. Both lead with the character count,
+  // which is what indexing's ASCII option needs -- a text being streamed as
+  // characters need not assemble at all.
+  const nc = asciiCodes(state.text).length;
+  const chars = `${nc} character${nc === 1 ? "" : "s"}`;
   if (res.errors.length) {
     ui.status.dataset.error = "true";
-    ui.status.innerHTML = res.errors.slice(0, 50).map(e =>
+    ui.status.innerHTML = `<div class="asm-chars">${chars}</div>` + res.errors.slice(0, 50).map(e =>
       `<div class="asm-err" data-line="${e.line}">line ${e.line}: ${esc(e.msg)}</div>`).join("") +
       (res.errors.length > 50 ? `<div>… and ${res.errors.length - 50} more</div>` : "");
   } else {
     ui.status.dataset.error = "false";
     const n = res.words.length;
-    ui.status.textContent = `${n} instruction${n === 1 ? "" : "s"}` +
+    ui.status.textContent = `${n} instruction${n === 1 ? "" : "s"} · ${chars}` +
       (defines.length ? `, ${defines.length} define${defines.length === 1 ? "" : "s"}` : "") +
       (dirty() ? " · unsaved" : state.loadedName ? " · saved" : "");
   }

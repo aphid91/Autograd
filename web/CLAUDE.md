@@ -753,6 +753,18 @@ tables, the file parser, `a*x+b`), tested in `tests/indexer.test.mjs`.
   toast on Apply. a and b do not apply (they are disabled): the values are
   machine code, written as **unsigned** integers (a C-instruction is
   57344 or more). A program with errors is refused in the preview.
+- **ASCII** (a checkbox beside the program, Hack… only) streams the
+  program's **text** instead of its machine code: one character code per
+  entry from #0 (`asciiCodes()` in hack.js: the file exactly as written,
+  comments and `#define`s included, a CRLF or lone CR read as one `\n`,
+  characters past ASCII as their code point), and every entry past the end
+  is **-1**, end of stream (`END_OF_STREAM`; `tableValues()`'s `pad`).
+  Assembly errors do not matter here, so any saved text works. The sheet
+  shows the character count beside the box, and the preview how many to
+  index for the whole file **plus its -1** (count + 1) and shows each
+  code's character; a stream that is cut, or ends with no room for the
+  -1, says so in a toast on Apply. The Assembler's status strip leads with
+  the same character count, errors or not.
 
 ### The assembler
 

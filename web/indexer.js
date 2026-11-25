@@ -65,11 +65,13 @@ export function parseTable(text) {
 
 // The table's first n entries. A file shorter than n repeats from its start.
 // A Hack program (`file` is its words) does not: it fills from the start and
-// the rest are 0, and a program longer than n is cut short -- the caller
-// reports that. Its values are machine code and are never put through a*x+b.
+// the rest are `pad` (0; the ASCII stream pads with -1, its end-of-stream
+// mark), and a program longer than n is cut short -- the caller reports
+// that. Its values are machine code (or character codes) and are never put
+// through a*x+b.
 // `limit` is the largest magnitude a value may have (the doubling table
 // reaches it at 2^24, VALUE_LIMIT).
-export function tableValues(kind, n, { file = null, seed = 1, limit = 2 ** 24 } = {}) {
+export function tableValues(kind, n, { file = null, seed = 1, limit = 2 ** 24, pad = 0 } = {}) {
   if (kind === "ascending") return Array.from({ length: n }, (_, i) => i);
   if (kind === "alternating") return Array.from({ length: n }, (_, i) => i % 2);
   if (kind === "doubling") return Array.from({ length: n }, (_, i) => Math.min(2 ** i, limit));
@@ -84,7 +86,7 @@ export function tableValues(kind, n, { file = null, seed = 1, limit = 2 ** 24 } 
   }
   if (kind === "hack") {
     const words = file || [];
-    return Array.from({ length: n }, (_, i) => (i < words.length ? words[i] : 0));
+    return Array.from({ length: n }, (_, i) => (i < words.length ? words[i] : pad));
   }
   if (kind === "file") {
     if (!file || !file.length) return Array(n).fill(DEFAULT);
