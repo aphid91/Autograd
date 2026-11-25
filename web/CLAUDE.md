@@ -1805,16 +1805,21 @@ What sounds:
   uncorrelated voices. A tanh soft clip is the safety net (switchable). The
   meter shows the peak before it, in dB, and counts clipped samples.
 
-**Time.** The sim ticks in bursts, a frame's worth at once; the synth plays
-them back evenly at the rate they were run at, **latency** behind (60 ms).
-Playback starts once that much is queued, and its speed follows the queue's
-depth (smoothed, 0.25× to 1.25×): if the sim cannot reach its rate (the
-frame budget drops ticks), playback slows and pitches sag rather than
-gapping. A queue over 3 latencies deep is **skipped** to the target, not
-raced through. Run dry -- paused, or stalled -- every voice releases and
-playback waits to refill. A tick takes effect at its start (an early
-version applied each tick after its own duration, at a placeholder rate of
-1 tps, and so played nothing at all).
+**Time.** The sim ticks in bursts; the synth plays them back evenly at the
+rate they were run at, **latency** behind (60 ms) -- the dial's figure at
+every tick rate. Each tick is **dated on the audio clock** when its batch
+arrives: the batch's last tick at the arrival, the ones before it a tick
+apart (`runAt()`), since they were run at that rate. Playback starts when
+the oldest queued tick was run the latency ago, and its speed follows the
+**lag** (`lagS()`: when the next queued tick will start, at normal speed,
+less when it was run; smoothed, 0.25× to 1.25×): if the sim cannot reach
+its rate, playback slows and pitches sag rather than gapping. A lag over 3
+latencies is **skipped** to the target, not raced through. Run dry --
+paused, or stalled -- every voice releases and playback waits to refill. A
+tick takes effect at its start (an early version applied each tick after
+its own duration, at a placeholder rate of 1 tps, and so played nothing at
+all). The meter's `lag` is `lagS()`; it does not include the device's own
+output latency.
 
 **Voices.** A voice belongs to an active run, never to a candidate as such:
 13 candidates of which 4 are active take 4 voices. Past the **voice limit**,
@@ -2000,20 +2005,35 @@ and gates.
 playback took the only queued tick, and the skip test, on the depth
 measured *before* that, `skip()`'d an empty queue -- a throw, and an
 AudioWorkletProcessor that throws is silent for good, so sound came back
-only by switching it off and on. Now the start threshold is at least 1.5
-ticks (`max(latency, 1.5 / rate)`), the depth is re-measured after the
-start, `skip()` returns on an empty queue, and the worklet catches any
-throw, stops the synth (it restarts on the next ticks) and posts
-`{type: "error"}`, which main.js logs. Pinned by a test streaming 1000 →
-5 → 10 → 2 → 1000 tps that asserts no 100 ms window goes silent.
+only by switching it off and on. Now the lag is measured after the start,
+a skip needs a queued tick, `skip()` returns on an empty queue and keeps
+the newest tick, and the worklet catches any throw, stops the synth (it
+restarts on the next ticks) and posts `{type: "error"}`, which main.js
+logs. Pinned by a test streaming 1000 → 5 → 10 → 2 → 1000 tps that
+asserts no 100 ms window goes silent.
+
+**Slow rates used to ignore the latency dial.** The queue's depth was
+counted in whole waiting ticks, which cannot tell a backlog from the next
+tick not having come yet, so the fix above gave it a floor of 1.5 ticks
+(`max(latency, 1.5 / rate)`): 300 ms at 5 tps, 750 at 2, whatever the
+dial said, and the meter read only 200 or 400 (one or two ticks). Dating
+each tick on arrival removed the floor: the lag is a time, not a count,
+so it reads the latency right through a tick. Two details make it steady
+at 1-2 tps, each found by a swing of about ±100 ms there: the lag is read
+off the next tick **at normal speed** (so it answers to the speed at
+once), and the speed **holds while nothing is queued** -- the lag is then
+the playing tick's, already history, and steering on it wound the speed
+up. Measured under node with arrivals jittered 3 ms, posts every 5 ms and
+4-block render bursts: within a few ms of the dial from 1 to 20k tps,
+speed within 0.95-1.06; at 20 ms latency it ran dry once or twice in 25 s
+below 10 tps. `tests/audio.test.mjs` holds every tick to the dial ±6 ms
+at 20, 60 and 250 ms and 1 to 1000 tps (mutation-tested: the old floor,
+the speed steering with nothing queued, and undated batches each fail it).
 
 **The queue's lag cap scales with the tick.** It drops the oldest ticks
-past 1 s queued, which at 1 tps is one tick -- less than the 1.5 ticks
-playback waits for, so ticks were dropped and the drone moved every other
-tick (or, fed perfectly evenly, never started). The cap is now at least
-`(SKIP_AT + 1) * 1.5` ticks; at 1 tps the audio runs about 1.5 s behind
-the picture, the price of never running dry between ticks. Pinned by a
-test that every tick plays at 0.5, 1 and 2 tps.
+past 1 s queued, which at 1 tps is one tick -- the one waiting behind the
+tick playing, so the drone moved every other tick. The cap is at least 2
+ticks. Pinned by a test that every tick plays at 0.5, 1 and 2 tps.
 
 **Hold on underrun** (off by default): when the queue runs dry, the voices
 hold where they are instead of releasing, and playback picks up the moment

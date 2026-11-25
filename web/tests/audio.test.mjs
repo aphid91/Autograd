@@ -103,16 +103,40 @@ test("fires every tick are a buzz at the tick rate", () => {
   for (let lag = 8; lag < 44; lag++) assert.ok(corr(lag) < at - 0.05, `lag ${lag}: ${corr(lag)} vs ${at}`);
 });
 
-test("playback waits for the latency's worth, and an empty queue falls silent", () => {
+test("playback starts the latency after a tick was run, and an empty queue falls silent", () => {
   const s = synth({ latencyMs: 100, releaseMs: 10 });
   s.message({ type: "config", lengths: new Float64Array([4]), groups: [0, 0] });
-  ticks(s, 50, 1000, [0]);        // 50 ms: not enough to start
-  assert.equal(Math.max(...render(s, 4800).map(Math.abs)), 0);
-  ticks(s, 100, 1000, [0]);       // 150 ms queued: plays, then runs dry
+  // 50 ticks at 1000 tps arriving now: the first was run 49 ms ago, so it
+  // starts sounding 51 ms from now -- to the 128-sample block.
+  ticks(s, 50, 1000, [0]);
   const out = render(s, SR);
-  assert.ok(Math.max(...out.subarray(0, 4800).map(Math.abs)) > 0, "plays");
+  const first = out.findIndex(x => x !== 0);
+  assert.ok(Math.abs(first - 0.051 * SR) <= 128, `starts at ${(first / SR * 1000).toFixed(1)} ms`);
   assert.equal(s.meter().voices, 0, "every voice released once the queue ran dry");
   assert.equal(Math.max(...out.subarray(SR / 2).map(Math.abs)), 0, "silent after");
+});
+
+test("the latency is the dial's at any tick rate, slow ones included", () => {
+  // A tick is dated when its batch arrives and plays the latency after.
+  // Once the latency had a floor of 1.5 ticks: 300 ms at 5 tps, 750 at 2,
+  // whatever the dial said.
+  for (const lat of [20, 60, 250]) for (const rate of [1, 2, 5, 10, 30, 1000]) {
+    const s = synth({ latencyMs: lat });
+    s.message({ type: "config", lengths: new Float64Array([4]), groups: [0, 0] });
+    const B = 128, out = new Float32Array(B), delays = [];
+    let sent = 0, last = -1;
+    for (let blk = 0; blk * B < 8 * SR; blk++) {
+      const t = blk * B / SR, due = Math.floor(t * rate) + 1 - sent;   // ticks run by now
+      if (due > 0) { s.message({ type: "ticks", n: due, tick0: sent, words: 1, rate, bits: new Uint32Array(due).fill(1), f0: new Uint16Array(due), f1: new Uint16Array(due) }); sent += due; }
+      s.render(out, B);
+      if (s.curTick !== last) { last = s.curTick; if (t > 3) delays.push((blk + 1) * B / SR - s.curTick / rate); }
+    }
+    assert.ok(delays.length > 2, `${lat} ms, ${rate} tps: ticks played`);
+    for (const d of delays) assert.ok(Math.abs(d * 1000 - lat) < 6, `${lat} ms, ${rate} tps: a tick sounded ${(d * 1000).toFixed(1)} ms after it ran`);
+    const m = s.meter();
+    assert.ok(Math.abs(m.lagMs - lat) < 6, `${lat} ms, ${rate} tps: meter reads ${m.lagMs.toFixed(1)}`);
+    assert.equal(m.underruns, 0, `${lat} ms, ${rate} tps: never ran dry`);
+  }
 });
 
 test("a deep backlog is skipped, not raced through", () => {
@@ -562,8 +586,8 @@ test("a slow tick rate keeps sounding: no crash, no dropouts, and back to fast a
 });
 
 test("at 1 tps every tick is played, one a second", () => {
-  // A flat 1 s cap on the queue held less than the 1.5 ticks playback waits
-  // for, so it dropped ticks: the drone moved every other tick, or not at all.
+  // A flat 1 s cap on the queue dropped the tick waiting behind the one
+  // playing, so the drone moved every other tick, or not at all.
   for (const rate of [0.5, 1, 2]) {
     const s = synth();
     s.message({ type: "config", lengths: new Float64Array([4]), groups: [0] });

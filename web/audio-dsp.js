@@ -2,12 +2,15 @@
 // no Web Audio in it, so audio-worklet.js wraps it on the audio thread and
 // the tests drive it under node.
 //
-// Time: every tick the sim ran arrives here stamped only by its order. The
-// synth plays them back at the tick rate they were run at, `latencyMs`
-// behind, so a burst of ticks run in one frame comes out evenly spaced. If
-// the sim falls behind (the frame budget drops ticks), the queue shrinks and
-// playback slows to match: the clicks drop in pitch rather than gapping. If
-// it runs dry, every voice releases and playback waits to refill -- or,
+// Time: every tick the sim ran arrives here in batches, and each tick is
+// dated on the audio clock when its batch arrives -- the batch's last tick
+// at the arrival, the ones before it a tick apart (`runAt()`), since they
+// were run at that rate. The synth plays each tick `latencyMs` after that
+// date, so a burst of ticks run in one frame comes out evenly spaced, and
+// the delay is the dial's at every tick rate. If the sim falls behind (the
+// frame budget drops ticks), the lag shrinks and playback slows to match:
+// the clicks drop in pitch rather than gapping. If it runs dry, every
+// voice releases and playback waits to refill -- or,
 // with `holdUnderrun`, the voices hold where they are for up to HOLD_MAX_S
 // and playback picks up the moment ticks arrive, with no refill wait.
 //
@@ -144,6 +147,8 @@ export class GatesSynth {
     this.held = false;                   // holding through an underrun
     this.heldS = 0;
     this.curTick = -1;                   // the tick being played, absolute
+    this.curRun = 0;                     // ...when it was run (runAt())
+    this.curStart = 0;                   // ...and when it started sounding
     this.fade = 0;                       // 0..1, the fade in from startTick
     // Click resonators: group g's are g*resS.. (truthy, then falsy):
     // y = c1*y1 + c2*y2 + x. Sized for the most there can be.
@@ -362,15 +367,17 @@ export class GatesSynth {
   push(b) {
     if (b.words !== this.words || !b.n) return;   // from before the last config
     if (b.gen != null && this.gen != null && b.gen !== this.gen) return;
+    // Arrived now, on the audio clock: what dates its ticks (runAt()).
+    b.arr = this.abs;
     this.queue.push(b);
     this.queued += b.n;
     if (this.offline) return;
     // Never build more than MAX_QUEUE_S of lag: drop the oldest ticks --
-    // but always keep room for a few ticks. At 1 tps one tick is a second,
-    // and a flat 1 s cap held less than the 1.5 ticks playback waits for,
-    // so every other tick was dropped and the drone moved at half speed.
+    // but always keep room for two ticks. At 1 tps one tick is a second,
+    // and a flat 1 s cap dropped the tick waiting to follow the one playing,
+    // so the drone moved every other tick.
     const rate = Math.max(b.rate, 1e-3);
-    const cap = Math.max(MAX_QUEUE_S, (SKIP_AT + 1) * 1.5 / rate);
+    const cap = Math.max(MAX_QUEUE_S, 2 / rate);
     while (this.queue.length > 1 && this.queued / rate > cap) {
       const old = this.queue.shift();
       this.flips(old, this.qi, old.n);   // its truthiness changes still hold
@@ -566,10 +573,39 @@ export class GatesSynth {
     }
   }
 
+  // When tick k of batch b was run, in samples on the audio clock: its
+  // batch's arrival, less a tick for each tick after it in the batch.
+  runAt(b, k) {
+    return (b.arr ?? 0) - (b.n - 1 - k) * this.sr / Math.max(b.rate, 1e-3);
+  }
+
+  // How far behind the sim playback is, in seconds: from when a tick was run
+  // to when it starts sounding. Read off the next queued tick -- when it
+  // would start if the one playing finished at normal speed, so the figure
+  // answers to the speed at once rather than a tick later -- or, with none
+  // queued, off the one playing, as it was when it started (only the meter
+  // reads that case: the speed holds while nothing is queued). At a
+  // steady rate both read the latency all the way through a tick -- no
+  // sawtooth between arrivals, whatever the tick rate -- which is what lets
+  // the latency be the dial's at 5 tps, where a depth counted in whole
+  // ticks had to hold a tick and a half (300 ms) to tell a backlog from
+  // the next tick not having come yet.
+  lagS() {
+    const sr = this.sr, tps = Math.max(this.rate, 1e-3);
+    const moving = this.playing && !this.held;
+    if (this.queued) {
+      const rem = moving ? Math.max(0, 1 - this.tickPos) / tps : 0;
+      return (this.abs - this.runAt(this.queue[0], this.qi)) / sr + rem;
+    }
+    return moving ? (this.curStart - this.curRun) / sr : 0;
+  }
+
   // Apply the next queued tick, or report that there is none.
   nextTick() {
     if (!this.queued) return false;
     const b = this.queue[0], k = this.qi;
+    this.curRun = this.runAt(b, k);
+    this.curStart = this.abs + (this.logging ? this.logAt : 0);
     this.rate = b.rate;
     this.curTick = (b.tick0 ?? 0) + k;
     if (this.rate !== this.trackRate) {
@@ -669,15 +705,9 @@ export class GatesSynth {
   // Fill out[0..n) with mono samples.
   render(out, n) {
     const sr = this.sr, p = this.p;
-    // Start once the queue holds the latency's worth; follow the queue's
-    // depth with the playback speed.
-    // At a slow tick rate a single tick outlasts the latency (200 ms at 5
-    // tps against 60 ms), so the target is at least a tick and a half --
-    // otherwise one queued tick reads as a backlog to skip and the queue
-    // runs dry between every pair of ticks.
-    const qRate = () => Math.max(this.queue.length ? this.queue[0].rate : this.rate, 1e-3);
-    const target = Math.max(p.latencyMs / 1000, 1.5 / qRate());
-    let queuedS = this.queued / qRate();
+    // Start once the oldest queued tick was run the latency ago; follow the
+    // lag (lagS()) with the playback speed.
+    const target = Math.max(p.latencyMs / 1000, 1e-3);
     // A tick takes effect at its start: tickPos is how far through the one
     // already applied playback is.
     if (this.held) {
@@ -685,20 +715,30 @@ export class GatesSynth {
       if (this.queued) { this.held = false; this.heldS = 0; this.tickPos = 0; if (this.nextTick()) this.played++; }
       else if ((this.heldS += n / sr) > HOLD_MAX_S && !this.offline) this.gatesOff();
     }
-    if (!this.playing && this.queued && (this.offline || queuedS >= target)) {
+    if (!this.playing && this.queued &&
+        (this.offline || (this.abs - this.runAt(this.queue[0], this.qi)) / sr >= target)) {
       this.playing = true; this.speed = 1; this.tickPos = 0; this.played = 0;
       this.tps = this.rate / sr;
       this.played = this.nextTick() ? 1 : 0; this.sampleNo = 0;
-      // Measured again: starting took a tick off the queue. Skipping on the
-      // stale figure once skip()'d an empty queue -- a throw on the audio
-      // thread, and an AudioWorkletProcessor that throws is silent for good.
-      queuedS = this.queued / qRate();
     }
     if (this.offline) this.speed = 1;
     else {
-      if (this.playing && queuedS > SKIP_AT * target) { this.skips++; this.skip(queuedS - target); }
-      if (this.playing) {
-        const want = Math.min(MAX_SPEED, Math.max(0.25, queuedS / target));
+      // Measured after the start, which took a tick off the queue: skipping
+      // on a stale figure once skip()'d an empty queue -- a throw on the
+      // audio thread, and an AudioWorkletProcessor that throws is silent for
+      // good. A backlog is only ever skipped from the queue (skip() keeps
+      // the newest tick), so the lag it reads falls as it skips.
+      let lag = this.lagS();
+      if (this.playing && this.queued && lag > SKIP_AT * target) {
+        this.skips++; this.skip(lag - target); lag = this.lagS();
+      }
+      // Only while a tick is queued. With none, the lag is the playing
+      // tick's, already history: steering on it is steering on a figure the
+      // speed cannot move until the next tick, and at 2 tps that delay wound
+      // the speed into a swing of ±100 ms. The speed holds until a tick
+      // comes; at a high rate one nearly always is.
+      if (this.playing && this.queued) {
+        const want = Math.min(MAX_SPEED, Math.max(0.25, lag / target));
         this.speed += (want - this.speed) * Math.min(1, n / sr / SPEED_TAU_S);
       }
     }
@@ -1118,12 +1158,11 @@ export class GatesSynth {
 
   // What the panel shows; resets the peak and clip count.
   meter() {
-    const rate = this.queue.length ? this.queue[0].rate : this.rate;
     const m = {
       type: "meter", voices: this.nv, limit: Math.min(this.p.voiceLimit, VOICE_LIMIT_MAX),
       active: this.active, refused: this.refused, candidates: this.n,
       peak: this.peak, clipped: this.clipped, ticks: this.ticksPlayed,
-      lagMs: this.queued / Math.max(rate, 1e-3) * 1000, speed: this.playing ? this.speed : 0,
+      lagMs: this.lagS() * 1000, speed: this.playing ? this.speed : 0,
       underruns: this.underruns, skips: this.skips, beltsMuted: !!this.beltsMuted,
     };
     this.peak = 0; this.clipped = 0; this.ticksPlayed = 0;
