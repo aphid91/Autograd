@@ -139,7 +139,8 @@ The **Tweakpane** panel sits in the board's top-right corner, collapsed by
 default. Top to bottom: Status, Board, View, Audio, Video, Presentation,
 Assembler, Dev, Debug. It holds the saves, View toggles (seed
 tint -- the green/red wash on seeded belts, ghosts included -- labels,
-items, belts (placed belts and underground ends; a planned run's
+items, **item numbers** (on by default; off, items are just their
+green/red discs), belts (placed belts and underground ends; a planned run's
 ghost still draws), gates (every machine, Sources included -- for a brief
 look at the belts underneath; still there and still tappable, and items
 held inside a machine still draw: View > items hides those), sources
@@ -2121,6 +2122,108 @@ presentation's views like the rest of View; not in saves yet), with
   bright -- chevron opacity is the usual lever). Video frames use a second
   instance, so a recording glows as the screen does.
 
+## Motion blur
+
+View > look > **motion blur** (samples per render, 1..64; **1 is off**):
+temporal supersampling. Each frame shown is the mean of k renders spread
+over the span of sim time the frame covers, each at its own tick and its
+own camera, bloomed once at the end -- a model of a real exposure rather
+than a smear filter. For video above all, and for realtime on a machine
+that can afford k renders a frame. Per player and in views (presets,
+presentations), like the rest of look. [mblur.js](mblur.js) is the timing
+(pure, `tests/mblur.test.mjs`), [blur.js](blur.js) the averaging.
+
+- **Off is the old path, not a cheap version of the new one.** At 1,
+  paint() takes exactly its old branches, no accumulator is created and the
+  worker cuts nothing (`W.blurG` 0); the only additions are a number
+  compared per frame and render.js's `part` tests. Measured in the
+  browser: with the setting at 1, zero accumulators exist and zero frames
+  take the blur path.
+- **What is blurred**: the board -- belts, machines, items **and their
+  numbers** (they move), status colours and afterglow (each sample is
+  coloured at its own time), the pixel overlay. **What is not**: ghosts,
+  the selection, frame and audio boxes, vector marks, Source values,
+  notes, index badges and layer labels, drawn once, sharp, over the mean
+  from the frame's final state (render.js `part: "board"` /
+  `"overlay"`). A paused board with a still camera draws ordinarily.
+- **Bloom is taken from the samples without their numbers.** Item numbers
+  never glowed (they were drawn after bloom), so with bloom on each sample
+  is captured twice -- before its numbers (render.js `onCapture`) and whole
+  -- into two sums: the frame is the whole sum's mean, and the glow is
+  taken from the other's (`Bloom.apply(ctx, params, source)`). Bloom off,
+  one capture per sample.
+- **Averaged in floating point and linear light.** Each sample is uploaded
+  to a WebGL2 texture and added into a half-float buffer, sRGB decoded
+  before and encoded after. Canvas alpha would round every step to 8 bits
+  and band by 64 samples; sRGB averaging would darken a bright item
+  smeared over the dark board. Needs `EXT_color_buffer_float`; without it
+  motion blur is off (a console warning), as bloom is without WebGL2.
+
+**Where the samples sit.** A **video** knows each frame's time, so frame
+f's samples end on the frame's own tick and step back evenly through it,
+`T_f - (k-1-i) * span / k` (`frameSampleTimes()`): the last sample is the
+frame, so the blur trails motion and adds no lag; frame 0's do not reach
+back before the video's first tick. The camera moves **per sample** --
+`frameBox()` at the sample's fractional frame -- so a fast zoom blurs the
+whole picture, as a real shutter would.
+
+**Realtime** cannot do that: the worker ticks ahead on its own clock and
+the screen sees its state once a frame. So the samples sit on a fixed
+**grid** of sim time, `m * g` for whole m, with `g` a frame's ticks over k
+(`gridSpacing()`: rate x the smoothed frame interval / k, resent to the
+worker only when it moves by a tenth). The worker **cuts its delta at the
+grid's ticks** (`isCut()`, in `SimHost.slice()`): each cut is a delta of
+its own, and a reply carries the slices ahead of the delta (`d.chunks`).
+The screen holds them (`W.queue`) and, for each grid point in the frame's
+span (`gridSampleTimes()`: `(S, E]`, S what the last frame showed),
+applies the slices up to that tick and renders -- so **every sample is a
+real state**, never an extrapolation, and the forecast animates each one's
+fraction of a tick as usual. The camera is interpolated from the last
+frame's to this one's (`lerpCam()`: centre linear, zoom geometric), so a
+pan blurs too -- and while paused, a moving camera takes k samples of the
+one state.
+
+- A frame that runs long holds more grid points; past 2k they are thinned
+  evenly, keeping the newest. A frame with **no** grid point in its span
+  (the worker's next delta had not come) shows the last frame's mean again
+  (`MB.held`): a sharp frame among blurred ones reads as flicker -- 3 frames
+  in 10 did in headless Chromium before this, none after. Only while
+  playing and only for the same board revision, canvas size and camera, so
+  an edit or a pan is never shown stale.
+- Both sides compute a grid point as the same `m * g` in doubles and the
+  worker tests the neighbouring m's with that very `floor()`, so they agree
+  on the tick to the bit rather than by algebra that could round the other
+  way. A slice cut on an old grid (g just changed) is still applied in
+  order; its sample is drawn from the latest state at or before its tick.
+- At most `MAX_CHUNKS` (256) slices wait between replies; past that the
+  worker stops cutting and the changes ride the next slice. Merging is
+  safe, dropping would not be -- a delta is only what changed since the
+  last.
+- **The main thread** (worker off, or a baked soundtrack playing) steps the
+  mirror to each grid point itself, inside its usual frame budget, and
+  draws there; what does not fit is dropped as before.
+- The audio flush, the tick counter and the Status readout run after the
+  samples, so they see the frame's final state as always.
+
+`tests/mblur.test.mjs` holds the realtime claim: the worker runs its real
+loop on a fake clock with the grid on, and at **every grid point** the
+mirror, stepped through the slices, is checked against an ordinary Sim
+stepped to exactly that tick (every ring, counter, anchor, channel and the
+Pixel screen) -- at grid spacings of 0.4, 1, 7.5 and 40 ticks on
+`cpu.npz`. Mutation-tested: no cuts fails all four; cutting a tick late
+fails the two coarse grids (at 1 tick or less every tick is cut anyway,
+so it changes nothing there). Plus the pure parts: cuts against a brute
+force over 5000 ticks at nine spacings, the span and its thinning, a
+video frame's times, the camera lerp. In headless Chromium every path ran
+without an error -- worker, main thread, bloom (both sums filled), a
+paused pan, a video frame -- and a video frame of a moving run at 3 ticks
+a frame came out smeared along the belts with the machines sharp.
+
+**Cost** is k renders a frame, plus an upload and a blend each: in headless
+Chromium's software GL a whole-board frame at 16 samples is a few frames a
+second. That is why it is a slider: a video does not care, and a
+realtime view wants as many as the machine affords.
+
 ## Video
 
 The panel's **Video** folder renders a stretch of the simulation **offline**
@@ -2147,6 +2250,8 @@ the camera arithmetic, loaded always and tested in node;
   second to draw still lasts 1/60 s. `await video.add()` is the
   backpressure (Fluoddity's note): dropping it queues frames until the tab
   dies.
+- **Motion blur** (View > look): each frame is k samples over the frame's
+  ticks, the camera moving per sample (see "Motion blur").
 - **What is drawn**: the board as View draws it -- grid, status colours,
   the pixel overlay (the copy gets its own Screen, starting blank), labels,
   **layers** (hidden ones left out, items included, tints and layer labels)
@@ -2484,7 +2589,7 @@ largest JS span left.
 | `main.js` | wiring: applies the shell's and panel's requests to the board; resize, redraw, the play loop |
 | `sim.js` | the simulation: segment index, closed-form belts, gates, the wake list, the clock -- the desktop's CPU tick; `forecast()` |
 | `rate.js` | `RATE_MIN`/`RATE_MAX`, the tick-rate bounds: the one place the cap is stated. The clock, the speed box, video ticks/s and audio's reference rate all read it; import-free so the AudioWorklet can load it |
-| `simhost.js` | the sim on a worker: the deltas, the board and state messages, the epoch, `SimHost` and its loop's slices; pure, no DOM |
+| `simhost.js` | the sim on a worker: the deltas, the board and state messages, the epoch, `SimHost` and its loop's slices, motion blur's grid-tick slices; pure, no DOM |
 | `simworker.js` | the worker itself: a `SimHost` and the loop that runs it |
 | `flow.js` | where items are drawn: belt paths, the machines' internal links and wait points, the tick animated from the forecast |
 | `ui.js` | the shell's state and DOM: modes, sim and turn buttons, thumb pads, swatches, long press, picker |
@@ -2511,7 +2616,7 @@ largest JS span left.
 | `saves.js` | browser saves: whole `.npz` files in localStorage, and their index |
 | `board.js` | the save's arrays, validation, derived render lists, `entityAt`/`describe`, placing, erasing, capturing, and the two setting writers |
 | `camera.js` | camera (world +Y up, zoom in CSS px/cell), pointer gestures, and taps |
-| `render.js` | Canvas 2D drawing under a world transform; labels in screen space |
+| `render.js` | Canvas 2D drawing under a world transform; labels in screen space; `part` splits a frame into a blur sample and the sharp marks over it |
 | `planner.js` | belt-run geometry: paths, facings, the tip, auto-undergrounds |
 | `stamp.js` | stamps: rotate and mirror (port of `core/stamp.py`), cells, subsets |
 | `segtrace.js` | the belt run through a cell, as `core/segments.py` would cut it |
@@ -2520,6 +2625,8 @@ largest JS span left.
 | `glyphs.js` | the machine glyphs, ports of the shader's `sd_*` marks |
 | `tune.js` | the Dev dials: defaults, panel spec, the live values |
 | `bloom.js` | View > look's bloom: a WebGL2 post-pass over the 2D canvas; loaded on demand |
+| `mblur.js` | motion blur's timing: the sample grid, the worker's cut ticks, a video frame's sample times, the camera lerp; pure |
+| `blur.js` | motion blur's averaging: a WebGL2 half-float accumulator, in linear light, two layers for bloom |
 | `history.js` | undo, redo and the checkpoint, over board snapshots |
 | `notes.js` | labels: the desktop's text-box records, hit-testing, wrapping, fitting a box to its text |
 | `indexer.js` | indexing: the orders, the value tables, the file parser, a·x+b |

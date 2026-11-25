@@ -16,6 +16,7 @@
 
 import { VIDEO_FPS, frameCount, frameBox } from "./video-params.js";
 import { Camera } from "./camera.js";
+import { frameSampleTimes } from "./mblur.js";
 
 const CODECS = ["avc", "vp9", "av1"];        // best-supported first (Fluoddity's order)
 const AUDIO_CODECS = ["aac", "opus"];
@@ -23,11 +24,15 @@ const YIELD_MS = 30;                          // drawing between yields to the p
 
 // Record `sim` (a clone the caller made, at the tick the video starts on;
 // it is stepped and not restored). `draw(ctx, sim, cam, alpha)` renders one
-// frame as main.js would; `audio`, if given, is { params, bake } for the
+// frame as main.js would; `blur`, if given (View > look > motion blur above
+// 1), is { k, begin(ctx), sample(ctx, sim, cam, alpha), finish(ctx, sim,
+// cam, alpha) }: each frame is then k samples ending on the frame's own tick
+// (mblur.js frameSampleTimes), each with the camera at its own fraction of
+// the move, averaged and finished in place of `draw`; `audio`, if given, is { params, bake } for the
 // soundtrack (`bake` is audio-bake.js's bakeAudio). `writable` is a file to
 // stream into, or null to buffer in memory. Resolves to
 // { kind: "buffered", blob } | { kind: "streamed" } | { kind: "empty" }.
-export async function recordVideo({ sim, settings, startCam, endCam, draw, audio, writable,
+export async function recordVideo({ sim, settings, startCam, endCam, draw, blur = null, audio, writable,
                                     onProgress, shouldStop }) {
   const W = settings.width, H = settings.height;
   const frames = frameCount(settings), tps = settings.tps, t0 = sim.tick;
@@ -92,10 +97,27 @@ export async function recordVideo({ sim, settings, startCam, endCam, draw, audio
     for (let f = 0; f < frames; f++) {
       if (shouldStop?.()) break;             // keep what is encoded: a partial video is still a video
       const at = t0 + (f * tps) / VIDEO_FPS;
-      while (sim.tick < Math.floor(at)) sim.step();
-      const box = frameBox(startCam, endCam, settings, f, frames);
-      cam.cx = box.cx; cam.cy = box.cy; cam.zoom = W / (2 * box.hw);
-      draw(ctx, sim, cam, at - sim.tick);
+      // The camera at frame ff (fractional for blur samples), from the move.
+      const aim = (ff) => {
+        const box = frameBox(startCam, endCam, settings, ff, frames);
+        cam.cx = box.cx; cam.cy = box.cy; cam.zoom = W / (2 * box.hw);
+      };
+      if (blur && blur.k > 1) {
+        // k samples over the frame's span of ticks, the last on the frame
+        // itself; none before the first frame (the video starts at t0).
+        blur.begin(ctx);
+        for (const t of frameSampleTimes(at, tps / VIDEO_FPS, blur.k, t0)) {
+          while (sim.tick < Math.floor(t)) sim.step();
+          aim(Math.max(0, (t - t0) * VIDEO_FPS / tps));
+          blur.sample(ctx, sim, cam, t - sim.tick);
+        }
+        aim(f);
+        blur.finish(ctx, sim, cam, at - sim.tick);
+      } else {
+        while (sim.tick < Math.floor(at)) sim.step();
+        aim(f);
+        draw(ctx, sim, cam, at - sim.tick);
+      }
       await video.add(f / VIDEO_FPS, 1 / VIDEO_FPS);
       done = f + 1;
       await feedAudio((f + 1) / VIDEO_FPS);

@@ -35,6 +35,8 @@ import { cropBox, evenDim, fitBox, frameBox, frameCount, viewBox } from "./video
 import { presentationName, editName, startPresentation, fetchPresentation, presentationRecord, safeName } from "./present.js";
 import * as P from "./prof.js";
 import { applyDelta, exportFull, boardMessage } from "./simhost.js";
+import { Accumulator } from "./blur.js";
+import { gridSpacing, gridSampleTimes, lerpCam, camMoved } from "./mblur.js";
 import { freezePersist, unfreezePersist, persistEnabled } from "./persist.js";
 import { presetNames, readPresets, putPreset, deletePreset, presetFile, parsePresetFile } from "./audiopresets.js";
 import { viewPresetNames, readViewPresets, putViewPreset, deleteViewPreset, viewPresetFile, parseViewPresetFile } from "./viewpresets.js";
@@ -165,6 +167,9 @@ const debug = window.gates = {
   profText: () => P.formatReport(P.prof.last),
   get worker() { return W; },
   setWorker: (on) => { workerWanted = on; redraw(); },
+  get mblur() { return MB; },
+  videoBlur: () => videoBlur(),
+  drawVideoFrame: (...a) => drawVideoFrame(...a),
 };
 
 // --- the pixel overlay --------------------------------------------------------
@@ -483,7 +488,7 @@ function videoBoxes() {
 // pressed (`recLayers`), since the copy shares the live board's grid, table
 // and lists and an edit stops the recording anyway.
 let recLayers = null;
-function drawVideoFrame(ctx, s, vcam, alpha) {
+function drawVideoFrame(ctx, s, vcam, alpha, extra = {}) {
   render(ctx, s.board, vcam, 1, {
     ...view, sim: s, alpha, ghosts: [],
     // The afterglow at the video's own time.
@@ -491,7 +496,29 @@ function drawVideoFrame(ctx, s, vcam, alpha) {
                  view.beltStatus ? beltStatus(s, s.tick + alpha, panel.video.tps) : null, true),
     pixels: s.screen ? { screen: s.screen, alpha: view.pixelAlpha, max: view.pixelMax, textBg: view.pixelTextBg } : null,
     onWorld: bloomHook("video"),
+    ...extra,
   });
+}
+
+// Motion blur for a video (video.js `blur`): the samples are board parts
+// into the "video" sum, the frame their mean, bloomed, with the sharp marks
+// (Source values, notes, layer labels) over it from the frame's own state.
+function videoBlur() {
+  const k = blurSetting(), acc = k > 1 ? accFor("video") : null;
+  if (!acc) return null;
+  return {
+    k,
+    begin: (c) => acc.begin(c.canvas.width, c.canvas.height),
+    sample: (c, s, vcam, alpha) => {
+      const b = bloomHook("video");
+      drawVideoFrame(c, s, vcam, alpha, { part: "board", onCapture: b ? (cc) => acc.addSample(cc.canvas, 0) : null });
+      acc.addSample(c.canvas, 1);
+    },
+    finish: (c, s, vcam, alpha) => {
+      blurComposite(c, acc, bloomHook("video"));
+      drawVideoFrame(c, s, vcam, alpha, { part: "overlay" });
+    },
+  };
 }
 
 // Camera-aware audio in a video hears the VIDEO's frame, which moves with
@@ -548,7 +575,7 @@ async function recordVideoNow() {
   try {
     const [{ recordVideo }, bakeMod] = await Promise.all([import("./video.js"), withSound ? import("./audio-bake.js") : null]);
     const res = await recordVideo({
-      sim: copy, settings, startCam, endCam, draw: drawVideoFrame,
+      sim: copy, settings, startCam, endCam, draw: drawVideoFrame, blur: videoBlur(),
       audio: withSound ? { params: { ...panel.audio }, bake: bakeMod.bakeAudio, selection: soundSel?.cells ?? null,
                            space: currentSpace(), spaceAt: videoSpaceAt(settings, startCam, endCam, copy.tick) } : null,
       writable: choice.kind === "file" ? choice.writable : null,
@@ -1155,12 +1182,124 @@ function bloomHook(key) {
     }
     return undefined;
   }
-  return (c) => {
+  // `src`: the picture to take the glow from, when it is not c's own canvas
+  // (motion blur's averaged board).
+  return (c, src) => {
     try {
       if (!blooms.has(key)) blooms.set(key, new bloomMod.Bloom());
-      blooms.get(key).apply(c, { intensity: view.bloom, cutoff: view.bloomCutoff, radius: view.bloomRadius });
+      blooms.get(key).apply(c, { intensity: view.bloom, cutoff: view.bloomCutoff, radius: view.bloomRadius }, src);
     } catch (e) { bloomFailed = true; console.warn("bloom", e); }
   };
+}
+
+// --- motion blur -----------------------------------------------------------
+//
+// View > look > motion blur: k renders a frame, averaged, then bloomed once
+// (mblur.js has the timing, blur.js the averaging). At 1 nothing here runs and
+// paint() takes its ordinary path. Each sample is the board at its own tick
+// and its own camera -- realtime samples on a grid of ticks the worker slices
+// its deltas at, the camera interpolated from the last frame's to this one's;
+// a video's k samples ending on each frame's tick. Item numbers are in the
+// samples (they move); ghosts, selections, boxes, Source values, notes and
+// layer labels draw once, sharp, over the mean (render.js `part`).
+const MB = {
+  accs: new Map(),   // "screen" / "video" -> blur.js Accumulator (each its own size)
+  failed: false,
+  S: null,           // the sim time the last frame showed
+  cam: null,         // the camera it showed, { cx, cy, zoom }
+  frameSec: 1 / 60,  // frame interval, smoothed: sets the grid's spacing
+  lastFrame: null,
+  scam: new Camera(),
+  drawn: false,      // this frame's samples are in the "screen" sum
+  held: null,        // what the sum holds: { revision, w, h, cam } -- for a frame with no samples
+};
+const blurSetting = () => Math.max(1, Math.min(64, Math.round(+view.motionBlur || 1)));
+function accFor(key) {
+  if (MB.failed) return null;
+  let a = MB.accs.get(key);
+  if (!a) {
+    try { a = new Accumulator(); } catch (e) { console.warn("motion blur", e); a = { ok: false }; }
+    if (!a.ok) { MB.failed = true; console.warn("motion blur off: needs WebGL2 with EXT_color_buffer_float"); return null; }
+    MB.accs.set(key, a);
+  }
+  return a;
+}
+// The k this frame renders with: 1 (off) unless the setting is above 1 and
+// the accumulator works.
+const blurK = () => (blurSetting() > 1 && accFor("screen") ? blurSetting() : 1);
+// The worker's grid spacing for k, at the clock's rate and the frame rate
+// seen lately; 0 when motion blur is off.
+const blurGrid = (k) => (k > 1 ? gridSpacing(clock.rate, MB.frameSec, k) : 0);
+
+// One blur sample of the live board, into the "screen" sum: the board part
+// of a render at the sample's camera, the sim as it stands, at `at`.
+function screenSample(acc, at, sc, lv) {
+  const b = bloomHook("screen");
+  const gT = view.gateStatus ? gateStatus(sim, at, clock.rate) : null;
+  const bT = view.beltStatus ? beltStatus(sim, at, clock.rate) : null;
+  render(ctx, board, sc, dpr, {
+    ...view, part: "board", sim, alpha: Math.min(1, Math.max(0, at - sim.tick)),
+    hide: run ? runCopies().copies.filter(c => c.over).map(c => c.start) : null,
+    pixels: sim?.screen ? { screen, alpha: view.pixelAlpha, max: view.pixelMax, textBg: view.pixelTextBg } : null,
+    ...layerOpts(lv, gT, bT),
+    onCapture: b ? (c) => acc.addSample(c.canvas, 0) : null,
+  });
+  acc.addSample(ctx.canvas, 1);
+}
+
+// The mean of a sum into ctx's canvas, then the glow taken from the sum
+// without the item numbers (layer 0), if bloom is on.
+function blurComposite(c, acc, bloomFn) {
+  c.save();
+  c.setTransform(1, 0, 0, 1, 0, 0);
+  c.globalCompositeOperation = "copy";
+  c.globalAlpha = 1;
+  c.drawImage(acc.resolve(1), 0, 0, c.canvas.width, c.canvas.height);
+  c.restore();
+  if (bloomFn && acc.layers[0].n) bloomFn(c, acc.resolve(0));
+}
+
+// A frame's samples. `E` is the sim time the frame shows; `advance(t)`
+// brings the sim up to floor(t) (applying the worker's slices, or stepping)
+// and `finish()` brings it the rest of the way. Renders into the "screen"
+// sum and returns true, or returns false when there is nothing to blur
+// (paused with a still camera: an ordinary frame is the same picture).
+function blurFrame(k, E, advance, finish) {
+  const acc = accFor("screen");
+  const cur = { cx: cam.cx, cy: cam.cy, zoom: cam.zoom };
+  const S = MB.S, prev = MB.cam || cur;
+  // Times and their camera fractions. A frame after a pause, a Reset or a
+  // load starts a fresh span (S is only trusted if it is a little behind E).
+  let samples = [];
+  const g = W.blurG > 0 && workerUsable() ? W.blurG : blurGrid(k);
+  if (S !== null && E > S && E - S < 8 * k * g + 4) {
+    samples = gridSampleTimes(S, E, g, 2 * k).map(t => ({ t, u: (t - S) / (E - S) }));
+  }
+  if (!samples.length && camMoved(prev, cur)) {
+    for (let i = 0; i < k; i++) samples.push({ t: E, u: (i + 1) / k });
+  }
+  if (!samples.length) {
+    finish();
+    // Playing, but no grid point fell in this frame (the worker's next
+    // delta had not come): show the last frame's mean again rather than a
+    // sharp frame, which between blurred ones reads as flicker. Only for
+    // the same board, size and camera, so nothing stale is ever shown.
+    const h = MB.held;
+    return !clock.paused && !!h && h.revision === board.revision && h.w === ctx.canvas.width && h.h === ctx.canvas.height && !camMoved(h.cam, cur);
+  }
+  const lv = layerView();
+  acc.begin(ctx.canvas.width, ctx.canvas.height);
+  MB.scam.resize(cam.w, cam.h);
+  P.begin("blur samples");
+  for (const { t, u } of samples) {
+    advance(t);
+    Object.assign(MB.scam, lerpCam(prev, cur, Math.min(1, Math.max(0, u))));
+    screenSample(acc, t, MB.scam, lv);
+  }
+  P.end();
+  finish();
+  MB.held = { revision: board.revision, w: ctx.canvas.width, h: ctx.canvas.height, cam: cur };
+  return true;
 }
 
 // Debug > profile frames (prof.js): the timing tree over the board, a
@@ -1201,6 +1340,8 @@ const W = {
   ahead: false,      // the mirror moved on without the worker: send it the state before it runs
   rate: 0, pixels: null, sleeping: null, audioGen: null, gainGen: null,
   audioLink: null,   // the audio engine whose synth the worker sends ticks to directly
+  blurG: 0,          // motion blur's grid spacing as last sent (0: off)
+  queue: null,       // this frame's deltas, held for motion blur to step through
 };
 let workerWanted = true;   // Debug > sim worker
 function startWorker() {
@@ -1239,7 +1380,7 @@ function workerBoard(fresh, alloc = sim.lastAlloc) {
   wpost({ ...boardMessage(sim, alloc, fresh), epoch: ++W.epoch });
   if (fresh) wpost({ ...exportFull(sim), epoch: W.epoch });
   W.delta = null; W.pulling = false; W.ahead = false;
-  if (fresh) W.pixels = W.sleeping = W.truth = W.audioGen = W.gainGen = null;
+  if (fresh) { W.pixels = W.sleeping = W.truth = W.audioGen = W.gainGen = null; W.blurG = 0; }
 }
 // The main thread changed the sim's state itself (stepped it, restored a
 // bake's state): anything the worker sends from before is stale, and it
@@ -1280,17 +1421,29 @@ function workerSettings() {
 }
 // One frame with the worker: apply what it sent, keep it playing at the
 // clock's rate (or paused), ask for the next delta. Returns the ticks the
-// mirror moved on by.
-function workerFrame() {
+// mirror moved on by. With `hold` (motion blur), the deltas -- its slices,
+// then the delta itself -- are left in W.queue for blurFrame() to step the
+// mirror through, sample by sample.
+function workerFrame(hold = false, k = 1) {
   let ran = 0;
   workerSettings();
+  // Motion blur's grid: resent only when it moves by a tenth, since every
+  // change shifts the grid the worker slices on.
+  const g = blurGrid(k);
+  if ((g > 0) !== (W.blurG > 0) || (g > 0 && Math.abs(g - W.blurG) > 0.1 * W.blurG)) {
+    wpost({ type: "blur", g });
+    W.blurG = g;
+  }
   const d = W.delta;
+  W.queue = null;
   if (d) {
     W.delta = null;
     const t0 = sim.tick;
-    applyDelta(sim, d, sim.screen);
+    const list = d.chunks?.length ? [...d.chunks, d] : [d];
+    if (hold) W.queue = list;
+    else for (const x of list) applyDelta(sim, x, sim.screen);
     if (audio && !bakedPlay) audio.rec.ingest(d.audio);
-    ran = Math.max(0, sim.tick - t0);
+    ran = Math.max(0, d.tick - t0);
     W.at = d.at; W.frac = d.frac;
   }
   if (!clock.paused) {
@@ -1326,6 +1479,14 @@ function paint(now) {
   P.frameStart(now);
   P.begin("paint");
   let ran = 0;
+  // The frame interval, smoothed (motion blur's grid follows it).
+  if (MB.lastFrame !== null) {
+    const dt = Math.min(0.1, Math.max(1 / 240, (now - MB.lastFrame) / 1000));
+    MB.frameSec += (dt - MB.frameSec) * 0.1;
+  }
+  MB.lastFrame = now;
+  MB.drawn = false;
+  const k = sim ? blurK() : 1;
   if (sim) {
     // An edit since the last frame re-derives the runs and starts fresh --
     // here rather than at each edit site, so no edit path can forget it.
@@ -1342,16 +1503,30 @@ function paint(now) {
       W.running = false;
       mirrorMoved();
     }
+    // Motion blur steps the sim through the frame's ticks itself, drawing a
+    // sample at each grid point on the way (blurFrame()); off, each path
+    // below is exactly what it was.
+    const tick0 = sim.tick;
     if (viaWorker) {
-      ran = workerFrame();
+      ran = workerFrame(k > 1, k);
       if (bakedPlay) stopBakedPlay();
+      if (k > 1) {
+        const q = W.queue || [];
+        const end = q.length ? q[q.length - 1].tick : sim.tick;
+        const applyUpTo = (t) => { while (q.length && q[0].tick <= Math.floor(t)) applyDelta(sim, q.shift(), sim.screen); };
+        MB.drawn = blurFrame(k, end + clock.frac, applyUpTo, () => applyUpTo(Infinity));
+        W.queue = null;
+      }
     } else if (!clock.paused && bakePlayable()) {
       // Baked: step to the tick being heard. The buffer runs on its own
       // clock, so falling behind costs frames, never sync.
       if (!bakedPlay) startBakedPlay();
       const target = Math.min(bakedTick(), bake.end);
       const t0 = performance.now();
-      while (sim.tick < Math.floor(target) && performance.now() - t0 < BAKED_BUDGET_MS) { sim.step(); ran++; }
+      const stepTo = (t) => { while (sim.tick < Math.floor(t) && performance.now() - t0 < BAKED_BUDGET_MS) sim.step(); };
+      if (k > 1) MB.drawn = blurFrame(k, target, stepTo, () => stepTo(target));
+      else stepTo(target);
+      ran = sim.tick - tick0;
       clock.frac = Math.min(1, Math.max(0, target - sim.tick));
       if (ran) mirrorMoved();
     } else if (!clock.paused) {
@@ -1360,12 +1535,23 @@ function paint(now) {
       // the backlog too, so coming back never freezes to catch up.
       const dt = lastNow === null ? 0 : Math.min(0.25, (now - lastNow) / 1000);
       const n = clock.advance(dt);
-      const t0 = performance.now();
-      for (; ran < n; ran++) {
-        if (ran > 0 && performance.now() - t0 > STEP_BUDGET_MS) { clock.dropped += n - ran; break; }
-        sim.step();
-      }
+      const t0 = performance.now(), last = tick0 + n;
+      // Stepping within the frame's budget; what does not fit is dropped.
+      const stepTo = (t) => {
+        const want = Math.min(last, Math.floor(t));
+        while (sim.tick < want) {
+          if (sim.tick > tick0 && performance.now() - t0 > STEP_BUDGET_MS) return;
+          sim.step();
+        }
+      };
+      if (k > 1) MB.drawn = blurFrame(k, last + clock.frac, stepTo, () => stepTo(last));
+      else stepTo(last);
+      ran = sim.tick - tick0;
+      if (ran < n) clock.dropped += n - ran;
       if (ran) mirrorMoved();
+    } else if (k > 1) {
+      // Paused: still a blur while the camera moves.
+      MB.drawn = blurFrame(k, sim.tick + clock.alpha, () => {}, () => {});
     }
     P.end();
     shell.setTick(sim.tick);
@@ -1404,6 +1590,9 @@ function paint(now) {
   const gTint = view.gateStatus ? P.span("gateStatus", () => gateStatus()) : null;
   const bTint = view.beltStatus ? P.span("beltStatus", () => beltStatus()) : null;
   P.begin("render");
+  // Motion blur drew this frame's samples already: their mean, bloomed, then
+  // the sharp marks over it. Otherwise the ordinary whole render.
+  if (MB.drawn) P.span("blur composite", () => blurComposite(ctx, MB.accs.get("screen"), bloomHook("screen")));
   render(ctx, board, cam, dpr, { ...view, selected: info, ghosts, sim, alpha: clock.alpha, hide, vector: vectorMarks(),
                                 indexLabels: indexLabels(), noteSel: noteEdit, noteGrips: labelHeld(),
                                 ghostNotes: ghostNotes(),
@@ -1412,7 +1601,12 @@ function paint(now) {
                                 soundSpace: spaceMarks(),
                                 ...layerOpts(lv, gTint, bTint),
                                 layerLabelHits: labelHits = [], layerLabelSel: labelSel,
+                                part: MB.drawn ? "overlay" : null,
                                 onWorld: bloomHook("screen") });
+  // What this frame showed, for the next one's span (kept with blur off
+  // too, so switching it on mid-play starts from here).
+  MB.S = sim ? sim.tick + clock.alpha : null;
+  MB.cam = { cx: cam.cx, cy: cam.cy, zoom: cam.zoom };
   // Debug > GPU sync: wait for the canvas to finish rasterising, so the
   // pixel cost shows up as a number (prof.js).
   if (P.prof.on && P.prof.gpuSync) P.span("gpu sync", () => ctx.getImageData(0, 0, 1, 1));

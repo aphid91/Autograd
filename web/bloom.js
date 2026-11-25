@@ -184,9 +184,12 @@ export class Bloom {
 
   // Bloom `ctx`'s canvas as it stands and add the glow back into it.
   // `intensity` 0..: the glow's gain; `cutoff` 0..1: the luminance below
-  // which nothing glows; `radius` 1..BLOOM_LEVELS: how wide.
-  apply(ctx, { intensity, cutoff, radius }) {
-    const src = ctx.canvas, gl = this.gl;
+  // which nothing glows; `radius` 1..BLOOM_LEVELS: how wide. `source` is the
+  // picture the glow is taken from, ctx's own canvas by default; motion blur
+  // passes its averaged board (blur.js), the size of ctx's canvas, so the
+  // glow is of the blurred picture and is added once.
+  apply(ctx, { intensity, cutoff, radius }, source = ctx.canvas) {
+    const src = source, gl = this.gl;
     if (!(intensity > 0) || !src.width || !src.height) return;
     this.resize(src.width, src.height);
     gl.bindTexture(gl.TEXTURE_2D, this.src);

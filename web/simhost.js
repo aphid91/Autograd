@@ -35,6 +35,7 @@
 
 import { Sim, Clock } from "./sim.js";
 import { Board } from "./board.js";
+import { isCut } from "./mblur.js";
 
 // The gate block of an entity row: input values, input held, output values,
 // output held -- MAX_CHANNELS slots each, from F_IN_VALUE.
@@ -279,6 +280,11 @@ export const IDLE_MS = 500;
 // keeps 60 ms queued, and a frame's gap (50 ms and more on a phone) plus
 // the audio thread's own bursts was enough to run it dry.
 export const AUDIO_POST_MS = 5;
+// Motion blur's slices (mblur.js): at most this many held between requests.
+// Past it the worker stops cutting and the rest of the changes ride the next
+// slice -- merging is safe, dropping a slice would not be (a delta is only
+// what changed since the last one).
+export const MAX_CHUNKS = 256;
 
 export class SimHost {
   // `post(message, transfer)` sends to the main thread; `now()` is the clock.
@@ -299,6 +305,12 @@ export class SimHost {
     this.tap = null;
     this.audioPort = null;       // a MessagePort into the synth, or null: audio rides the deltas
     this.audioSent = 0;
+    // Motion blur: the sample grid's spacing in ticks (0: off), and the
+    // slices cut at its ticks since the last reply, oldest first. Each is a
+    // delta of its own, so the mirror can be stepped through them and drawn
+    // at every grid point.
+    this.blurG = 0;
+    this.chunks = [];
   }
 
   message(m) {
@@ -309,6 +321,7 @@ export class SimHost {
         // and the next tick starts with everything awake.
         this.epoch = m.epoch;
         if (this.sim) { applyFull(this.sim, m); this.sim.wakeAll(); this.tr?.clear(); this.tap?.take(); }
+        this.chunks = [];
         return;
       case "play": this.clock.setRate(m.rate); this.clock.frac = m.frac ?? this.clock.frac; this.clock.paused = false; this.playing = true; this.last = null; this.pulled = this.now(); return;
       case "pause":
@@ -324,6 +337,7 @@ export class SimHost {
       case "truth": this.truthOn = m.on; if (this.sim) this.sim.truthOn = m.on; return;
       case "audio": this.tapCfg = m.cfg; this.wire(); return;
       case "audioport": this.audioPort?.close?.(); this.audioPort = m.port || null; return;
+      case "blur": this.blurG = m.g > 0 ? m.g : 0; return;
     }
   }
 
@@ -334,6 +348,7 @@ export class SimHost {
     // gathered while the rebuild seeds the new ones (the mirror seeds the
     // same).
     this.tr?.clear();
+    this.chunks = [];
     this.tap = null;
     if (this.sim) { this.sim.track = null; this.sim.audio = null; this.sim.screen = null; }
     // A new board gets a new Sim; an edit keeps this one. Either way it then
@@ -392,6 +407,13 @@ export class SimHost {
     const transfer = d.transfer;
     delete d.transfer;
     if (d.audio) transfer.push(...audioBuffers(d.audio));
+    // Motion blur's slices go ahead of it: the mirror applies them in order,
+    // then this delta.
+    if (this.chunks.length) {
+      for (const c of this.chunks) { transfer.push(...c.transfer); delete c.transfer; }
+      d.chunks = this.chunks;
+      this.chunks = [];
+    }
     this.post(d, transfer);
   }
 
@@ -420,6 +442,9 @@ export class SimHost {
     for (let i = 0; i < n; i++) {
       if (i > 0 && this.now() - t0 > SLICE_MS) { this.clock.dropped += n - i; break; }
       this.sim.step();
+      if (this.blurG > 0 && this.chunks.length < MAX_CHUNKS && isCut(this.sim.tick, this.blurG)) {
+        this.chunks.push(takeDelta(this.sim, this.tr));
+      }
     }
     if (this.audioPort && this.now() - this.audioSent >= AUDIO_POST_MS) this.sendAudio();
     // The next tick's due time; run again at once when there is work.

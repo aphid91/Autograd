@@ -141,16 +141,30 @@ function bodyRect(ctx, x, y, w, h) {
   if (r > 0) ctx.roundRect(x, y, w, h, r); else ctx.rect(x, y, w, h);
 }
 
+// `opts.part` splits a frame for motion blur (mblur.js, blur.js); without it
+// the frame is drawn whole, exactly as it always was:
+//   - "board": one blur sample -- the board, its items AND their numbers
+//     (they move, so they blur), the pixel overlay. No ghosts, no bloom, no
+//     editing marks. `onCapture(ctx)`, if given, is called just before the
+//     item numbers, so bloom can take its source from a picture without
+//     them (they never glowed).
+//   - "overlay": what stays sharp over the averaged samples -- ghosts,
+//     frame and audio boxes, the vector marks, the selection, notes, index
+//     badges, Source values and layer labels. Nothing is cleared first.
 export function render(ctx, board, cam, dpr, opts = {}) {
   const view = { ...DEFAULT_VIEW, ...opts };
+  const part = view.part || null;
+  const boardPart = part !== "overlay";
   const z = cam.zoom;
   lodZ = z;
   lodO = view.simpleView ? 1 : TUNE.lodZoom;
   LOOK.corner = Math.max(0, +view.corner || 0);
   LOOK.chevrons = view.chevronAlpha ?? 1;
   ctx.setTransform(1, 0, 0, 1, 0, 0);
-  ctx.fillStyle = COL.void;
-  ctx.fillRect(0, 0, ctx.canvas.width, ctx.canvas.height);
+  if (boardPart) {
+    ctx.fillStyle = COL.void;
+    ctx.fillRect(0, 0, ctx.canvas.width, ctx.canvas.height);
+  }
   if (!board) return;
 
   // World transform: x right, y up, one unit per cell.
@@ -162,80 +176,98 @@ export function render(ctx, board, cam, dpr, opts = {}) {
   const on = (x, y, w = 1, h = 1) => x + w >= v.x0 && x <= v.x1 && y + h >= v.y0 && y <= v.y1;
   const S = board.T.cell.DIR_STEPS;
 
-  ctx.fillStyle = view.bg || COL.bg;
-  ctx.fillRect(0, 0, board.width, board.height);
-
-  // Grid, under everything, so belts read as joined across cell edges.
-  if (view.grid && z >= LOD.gridLines) span("grid", () => {
-    const gx0 = Math.max(0, Math.floor(v.x0)), gx1 = Math.min(board.width, Math.ceil(v.x1));
-    const gy0 = Math.max(0, Math.floor(v.y0)), gy1 = Math.min(board.height, Math.ceil(v.y1));
-    for (const major of [false, true]) {
-      ctx.beginPath();
-      for (let x = gx0; x <= gx1; x++) {
-        if ((x % 8 === 0) !== major) continue;
-        ctx.moveTo(x, gy0); ctx.lineTo(x, gy1);
-      }
-      for (let y = gy0; y <= gy1; y++) {
-        if ((y % 8 === 0) !== major) continue;
-        ctx.moveTo(gx0, y); ctx.lineTo(gx1, y);
-      }
-      ctx.strokeStyle = major ? COL.gridMajor : COL.grid;
-      ctx.lineWidth = px;
-      ctx.globalAlpha = TUNE.gridOpacity;
-      ctx.stroke();
-      ctx.globalAlpha = 1;
-    }
-  });
-
-  // Placed belts a run (or its copies) will turn draw only as the ghost.
+  // The lists the marks need too (Source values read `structs`).
   const hide = view.hide?.length ? new Set(view.hide.map(([x, y]) => `${x},${y}`)) : null;
-  // View > belts off hides placed belts and underground ends (ghosts of a
-  // run being planned still draw).
-  // `lists`: the board's own lists with hidden layers' entities left out
-  // (main.js filters them once per change, not per frame).
   const L = view.lists || board;
-  if (view.belts !== false) {
-    span("belts", () => drawBelts(ctx, hide ? L.belts.filter(b => !hide.has(`${b.x},${b.y}`)) : L.belts, z, on, S, view.seedTint, view.beltTint || null));
-    span("unders", () => drawUnders(ctx, L.unders, z, on, S, view.underTint || view.beltTint || null));
-  }
-  // View > sources off: Sources are not drawn (there are hundreds on a
-  // computer, and they hide the machines worth looking at). Still there.
-  // View > gates off hides every machine, Sources included -- for a look at
-  // the belts underneath. Still there, and still tappable.
   const structs = view.gates === false ? []
     : view.sources === false ? L.structs.filter(s => board.T.types[s.type].name !== "source") : L.structs;
-  span("structs", () => drawStructs(ctx, board.T, structs, z, px, on, S, view.ports, view.labels, view.gateTint || null));
-
-  ctx.strokeStyle = COL.border;
-  ctx.lineWidth = 2 * px;
-  ctx.strokeRect(0, 0, board.width, board.height);
-
-  // The planning ghosts go under the items -- or, while the pixel overlay
-  // is on, over it, so what is being placed stays visible on the screen.
   const ghosts = (view.ghosts || [view.ghost]).filter(Boolean);
   const drawGhosts = () => { if (ghosts.length) span("ghosts", () => { for (const g of ghosts) drawGhost(ctx, board.T, g, z, px, on, S, view.ports, view.labels, view.seedTint); }); };
-  if (!view.pixels) drawGhosts();
 
-  // Items last among the board's contents: cargo on a cell, over any tint,
-  // so a red wash never changes the colour that says an item's sign.
   let cargo = null;
-  if (view.sim && view.items !== false) cargo = span("items", () => drawItems(ctx, view.sim, view.alpha || 0, z, on, S, view.hiddenCells, board.width, view.dim?.cells));
+  if (boardPart) {
+    ctx.fillStyle = view.bg || COL.bg;
+    ctx.fillRect(0, 0, board.width, board.height);
 
-  // Layers: what an inactive layer holds is washed out -- colour drained,
-  // then darkened -- body, glyph, ports and items alike, so what can be
-  // touched stands out. Over the items, under the editing marks.
-  if (view.dim) span("dim", () => drawDim(ctx, view.dim.rects, on, world));
+    // Grid, under everything, so belts read as joined across cell edges.
+    if (view.grid && z >= LOD.gridLines) span("grid", () => {
+      const gx0 = Math.max(0, Math.floor(v.x0)), gx1 = Math.min(board.width, Math.ceil(v.x1));
+      const gy0 = Math.max(0, Math.floor(v.y0)), gy1 = Math.min(board.height, Math.ceil(v.y1));
+      for (const major of [false, true]) {
+        ctx.beginPath();
+        for (let x = gx0; x <= gx1; x++) {
+          if ((x % 8 === 0) !== major) continue;
+          ctx.moveTo(x, gy0); ctx.lineTo(x, gy1);
+        }
+        for (let y = gy0; y <= gy1; y++) {
+          if ((y % 8 === 0) !== major) continue;
+          ctx.moveTo(gx0, y); ctx.lineTo(gx1, y);
+        }
+        ctx.strokeStyle = major ? COL.gridMajor : COL.grid;
+        ctx.lineWidth = px;
+        ctx.globalAlpha = TUNE.gridOpacity;
+        ctx.stroke();
+        ctx.globalAlpha = 1;
+      }
+    });
 
-  // The pixel overlay (pixel.js): over the board and its items.
-  if (view.pixels) {
-    span("pixels", () => drawPixels(ctx, board, view.pixels.screen, view.pixels.alpha, view.pixels.max, on, view.pixels.textBg));
+    // Placed belts a run (or its copies) will turn draw only as the ghost
+    // (`hide`). View > belts off hides placed belts and underground ends
+    // (ghosts of a run being planned still draw). `lists`: the board's own
+    // lists with hidden layers' entities left out (main.js filters them once
+    // per change, not per frame).
+    if (view.belts !== false) {
+      span("belts", () => drawBelts(ctx, hide ? L.belts.filter(b => !hide.has(`${b.x},${b.y}`)) : L.belts, z, on, S, view.seedTint, view.beltTint || null));
+      span("unders", () => drawUnders(ctx, L.unders, z, on, S, view.underTint || view.beltTint || null));
+    }
+    // View > sources off: Sources are not drawn (there are hundreds on a
+    // computer, and they hide the machines worth looking at). Still there.
+    // View > gates off hides every machine, Sources included -- for a look at
+    // the belts underneath. Still there, and still tappable.
+    span("structs", () => drawStructs(ctx, board.T, structs, z, px, on, S, view.ports, view.labels, view.gateTint || null));
+
+    ctx.strokeStyle = COL.border;
+    ctx.lineWidth = 2 * px;
+    ctx.strokeRect(0, 0, board.width, board.height);
+
+    // The planning ghosts go under the items -- or, while the pixel overlay
+    // is on, over it, so what is being placed stays visible on the screen.
+    // A blur sample has none: they are editing marks, drawn sharp on top.
+    if (!view.pixels && !part) drawGhosts();
+
+    // Items last among the board's contents: cargo on a cell, over any tint,
+    // so a red wash never changes the colour that says an item's sign.
+    if (view.sim && view.items !== false) cargo = span("items", () => drawItems(ctx, view.sim, view.alpha || 0, z, on, S, view.hiddenCells, board.width, view.dim?.cells));
+
+    // Layers: what an inactive layer holds is washed out -- colour drained,
+    // then darkened -- body, glyph, ports and items alike, so what can be
+    // touched stands out. Over the items, under the editing marks.
+    if (view.dim) span("dim", () => drawDim(ctx, view.dim.rects, on, world));
+
+    // The pixel overlay (pixel.js): over the board and its items.
+    if (view.pixels) {
+      span("pixels", () => drawPixels(ctx, board, view.pixels.screen, view.pixels.alpha, view.pixels.max, on, view.pixels.textBg));
+      if (!part) drawGhosts();
+    }
+  }
+
+  // A blur sample ends here: the item numbers are part of it (they move),
+  // after the capture bloom takes its source from (they never glow).
+  if (part === "board") {
+    if (view.onCapture) { ctx.save(); view.onCapture(ctx); ctx.restore(); }
+    if (cargo && view.itemText !== false) span("itemLabels", () => drawItemLabels(ctx, cargo, cam, dpr));
+    return;
+  }
+  // The marks over averaged samples start with the ghosts the samples left out.
+  if (part === "overlay") {
+    ctx.setTransform(world);
     drawGhosts();
   }
 
   // Everything so far is the board itself; what follows is editing marks
   // and screen-space text. The bloom (bloom.js) takes the picture here, so
   // a selection or a frame box never glows, and lays its glow over it.
-  if (view.onWorld) {
+  if (view.onWorld && !part) {
     ctx.save();
     span("bloom", () => view.onWorld(ctx));
     ctx.restore();
@@ -286,7 +318,7 @@ export function render(ctx, board, cam, dpr, opts = {}) {
     ctx.strokeRect(sel.x - pad, sel.y - pad, sel.w + 2 * pad, sel.h + 2 * pad);
   }
 
-  if (cargo) span("itemLabels", () => drawItemLabels(ctx, cargo, cam, dpr));
+  if (cargo && view.itemText !== false) span("itemLabels", () => drawItemLabels(ctx, cargo, cam, dpr));
   if (view.notes !== false && board.notes?.length) drawNotes(ctx, board.notes, cam, dpr, view.noteSel ?? -1, !!view.noteGrips);
   // Labels lifted into a selection, or about to be pasted: ghosted, and a
   // selected one outlined as a lifted entity is.

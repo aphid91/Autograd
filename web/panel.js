@@ -15,7 +15,8 @@ const PANE_KEY = "gates.web.pane.v1";
 const DIR_NAMES = ["+X east", "+Y north", "-X west", "-Y south"];
 
 // View > look: the shipped values, and the panel's dials in order.
-export const LOOK_DEFAULTS = { bg: "#1f1f24", corner: 0, chevronAlpha: 1, bloom: 0, bloomCutoff: 0.7, bloomRadius: 5 };
+// motionBlur: samples per render (mblur.js); 1 is off.
+export const LOOK_DEFAULTS = { bg: "#1f1f24", corner: 0, chevronAlpha: 1, bloom: 0, bloomCutoff: 0.7, bloomRadius: 5, motionBlur: 1 };
 const LOOK_SPEC = [
   ["bg", "background", { view: "color" }],
   ["corner", "corner radius", { min: 0, max: 0.5, step: 0.01 }],
@@ -23,6 +24,7 @@ const LOOK_SPEC = [
   ["bloom", "bloom intensity", { min: 0, max: 4, step: 0.01 }],
   ["bloomCutoff", "bloom cutoff", { min: 0, max: 1, step: 0.01 }],
   ["bloomRadius", "bloom radius", { min: 1, max: 8, step: 0.05 }],
+  ["motionBlur", "motion blur", { min: 1, max: 64, step: 1 }],
 ];
 
 // The status colours' shipped values (View > status colours), as hex so
@@ -110,7 +112,7 @@ export class Panel {
       board.addButton({ title: "Delete saved" }).on("click", () => this.local.saved && cb.onDeleteLocal(this.local.saved)),
     ];
 
-    this.view = { grid: false, ports: true, labels: true, seedTint: true, notes: true, momentum: true, items: true, belts: true, gates: true, gateStatus: true, sources: true, beltStatus: true, beltActive: true, statusGlow: 15, statusGlowTime: false, statusGlowS: 0.5, statusSluggish: 0, fps: false, pixelAlpha: 0, pixelMax: 64, pixelTextBg: true, layers: false, simpleView: false, truthiness: false, ...LOOK_DEFAULTS, ...this.prefs.view };
+    this.view = { grid: false, ports: true, labels: true, seedTint: true, notes: true, momentum: true, items: true, belts: true, gates: true, gateStatus: true, sources: true, beltStatus: true, beltActive: true, statusGlow: 15, statusGlowTime: false, statusGlowS: 0.5, statusSluggish: 0, fps: false, itemText: true, pixelAlpha: 0, pixelMax: 64, pixelTextBg: true, layers: false, simpleView: false, truthiness: false, ...LOOK_DEFAULTS, ...this.prefs.view };
     if (!/^#[0-9a-f]{6}$/i.test(this.view.bg)) this.view.bg = LOOK_DEFAULTS.bg;
     const view = this.pane.addFolder({ title: "View", expanded: false });
     this.viewBindings = [];
@@ -124,7 +126,7 @@ export class Panel {
     // in this order). Same keys and the same handler: only where they show.
     const DEV_VIEW = new Set(["grid", "ports", "labels", "momentum", "beltActive", "pixelMax"]);
     const devView = [];
-    for (const [key, label] of [["grid", "grid lines"], ["ports", "ports"], ["labels", "source values"], ["seedTint", "seed tint"], ["notes", "labels (notes)"], ["momentum", "pan momentum"], ["items", "items"], ["belts", "belts"], ["gates", "gates"], ["gateStatus", "gate status colours"], ["beltStatus", "belt status colours"], ["beltActive", "stalled but moving: green"], ["truthiness", "truthiness colours"], ["sources", "sources"], ["fps", "fps counter"], ["layers", "layers"], ["simpleView", "simple view"]]) {
+    for (const [key, label] of [["grid", "grid lines"], ["ports", "ports"], ["labels", "source values"], ["seedTint", "seed tint"], ["notes", "labels (notes)"], ["momentum", "pan momentum"], ["items", "items"], ["itemText", "item numbers"], ["belts", "belts"], ["gates", "gates"], ["gateStatus", "gate status colours"], ["beltStatus", "belt status colours"], ["beltActive", "stalled but moving: green"], ["truthiness", "truthiness colours"], ["sources", "sources"], ["fps", "fps counter"], ["layers", "layers"], ["simpleView", "simple view"]]) {
       if (DEV_VIEW.has(key)) { devView.push([key, label, {}]); continue; }
       this.viewBindings.push(view.addBinding(this.view, key, { label }).on("change", pushView));
     }
