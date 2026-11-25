@@ -466,9 +466,12 @@ let recording = null;       // { cancel } while a video renders
 const camState = () => ({ cx: cam.cx, cy: cam.cy, zoom: cam.zoom, w: cam.w, h: cam.h });
 
 // What the video frame covers, for the preview: the crop box now, and the
-// end camera's (dashed), in the video's aspect.
+// end camera's (dashed), in the video's aspect. Shown while the Video folder
+// is open, **even with the pane collapsed**: collapsing the pane is how the
+// player gets it out of the way to frame the shot. (Audio's camera box, by
+// contrast, does hide with the pane.)
 function videoBoxes() {
-  if (!videoOpen || !panel.paneOpen) return null;
+  if (!videoOpen) return null;
   const v = panel.video, aspect = v.width / v.height;
   const boxes = [{ ...cropBox(camState(), aspect), dashed: false }];
   if (endCam) boxes.push({ ...cropBox(endCam, aspect), dashed: true });

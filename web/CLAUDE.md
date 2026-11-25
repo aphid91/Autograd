@@ -1789,8 +1789,8 @@ both dials default to 0.
 - **Shown** as the box dashed and, with a soft edge, the fringe's limit
   dotted with round corners (distance is Euclidean). The region's always
   shows; the camera's only while the Audio folder is open in an expanded
-  pane -- the same rule the video frame now follows (it ignored a minimised
-  pane before). A sub-folder folding inside Audio or Video bubbles a fold
+  pane. The video frame deliberately does **not** follow that rule (see
+  "Video"): it stays up with the pane collapsed. A sub-folder folding inside Audio or Video bubbles a fold
   event up; those are ignored by target.
 - **Bakes and videos**: a bake uses the space at the press; a video's
   soundtrack with camera-aware on hears the **video's** frame, which moves
@@ -2166,7 +2166,10 @@ the camera arithmetic, loaded always and tested in node;
   encoded (Linux Chromium); H.264, then VP9, then AV1 for the picture, each
   asked of the browser rather than assumed.
 - **The camera**: the frame is the largest box of the video's aspect that
-  fits the view (`cropBox()`), shown on the board while the folder is open;
+  fits the view (`cropBox()`), shown on the board while the folder is open
+  -- **including with the whole pane collapsed**, which is how the player
+  gets the panel out of the way to frame the shot (it once hid with the
+  pane, which defeated that; Audio's camera box still does);
   **Select end camera state** captures the view as it is, drawn dashed, and
   **Unset end camera** drops it. The move runs from the view at Record to
   the end state over **start lerp .. end lerp** (fractions of the video,
