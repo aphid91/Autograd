@@ -518,6 +518,7 @@ html, body {
   padding: calc(8 * var(--u)); white-space: pre-wrap; max-height: calc(110 * var(--u)); overflow-y: auto;
 }
 .idx-preview[data-error="true"] { color: var(--danger); }
+.idx-preview[data-warn="true"] { color: #ffcf6a; }
 .idx-apply { color: var(--accent); border-color: var(--accent); }
 /* The scale sheet, at the top of the screen for room: a short scrolling
    list of presets (and Table…), the formula, the two pitch dials, then the
@@ -695,6 +696,10 @@ html, body {
    red at or below. */
 .numsw.pos .swb { border-color: #4d9a58; }
 .numsw.neg .swb { border-color: #b2504a; }
+/* An ASCII source's swatches: characters, not numbers, in lime. */
+.numsw .num.chr { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; color: #b8f060; font-size: calc(11 * var(--u)); }
+/* The button that turns a Source into an ASCII source and back. */
+.convsrc .conv-art { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-weight: 700; font-size: calc(13 * var(--u)); color: #b8f060; line-height: 1; }
 
 /* ----------------------------------------------------------------------
    THE RATE PANEL: ticks per second, floated just above the Sim section.
@@ -1250,3 +1255,13 @@ html, body {
   height: 38vh; width: 28px; margin: 0; accent-color: #8fb4ff; touch-action: none;
 }
 .rate-slider-val { min-width: 44px; text-align: center; font-variant-numeric: tabular-nums; }
+
+/* Typing into a keyboard machine (keycapture.js): the field that takes the
+   keys is there to be focused, never seen. 16px so iOS does not zoom. */
+.keycap {
+  position: fixed; left: 0; bottom: 0; width: 1px; height: 1px;
+  opacity: 0; pointer-events: none; font-size: 16px; resize: none;
+  border: 0; padding: 0; margin: 0; overflow: hidden;
+}
+.kbdtype[data-on="true"] { color: #e8d6a8; border-color: #c8b88a; }
+.kbdinfo { text-transform: none; letter-spacing: 0; }

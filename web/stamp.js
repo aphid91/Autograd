@@ -5,7 +5,7 @@
 // A stamp is plain data, so it persists in a toolbar slot as JSON:
 //
 //   { entries: [entry], w, h, notes }   normalised: the covered box starts at 0,0
-//   entry = { type, dx, dy, dir, flip, exit, partner, emit, seed }
+//   entry = { type, dx, dy, dir, flip, exit, partner, emit, ascii, seed }
 //   notes = [label]: the desktop's label records (notes.js), rect in the
 //           stamp's frame -- core/stamp.py's Stamp.annotations. Optional:
 //           a stamp stored before labels travelled has none.
@@ -15,7 +15,8 @@
 // and it survives an id renumbering. `partner` is the index of another entry
 // in this stamp (an underground pair), or null -- recorded in stamp-local
 // terms so a copied pair re-pairs with itself on paste. `emit` is a Source's
-// value and `seed` a belt's seed value, each null when absent.
+// value and `seed` a belt's seed value, each null when absent; `ascii` a
+// Source's ASCII flag (board.js F_ASCII), absent or false on a plain one.
 
 const byNameCache = new WeakMap();
 

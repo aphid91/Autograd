@@ -12,6 +12,24 @@ import { parseAudio } from "./audio-params.js";
 
 export const FORMAT_VERSION = 1;
 
+
+// A Source's ASCII flag lives in the row slot a belt keeps its seed's
+// on-flag in (Belt.F_SEED_ON, 24): nothing reads that slot on a Source --
+// not this app's sim, not the desktop -- and it is outside the gate block
+// (F_IN_VALUE + 4 * MAX_CHANNELS), which the worker's deltas copy whole
+// into the screen's rows on every fire. A spare INPUT slot would have been
+// overwritten by the worker's stale copy the first time the Source fired.
+// In the row, it rides saves, snapshots, undo and copies for free; the
+// desktop loads the save as a plain Source.
+export const F_ASCII = 24;
+function checkAsciiSlot(T) {
+  const E = T.entity, gateEnd = T.sim.F_IN_VALUE + 4 * T.sim.MAX_CHANNELS;
+  const src = Object.values(T.types).find(t => t.name === "source");
+  if (E.F_SEED_ON !== F_ASCII || F_ASCII < gateEnd || F_ASCII >= E.STRIDE || (src && src.sim.n_in !== 0)) {
+    throw new Error(`entity slot ${F_ASCII} is not free for a Source's ASCII flag`);
+  }
+}
+
 export class Board {
   constructor(T, arrays) {
     this.T = T;            // types.json
@@ -45,6 +63,10 @@ export class Board {
     this.layers = parseLayers(arrays.layers?.data);
     adoptOrphans(this.layers, this.rowLayers());
     this.layersRev = 0;
+    // A Source's ASCII flag (see F_ASCII): cosmetic, so its own revision --
+    // an undo step and an autosave, never a restart of the simulation.
+    checkAsciiSlot(T);
+    this.styleRev = 0;
     // The save's audio settings (audio-params.js), or null if it has none.
     // main.js keeps this the dials in front of the player, so every save
     // writes them; not part of a snapshot, so undo never touches them.
@@ -168,6 +190,7 @@ export class Board {
       dir: this.field(row, E.F_DIR) | 0,
       flip: !!this.field(row, E.F_FLIPPED),
       emit: td.name === "source" ? this.field(row, E.F_EMIT) : null,
+      ascii: td.name === "source" ? !!this.field(row, F_ASCII) : null,
       seedOn: td.kind === "belt" ? !!this.field(row, E.F_SEED_ON) : null,
       seedValue: td.kind === "belt" ? this.field(row, E.F_SEED_VALUE) : null,
     };
@@ -319,7 +342,7 @@ export class Board {
   // Each cell's .y holds its offset within the PLACED footprint, which is
   // what Gameboard._stamp_footprint() writes and what the desktop renderer
   // un-places to find a port.
-  spawnStructure(type, origin, dir, flip, { emit = null, derive = true, layer } = {}) {
+  spawnStructure(type, origin, dir, flip, { emit = null, ascii = false, derive = true, layer } = {}) {
     const E = this.T.entity, C = this.T.cell, S = E.STRIDE;
     const { o, blocked } = this.footprint(type, origin, dir, flip);
     if (blocked.length) return -1;
@@ -334,7 +357,10 @@ export class Board {
     this.setField(row, E.F_W, o.w);
     this.setField(row, E.F_H, o.h);
     this.setField(row, E.F_FLIPPED, flip ? 1 : 0);
-    if (this.T.types[type].name === "source") this.setField(row, E.F_EMIT, emit ?? 0);
+    if (this.T.types[type].name === "source") {
+      this.setField(row, E.F_EMIT, emit ?? 0);
+      if (ascii) this.setField(row, F_ASCII, 1);
+    }
     this.tagLayer(row, layer);
     this.liveCount++;
     const wordX = (dir << C.DIR_SHIFT) | (type << C.TYPE_SHIFT) | (row << C.ID_SHIFT);
@@ -443,6 +469,7 @@ export class Board {
         exit: type === C.TYPE_UNDER && !!this.field(r, E.F_UNDER_IS_EXIT),
         partner: partner && index.has(partner) ? index.get(partner) : null,
         emit: td.name === "source" ? this.field(r, E.F_EMIT) : null,
+        ascii: td.name === "source" && !!this.field(r, F_ASCII),
         seed: td.kind === "belt" && this.field(r, E.F_SEED_ON) ? this.field(r, E.F_SEED_VALUE) : null,
         layer: this.field(r, F_LAYER) | 0,
       };
@@ -487,7 +514,7 @@ export class Board {
       // none (a copy being pasted) puts it on the current layer.
       if (t === C.TYPE_BELT) row = this.spawnBelt(x, y, e.dir, e.seed ?? null, e.layer);
       else if (t === C.TYPE_UNDER) row = this.spawn1(t, x, y, e.dir, { isExit: e.exit, layer: e.layer });
-      else row = this.spawnStructure(t, [x, y], e.dir, e.flip, { emit: e.emit, derive: false, layer: e.layer });
+      else row = this.spawnStructure(t, [x, y], e.dir, e.flip, { emit: e.emit, ascii: !!e.ascii, derive: false, layer: e.layer });
       rows.set(i, row);
     });
     const E = this.T.entity;
@@ -583,6 +610,20 @@ export class Board {
     this.derive();
   }
 
+  // An ASCII source is an ordinary Source that draws its value as a
+  // character. The engine never reads the flag, so turning it on or off is
+  // not a board edit: no derive(), no restart -- the render list is patched
+  // in place and `styleRev` makes it an undo step and an autosave.
+  isAscii(row) { return !!this.field(row, F_ASCII); }
+  setAscii(row, on) {
+    if (this.isAscii(row) === !!on) return false;
+    this.setField(row, F_ASCII, on ? 1 : 0);
+    const s = this.structs?.find(x => x.row === row);
+    if (s) s.ascii = !!on;
+    this.styleRev++;
+    return true;
+  }
+
   // The seed's on-flag and sign are mirrored into the cell's .z, because
   // the desktop renderer reads them from the grid with no row lookup. A
   // row-only write would leave the desktop drawing a stale tint.
@@ -636,7 +677,8 @@ export class Board {
           partner: this.field(r, E.F_UNDER_PARTNER) | 0, span: null });
       } else {
         structs.push({ row: r, type, x, y, dir, flip, w: o.w, h: o.h, o,
-          emit: td.name === "source" ? this.field(r, E.F_EMIT) : null });
+          emit: td.name === "source" ? this.field(r, E.F_EMIT) : null,
+          ascii: td.name === "source" && !!this.field(r, F_ASCII) });
         for (const [lx, ly, f] of o.outputs) {
           const k = (y + ly) * W + (x + lx);
           this.portOut.set(k, (this.portOut.get(k) || 0) | (1 << f));

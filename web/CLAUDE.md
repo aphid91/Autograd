@@ -913,6 +913,131 @@ stamps naming "sink" resolve through `T.aliases` (`typeByName()`).
   `types.json` without `installPixel()`, so they still compare Sink with
   Sink.
 
+### ASCII sources
+
+An **ASCII source** is a Source that draws its value as a character. To the
+engine it is an ordinary Source -- the same type, the same row, the same
+ticks -- and the difference is a **flag in the row**, so a save carrying
+them loads on the desktop as plain Sources. [ascii.js](ascii.js) is the one
+place that says what a number means as a character (`isAscii()`: the whole
+part in 0..127; `glyphOf()`, `parseValue()`, `valueText()`), shared by the
+board, the picker, the index preview and the keyboard; tested in
+`tests/ascii.test.mjs`.
+
+- **The flag is in slot 24** (`F_ASCII` in board.js), a belt's seed
+  on-flag, which nothing reads on a Source. Not a spare *input* slot,
+  though the Source has three: the worker's deltas copy a gate's whole
+  channel block (`F_IN_VALUE` .. +16) into the screen's rows on every fire,
+  so a flag there was overwritten by the worker's stale copy the first time
+  the Source fired. `checkAsciiSlot()` pins the slot at load.
+- **Converting is not an edit.** The engine never reads the flag, so
+  `Board.setAscii()` patches the render list in place and bumps
+  `board.styleRev` (part of the undo key, so an undo step and an autosave)
+  -- no `derive()`, and the simulation runs on.
+- **Drawing**: lime (`ASCII_COLOUR`) where a Source is light blue, and the
+  value's character where a Source shows its number: printable ones as
+  themselves (a space as `␣`), control codes and DEL as their Unicode
+  control pictures (`␊` a newline, `␈` backspace), and anything that is not
+  ASCII -- -78.3584, say, which an ASCII source is allowed to emit -- as
+  the **null glyph**, a hollow box. With gate status colours on (the
+  default) the status colour wins, as it does over every machine's own
+  colour; the character still says which it is.
+- **While the Hand has an ASCII source inspected**, every value whose whole
+  part is printable shows as its character instead of its number: the
+  items' numbers and the other Sources' values (`view.asciiChars`,
+  `sourceText()`/`valueText()` in render.js).
+- **The Hand's picker** on an ASCII source: its six swatches are the six
+  most recent distinct values picked in the picker for one (localStorage,
+  `gates.web.asciiRecent.v1`; picks only -- indexing does not count),
+  starting from space, `A`, `0`, `\n`, `.`, `-`; drawn as characters. The
+  value box reads a single character as that character (`5` is 53, `=`
+  is 61) and longer text as a number (`-1`, `53`), and shows a character
+  value as the character. On a **plain** Source the box reads a number as a
+  number and a lone non-number character as its code, so `=` gives 61 and
+  shows as 61. A **Number / ASCII** button converts the inspected Source to
+  the other kind. The placing bar has the same swatches, box and button for
+  the tool.
+- **The tool**: "ASCII source" in the slot picker (a `structure` slot of
+  type `source` with `ascii: true`). Copy, paste, cut, stamps and baked
+  slots carry the flag (`entry.ascii`); vector selection's pattern match
+  ignores it, as it ignores the value.
+- **Indexing** has an **ASCII sources** box when the indexed set holds
+  Sources: ticked, every indexed Source becomes an ASCII source; unticked,
+  a plain one; a mixed set starts indeterminate, each keeping its kind
+  until the box is touched. Ticking the Hack table's ASCII stream ticks it
+  too. With it on, values whose whole part is outside 0..127 are warned
+  about in the preview and in a toast on Apply -- allowed, shown as the
+  null glyph -- except the stream's end-of-stream -1s, which are
+  deliberate.
+
+### The keyboard
+
+**Keyboard** ([keyboard.js](keyboard.js)) is a second web-only machine: 5×3,
+beige, one output in the middle of a long side (authored on the north face
+of the middle top cell; flip is not offered, since it would only do what a
+half turn does). It is the first thing on the board the player talks to
+**while the simulation runs**. Tap it in the Hand and the device's keyboard
+comes up; each key press is one ASCII code (`ascii.js keyCode()`: Enter is
+10, Backspace 8, Delete 127, Tab 9, Escape 27, ctrl+letter its control code;
+keys with no code, like the arrows, nothing). It emits them in order, one
+per tick at most, holding the rest under back pressure.
+
+- **A new type id, 13**, so a save holding one is **web-only**: the desktop
+  does not know the id (accepted). `installWebTypes()` ([webtypes.js](webtypes.js))
+  installs both web-only machines, Pixel and Keyboard, wherever types.json
+  is loaded.
+- **To the engine it is a generator** -- no inputs, one output, a constant
+  -- whose constant is the head of its queue, and which is not ready
+  (`inputsReady()`) with nothing queued, so gate status colours call an idle
+  keyboard starved. `Sim.keys` is the queues (row -> codes, at most
+  `KEY_QUEUE_MAX`, 256); `Sim.inject(row, code)` queues one and `touch()`es
+  the row, since a sleeping gate reads nothing and would never notice
+  (mutation-tested: without the touch the wake-list test fails).
+- **A key press is not an edit.** An edit restarts the simulation, so a
+  press goes into the running sim instead: **to the worker** while it ticks
+  (a `key` message carrying the board's revision -- one sent just before an
+  edit or a load is dropped by the worker rather than landing on the new
+  board), or **into the mirror** while this thread ticks or the clock is
+  paused, after which the worker is handed the whole state before it runs
+  again (`mirrorMoved()`).
+- **The queue is dynamic state, like a ring**: emptied by every fresh start
+  (`flush()`: an edit, Reset), carried by `clone()` and `restoreFrom()`, and
+  sent whole in a delta whenever it changed (`Tracker.keys`) and in every
+  full state, so the mirror's Status and the Hand show how many are
+  waiting. A **forecast** sees the coming fire but never takes the token
+  (it does not know the queue to roll back).
+- **What it cannot replay**: a bake or a video does not contain keystrokes
+  (they are not on the board), and Reset forgets them. The tick being
+  animated was forecast before a key arrived, so a token pops onto the
+  out-edge rather than gliding for one tick.
+- **Taking the keys** ([keycapture.js](keycapture.js)): a hidden textarea
+  that takes the focus inside the Hand's tap (a phone raises its keyboard
+  only for a focus made in a gesture). A physical keyboard is read from
+  `keydown` (default prevented, so the field never changes); an on-screen
+  one reports no usable keys (Android's keyCode 229), so its `input` events
+  are read as the field's text before and after (`textDiff()`): a typed
+  character, a backspace, a newline, or an autocorrected word as backspaces
+  and its new text. The field keeps a few spaces between presses, so a
+  backspace always has something to delete, and is reset after each press
+  but never mid-composition. The app's shortcuts ignore keys in a text
+  field, so Space types a space; a `mousedown` on any button is kept from
+  taking the focus, so Play or Reset does not drop the phone's keyboard.
+  The Hand's bar shows **Type / Typing** (tap to raise the keyboard again)
+  and the last code and how many are waiting.
+
+`tests/keyboard.test.mjs`: the type's geometry at every facing; typed codes
+come out in order, one a tick, and nothing without a key; back pressure
+holds the rest (nothing lost or made); a sleeping and a full timeline agree
+tick for tick with keys typed mid-run after quiet stretches; a forecast
+does not take a token, a clone owns its queue, Reset and an edit empty it;
+and keys sent to a ticking worker reach the mirror exactly as a reference
+typed into directly, a stale key is dropped, and a full state carries the
+queue back. Mutation-tested: no wake on a key, the forecast taking the
+token, the delta without the queue, a stale key kept, and a flush that
+keeps the queue each fail it. Checked in Chromium: typing `Hi there`, Enter
+and Backspace with the sim paused, then `!?` while it played (through the
+worker), put exactly those codes on the keyboard's belt.
+
 ### How machines draw
 
 As the desktop draws them, because a design reads by it: the body, the
@@ -2674,6 +2799,10 @@ largest JS span left.
 | `viewpresets.js` | view presets: a presentation view (View, colours, Dev, layers) under a name, in the browser and as `.json` files |
 | `audio-bake.js` | baking: a stretch of ticks rendered offline, and the WAV writer; loaded on demand |
 | `pixel.js` | the Pixel machine (web-only, in Sink's id), its screen, and the overlay's drawing |
+| `keyboard.js` | the Keyboard machine (web-only, type id 13): a generator that emits what is typed |
+| `webtypes.js` | `installWebTypes()`: Pixel and Keyboard into a loaded types.json |
+| `keycapture.js` | the hidden field that takes a keyboard's keys, physical or on-screen |
+| `ascii.js` | what a value means as a character: glyphs, the value box, recents, key codes (pure) |
 | `present.js` | presentation mode: the `#b=` route, its controls, the camera schedule, the info panel |
 | `prof.js` | Debug > profile frames: named spans, the per-frame timing tree |
 | `persist.js` | the one switch that stops every localStorage write (presentation mode) |

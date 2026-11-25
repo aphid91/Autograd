@@ -48,6 +48,7 @@ export class Tracker {
     this.runFlag = new Uint8Array(runs); this.runs = [];
     this.pushes = [];                // (run index, slot) pairs, in order
     this.pixels = [];                // row, then its four input values, per fire, in order
+    this.keys = false;               // a keyboard's queue changed (Sim.inject(), a fire)
   }
   row(r) { if (!this.rowFlag[r]) { this.rowFlag[r] = 1; this.rows.push(r); } }
   run(oi) { if (!this.runFlag[oi]) { this.runFlag[oi] = 1; this.runs.push(oi); } }
@@ -56,6 +57,7 @@ export class Tracker {
     for (const r of this.rows) this.rowFlag[r] = 0;
     for (const i of this.runs) this.runFlag[i] = 0;
     this.rows.length = 0; this.runs.length = 0; this.pushes.length = 0; this.pixels.length = 0;
+    this.keys = false;
   }
 }
 
@@ -169,9 +171,12 @@ export function takeDelta(sim, tr, extra = {}) {
     fired[j] = sim.fired[r];
   });
   const pixels = Float64Array.from(tr.pixels);
+  // The keyboards' queues, whole, whenever one changed: a few codes, and the
+  // mirror's Status shows how many are waiting.
+  const keys = tr.keys ? [...sim.keys].map(([r, q]) => [r, q.slice()]) : null;
   tr.clear();
   const d = { type: "delta", tick: sim.tick, stats: statsOf(sim), runs, runVals, pushes, enter, payload,
-              rows, chans, fired, pixels, ...extra };
+              rows, chans, fired, pixels, ...(keys ? { keys } : {}), ...extra };
   d.transfer = [runs.buffer, runVals.buffer, pushes.buffer, enter.buffer, payload.buffer,
                 rows.buffer, chans.buffer, fired.buffer, pixels.buffer];
   // Truthiness, only while it is on (Sim.truthOn): each run's and row's bit.
@@ -210,6 +215,7 @@ export function applyDelta(sim, d, screen = null) {
     const p = d.pixels;
     for (let j = 0; j + 4 < p.length; j += 5) screen.fire(p[j], [p[j + 1], p[j + 2], p[j + 3], p[j + 4]]);
   }
+  if (d.keys) { sim.keys = new Map(d.keys.map(([r, q]) => [r, q.slice()])); sim.keysVersion = (sim.keysVersion || 0) + 1; }
   sim.tick = d.tick;
   Object.assign(sim.stats, d.stats);
   sim.version++;
@@ -219,7 +225,7 @@ export function applyDelta(sim, d, screen = null) {
 
 // The whole dynamic state: every run, every ring, every gate row.
 export function exportFull(sim) {
-  const tr = { runs: sim.order.map((_, i) => i), rows: sim.gates.map(g => g.row), pushes: [], pixels: [], clear() {} };
+  const tr = { runs: sim.order.map((_, i) => i), rows: sim.gates.map(g => g.row), pushes: [], pixels: [], keys: true, clear() {} };
   const d = takeDelta(sim, tr, { type: "state" });
   // The rings whole, run by run.
   const caps = Int32Array.from(sim.order, s => s.cap);
@@ -338,6 +344,12 @@ export class SimHost {
       case "audio": this.tapCfg = m.cfg; this.wire(); return;
       case "audioport": this.audioPort?.close?.(); this.audioPort = m.port || null; return;
       case "blur": this.blurG = m.g > 0 ? m.g : 0; return;
+      // A key typed on a keyboard (keyboard.js), while this side ticks. Only
+      // onto the board it was typed at: one sent just before an edit or a
+      // load arrives after the new board and is dropped.
+      case "key":
+        if (this.sim && m.revision === this.sim.board.revision) this.sim.inject(m.row, m.code);
+        return;
     }
   }
 

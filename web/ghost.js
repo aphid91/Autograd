@@ -57,7 +57,7 @@ export function stampGhost(board, entries, at) {
         span: !e.exit && p !== null && p !== undefined && at[p] ? at[p] : null });
     } else {
       structs.push({ type: id, x, y, dir: e.dir, flip: e.flip ? 1 : 0, w: o.w, h: o.h, o,
-        emit: td.name === "source" ? (e.emit ?? 0) : null });
+        emit: td.name === "source" ? (e.emit ?? 0) : null, ascii: td.name === "source" && !!e.ascii });
     }
   });
 

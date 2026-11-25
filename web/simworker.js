@@ -9,7 +9,7 @@
 // request, a pause, an edit -- are handled between slices, which last at
 // most SLICE_MS.
 
-import { installPixel } from "./pixel.js";
+import { installWebTypes } from "./webtypes.js";
 import { SimHost } from "./simhost.js";
 
 let host = null;
@@ -49,7 +49,7 @@ self.onmessage = (e) => (host ? handle(e.data) : early.push(e.data));
 fetch("types.json")
   .then(r => r.json())
   .then(t => {
-    host = new SimHost(installPixel(t), (m, transfer) => self.postMessage(m, transfer || []));
+    host = new SimHost(installWebTypes(t), (m, transfer) => self.postMessage(m, transfer || []));
     for (const m of early.splice(0)) handle(m);
     self.postMessage({ type: "ready" });
   })

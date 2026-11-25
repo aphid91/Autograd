@@ -211,4 +211,4 @@ export function asciiCodes(source) {
 
 // Indexing's ASCII stream ends with this value, repeated over every entry
 // past the last character, so a reader can tell the file has ended.
-export const END_OF_STREAM = -1;
+export { END_OF_STREAM } from "./ascii.js";

@@ -82,12 +82,13 @@ const LOD = {
 const EMIT_SCALE = 0.56;
 const OVERLAY_WIDTH = 0.28;
 function emitSize(s, z) {
-  const text = fmtNumber(s.emit);
+  const text = sourceText(s);
   return TUNE.emitSize * Math.min(EMIT_SCALE * z, (s.w * z * 0.8) / (text.length * 0.62));
 }
 const emitShown = (s, z, labels) => s.emit !== null && labels && z >= LOD.marks;
 
 import { structGlyph } from "./glyphs.js";
+import { glyphOf, isPrintable, NULL_GLYPH, ASCII_COLOUR } from "./ascii.js";
 import { wrapLabel } from "./layers.js";
 import { TUNE } from "./tune.js";
 import { itemPoints } from "./flow.js";
@@ -109,6 +110,21 @@ const shade = (c, k) => css(c.map(v => v * k));
 // past 2^23 is whole, so without the bound the style depended on whether a
 // value happened to have a fraction rather than on how big it was.)
 const FULL_INT_LIMIT = 2 ** 24;
+
+// What a Source wears. An ASCII source shows its value's character (a
+// control code as its Unicode picture, anything not ASCII as the null
+// glyph, a hollow box). While the Hand has an ASCII source inspected
+// (`view.asciiChars`), every value whose whole part is a printable
+// character shows that character instead of its number: the other
+// Sources' values and the items' numbers alike.
+let charMode = false;
+function sourceText(s) {
+  if (s.ascii) return glyphOf(s.emit) ?? NULL_GLYPH;
+  return valueText(s.emit);
+}
+function valueText(v) {
+  return charMode && isPrintable(v) ? glyphOf(v) : fmtNumber(v);
+}
 
 export function fmtNumber(v) {
   if (Number.isInteger(v) && Math.abs(v) <= FULL_INT_LIMIT) return String(v);
@@ -158,6 +174,7 @@ export function render(ctx, board, cam, dpr, opts = {}) {
   const z = cam.zoom;
   lodZ = z;
   lodO = view.simpleView ? 1 : TUNE.lodZoom;
+  charMode = !!view.asciiChars;
   LOOK.corner = Math.max(0, +view.corner || 0);
   LOOK.chevrons = view.chevronAlpha ?? 1;
   ctx.setTransform(1, 0, 0, 1, 0, 0);
@@ -603,7 +620,7 @@ function drawStructs(ctx, T, structs, z, px, on, S, ports, labels, tint = null) 
   const byColour = new Map();   // css -> [colour, machines]
   for (const s of structs) {
     if (!on(s.x, s.y, s.w, s.h)) continue;
-    const c = (tint && s.row !== undefined && tint.get(s.row)) || types[s.type].colour || GREY;
+    const c = (tint && s.row !== undefined && tint.get(s.row)) || (s.ascii ? ASCII_COLOUR : types[s.type].colour) || GREY;
     const key = cssOf(c);
     let g = byColour.get(key);
     if (!g) byColour.set(key, g = [c, []]);
@@ -735,7 +752,15 @@ function drawLabels(ctx, T, structs, cam, dpr, on, dimRows = null) {
     ctx.font = `600 ${size.toFixed(1)}px system-ui, sans-serif`;
     const [sx, sy] = cam.worldToScreen(s.x + s.w / 2, s.y + s.h / 2);
     ctx.globalAlpha = dimRows?.has(s.row) ? a0 * DIM_TEXT : a0;
-    ctx.fillText(fmtNumber(s.emit), sx, sy);
+    const t = sourceText(s);
+    // A character on a lime body needs the item numbers' dark halo to read.
+    if (s.ascii) {
+      ctx.lineJoin = "round";
+      ctx.lineWidth = Math.max(2, size * 0.16);
+      ctx.strokeStyle = COL.itemHalo;
+      ctx.strokeText(t, sx, sy);
+    }
+    ctx.fillText(t, sx, sy);
   }
   ctx.globalAlpha = a0;
 }
@@ -947,7 +972,7 @@ function drawItemLabels(ctx, cargo, cam, dpr) {
   ctx.fillStyle = COL.itemNum;
   for (let i = 0; i < labels.length; i += 3) {
     const [sx, sy] = cam.worldToScreen(labels[i], labels[i + 1]);
-    const t = fmtNumber(labels[i + 2]);
+    const t = valueText(labels[i + 2]);
     ctx.strokeText(t, sx, sy);
     ctx.fillText(t, sx, sy);
   }

@@ -28,10 +28,14 @@ import { History } from "./history.js";
 import { icon } from "./icons.js";
 import { DEFAULT, naturalOrder, tableValues, finalValues } from "./indexer.js";
 import { END_OF_STREAM } from "./hack.js";
+import { isAscii, nameOf } from "./ascii.js";
 import { openAssembler, isAssemblerOpen } from "./assembler.js";
 import { toast } from "./toast.js";
 import { entrySize, typeByName } from "./stamp.js";
-import { installPixel, Screen } from "./pixel.js";
+import { Screen } from "./pixel.js";
+import { installWebTypes } from "./webtypes.js";
+import { KEY_QUEUE_MAX } from "./keyboard.js";
+import { KeyCapture } from "./keycapture.js";
 import { cropBox, evenDim, fitBox, frameBox, frameCount, viewBox } from "./video-params.js";
 import { presentationName, editName, startPresentation, fetchPresentation, presentationRecord, safeName } from "./present.js";
 import * as P from "./prof.js";
@@ -1239,7 +1243,7 @@ function screenSample(acc, at, sc, lv) {
   const gT = view.gateStatus ? gateStatus(sim, at, clock.rate) : null;
   const bT = view.beltStatus ? beltStatus(sim, at, clock.rate) : null;
   render(ctx, board, sc, dpr, {
-    ...view, part: "board", sim, alpha: Math.min(1, Math.max(0, at - sim.tick)),
+    ...view, part: "board", sim, alpha: Math.min(1, Math.max(0, at - sim.tick)), asciiChars: asciiChars(),
     hide: run ? runCopies().copies.filter(c => c.over).map(c => c.start) : null,
     pixels: sim?.screen ? { screen, alpha: view.pixelAlpha, max: view.pixelMax, textBg: view.pixelTextBg } : null,
     ...layerOpts(lv, gT, bT),
@@ -1557,6 +1561,11 @@ function paint(now) {
     P.end();
     shell.setTick(sim.tick);
     if (inspectRow >= 0) P.span("liveText", () => panel.setLive(liveText(inspectRow)));
+    // A keyboard's waiting count moves as the worker's deltas land.
+    if (isKeyboard(inspectRow)) {
+      const iv = shell.state.inspectValue;
+      if (iv?.kind === "keyboard" && iv.waiting !== sim.keysWaiting(inspectRow)) shell.setInspectValue(handValueOf(inspectRow));
+    }
   }
   P.begin("misc");
   driveDryRun();
@@ -1594,7 +1603,7 @@ function paint(now) {
   // Motion blur drew this frame's samples already: their mean, bloomed, then
   // the sharp marks over it. Otherwise the ordinary whole render.
   if (MB.drawn) P.span("blur composite", () => blurComposite(ctx, MB.accs.get("screen"), bloomHook("screen")));
-  render(ctx, board, cam, dpr, { ...view, selected: info, ghosts, sim, alpha: clock.alpha, hide, vector: vectorMarks(),
+  render(ctx, board, cam, dpr, { ...view, selected: info, ghosts, sim, alpha: clock.alpha, hide, vector: vectorMarks(), asciiChars: asciiChars(),
                                 indexLabels: indexLabels(), noteSel: noteEdit, noteGrips: labelHeld(),
                                 ghostNotes: ghostNotes(),
                                 pixels: sim?.screen ? { screen, alpha: view.pixelAlpha, max: view.pixelMax, textBg: view.pixelTextBg } : null,
@@ -1625,7 +1634,7 @@ function paint(now) {
 // (clearing the way, then building) are one step.
 // The board's edit key: entities and labels both. A label edit is an undo
 // step but not a board edit -- it must not restart the simulation.
-const editKey = () => `${board.revision}/${board.notesRev}/${board.layersRev}`;
+const editKey = () => `${board.revision}/${board.notesRev}/${board.layersRev}/${board.styleRev}`;
 
 function recordStep() {
   if (!board || sel || editKey() === committed) return;
@@ -2080,7 +2089,7 @@ function gateStateOf(s) {
   const out = new Map();
   for (const g of s.gates) {
     const blocked = g.drains.some(ch => s.outHeld(g.row, ch));
-    const starved = g.sim.n_in > 0 && !s.inputsReady(g);
+    const starved = (g.sim.n_in > 0 || g.sim.keyboard) && !s.inputsReady(g);
     out.set(g.row, blocked ? GATE_BLOCKED : starved ? GATE_STARVED : GATE_RUNNING);
   }
   return out;
@@ -2149,6 +2158,7 @@ function liveText(row) {
       }
       lines.push(`out  ${outs.join("   ")}`);
     }
+    if (g.sim.keyboard) lines.push(`typed, waiting  ${sim.keysWaiting(row)}`);
     lines.push(`tick ${sim.tick}`);
     return lines.join("\n");
   }
@@ -2199,7 +2209,47 @@ function syncBar() {
 
 function inspect(row) {
   inspectRow = row;
+  // A keyboard in the Hand takes the keys: the hidden field gets the focus
+  // (inside this tap, or a phone would not raise its keyboard).
+  if (isKeyboard(row) && pickable(row)) keycap().start();
+  else if (capture?.active) capture.stop();
   syncInspect();
+}
+
+// --- the keyboard (keyboard.js) ---------------------------------------------
+//
+// The first thing on the board the player talks to while it runs. A press
+// is not an edit -- an edit restarts the simulation -- but a token queued on
+// the keyboard in the simulation itself (Sim.inject()): on the worker while
+// it ticks (the mirror learns the queue from its deltas), or on the mirror
+// when this thread ticks or the clock is paused (and the worker is handed
+// the whole state before it runs again). Each key carries the board's
+// revision, so one sent just before an edit is dropped by the worker
+// rather than landing on the new board.
+
+let capture = null;
+const keycap = () => (capture ||= new KeyCapture((code) => typeKey(code), () => {
+  if (isKeyboard(inspectRow)) shell.setInspectValue(handValueOf(inspectRow));
+}));
+let lastKey = null;    // the last code typed, for the Hand's bar
+
+function isKeyboard(row) {
+  return !!board && row >= 0 && board.describe(row)?.td.class === "Keyboard";
+}
+
+function typeKey(code) {
+  const row = inspectRow;
+  if (!sim || !isKeyboard(row) || !pickable(row)) return;
+  sim.sync();
+  if (W.ready && !W.failed && W.running) {
+    wpost({ type: "key", row, code, revision: board.revision });
+  } else {
+    if (!sim.inject(row, code, KEY_QUEUE_MAX)) { toast("The keyboard's queue is full.", 2000); return; }
+    mirrorMoved();
+  }
+  lastKey = code;
+  shell.setInspectValue(handValueOf(row));
+  redraw();
 }
 
 // The Status pane and the Hand's number swatches both show the inspected
@@ -2219,7 +2269,8 @@ function handValueOf(row) {
   const info = board?.describe(row);
   // An inactive layer's entities can be inspected but not edited.
   if (!info || !pickable(row)) return null;
-  if (info.emit !== null) return { kind: "emit", values: VALUE_CHOICES, current: info.emit };
+  if (info.emit !== null) return { kind: "emit", ascii: info.ascii, values: VALUE_CHOICES, current: info.emit };
+  if (info.td.class === "Keyboard") return { kind: "keyboard", waiting: sim?.keysWaiting(row) ?? 0, last: lastKey, typing: !!capture?.active };
   if (info.seedOn !== null) return { kind: "seed", values: VALUE_CHOICES, current: info.seedOn ? info.seedValue : null };
   return null;
 }
@@ -2236,6 +2287,25 @@ function setInspectValue(v) {
     board.setSeed(inspectRow, !off, off ? info.seedValue : v);
   }
   syncInspect();
+}
+
+// The Hand's convert button: a Source becomes an ASCII source and back. The
+// engine never reads the flag, so this is not an edit -- the simulation runs
+// on -- but it is an undo step (board.styleRev).
+function convertSource() {
+  const info = board?.describe(inspectRow);
+  if (!info || info.emit === null || !pickable(inspectRow)) return;
+  board.setAscii(inspectRow, !info.ascii);
+  syncInspect();
+}
+
+// While the Hand has an ASCII source inspected, every value on the board
+// that is a printable character shows as that character (render.js
+// view.asciiChars): the items and the other Sources alike.
+function asciiChars() {
+  if (shell?.state.mode !== "hand" || inspectRow < 0 || !board) return false;
+  const info = board.describe(inspectRow);
+  return !!info?.ascii;
 }
 
 // --- the vector picker ------------------------------------------------------
@@ -2405,10 +2475,17 @@ function indexPreview(o) {
   const { list, values, cut } = indexValues(o);
   if (!list.length) return { n: 0, error: "Nothing indexed: select some Sources or belts." };
   const fmt = (v) => (v === DEFAULT ? "default" : String(parseFloat(v.toPrecision(6))));
+  // The Sources: how many, and whether they are all ASCII sources now --
+  // what the sheet's ASCII sources box starts from.
+  const srcs = list.filter(({ e }) => e.type === "source");
+  const sources = { n: srcs.length, ascii: srcs.length > 0 && srcs.every(({ e }) => e.ascii),
+                    mixed: srcs.some(({ e }) => e.ascii) && srcs.some(({ e }) => !e.ascii) };
+  const asciiOut = o.asciiSources ?? (sources.ascii && !sources.mixed);
   // ASCII: each code with the character it is, so the stream can be read.
-  const chr = (v) => (!o.ascii || v === END_OF_STREAM ? (o.ascii ? "  end" : "")
-    : `  ${v === 10 ? "\\n" : v === 9 ? "\\t" : v === 13 ? "\\r" : v < 32 || v === 127 ? "·" : `'${String.fromCodePoint(v)}'`}`);
-  const lines = list.slice(0, 12).map(({ e }, n) => `#${n}  ${e.type === "source" ? "Source" : "belt  "}  ${fmt(values[n])}${chr(values[n])}`);
+  const stream = o.kind === "hack" && o.ascii;
+  const chr = (v, src) => (v === DEFAULT ? "" : stream && v === END_OF_STREAM ? "  end"
+    : (stream || (asciiOut && src)) && nameOf(v) ? `  ${nameOf(v)}` : "");
+  const lines = list.slice(0, 12).map(({ e }, n) => `#${n}  ${e.type === "source" ? "Source" : "belt  "}  ${fmt(values[n])}${chr(values[n], e.type === "source")}`);
   if (list.length > 12) lines.push(`… and ${list.length - 12} more`);
   if (o.kind === "hack" && o.ascii) {
     // The stream is complete once its last character and one -1 are in:
@@ -2423,7 +2500,26 @@ function indexPreview(o) {
     lines.unshift(cut ? `"${o.hackName}": ${len} instructions, only the first ${list.length} fit -- the rest are cut`
       : `"${o.hackName}": ${len} instructions${list.length > len ? `, then ${list.length - len} zeros` : ""}`, "");
   }
-  return { n: list.length, text: lines.join("\n") };
+  // Turning them into ASCII sources with values that are not characters
+  // (whole part outside 0..127) is allowed -- they show the null glyph --
+  // but said. The stream's end-of-stream -1s are deliberate, so exempt.
+  const bad = asciiOut ? nonAscii(list, values, stream) : 0;
+  return { n: list.length, text: lines.join("\n"), sources,
+           warning: bad ? `${bad} Source${bad === 1 ? "" : "s"} would get a value that is not an ASCII character (0..127): ${bad === 1 ? "it shows" : "they show"} a hollow box.` : null };
+}
+
+// How many indexed Sources get a value whose whole part is outside 0..127,
+// the stream's -1s aside.
+function nonAscii(list, values, stream) {
+  let n = 0;
+  list.forEach(({ e }, k) => {
+    const v = values[k];
+    if (e.type !== "source") return;
+    const x = v === DEFAULT ? 0 : v;
+    if (stream && x === END_OF_STREAM) return;
+    if (!isAscii(x)) n++;
+  });
+  return n;
 }
 
 function indexApply(o) {
@@ -2432,10 +2528,20 @@ function indexApply(o) {
   if (cut && o.ascii) toast(`The text did not fit: ${cut} character${cut === 1 ? "" : "s"} cut (${list.length} indexed, ${o.file.length + 1} needed with the end-of-stream −1).`, 5000);
   else if (cut) toast(`The program did not fit: ${cut} instruction${cut === 1 ? "" : "s"} cut (${list.length} indexed, ${o.file.length} needed).`, 5000);
   else if (o.ascii && list.length === o.file.length) toast(`Every character is in, but there was no room for the end-of-stream −1 (${o.file.length + 1} needed).`, 5000);
+  // The ASCII sources box: every indexed Source becomes the kind it says
+  // (null: each keeps its own).
+  if (o.asciiSources === true) {
+    const bad = nonAscii(list, values, o.kind === "hack" && o.ascii);
+    if (bad) toast(`${bad} ASCII source${bad === 1 ? "" : "s"} got a value that is not a character: shown as a hollow box.`, 5000);
+  }
   list.forEach(({ i, e }, n) => {
     const entry = sel.stamp.entries[i];
     const v = values[n];
-    if (e.type === "source") entry.emit = v === DEFAULT ? 0 : v;
+    if (e.type === "source") {
+      entry.emit = v === DEFAULT ? 0 : v;
+      if (o.asciiSources === true) entry.ascii = true;
+      else if (o.asciiSources === false) delete entry.ascii;
+    }
     else entry.seed = v;                 // null: no seed
   });
   shell.setIndexing(null);
@@ -2864,7 +2970,7 @@ function placementAt(tool, origin) {
   const o = T.types[type].orient[`${dir}${flip ? 1 : 0}`];
   const { blocked } = board.footprint(type, origin, dir, flip);
   return { tool, kind: "structure", type, origin, dir, flip, w: o.w, h: o.h, o,
-           value: toolValue(tool), blocked };
+           value: toolValue(tool), ascii: !!tool.ascii, blocked };
 }
 
 function placeGhost(pl) {
@@ -2878,7 +2984,7 @@ function placeGhost(pl) {
              blocked: pl.blocked, box };
   }
   const emit = T.types[pl.type].name === "source" ? pl.value : null;
-  return { structs: [{ type: pl.type, x, y, dir: pl.dir, flip: pl.flip, w: pl.w, h: pl.h, o: pl.o, emit }],
+  return { structs: [{ type: pl.type, x, y, dir: pl.dir, flip: pl.flip, w: pl.w, h: pl.h, o: pl.o, emit, ascii: pl.ascii }],
            blocked: pl.blocked, box };
 }
 
@@ -2959,7 +3065,7 @@ function placeOne(pl, original) {
   }
   const [x, y] = pl.origin;
   if (pl.kind === "rawbelt") board.spawnBelt(x, y, pl.dir, pl.value);
-  else board.spawnStructure(pl.type, pl.origin, pl.dir, pl.flip, { emit: pl.value, derive: false });
+  else board.spawnStructure(pl.type, pl.origin, pl.dir, pl.flip, { emit: pl.value, ascii: pl.ascii, derive: false });
   return true;
 }
 
@@ -3842,7 +3948,7 @@ async function init() {
   // Presenting writes nothing to the browser's storage: frozen before the
   // shell and the panel read (and would otherwise rewrite) their stores.
   if (presenting) { freezePersist(); document.body.classList.add("presenting"); }
-  T = installPixel(await (await fetch("types.json")).json());
+  T = installWebTypes(await (await fetch("types.json")).json());
   startWorker();
 
   let lastMode = null;
@@ -3875,6 +3981,8 @@ async function init() {
     onPlanBuild: () => commitRun(),
     onPlaceCancel: () => { if (shell.activeStamp) exitPaste(); else endPlace(); },
     onInspectValue: (v) => setInspectValue(v),
+    onConvertSource: () => convertSource(),
+    onKeyboardFocus: () => { if (isKeyboard(inspectRow)) { keycap().start(); syncInspect(); } },
     onPlanRoute: () => {
       run.route = ROUTES[(ROUTES.indexOf(run.route) + 1) % ROUTES.length];
       shell.heldTool.route = run.route;   // the tool remembers its route

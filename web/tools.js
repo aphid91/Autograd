@@ -10,6 +10,7 @@
 
 import { isValidStamp, typeByName } from "./stamp.js";
 import { structGlyph } from "./glyphs.js";
+import { ASCII_COLOUR } from "./ascii.js";
 
 export const CW = (d) => (d + 3) % 4;    // directions are CCW quarter turns
 export const CCW = (d) => (d + 1) % 4;
@@ -28,6 +29,9 @@ export function catalog(T) {
   for (const td of Object.values(T.types)) {
     if (td.kind !== "structure") continue;
     out.push({ kind: "structure", type: td.name, label: td.class });
+    // An ASCII source is a Source with a flag (board.js F_ASCII): the same
+    // machine to the engine, its value drawn as a character.
+    if (td.name === "source") out.push({ kind: "structure", type: td.name, ascii: true, label: "ASCII source" });
   }
   return out;
 }
@@ -35,7 +39,7 @@ export function catalog(T) {
 export function sameTool(a, b) {
   if (a.kind !== b.kind) return false;
   if (a.kind === "stamp") return a.stamp === b.stamp;
-  return a.kind !== "structure" || a.type === b.type;
+  return a.kind !== "structure" || (a.type === b.type && !!a.ascii === !!b.ascii);
 }
 
 export function labelFor(T, slot) {
@@ -145,7 +149,7 @@ export function toolArt(T, slot) {
   const td = typeOf(T, slot.type);
   if (!td) return "";
   const o = td.orient[`${d}${slot.flip ? 1 : 0}`];
-  const c = td.colour || [0.5, 0.5, 0.5];
+  const c = (slot.ascii ? ASCII_COLOUR : td.colour) || [0.5, 0.5, 0.5];
   const ins = o.inputs.map(([x, y, f]) => port(x, y, f, true)).join("");
   const outs = o.outputs.map(([x, y, f]) => port(x, y, f, false)).join("");
   // The control overlay and the glyph, as on the board.
@@ -182,7 +186,7 @@ export function stampArt(T, stamp) {
     } else if (t.td.kind === "under") {
       body += `<rect x="${e.dx + 0.15}" y="${e.dy + 0.15}" width="0.7" height="0.7" fill="#6b7380"/>`;
     } else {
-      const c = t.td.colour || [0.5, 0.5, 0.5];
+      const c = (e.ascii ? ASCII_COLOUR : t.td.colour) || [0.5, 0.5, 0.5];
       body += `<rect x="${e.dx + 0.06}" y="${e.dy + 0.06}" width="${o.w - 0.12}" height="${o.h - 0.12}" fill="${css(c)}"/>`;
     }
   }

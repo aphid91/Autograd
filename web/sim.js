@@ -97,6 +97,12 @@ export class Sim {
     // fire or push).
     this.truthOn = false;
     this.truth = new Uint8Array(0);
+    // Keyboards (keyboard.js): each one's queue of typed codes, row ->
+    // array, oldest first. Live input from the player, not derived from the
+    // board, so it is dynamic state like a ring: emptied on every fresh
+    // start (flush()), carried by clone(), the worker's deltas and full
+    // states (simhost.js), and never consumed by a forecast.
+    this.keys = new Map();
     this.onRebuild = null;
     this.allocOverride = null;      // simhost.js: the allocator a rebuild must start from
     this.sync();
@@ -589,7 +595,31 @@ export class Sim {
       for (let c = 0; c < g.sim.n_in; c++) this.clearIn(g.row, c);
       for (let c = 0; c < g.sim.n_out; c++) this.clearOut(g.row, c);
     }
+    this.keys = new Map();   // a fresh start forgets what was typed
+    this.keysVersion = (this.keysVersion || 0) + 1;
   }
+
+  // A key press on keyboard `row`: queue its code. Returns whether it was
+  // taken -- not a keyboard (or not live), or a full queue, and it is not.
+  // The keyboard is asked again on the coming tick (touch()), since a
+  // sleeping gate reads nothing and would never notice.
+  inject(row, code, max = 256) {
+    const g = this.gateOf.get(row);
+    if (!g || !g.sim.keyboard || !Number.isFinite(code)) return false;
+    let q = this.keys.get(row);
+    if (!q) this.keys.set(row, q = []);
+    if (q.length >= max) return false;
+    q.push(Math.fround(code));
+    this.keysVersion = (this.keysVersion || 0) + 1;
+    if (this.sched) this.touch(row);
+    if (this.track) this.track.keys = true;
+    this.version++;
+    this.fc = null;
+    return true;
+  }
+
+  // How many codes keyboard `row` has waiting.
+  keysWaiting(row) { return this.keys.get(row)?.length || 0; }
 
   // Engine.seed_segments(): one item per seeded belt cell, onto the tail of
   // its run, the oldest first and each one spacing older than the next, so a
@@ -816,13 +846,27 @@ export class Sim {
     if (s.n_in === 0) {
       // A generator fills whichever connected zones are free, independently.
       if (!drains.length) return false;
-      const emit = this.f(row, this.T.entity.F_EMIT);
+      // A keyboard's constant is the head of its queue, and with nothing
+      // typed it has nothing to emit. The head is taken only when it went
+      // somewhere, and never by a forecast (which rolls everything back but
+      // does not know the queue).
+      let q = null;
+      if (s.keyboard) {
+        q = this.keys.get(row);
+        if (!q || !q.length) return false;
+      }
+      const emit = q ? q[0] : this.f(row, this.T.entity.F_EMIT);
       const results = evalOps(this.T, s.ops, [], emit);
       const produced = [];
       for (const c of drains) {
         if (this.outHeld(row, c) || c >= results.length || results[c] === null) continue;
         this.setOut(row, c, results[c]);
         produced.push(c);
+      }
+      if (q && produced.length && !this.rec) {
+        q.shift();
+        this.keysVersion = (this.keysVersion || 0) + 1;
+        if (this.track) this.track.keys = true;
       }
       if (this.rec && produced.length) this.rec.fires.set(row, { values: [], results, consumed: [], produced });
       if (this.truthOn && !this.rec && produced.length) this.truth[row] = truthOf(g, null, results);
@@ -849,6 +893,9 @@ export class Sim {
 
   inputsReady(g) {
     const row = g.row, s = g.sim, R = this.T.sim;
+    // A keyboard is ready only with something typed (gate status colours
+    // then call an idle one starved, which it is).
+    if (s.keyboard) return this.keysWaiting(row) > 0;
     if (s.n_in === 0) return true;
     if (s.fire_rule === R.FIRE_SELECT) {
       const [ctl, pos, neg] = s.select;
@@ -1187,6 +1234,7 @@ export class Sim {
     c.audio = null; c.rec = null; c.fc = null; c.screen = null; c.undoLog = null;
     c.fired = this.fired.slice();
     c.truth = this.truth.slice();
+    c.keys = copyKeys(this.keys);
     c.sched = this.sched ? c.makeSched() : null;   // its own, everything awake
     return c;
   }
@@ -1206,6 +1254,8 @@ export class Sim {
     this.tick = snap.tick;
     this.fired.set(snap.fired);
     this.truth.set(snap.truth);
+    this.keys = copyKeys(snap.keys);
+    this.keysVersion = (this.keysVersion || 0) + 1;
     Object.assign(this.stats, snap.stats);
     this.version++;
     this.fc = null;
@@ -1337,6 +1387,11 @@ export function truthOf(g, values, results) {
   if (g.tKind === 1) return values && values[g.tCh] > 0 ? 1 : 0;
   if (g.tKind === 2) return results[g.tCh] > 0 ? 1 : 0;
   return 1;
+}
+
+// The keyboards' queues, copied (clone(), restoreFrom(), simhost.js).
+export function copyKeys(keys) {
+  return new Map([...(keys || [])].filter(([, q]) => q.length).map(([r, q]) => [r, q.slice()]));
 }
 
 export function evalOps(T, ops, values, konst) {

@@ -48,6 +48,19 @@ export function glyphPaths(name, cx, cy, r, t) {
       const k = name === "wye_down" ? -1 : 1;
       return { stroke: S(-r, k * r, 0, 0) + S(r, k * r, 0, 0) + S(0, 0, 0, -k * r), fill: "" };
     }
+    case "keys": {
+      // The keyboard (keyboard.js): two rows of keys and a space bar.
+      const k = r * 0.36, g = r * 0.14, cols = 5;
+      const w0 = cols * k + (cols - 1) * g, x0 = cx - w0 / 2;
+      const rect = (x, y, w, h) => `M${x} ${y}h${w}v${h}h${-w}Z`;
+      let fill = "";
+      for (let row = 0; row < 2; row++) {
+        const y = cy + r * 0.5 - row * (k + g);
+        for (let c = 0; c < cols; c++) fill += rect(x0 + c * (k + g), y - k / 2, k, k);
+      }
+      fill += rect(x0 + (k + g), cy + r * 0.5 - 2 * (k + g) - k / 2, 3 * k + 2 * g, k);
+      return { stroke: "", fill };
+    }
     default:
       return { stroke: "", fill: "" };
   }

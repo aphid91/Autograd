@@ -16,6 +16,7 @@ import { assemble, asciiCodes } from "./hack.js";
 import { listPrograms, getProgram } from "./hackstore.js";
 import { PALETTE, SIZE_NAMES, css as noteCss } from "./notes.js";
 import { persistEnabled } from "./persist.js";
+import { loadRecent, saveRecent, pushRecent, parseValue, valueText, nameOf, isAscii } from "./ascii.js";
 
 const STORE_KEY = "gates.web.shell.v1";
 const LONG_PRESS_MS = 500;   // as sand mode
@@ -140,7 +141,17 @@ export class Shell {
     this.buildThumbs();
     this.wireScroll();
     this.wirePicker();
+    // An ASCII source's number swatches: the six most recent distinct
+    // values picked in the picker (ascii.js), most recent first.
+    this.asciiRecent = loadRecent();
     this.render();
+  }
+
+  // A value picked in the picker for an ASCII source joins the recents.
+  // Picks only: indexing writes values too, and does not count.
+  pickedAscii(v) {
+    this.asciiRecent = pushRecent(this.asciiRecent, v);
+    saveRecent(this.asciiRecent);
   }
 
   // --- persistence and notification -------------------------------------
@@ -663,6 +674,11 @@ export class Shell {
     const m = document.getElementById("indexsheet");
     if (!m) return;
     const st = this.indexSheet || (this.indexSheet = { kind: "ascending", file: null, fileName: "", seed: 1, hack: "", ascii: false });
+    // The ASCII sources box: null until touched, meaning every Source keeps
+    // its own kind; true or false turns them all into that kind. Fresh on
+    // each opening, so it starts from the Sources as they are.
+    st.asciiSources = null;
+    const srcRow = m.querySelector("#index-src");
     const tables = m.querySelector("#index-tables"), extra = m.querySelector("#index-extra");
     const ain = m.querySelector("#index-a"), bin = m.querySelector("#index-b");
     const preview = m.querySelector("#index-preview"), apply = m.querySelector("#index-apply");
@@ -683,9 +699,9 @@ export class Shell {
     const opts = () => {
       if (st.kind === "hack") {
         const h = hackWords();
-        return { kind: "hack", ascii: st.ascii, file: h.words || null, hackError: h.error || null, hackName: st.hack, a: 1, b: 0 };
+        return { kind: "hack", ascii: st.ascii, file: h.words || null, hackError: h.error || null, hackName: st.hack, a: 1, b: 0, asciiSources: st.asciiSources };
       }
-      return { kind: st.kind, file: st.file, seed: st.seed, a: num(ain, 1), b: num(bin, 0) };
+      return { kind: st.kind, file: st.file, seed: st.seed, a: num(ain, 1), b: num(bin, 0), asciiSources: st.asciiSources };
     };
     const refresh = () => {
       tables.replaceChildren(...TABLES.map(k => {
@@ -727,7 +743,9 @@ export class Shell {
           lab.className = "idx-check";
           const box = document.createElement("input");
           box.type = "checkbox"; box.checked = st.ascii;
-          box.onchange = () => { st.ascii = box.checked; refresh(); };
+          // Streaming text usually means ASCII sources: tick that box too
+          // (it can be unticked).
+          box.onchange = () => { st.ascii = box.checked; if (st.ascii) st.asciiSources = true; refresh(); };
           lab.append(box, " ASCII");
           const note = document.createElement("span");
           note.className = "idx-note";
@@ -746,7 +764,27 @@ export class Shell {
       const res = o.hackError ? { n: 0, error: o.hackError }
         : bad ? { n: 0, error: "a and b must be numbers" } : this.cb.onIndexPreview?.(o) || { n: 0 };
       preview.dataset.error = String(!!res.error);
-      preview.textContent = res.error || res.text || "";
+      preview.dataset.warn = String(!res.error && !!res.warning);
+      preview.textContent = res.error || ((res.warning ? `⚠ ${res.warning}\n\n` : "") + (res.text || ""));
+      // ASCII sources: every indexed Source made one kind or the other.
+      // Mixed Sources start indeterminate, each keeping its own.
+      srcRow.replaceChildren();
+      const src = res.sources;
+      if (src && src.n) {
+        const lab = document.createElement("label");
+        lab.className = "idx-check";
+        const box = document.createElement("input");
+        box.type = "checkbox";
+        box.checked = st.asciiSources ?? (src.ascii && !src.mixed);
+        box.indeterminate = st.asciiSources === null && src.mixed;
+        box.onchange = () => { st.asciiSources = box.checked; refresh(); };
+        lab.append(box, ` ASCII sources`);
+        const note = document.createElement("span");
+        note.className = "idx-note";
+        note.textContent = st.asciiSources === null && src.mixed ? `${src.n} Sources, mixed: each keeps its kind`
+          : `${src.n} Source${src.n === 1 ? "" : "s"} ${box.checked ? "drawn as characters" : "drawn as numbers"}`;
+        srcRow.append(lab, note);
+      }
       apply.disabled = !!res.error || !res.n;
       apply.textContent = res.n ? `Apply to ${res.n}` : "Apply";
     };
@@ -845,12 +883,30 @@ export class Shell {
     btn("place-cancel", "cancel", icon("x"), "Cancel", () => this.cb.onPlaceCancel?.());
     btn("place-ccw", "", icon("rotCcw"), "Left", () => this.turn(CCW));
     btn("place-cw", "", icon("rotCw"), "Right", () => this.turn(CW));
-    const values = this.state.planning.values;
     const tool = this.heldTool;
-    if (!values || !tool) return;
-    row.append(this.numberGrid(values, toolValue(tool), (v) => this.setValue(v)));
+    const ascii = !!tool?.ascii;
+    const values = ascii ? this.asciiRecent : this.state.planning.values;
+    if (!this.state.planning.values || !tool) return;
+    const pick = (v) => { if (ascii) this.pickedAscii(v); this.setValue(v); };
+    row.append(this.numberGrid(values, toolValue(tool), pick, ascii));
     // A Source can emit anything: a box for a number the swatches lack.
-    if (tool.kind === "structure") row.append(this.customValue(values, toolValue(tool), (v) => this.setValue(v)));
+    if (tool.kind === "structure") {
+      row.append(this.customValue(values, toolValue(tool), pick, ascii));
+      // Swap the tool between the two kinds of Source.
+      row.append(this.convertButton(ascii, () => { if (ascii) delete tool.ascii; else tool.ascii = true; this.changed(); }));
+    }
+  }
+
+  // The button that turns a Source into an ASCII source and back: it names
+  // what it turns it into.
+  convertButton(ascii, fn) {
+    const b = document.createElement("button");
+    b.type = "button";
+    b.className = "b planbtn compact convsrc";
+    b.innerHTML = ascii ? `<span class="conv-art">12</span><span>Number</span>` : `<span class="conv-art">Ab</span><span>ASCII</span>`;
+    b.title = ascii ? "Make this a plain Source" : "Make this an ASCII source";
+    b.addEventListener("click", fn);
+    return b;
   }
 
   // A text box beside the number swatches, for a Source value they do not
@@ -858,7 +914,11 @@ export class Shell {
   // is lit, as a swatch would be), and is empty otherwise. It applies on
   // Enter or when it loses focus, never per keystroke -- the bar re-renders
   // on a change and would take the field away mid-number.
-  customValue(presets, current, onPick) {
+  //
+  // On an ASCII source a single character is that character ("5" is 53,
+  // "=" is 61) and longer text a number; elsewhere a number is a number and
+  // a lone non-number character its code (ascii.js parseValue()).
+  customValue(presets, current, onPick, ascii = false) {
     const custom = current !== null && !presets.includes(current);
     const wrap = document.createElement("form");
     wrap.className = "numcustom";
@@ -868,14 +928,14 @@ export class Shell {
     // The plain keyboard: iOS's decimal pad has no minus sign.
     input.autocomplete = "off";
     input.spellcheck = false;
-    input.placeholder = "other";
+    input.placeholder = ascii ? "char" : "other";
     input.setAttribute("aria-label", "Custom value");
-    input.value = custom ? String(current) : "";
+    input.value = custom ? valueText(current, ascii) : "";
+    if (ascii) input.autocapitalize = "off";
     const apply = () => {
-      const t = input.value.trim().replace(",", ".");
-      if (!t) return;
-      const v = Number(t);
-      if (!Number.isFinite(v)) { input.setAttribute("aria-invalid", "true"); return; }
+      if (!input.value.trim() && input.value !== " ") return;
+      const v = parseValue(input.value, ascii);
+      if (v === null || !Number.isFinite(v)) { input.setAttribute("aria-invalid", "true"); return; }
       input.removeAttribute("aria-invalid");
       // Stored as the float32 the entity row will hold, so the box and the
       // board show the same number.
@@ -892,12 +952,15 @@ export class Shell {
   // Two rows of three number swatches, so they fit beside a few buttons
   // without the row scrolling them out of reach. `current` is the lit one,
   // or null for none.
-  numberGrid(values, current, onPick) {
+  numberGrid(values, current, onPick, ascii = false) {
     const grid = document.createElement("div");
     grid.className = "numgrid";
     for (const v of values) {
+      // An ASCII source's swatches show characters.
+      const shown = ascii && isAscii(v) && v === Math.floor(v) ? (v > 32 && v < 127 ? String.fromCharCode(v) : nameOf(v)) : String(v);
+      const esc = shown.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
       const sw = this.swatch({
-        art: `<span class="num">${v}</span>`, name: String(v), cls: `numsw ${v > 0 ? "pos" : "neg"}`,
+        art: `<span class="num${ascii ? " chr" : ""}">${esc}</span>`, name: shown, cls: `numsw ${v > 0 ? "pos" : "neg"}`,
         selected: current === v,
         onTap: () => onPick(v),
       });
@@ -940,13 +1003,36 @@ export class Shell {
     }
     const iv = this.state.inspectValue;
     if (!iv) return;
+    if (iv.kind === "keyboard") { this.renderKeyboard(row, iv); return; }
     const label = document.createElement("span");
     label.className = "rowlabel";
     label.textContent = iv.kind === "emit" ? "Emits" : "Seed";
-    row.append(label, this.numberGrid(iv.values, iv.current, (v) => this.cb.onInspectValue?.(v)));
+    const ascii = !!iv.ascii;
+    const values = ascii ? this.asciiRecent : iv.values;
+    const pick = (v) => { if (ascii) this.pickedAscii(v); this.cb.onInspectValue?.(v); };
+    row.append(label, this.numberGrid(values, iv.current, pick, ascii));
     // A box for any other number: a Source's emit value or a belt's seed.
     // (Typing the seed it already has is no change, so it never unseeds.)
-    row.append(this.customValue(iv.values, iv.current, (v) => this.cb.onInspectValue?.(v)));
+    row.append(this.customValue(values, iv.current, pick, ascii));
+    if (iv.kind === "emit") row.append(this.convertButton(ascii, () => this.cb.onConvertSource?.()));
+  }
+
+  // A keyboard in the Hand: whether it has the keys, a button to raise the
+  // phone's keyboard again (closing it on the phone does not end typing
+  // here), and what is waiting to go out.
+  renderKeyboard(row, iv) {
+    const b = document.createElement("button");
+    b.type = "button";
+    b.className = "b planbtn compact kbdtype";
+    b.dataset.on = String(!!iv.typing);
+    b.innerHTML = `<span class="conv-art">⌨</span><span>${iv.typing ? "Typing" : "Type"}</span>`;
+    b.title = "Type into this keyboard";
+    b.addEventListener("click", () => this.cb.onKeyboardFocus?.());
+    const info = document.createElement("span");
+    info.className = "rowlabel kbdinfo";
+    const last = iv.last === null || iv.last === undefined ? "" : `last ${nameOf(iv.last) ?? iv.last} · `;
+    info.textContent = `${last}${iv.waiting} waiting`;
+    row.append(b, info);
   }
 
   setInspectValue(iv) {
@@ -1168,7 +1254,7 @@ export class Shell {
       b.addEventListener("click", () => {
         const tool = entry.kind === "stamp"
           ? { kind: "stamp", name: entry.name, stamp: copyStamp(entry.stamp), dir: 0, flip: false }
-          : { kind: entry.kind, ...(entry.type ? { type: entry.type } : {}), dir: 0, flip: false };
+          : { kind: entry.kind, ...(entry.type ? { type: entry.type } : {}), ...(entry.ascii ? { ascii: true } : {}), dir: 0, flip: false };
         if (slot === null) { s.slots.push(tool); s.selected = s.slots.length - 1; }
         else { s.slots[slot] = tool; s.selected = slot; }
         this.closePicker();
