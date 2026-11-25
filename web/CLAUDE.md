@@ -1265,7 +1265,10 @@ reasoning is in the comment above `makeSched()`; in short:
   ticks, by the drone's rule as before, and every sleeping run whose newest
   item is still sliding into place, by the closed form (`moveUntil`,
   `movers`; with the anchor at the end it moves on every tick before entry
-  + its packed place / speed). The bits are identical to the scan's.
+  + its packed place / speed). The bits are identical to the scan's. Only
+  **candidates** (`seg.aIdx >= 0`) are asked or tracked as movers: `hit()`
+  ignores every other run, so the rest cost nothing (see "Muted belts cost
+  nothing").
 
 **Measured** (Node, `step()` alone, best of 5):
 
@@ -1884,6 +1887,42 @@ ticks did not. Two causes, both fixed, and neither touches a bake:
   still come from the main thread, on the worklet's own port, so the two
   are not ordered: configs and tick batches both carry the recorder's
   generation, and the synth drops a batch from another one.
+
+**Muted belts cost nothing.** With the belt gain at 0 -- and the falsy
+belt gain too while truthiness is on (`beltsMuted()` in audio-params.js)
+-- no run is a candidate: the recorder (and so the worker's tap) records
+no belt bits and ships none, the sim skips the audio's per-run work, and
+the synth keeps no voices and walks no bits (`dropVoices()`). Each voice
+would only ever have added exactly 0.0, so the sound is **bit-identical**
+to before -- checked end to end against the previous commit's sim,
+recorder and synth on `cpu.npz` and `GameOfLife_SLOW`, at 240 and 40k
+tps, realtime and offline, with truthiness and with vibrato and noise:
+not one sample differs. Unmuting reconfigures, and the next tick voices
+every run active then. Before, a muted belt cost everything a sounding one
+did. Per 128-sample block at 40k tps (budget 2.67 ms, Node):
+
+| | sounding | muted, before | muted, now |
+|---|---|---|---|
+| `GameOfLife_SLOW` | 0.59 ms | 0.59 | **0.25** |
+| ...with vibrato | 0.89 | 0.86 | **0.25** |
+| `cpu.npz` | 0.16 | 0.15 | **0.02** |
+
+And the recorder's share of the tick, on `cpu.npz`: +46% sounding, +27%
+muted; the belt bits shipped (up to 32 MB/s on Game of Life at 40k tps)
+go to nothing. **Muted gates already cost nothing**: `clicks()` returns at
+gain 0 and a silent resonator is skipped. `tests/audio.test.mjs` holds
+both halves: muted sounds exactly like no belts at all, with no voices;
+and a sounding, muted, sounding round trip voices the same runs as a
+synth never muted (mutation-tested: walking the bits while muted, and not
+forgetting them on mute, each fail it).
+
+Where a high tick rate's time goes otherwise, on `GameOfLife_SLOW` at 40k
+tps: about 0.20 ms a block walking every candidate's bit each tick, 0.26
+ms scheduling jittered clicks (jitter 1 times up to 64 clicks per group
+per tick separately; jitter 0 is one impulse, almost free -- but louder,
+since it adds in amplitude), 0.12 ms for 256 voices -- and **+0.3 ms when
+vibrato, tremolo or truthiness is on**, which puts every voice on the
+two-oscillator path. The noise exciter measured as free.
 
 **The meter shows "ran dry n · skipped m"** once either happens: the
 queue running out of ticks (an underrun: they came late, so raise the

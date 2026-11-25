@@ -29,7 +29,7 @@
 //   { type: "params", p }   the panel's dials
 //   { type: "stop" }        paused: drop the queue, release everything
 
-import { AUDIO_DEFAULTS, VOICE_LIMIT_MAX } from "./audio-params.js";
+import { AUDIO_DEFAULTS, VOICE_LIMIT_MAX, beltsMuted } from "./audio-params.js";
 import { scaleTable, scaleHz } from "./scale.js";
 
 const TABLE = 2048;
@@ -199,6 +199,15 @@ export class GatesSynth {
 
   applyParams() {
     const p = this.p, sr = this.sr;
+    // Belts muted -- gain 0, and the falsy gain 0 too if truthiness is on:
+    // no voices at all. Each would only add exactly 0.0 to every sample,
+    // so dropping them changes nothing heard, and saves the per-tick walk
+    // over every candidate's bit as well as the per-sample voices (on a
+    // busy board at 40k tps, half the synth's time). Unmuting starts from
+    // no bits, so the next tick turns on every run active then.
+    const muted = beltsMuted(p);
+    if (muted && !this.beltsMuted) this.dropVoices();
+    this.beltsMuted = muted;
     // The scale's wavelength table, rebuilt only when what it depends on
     // changes (a slider drag elsewhere must not recompile the formula).
     const sk = `${p.scaleMode}|${p.scaleExpr}|${p.scaleLut}|${p.beltMinLen}`;
@@ -393,6 +402,15 @@ export class GatesSynth {
 
   // Stop playback and release every voice; the next tick played gates
   // whatever it says afresh.
+  // Every voice gone at once, and the bits forgotten (belts muted).
+  dropVoices() {
+    this.nv = 0;
+    this.voiceOf?.fill(-1);
+    this.prev?.fill(0);
+    this.isRef?.fill(0);
+    this.active = 0; this.refused = 0;
+  }
+
   gatesOff() {
     this.playing = false;
     this.held = false; this.heldS = 0;
@@ -566,7 +584,7 @@ export class GatesSynth {
       this.clicks(1, b.f1F[k] * p.g1GainF / Math.pow(Math.max(1, this.groups[1]), norm), b.f1F[k], 1);
       this.flips(b, k, k + 1);
     }
-    const W = this.words, off = k * W, prev = this.prev, bits = b.bits;
+    const W = this.beltsMuted ? 0 : this.words, off = k * this.words, prev = this.prev, bits = b.bits;
     for (let w = 0; w < W; w++) {
       const now = bits[off + w];
       let d = now ^ prev[w];
@@ -1101,7 +1119,7 @@ export class GatesSynth {
       active: this.active, refused: this.refused, candidates: this.n,
       peak: this.peak, clipped: this.clipped, ticks: this.ticksPlayed,
       lagMs: this.queued / Math.max(rate, 1e-3) * 1000, speed: this.playing ? this.speed : 0,
-      underruns: this.underruns, skips: this.skips,
+      underruns: this.underruns, skips: this.skips, beltsMuted: !!this.beltsMuted,
     };
     this.peak = 0; this.clipped = 0; this.ticksPlayed = 0;
     return m;

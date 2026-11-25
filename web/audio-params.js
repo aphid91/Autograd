@@ -174,6 +174,11 @@ export const AUDIO_SPEC = [
 // within [minLen, maxLen] and, with a sound selection (a Set of y * width + x
 // cell indices), that touches it. One rule for the recorder (audio.js) and
 // the scale dialog's histogram, so the two cannot disagree.
+// Belts silent whatever happens: their gain is 0, and with truthiness on the
+// falsy one too. The recorder then records no run at all and the synth keeps
+// no voices -- each would only ever have added exactly 0.0.
+export const beltsMuted = (p) => !(p.beltGain > 0) && !(p.truthAudio && p.beltGainF > 0);
+
 export function eligibleRuns(sim, minLen, maxLen, selection = null) {
   const W = sim.board.width;
   const picked = (cells) => !selection || cells.some(([x, y]) => selection.has(y * W + x));

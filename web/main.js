@@ -271,7 +271,7 @@ function setAudio(on) {
 function meterText(m) {
   const db = m.peak > 0 ? (20 * Math.log10(m.peak)).toFixed(1) : "-inf";
   return `voices ${m.voices} / ${m.limit}` + (m.refused ? `  (${m.refused} refused)` : "") + "\n" +
-    `runs active ${m.active} of ${m.candidates}\n` +
+    (m.beltsMuted ? `belts muted (gain 0): no voices\n` : `runs active ${m.active} of ${m.candidates}\n`) +
     `peak ${m.peak.toFixed(2)} (${db} dB)` + (m.clipped ? `  clipped ${m.clipped}` : "") + "\n" +
     `lag ${Math.round(m.lagMs)} ms · speed ${m.speed.toFixed(2)}` +
     (m.underruns || m.skips ? `\nran dry ${m.underruns || 0} · skipped ${m.skips || 0}` : "") +

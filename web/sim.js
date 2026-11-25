@@ -759,11 +759,15 @@ export class Sim {
   // pushed or popped, or its newest item moved (the drone's rule). Returns
   // whether it pushed or popped.
   tickHeard(seg, t, A) {
+    // Only a run with a bit (a candidate: in the length window, the sound
+    // selection, belts not muted) is asked about; hit() ignores the rest,
+    // so skipping their two position reads changes nothing recorded.
+    const H = A && seg.aIdx >= 0 ? A : null;
     const h0 = seg.head, t0 = seg.tail;
-    const p0 = A && t0 > h0 ? this.positionOf(seg, t0 - 1, t) : -1;
+    const p0 = H && t0 > h0 ? this.positionOf(seg, t0 - 1, t) : -1;
     this.tickSegment(seg, t);
     const moved = seg.head !== h0 || seg.tail !== t0;
-    if (A && (moved || (t0 > h0 && this.positionOf(seg, t0 - 1, t + 1) > p0))) A.hit(seg);
+    if (H && (moved || (t0 > h0 && this.positionOf(seg, t0 - 1, t + 1) > p0))) H.hit(seg);
     return moved;
   }
 
@@ -1063,7 +1067,10 @@ export class Sim {
       if (!l) S.wakeAt.set(w, l = []);
       l.push(oi);
     }
-    if (A) {
+    // Sliding sleepers are tracked only for the audio, so only candidates
+    // (hit() ignores the rest). A reconfigure wakes everything, which
+    // rebuilds this list for the new candidates.
+    if (A && seg.aIdx >= 0) {
       const P = Math.max(0, L - (n - h) * d);
       seg.moveUntil = seg.enter[n % seg.cap] + Math.ceil(P / v);
       if (seg.moveUntil > t + 1) S.moversNext.push(oi);

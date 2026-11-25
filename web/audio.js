@@ -12,7 +12,7 @@
 // paint() calls flush() after stepping, which posts the frame's ticks with
 // their buffers transferred, and stop() while paused.
 
-import { audioGroupOf, eligibleRuns } from "./audio-params.js";
+import { audioGroupOf, eligibleRuns, beltsMuted } from "./audio-params.js";
 import { spaceWeights, spaceKey } from "./space.js";
 
 export class Recorder {
@@ -31,6 +31,10 @@ export class Recorder {
     this.selInfo = null;
     this.minLen = params.beltMinLen;
     this.cutoff = params.beltCutoff;
+    // Belts muted (gain 0, and the falsy gain 0 with truthiness): no run is
+    // a candidate, so nothing records, ships or walks a belt bit. The synth
+    // drops its voices to match (audio-dsp.js applyParams()).
+    this.beltsMuted = beltsMuted(params);
     this.sim = null;
     this.rebuilds = -1;
     this.cands = [];
@@ -112,6 +116,13 @@ export class Recorder {
     if (min !== this.minLen || max !== this.cutoff) { this.minLen = min; this.cutoff = max; this.rebuilds = -1; }
   }
 
+  // Belts muted or back: a reconfigure on the next tick, with no candidates
+  // or with them all again (each then starts from its state at that tick).
+  setBeltsMuted(muted) {
+    muted = !!muted;
+    if (muted !== this.beltsMuted) { this.beltsMuted = muted; this.rebuilds = -1; }
+  }
+
   // Which runs may sound, and each gate's click group. Flushes first: the
   // ticks so far belong to the old candidates.
   configure(sim) {
@@ -124,7 +135,7 @@ export class Recorder {
     const sel = this.selection, W = sim.board.width;
     const picked = (cells) => !sel || cells.some(([x, y]) => sel.has(y * W + x));
     // A run sounds if any of its cells is selected, underground ends included.
-    this.cands = eligibleRuns(sim, this.minLen, this.cutoff, sel);
+    this.cands = this.beltsMuted ? [] : eligibleRuns(sim, this.minLen, this.cutoff, sel);
     const n = this.cands.length;
     // Each run's bit, for hit(): -1 for a run that does not sound.
     for (const seg of sim.order) seg.aIdx = -1;
@@ -286,7 +297,7 @@ export async function startAudio(ctx, params, sim, onMeter) {
   rec.attach(sim);
   return {
     ctx, node, rec,
-    setParams(p) { node.port.postMessage({ type: "params", p }); rec.setLengths(p.beltMinLen, p.beltCutoff); rec.setTruth(p.truthAudio); },
+    setParams(p) { node.port.postMessage({ type: "params", p }); rec.setLengths(p.beltMinLen, p.beltCutoff); rec.setTruth(p.truthAudio); rec.setBeltsMuted(beltsMuted(p)); },
     // A bake's samples, as an AudioBuffer for this context.
     buffer(samples, sampleRate) {
       const b = ctx.createBuffer(1, samples.length, sampleRate);

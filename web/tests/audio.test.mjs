@@ -683,3 +683,57 @@ test("an underrun clears the refused runs with their count: it never goes below 
   for (const i of [1, 2]) s.off(i);   // ...and off
   assert.equal(s.refused, 0);
 });
+
+// Belts muted (gain 0, and the falsy gain 0 with truthiness): the synth
+// keeps no voices and skips the per-tick bit walk -- each voice would only
+// ever have added exactly 0.0 -- so the sound must be exactly the gates
+// alone: the same as a board whose runs are all outside the length window
+// and so never candidates. Unmuting starts from no bits, and the next tick
+// turns on every run active then.
+async function streamed(params, rate, onFrame = null) {
+  const bytes = readFileSync(save);
+  const sim = new Sim(T, await Board.fromNpz(T, bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength)));
+  for (let i = 0; i < 300; i++) sim.step();
+  const msgs = [];
+  const rec = new Recorder({ postMessage: (m) => msgs.push(m) }, params);
+  rec.attach(sim);
+  const s = synth(params), o = new Float32Array(128), out = [];
+  let bank = 0, blocks = 0;
+  for (let f = 0; f < 40; f++) {
+    onFrame?.(f, s);
+    bank += rate / 60;
+    const n = Math.floor(bank); bank -= n;
+    for (let i = 0; i < n; i++) sim.step();
+    rec.flush(rate);
+    for (const m of msgs.splice(0)) s.message(structuredClone(m));
+    for (; blocks < Math.round((f + 1) * SR / 60 / 128); blocks++) { s.render(o, 128); out.push(...o); }
+  }
+  return { s, out };
+}
+
+test("muted belts keep no voices and sound exactly like no belts at all", { skip: !existsSync(save) }, async () => {
+  for (const [rate, extra] of [[240, {}], [40000, {}], [40000, { truthAudio: true, beltGainF: 0, clickDetune: 3 }],
+                               [20000, { advAudio: true, vibDepth: 0.3, clickNoise: 0.5, clickNoiseMs: 20 }]]) {
+    const muted = await streamed({ ...AUDIO_DEFAULTS, beltGain: 0, ...extra }, rate);
+    const none = await streamed({ ...AUDIO_DEFAULTS, beltMinLen: 500, beltCutoff: 512, ...extra }, rate);
+    assert.equal(muted.s.nv, 0, `${rate} tps: no voices while muted`);
+    assert.ok(muted.out.some(x => x !== 0), `${rate} tps: the gates still sound`);
+    const at = muted.out.findIndex((x, i) => x !== none.out[i]);
+    assert.equal(at, -1, `${rate} tps: muted belts differ from no belts at sample ${at}`);
+  }
+  // Truthiness on with only the truthy gain at 0: the falsy belts still sound, so not muted.
+  const half = await streamed({ ...AUDIO_DEFAULTS, beltGain: 0, truthAudio: true, beltGainF: 1 }, 240);
+  assert.ok(half.s.nv > 0, "falsy belts audible: voices kept");
+});
+
+test("unmuting the belts voices the runs active at that moment", { skip: !existsSync(save) }, async () => {
+  const ref = await streamed({ ...AUDIO_DEFAULTS }, 240);
+  // Sounding, then muted (with runs active: stale bits to forget), then back.
+  const back = await streamed({ ...AUDIO_DEFAULTS }, 240, (f, s) => {
+    if (f === 10) { assert.ok(s.active > 0, "runs active before the mute"); s.message({ type: "params", p: { beltGain: 0 } }); }
+    if (f === 25) s.message({ type: "params", p: { beltGain: AUDIO_DEFAULTS.beltGain } });
+  });
+  assert.ok(back.s.nv > 0, "voices again after unmuting");
+  assert.equal(back.s.active, ref.s.active, "the same runs active as a synth that was never muted");
+  assert.equal([...back.s.prev].join(), [...ref.s.prev].join(), "the same bits");
+});
