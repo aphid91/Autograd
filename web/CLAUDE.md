@@ -991,7 +991,7 @@ per tick at most, holding the rest under back pressure.
 
 - **A new type id, 13**, so a save holding one is **web-only**: the desktop
   does not know the id (accepted). `installWebTypes()` ([webtypes.js](webtypes.js))
-  installs both web-only machines, Pixel and Keyboard, wherever types.json
+  installs the web-only machines (Pixel, Keyboard, and Button), wherever types.json
   is loaded.
 - **To the engine it is a generator** -- no inputs, one output, a constant
   -- whose constant is the head of its queue, and which is not ready
@@ -1055,6 +1055,74 @@ token, the delta without the queue, a stale key kept, and a flush that
 keeps the queue each fail it. Checked in Chromium: typing `Hi there`, Enter
 and Backspace with the sim paused, then `!?` while it played (through the
 worker), put exactly those codes on the keyboard's belt.
+
+### The button
+
+**Button** ([button.js](button.js)) is a third web-only machine (type id
+**14**): 3×3, a yellower beige than the keyboard, one input in the middle
+of the west face and the output straight across on the east (facing +X; a
+3×3 is symmetric about that row, so flip is not offered; no pass-through
+overlay). It has a **value** and an **ASCII flag** like a Source, drawn the
+same way (the value, or its character), and a **mode**: Event, Hold or
+Toggle. It fires only when **polled**: any token arriving on its input is
+consumed and answered with one token out -- the value while the button is
+"on", else 0. A fresh one has the value 1 (0 would look exactly like off).
+
+- **Pressing** happens in the **Hand**, and only while a button is the
+  inspected entity. Then a finger that lands on *any* button (the
+  inspected one included) is a press, not a tap: it never changes what the
+  Hand holds, never pans and never joins a pinch (`hooks.press` in
+  camera.js: a claimed pointer is kept out of `pts` from down to up). Each
+  finger is followed: arriving on a button presses it (+1), leaving it lets
+  go (-1), so a drag across a row presses each in turn. A finger landing
+  anywhere else is the Hand's as always -- bare board empties the hand,
+  another machine is inspected -- so to configure a different button, tap
+  bare board first. A label under the finger keeps its tap.
+- **Modes** (`Sim.press()`): **Event** -- each arrival queues one event (at
+  most `BUTTON_EVENT_MAX`, 16; a finger held still is one press), and each
+  poll with one waiting takes it and answers the value. **Hold** -- the
+  value while any finger is on it. **Toggle** -- each arrival flips it. The
+  queue count is deliberately not shown anywhere.
+- **Row slots**: the value in **25** and the mode in **26** (a belt's seed
+  value; the desktop's sleep flag -- nothing reads either on a machine
+  here), the ASCII flag in **24** as on a Source. **Not `F_EMIT`**: on a
+  Source that slot is a dead input, but the button's input channel 0 is
+  live there. `emitSlot()` in board.js says where each machine keeps its
+  value; `describe()`, `capture()`, stamps, ghosts and the render list carry
+  `emit`, `ascii` and `mode`. Changing the value or the mode is an **edit**
+  (`setEmit`, `setButtonMode`), as a Source's value is; the ASCII flag is
+  not (`setAscii`).
+- **The press state is sim state** (`Sim.buttons`: row -> `{ ev, on, held }`),
+  like a keyboard's queue: emptied by every fresh start (an edit, Reset),
+  carried by `clone()`/`restoreFrom()`, sent in deltas and full states with
+  the keyboards' queues (the same `Tracker.keys` flag), and a forecast never
+  takes an event. A press goes to the worker as a `press` message carrying
+  the board's revision (a stale one is dropped), or into the mirror while
+  this thread ticks or the clock is paused. Pressing needs no wake: a button
+  acts only when polled, and a poll's arrival wakes it.
+- **Drawn lit** (a warm inset over its body, whatever the status colour)
+  while a finger is on it or it is toggled on (`Sim.buttonLit()`, read from
+  the mirror, so a press made while the worker ticks lights up a frame
+  later).
+- The Hand's bar: the value swatches and box, **Number/ASCII**, and the
+  **mode** button (tap for the next). The placing bar has the same three for
+  the tool (`tool.mode`).
+- **Resizing** is specced, not built: [resizable_buttons.md](resizable_buttons.md).
+
+`tests/button.test.mjs`: the geometry at every facing; value, mode and flag
+in the row and through a capture; each mode's answers poll by poll, the
+event cap; a forecast keeps the event, a clone owns its state, Reset and an
+edit forget; a sleeping and a full timeline agree with presses mid-run in
+every mode; presses sent to a ticking worker reach the mirror exactly as a
+reference pressed directly, a stale press is dropped, a full state carries
+the state back. Mutation-tested: the forecast taking an event, and the
+delta dropping the buttons, each fail it. Checked in Chromium with Pixel 7
+emulation and CDP touches: tap selects a button with no press; with it
+held, taps on other buttons (and on itself) press without moving the
+selection; a drag from one button across another presses the second on
+arrival and does not move the camera; the mode button cycles; played, an
+Event button answered one 65 among 0s and a toggled-on one answered 66 on
+every poll; a tap on bare board emptied the hand.
 
 ### How machines draw
 
@@ -2838,6 +2906,7 @@ largest JS span left.
 | `audio-bake.js` | baking: a stretch of ticks rendered offline, and the WAV writer; loaded on demand |
 | `pixel.js` | the Pixel machine (web-only, in Sink's id), its screen, and the overlay's drawing |
 | `keyboard.js` | the Keyboard machine (web-only, type id 13): a generator that emits what is typed |
+| `button.js` | the Button machine (web-only, type id 14): answers each poll with its value while pressed, by mode |
 | `webtypes.js` | `installWebTypes()`: Pixel and Keyboard into a loaded types.json |
 | `keycapture.js` | the hidden field that takes a keyboard's keys, physical or on-screen |
 | `ascii.js` | what a value means as a character: glyphs, the value box, recents, key codes (pure) |

@@ -3,6 +3,7 @@
 // lifted off the board) and for a paste.
 
 import { typeByName } from "./stamp.js";
+import { BUTTON_DEFAULT_VALUE } from "./button.js";
 
 // Which directions each cell of a set of placed entries emits toward, as
 // Map(cell key -> mask). A cell an entry covers is in the map even when it
@@ -57,7 +58,8 @@ export function stampGhost(board, entries, at) {
         span: !e.exit && p !== null && p !== undefined && at[p] ? at[p] : null });
     } else {
       structs.push({ type: id, x, y, dir: e.dir, flip: e.flip ? 1 : 0, w: o.w, h: o.h, o,
-        emit: td.name === "source" ? (e.emit ?? 0) : null, ascii: td.name === "source" && !!e.ascii });
+        emit: td.name === "source" ? (e.emit ?? 0) : td.name === "button" ? (e.emit ?? BUTTON_DEFAULT_VALUE) : null,
+        ascii: (td.name === "source" || td.name === "button") && !!e.ascii, button: td.name === "button" });
     }
   });
 

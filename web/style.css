@@ -700,6 +700,7 @@ html, body {
 .numsw .num.chr { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; color: #a9c47c; font-size: calc(11 * var(--u)); }
 /* The button that turns a Source into an ASCII source and back. */
 .convsrc .conv-art { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-weight: 700; font-size: calc(13 * var(--u)); color: #a9c47c; line-height: 1; }
+.btnmode .conv-art { font-weight: 700; font-size: calc(13 * var(--u)); color: #d8c27a; line-height: 1; }
 
 /* ----------------------------------------------------------------------
    THE RATE PANEL: ticks per second, floated just above the Sim section.

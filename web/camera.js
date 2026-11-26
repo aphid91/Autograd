@@ -101,6 +101,7 @@ const LONG_PRESS_MS = 500;   // as the toolbar's long press
 
 export function attachGestures(el, camera, onChange, hooks = {}) {
   const pts = new Map();   // pointerId -> [x, y] in element CSS px
+  const claimed = new Set();   // pointers that are presses (hooks.press), not gestures
   let gesture = "idle";
   let press = null;        // { id, x, y }
   let holdTimer = null;
@@ -147,6 +148,14 @@ export function attachGestures(el, camera, onChange, hooks = {}) {
     stopGlide();   // a touch catches a gliding board
     el.setPointerCapture(e.pointerId);
     const p = local(e);
+    // A finger the board claims as a press (a button, button.js) is its own
+    // from down to up: it never joins a pan, a pinch or a tap, so another
+    // finger can still pan, and two fingers on two buttons are two presses.
+    if ((e.pointerType !== "mouse" || e.button === 0) && hooks.press?.claims(p[0], p[1])) {
+      claimed.add(e.pointerId);
+      hooks.press.begin(e.pointerId, p[0], p[1]);
+      return;
+    }
     pts.set(e.pointerId, p);
     if (pts.size === 1) {
       gesture = e.button === 0 ? "press" : "pan";
@@ -171,6 +180,7 @@ export function attachGestures(el, camera, onChange, hooks = {}) {
   });
 
   el.addEventListener("pointermove", (e) => {
+    if (claimed.has(e.pointerId)) { const p = local(e); hooks.press.move(e.pointerId, p[0], p[1]); return; }
     if (!pts.has(e.pointerId)) return;
     // Compare the first two pointers before and after this move, so a
     // finger joining or leaving never makes the view jump.
@@ -212,6 +222,7 @@ export function attachGestures(el, camera, onChange, hooks = {}) {
   });
 
   const lift = (e, cancelled) => {
+    if (claimed.delete(e.pointerId)) { hooks.press.end(e.pointerId); return; }
     if (!pts.has(e.pointerId)) return;
     pts.delete(e.pointerId);
     cancelHold();

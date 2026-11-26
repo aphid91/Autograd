@@ -61,6 +61,12 @@ export function glyphPaths(name, cx, cy, r, t) {
       fill += rect(x0 + (k + g), cy + r * 0.5 - 2 * (k + g) - k / 2, 3 * k + 2 * g, k);
       return { stroke: "", fill };
     }
+    case "button": {
+      // The button (button.js): a round cap on a square key.
+      const k = r * 0.9;
+      return { stroke: `M${cx - k} ${cy - k}h${2 * k}v${2 * k}h${-2 * k}Z`,
+                        fill: circle(cx, cy, r * 0.5) };
+    }
     default:
       return { stroke: "", fill: "" };
   }

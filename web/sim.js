@@ -35,6 +35,7 @@
 // job, as ctrl+R's on the desktop.
 
 import { RATE_MIN, RATE_MAX } from "./rate.js";
+import { F_BTN_VALUE, F_BTN_MODE, BTN_EVENT, BTN_TOGGLE, BTN_HOLD, BUTTON_EVENT_MAX, modeOf, freshButton, copyButtons } from "./button.js";
 
 const BELT = 1, UNDER = 7, EMPTY = 0;
 const NEVER = -(2 ** 30);   // an activity stamp for "never" (see flush())
@@ -103,6 +104,10 @@ export class Sim {
     // start (flush()), carried by clone(), the worker's deltas and full
     // states (simhost.js), and never consumed by a forecast.
     this.keys = new Map();
+    // Buttons (button.js): each one's events queued, toggle and fingers on
+    // it, row -> { ev, on, held }. Player input like the keyboards' queues,
+    // and kept the same way (Sim.press()).
+    this.buttons = new Map();
     this.onRebuild = null;
     this.allocOverride = null;      // simhost.js: the allocator a rebuild must start from
     this.sync();
@@ -596,7 +601,47 @@ export class Sim {
       for (let c = 0; c < g.sim.n_out; c++) this.clearOut(g.row, c);
     }
     this.keys = new Map();   // a fresh start forgets what was typed
+    this.buttons = new Map();   // ... and every press
     this.keysVersion = (this.keysVersion || 0) + 1;
+  }
+
+  // A finger arriving on button `row` (+1) or leaving it (-1). Arriving is
+  // a press: an event queued (at most `max`) or the toggle flipped, by the
+  // button's mode; the fingers are counted in every mode, for Hold and for
+  // drawing it lit. Not an edit. Nothing need be woken: a button acts only
+  // when polled, and a poll's own arrival wakes it. Returns whether `row`
+  // is a live button.
+  press(row, delta, max = BUTTON_EVENT_MAX) {
+    const g = this.gateOf.get(row);
+    if (!g || !g.sim.button || (delta !== 1 && delta !== -1)) return false;
+    let b = this.buttons.get(row);
+    if (!b) this.buttons.set(row, b = freshButton());
+    if (delta > 0) {
+      const mode = modeOf(this.f(row, F_BTN_MODE));
+      if (mode === BTN_EVENT) b.ev = Math.min(max, b.ev + 1);
+      else if (mode === BTN_TOGGLE) b.on = !b.on;
+      b.held++;
+    } else b.held = Math.max(0, b.held - 1);
+    this.keysVersion = (this.keysVersion || 0) + 1;
+    if (this.track) this.track.keys = true;
+    this.version++;
+    this.fc = null;
+    return true;
+  }
+
+  // Whether button `row` answers a poll now with its value (else 0).
+  buttonOn(row) {
+    const b = this.buttons.get(row);
+    if (!b) return false;
+    const mode = modeOf(this.f(row, F_BTN_MODE));
+    return mode === BTN_EVENT ? b.ev > 0 : mode === BTN_HOLD ? b.held > 0 : b.on;
+  }
+
+  // Whether to draw button `row` lit: a finger on it, or toggled on.
+  buttonLit(row) {
+    const b = this.buttons.get(row);
+    if (!b) return false;
+    return b.held > 0 || (b.on && modeOf(this.f(row, F_BTN_MODE)) === BTN_TOGGLE);
   }
 
   // A key press on keyboard `row`: queue its code. Returns whether it was
@@ -875,7 +920,19 @@ export class Sim {
     for (const c of drains) if (this.outHeld(row, c)) return false;   // back pressure
     const values = [];
     for (let c = 0; c < s.n_in; c++) values.push(this.inHeld(row, c) ? this.inValue(row, c) : null);
-    const results = evalOps(this.T, s.ops, values, 0);
+    // A button answers a poll with its value while on, else 0; an event is
+    // taken by the poll it answers, never by a forecast.
+    let konst = 0;
+    if (s.button && this.buttonOn(row)) {
+      konst = this.f(row, F_BTN_VALUE);
+      const b = this.buttons.get(row);
+      if (!this.rec && modeOf(this.f(row, F_BTN_MODE)) === BTN_EVENT) {
+        b.ev--;
+        this.keysVersion = (this.keysVersion || 0) + 1;
+        if (this.track) this.track.keys = true;
+      }
+    }
+    const results = evalOps(this.T, s.ops, values, konst);
     if (P && g.pixel) P.fire(row, values);
     const consumed = this.consumed(g, values).filter(c => this.inHeld(row, c));
     for (const c of consumed) this.clearIn(row, c);
@@ -1235,6 +1292,7 @@ export class Sim {
     c.fired = this.fired.slice();
     c.truth = this.truth.slice();
     c.keys = copyKeys(this.keys);
+    c.buttons = copyButtons(this.buttons);
     c.sched = this.sched ? c.makeSched() : null;   // its own, everything awake
     return c;
   }
@@ -1255,6 +1313,7 @@ export class Sim {
     this.fired.set(snap.fired);
     this.truth.set(snap.truth);
     this.keys = copyKeys(snap.keys);
+    this.buttons = copyButtons(snap.buttons);
     this.keysVersion = (this.keysVersion || 0) + 1;
     Object.assign(this.stats, snap.stats);
     this.version++;

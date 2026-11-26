@@ -17,6 +17,7 @@ import { listPrograms, getProgram } from "./hackstore.js";
 import { PALETTE, SIZE_NAMES, css as noteCss } from "./notes.js";
 import { persistEnabled } from "./persist.js";
 import { loadRecent, saveRecent, pushRecent, parseValue, valueText, nameOf } from "./ascii.js";
+import { BUTTON_MODE_NAMES, modeOf, nextMode } from "./button.js";
 
 const STORE_KEY = "gates.web.shell.v1";
 const LONG_PRESS_MS = 500;   // as sand mode
@@ -893,18 +894,34 @@ export class Shell {
     if (tool.kind === "structure") {
       row.append(this.customValue(values, toolValue(tool), pick, ascii));
       // Swap the tool between the two kinds of Source.
-      row.append(this.convertButton(ascii, () => { if (ascii) delete tool.ascii; else tool.ascii = true; this.changed(); }));
+      const isButton = tool.type === "button";
+      row.append(this.convertButton(ascii, () => { if (ascii) delete tool.ascii; else tool.ascii = true; this.changed(); }, isButton));
+      if (isButton) row.append(this.modeButton(modeOf(tool.mode), () => { tool.mode = nextMode(tool.mode); this.changed(); }));
     }
   }
 
   // The button that turns a Source into an ASCII source and back: it names
   // what it turns it into.
-  convertButton(ascii, fn) {
+  convertButton(ascii, fn, button = false) {
     const b = document.createElement("button");
     b.type = "button";
     b.className = "b planbtn compact convsrc";
     b.innerHTML = ascii ? `<span class="conv-art">12</span><span>Number</span>` : `<span class="conv-art">Ab</span><span>ASCII</span>`;
-    b.title = ascii ? "Make this a plain Source" : "Make this an ASCII source";
+    b.title = button ? (ascii ? "Show this button's value as a number" : "Show this button's value as a character")
+      : ascii ? "Make this a plain Source" : "Make this an ASCII source";
+    b.addEventListener("click", fn);
+    return b;
+  }
+
+  // A button's interaction mode (button.js), naming the current one; a tap
+  // moves to the next: Event, Hold, Toggle.
+  modeButton(mode, fn) {
+    const b = document.createElement("button");
+    b.type = "button";
+    b.className = "b planbtn compact btnmode";
+    const art = ["•", "▁", "⏻"][mode] ?? "•";
+    b.innerHTML = `<span class="conv-art">${art}</span><span>${BUTTON_MODE_NAMES[mode] ?? "Event"}</span>`;
+    b.title = "Interaction mode: Event (each press queues one value), Hold (the value while touched), Toggle (each press switches it on or off). Tap for the next.";
     b.addEventListener("click", fn);
     return b;
   }
@@ -1014,7 +1031,9 @@ export class Shell {
     // A box for any other number: a Source's emit value or a belt's seed.
     // (Typing the seed it already has is no change, so it never unseeds.)
     row.append(this.customValue(values, iv.current, pick, ascii));
-    if (iv.kind === "emit") row.append(this.convertButton(ascii, () => this.cb.onConvertSource?.()));
+    if (iv.kind === "emit") row.append(this.convertButton(ascii, () => this.cb.onConvertSource?.(), iv.mode !== null && iv.mode !== undefined));
+    // A button (button.js): its mode, cycled.
+    if (iv.mode !== null && iv.mode !== undefined) row.append(this.modeButton(iv.mode, () => this.cb.onButtonMode?.()));
   }
 
   // A keyboard in the Hand: whether it has the keys, a button to raise the

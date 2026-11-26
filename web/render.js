@@ -175,6 +175,7 @@ export function render(ctx, board, cam, dpr, opts = {}) {
   lodZ = z;
   lodO = view.simpleView ? 1 : TUNE.lodZoom;
   charMode = !!view.asciiChars;
+  litSim = view.sim && view.sim.buttonLit ? view.sim : null;
   LOOK.corner = Math.max(0, +view.corner || 0);
   LOOK.chevrons = view.chevronAlpha ?? 1;
   ctx.setTransform(1, 0, 0, 1, 0, 0);
@@ -608,6 +609,11 @@ function drawGhost(ctx, T, g, z, px, on, S, ports, labels, seedTint = true) {
 
 // `tint`: View > gate status colours -- a Map of row to colour that
 // replaces the body colour (main.js decides starved / blocked / running).
+// The sim a button asks whether it is lit (a finger on it, or toggled on):
+// set per render() from view.sim.
+let litSim = null;
+const LIT = "rgba(255, 236, 150, 0.55)";
+
 function drawStructs(ctx, T, structs, z, px, on, S, ports, labels, tint = null) {
   const types = T.types;
   const inset = 0.05;
@@ -620,7 +626,7 @@ function drawStructs(ctx, T, structs, z, px, on, S, ports, labels, tint = null) 
   const byColour = new Map();   // css -> [colour, machines]
   for (const s of structs) {
     if (!on(s.x, s.y, s.w, s.h)) continue;
-    const c = (tint && s.row !== undefined && tint.get(s.row)) || (s.ascii ? ASCII_COLOUR : types[s.type].colour) || GREY;
+    const c = (tint && s.row !== undefined && tint.get(s.row)) || (s.ascii && !s.button ? ASCII_COLOUR : types[s.type].colour) || GREY;
     const key = cssOf(c);
     let g = byColour.get(key);
     if (!g) byColour.set(key, g = [c, []]);
@@ -634,6 +640,18 @@ function drawStructs(ctx, T, structs, z, px, on, S, ports, labels, tint = null) 
     ctx.fill();
     ctx.strokeStyle = shade(c, 0.6);
     ctx.stroke();
+  }
+  // A pressed button lights up, over whatever colour its body took.
+  if (litSim) {
+    ctx.beginPath();
+    let any = false;
+    for (const s of structs) {
+      if (!s.button || s.row === undefined || !on(s.x, s.y, s.w, s.h) || !litSim.buttonLit(s.row)) continue;
+      const k = 0.18;
+      bodyRect(ctx, s.x + k, s.y + k, s.w - 2 * k, s.h - 2 * k);
+      any = true;
+    }
+    if (any) { ctx.fillStyle = LIT; ctx.fill(); }
   }
   end();
   if (z < LOD.marks) return;

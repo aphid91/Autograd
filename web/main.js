@@ -35,6 +35,7 @@ import { entrySize, typeByName } from "./stamp.js";
 import { Screen } from "./pixel.js";
 import { installWebTypes } from "./webtypes.js";
 import { KEY_QUEUE_MAX } from "./keyboard.js";
+import { BUTTON_MODE_NAMES, nextMode } from "./button.js";
 import { KeyCapture } from "./keycapture.js";
 import { cropBox, evenDim, fitBox, frameBox, frameCount, viewBox } from "./video-params.js";
 import { presentationName, editName, startPresentation, fetchPresentation, presentationRecord, safeName } from "./present.js";
@@ -2159,6 +2160,7 @@ function liveText(row) {
       lines.push(`out  ${outs.join("   ")}`);
     }
     if (g.sim.keyboard) lines.push(`typed, waiting  ${sim.keysWaiting(row)}`);
+    if (g.sim.button) lines.push(`mode  ${BUTTON_MODE_NAMES[info.mode] ?? "?"}   ${sim.buttonOn(row) ? "on" : "off"}`);
     lines.push(`tick ${sim.tick}`);
     return lines.join("\n");
   }
@@ -2269,7 +2271,7 @@ function handValueOf(row) {
   const info = board?.describe(row);
   // An inactive layer's entities can be inspected but not edited.
   if (!info || !pickable(row)) return null;
-  if (info.emit !== null) return { kind: "emit", ascii: info.ascii, values: VALUE_CHOICES, current: info.emit };
+  if (info.emit !== null) return { kind: "emit", ascii: info.ascii, values: VALUE_CHOICES, current: info.emit, mode: info.mode };
   if (info.td.class === "Keyboard") return { kind: "keyboard", waiting: sim?.keysWaiting(row) ?? 0, last: lastKey, typing: !!capture?.active };
   if (info.seedOn !== null) return { kind: "seed", values: VALUE_CHOICES, current: info.seedOn ? info.seedValue : null };
   return null;
@@ -2288,6 +2290,72 @@ function setInspectValue(v) {
   }
   syncInspect();
 }
+
+// The Hand's mode button on a button (button.js): the next mode. An edit,
+// like its value.
+function cycleButtonMode() {
+  const info = board?.describe(inspectRow);
+  if (!info || info.mode === null || !pickable(inspectRow)) return;
+  board.setButtonMode(inspectRow, nextMode(info.mode));
+  syncInspect();
+}
+
+// --- pressing buttons (button.js) -------------------------------------------
+//
+// With a button inspected in the Hand, a finger that lands on any button is
+// a press rather than a tap: it never pans, pinches or changes what the
+// Hand holds (camera.js `hooks.press`), so pressing a row of buttons leaves
+// the inspected one where it was. Each finger is followed while it is down:
+// arriving on a button presses it (+1), leaving lets it go (-1), so a drag
+// across a row presses each in turn and Hold sees exactly the buttons under
+// a finger. Like a key press, not an edit: into the worker's sim while it
+// ticks, else into the mirror. A finger that lands anywhere else is the
+// Hand's as always -- a tap on bare board or another machine still moves
+// the selection.
+
+const fingers = new Map();   // pointerId -> the button row under it, or -1
+
+function isButtonRow(row) {
+  return !!board && row >= 0 && board.describe(row)?.td.name === "button";
+}
+function buttonAt(sx, sy) {
+  const [wx, wy] = cam.screenToWorld(sx, sy);
+  const r = seeAt(Math.floor(wx), Math.floor(wy));
+  return isButtonRow(r) ? r : -1;
+}
+function pressingButtons() {
+  return !!board && !!sim && !presenting && !regionArmed && shell.state.mode === "hand" &&
+    labelSel === null && isButtonRow(inspectRow);
+}
+function pressButton(row, delta) {
+  if (!sim) return;
+  sim.sync();
+  if (W.ready && !W.failed && W.running) wpost({ type: "press", row, delta, revision: board.revision });
+  else if (sim.press(row, delta)) mirrorMoved();
+  redraw();
+}
+const pressHooks = {
+  claims(sx, sy) {
+    if (!pressingButtons()) return false;
+    // A label draws over the board and keeps its taps.
+    if (layerLabelHit(sx, sy) !== null || noteHit(sx, sy) >= 0) return false;
+    return buttonAt(sx, sy) >= 0;
+  },
+  begin(id, sx, sy) { fingers.set(id, -1); pressHooks.move(id, sx, sy); },
+  move(id, sx, sy) {
+    if (!fingers.has(id)) return;
+    const was = fingers.get(id), now = buttonAt(sx, sy);
+    if (now === was) return;
+    if (was >= 0) pressButton(was, -1);
+    if (now >= 0) pressButton(now, 1);
+    fingers.set(id, now);
+  },
+  end(id) {
+    const was = fingers.get(id);
+    fingers.delete(id);
+    if (was >= 0) pressButton(was, -1);
+  },
+};
 
 // The Hand's convert button: a Source becomes an ASCII source and back. The
 // engine never reads the flag, so this is not an edit -- the simulation runs
@@ -2972,7 +3040,7 @@ function placementAt(tool, origin) {
   const o = T.types[type].orient[`${dir}${flip ? 1 : 0}`];
   const { blocked } = board.footprint(type, origin, dir, flip);
   return { tool, kind: "structure", type, origin, dir, flip, w: o.w, h: o.h, o,
-           value: toolValue(tool), ascii: !!tool.ascii, blocked };
+           value: toolValue(tool), ascii: !!tool.ascii, mode: tool.mode ?? null, blocked };
 }
 
 function placeGhost(pl) {
@@ -2985,8 +3053,9 @@ function placeGhost(pl) {
     return { belts: [{ x, y, dir: pl.dir, inDir: board.incoming(x, y, pl.dir), seed }],
              blocked: pl.blocked, box };
   }
-  const emit = T.types[pl.type].name === "source" ? pl.value : null;
-  return { structs: [{ type: pl.type, x, y, dir: pl.dir, flip: pl.flip, w: pl.w, h: pl.h, o: pl.o, emit, ascii: pl.ascii }],
+  const isButton = T.types[pl.type].name === "button";
+  const emit = T.types[pl.type].name === "source" || isButton ? pl.value : null;
+  return { structs: [{ type: pl.type, x, y, dir: pl.dir, flip: pl.flip, w: pl.w, h: pl.h, o: pl.o, emit, ascii: pl.ascii, button: isButton }],
            blocked: pl.blocked, box };
 }
 
@@ -3067,7 +3136,7 @@ function placeOne(pl, original) {
   }
   const [x, y] = pl.origin;
   if (pl.kind === "rawbelt") board.spawnBelt(x, y, pl.dir, pl.value);
-  else board.spawnStructure(pl.type, pl.origin, pl.dir, pl.flip, { emit: pl.value, ascii: pl.ascii, derive: false });
+  else board.spawnStructure(pl.type, pl.origin, pl.dir, pl.flip, { emit: pl.value, ascii: pl.ascii, mode: pl.mode, derive: false });
   return true;
 }
 
@@ -3984,6 +4053,7 @@ async function init() {
     onPlaceCancel: () => { if (shell.activeStamp) exitPaste(); else endPlace(); },
     onInspectValue: (v) => setInspectValue(v),
     onConvertSource: () => convertSource(),
+    onButtonMode: () => cycleButtonMode(),
     onKeyboardFocus: () => { if (isKeyboard(inspectRow)) { keycap().start(); syncInspect(); } },
     onPlanRoute: () => {
       run.route = ROUTES[(ROUTES.indexOf(run.route) + 1) % ROUTES.length];
@@ -4090,7 +4160,7 @@ async function init() {
   setSoundBtn(soundWanted);
   if (soundWanted) { panel.setAudioMeter("starts on your first tap"); armSound(); }
   soundBtn.addEventListener("click", () => { setAudio(!soundWanted); storeSound(soundWanted); soundBtn.blur(); });
-  attachGestures(canvas, cam, redraw, { onTap, onLongPress, drag: dragHooks, momentum: () => view.momentum !== false });
+  attachGestures(canvas, cam, redraw, { onTap, onLongPress, drag: dragHooks, press: pressHooks, momentum: () => view.momentum !== false });
 
   fileInput.addEventListener("change", async () => {
     const f = fileInput.files[0];

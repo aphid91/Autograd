@@ -174,9 +174,11 @@ export function takeDelta(sim, tr, extra = {}) {
   // The keyboards' queues, whole, whenever one changed: a few codes, and the
   // mirror's Status shows how many are waiting.
   const keys = tr.keys ? [...sim.keys].map(([r, q]) => [r, q.slice()]) : null;
+  // The buttons' states ride with them (button.js): the same flag.
+  const buttons = tr.keys ? [...sim.buttons].map(([r, b]) => [r, b.ev, b.on ? 1 : 0, b.held]) : null;
   tr.clear();
   const d = { type: "delta", tick: sim.tick, stats: statsOf(sim), runs, runVals, pushes, enter, payload,
-              rows, chans, fired, pixels, ...(keys ? { keys } : {}), ...extra };
+              rows, chans, fired, pixels, ...(keys ? { keys, buttons } : {}), ...extra };
   d.transfer = [runs.buffer, runVals.buffer, pushes.buffer, enter.buffer, payload.buffer,
                 rows.buffer, chans.buffer, fired.buffer, pixels.buffer];
   // Truthiness, only while it is on (Sim.truthOn): each run's and row's bit.
@@ -216,6 +218,7 @@ export function applyDelta(sim, d, screen = null) {
     for (let j = 0; j + 4 < p.length; j += 5) screen.fire(p[j], [p[j + 1], p[j + 2], p[j + 3], p[j + 4]]);
   }
   if (d.keys) { sim.keys = new Map(d.keys.map(([r, q]) => [r, q.slice()])); sim.keysVersion = (sim.keysVersion || 0) + 1; }
+  if (d.buttons) sim.buttons = new Map(d.buttons.map(([r, ev, on, held]) => [r, { ev, on: !!on, held }]));
   sim.tick = d.tick;
   Object.assign(sim.stats, d.stats);
   sim.version++;
@@ -349,6 +352,11 @@ export class SimHost {
       // load arrives after the new board and is dropped.
       case "key":
         if (this.sim && m.revision === this.sim.board.revision) this.sim.inject(m.row, m.code);
+        return;
+      // A finger arriving on (+1) or leaving (-1) a button (button.js), the
+      // same way: only onto the board it was pressed on.
+      case "press":
+        if (this.sim && m.revision === this.sim.board.revision) this.sim.press(m.row, m.delta);
         return;
     }
   }

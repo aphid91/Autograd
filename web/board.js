@@ -9,6 +9,7 @@ import { readNpz, writeNpz } from "./npz.js";
 import { parseNotes } from "./notes.js";
 import { F_LAYER, BACKGROUND, parseLayers, serialiseLayers, adoptOrphans, byId } from "./layers.js";
 import { parseAudio } from "./audio-params.js";
+import { F_BTN_VALUE, F_BTN_MODE, BUTTON_DEFAULT_VALUE, modeOf } from "./button.js";
 
 export const FORMAT_VERSION = 1;
 
@@ -28,6 +29,13 @@ function checkAsciiSlot(T) {
   if (E.F_SEED_ON !== F_ASCII || F_ASCII < gateEnd || F_ASCII >= E.STRIDE || (src && src.sim.n_in !== 0)) {
     throw new Error(`entity slot ${F_ASCII} is not free for a Source's ASCII flag`);
   }
+}
+
+// Where a machine keeps the value it emits: a Source in F_EMIT, a button
+// (button.js) in F_BTN_VALUE; null for anything else. Both carry the ASCII
+// flag (F_ASCII), and a button its mode (F_BTN_MODE).
+export function emitSlot(T, td) {
+  return td?.name === "source" ? T.entity.F_EMIT : td?.name === "button" ? F_BTN_VALUE : null;
 }
 
 export class Board {
@@ -143,7 +151,9 @@ export class Board {
       if (!x) continue;
       mix(i); mix(x & ((1 << C.ID_SHIFT) - 1)); mix(g[i + 1]); mix(g[i + 2] & ~C.GHOST_MASK);
       const row = this.cellId(x);
-      if (this.T.types[(x >> C.TYPE_SHIFT) & C.TYPE_MASK]?.name === "source") { f32[0] = this.field(row, E.F_EMIT); mix(u32[0]); }
+      const es = emitSlot(this.T, this.T.types[(x >> C.TYPE_SHIFT) & C.TYPE_MASK]);
+      if (es !== null) { f32[0] = this.field(row, es); mix(u32[0]); }
+      if (es === F_BTN_VALUE) mix(this.field(row, F_BTN_MODE));
       if (g[i + 2] & C.SEED_BIT) { f32[0] = this.field(row, E.F_SEED_VALUE); mix(u32[0]); }
     }
     return h;
@@ -163,6 +173,10 @@ export class Board {
   cellDir(word) { return (word >> this.T.cell.DIR_SHIFT) & this.T.cell.DIR_MASK; }
   cellId(word) { return (word >> this.T.cell.ID_SHIFT) & this.T.cell.ID_MASK; }
   field(row, f) { return this.entities[row * this.T.entity.STRIDE + f]; }
+  // A Source's or a button's value (emitSlot()), else null.
+  emitOf(row, td) { const es = emitSlot(this.T, td); return es === null ? null : this.field(row, es); }
+  // A button's mode (button.js), else null.
+  modeOf(row, td) { return td?.name === "button" ? modeOf(this.field(row, F_BTN_MODE)) : null; }
   setField(row, f, v) { this.entities[row * this.T.entity.STRIDE + f] = v; }
 
   // The entity row covering cell (x, y), or -1. Every cell of a multi-cell
@@ -189,8 +203,9 @@ export class Board {
       h: this.field(row, E.F_H) | 0,
       dir: this.field(row, E.F_DIR) | 0,
       flip: !!this.field(row, E.F_FLIPPED),
-      emit: td.name === "source" ? this.field(row, E.F_EMIT) : null,
-      ascii: td.name === "source" ? !!this.field(row, F_ASCII) : null,
+      emit: this.emitOf(row, td),
+      ascii: emitSlot(this.T, td) !== null ? !!this.field(row, F_ASCII) : null,
+      mode: this.modeOf(row, td),
       seedOn: td.kind === "belt" ? !!this.field(row, E.F_SEED_ON) : null,
       seedValue: td.kind === "belt" ? this.field(row, E.F_SEED_VALUE) : null,
     };
@@ -342,7 +357,7 @@ export class Board {
   // Each cell's .y holds its offset within the PLACED footprint, which is
   // what Gameboard._stamp_footprint() writes and what the desktop renderer
   // un-places to find a port.
-  spawnStructure(type, origin, dir, flip, { emit = null, ascii = false, derive = true, layer } = {}) {
+  spawnStructure(type, origin, dir, flip, { emit = null, ascii = false, mode = null, derive = true, layer } = {}) {
     const E = this.T.entity, C = this.T.cell, S = E.STRIDE;
     const { o, blocked } = this.footprint(type, origin, dir, flip);
     if (blocked.length) return -1;
@@ -357,9 +372,11 @@ export class Board {
     this.setField(row, E.F_W, o.w);
     this.setField(row, E.F_H, o.h);
     this.setField(row, E.F_FLIPPED, flip ? 1 : 0);
-    if (this.T.types[type].name === "source") {
-      this.setField(row, E.F_EMIT, emit ?? 0);
+    const es = emitSlot(this.T, this.T.types[type]);
+    if (es !== null) {
+      this.setField(row, es, emit ?? (es === F_BTN_VALUE ? BUTTON_DEFAULT_VALUE : 0));
       if (ascii) this.setField(row, F_ASCII, 1);
+      if (es === F_BTN_VALUE) this.setField(row, F_BTN_MODE, modeOf(mode));
     }
     this.tagLayer(row, layer);
     this.liveCount++;
@@ -468,8 +485,9 @@ export class Board {
         dir: this.field(r, E.F_DIR) | 0, flip: !!this.field(r, E.F_FLIPPED),
         exit: type === C.TYPE_UNDER && !!this.field(r, E.F_UNDER_IS_EXIT),
         partner: partner && index.has(partner) ? index.get(partner) : null,
-        emit: td.name === "source" ? this.field(r, E.F_EMIT) : null,
-        ascii: td.name === "source" && !!this.field(r, F_ASCII),
+        emit: this.emitOf(r, td),
+        ascii: emitSlot(this.T, td) !== null && !!this.field(r, F_ASCII),
+        mode: this.modeOf(r, td),
         seed: td.kind === "belt" && this.field(r, E.F_SEED_ON) ? this.field(r, E.F_SEED_VALUE) : null,
         layer: this.field(r, F_LAYER) | 0,
       };
@@ -514,7 +532,7 @@ export class Board {
       // none (a copy being pasted) puts it on the current layer.
       if (t === C.TYPE_BELT) row = this.spawnBelt(x, y, e.dir, e.seed ?? null, e.layer);
       else if (t === C.TYPE_UNDER) row = this.spawn1(t, x, y, e.dir, { isExit: e.exit, layer: e.layer });
-      else row = this.spawnStructure(t, [x, y], e.dir, e.flip, { emit: e.emit, ascii: !!e.ascii, derive: false, layer: e.layer });
+      else row = this.spawnStructure(t, [x, y], e.dir, e.flip, { emit: e.emit, ascii: !!e.ascii, mode: e.mode ?? null, derive: false, layer: e.layer });
       rows.set(i, row);
     });
     const E = this.T.entity;
@@ -606,7 +624,17 @@ export class Board {
   // loads there with the setting intact.
 
   setEmit(row, value) {
-    this.setField(row, this.T.entity.F_EMIT, value);
+    const es = emitSlot(this.T, this.T.types[this.field(row, this.T.entity.F_TYPE) | 0]);
+    if (es === null) return;
+    this.setField(row, es, value);
+    this.derive();
+  }
+
+  // A button's mode (button.js). An edit, like its value: the sim reads it,
+  // and a fresh start is what tells the worker.
+  setButtonMode(row, mode) {
+    if (this.T.types[this.field(row, this.T.entity.F_TYPE) | 0]?.name !== "button") return;
+    this.setField(row, F_BTN_MODE, modeOf(mode));
     this.derive();
   }
 
@@ -677,8 +705,9 @@ export class Board {
           partner: this.field(r, E.F_UNDER_PARTNER) | 0, span: null });
       } else {
         structs.push({ row: r, type, x, y, dir, flip, w: o.w, h: o.h, o,
-          emit: td.name === "source" ? this.field(r, E.F_EMIT) : null,
-          ascii: td.name === "source" && !!this.field(r, F_ASCII) });
+          emit: this.emitOf(r, td),
+          ascii: emitSlot(this.T, td) !== null && !!this.field(r, F_ASCII),
+          button: td.name === "button" });
         for (const [lx, ly, f] of o.outputs) {
           const k = (y + ly) * W + (x + lx);
           this.portOut.set(k, (this.portOut.get(k) || 0) | (1 << f));

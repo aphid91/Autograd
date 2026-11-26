@@ -11,6 +11,7 @@
 import { isValidStamp, typeByName } from "./stamp.js";
 import { structGlyph } from "./glyphs.js";
 import { ASCII_COLOUR } from "./ascii.js";
+import { BUTTON_DEFAULT_VALUE } from "./button.js";
 
 export const CW = (d) => (d + 3) % 4;    // directions are CCW quarter turns
 export const CCW = (d) => (d + 1) % 4;
@@ -64,13 +65,13 @@ function typeOf(T, name) {
 export const VALUE_CHOICES = [0, 1, -1, 2, 4, 8];
 
 export function hasValue(slot) {
-  return !!slot && (slot.kind === "rawbelt" || (slot.kind === "structure" && slot.type === "source"));
+  return !!slot && (slot.kind === "rawbelt" || (slot.kind === "structure" && (slot.type === "source" || slot.type === "button")));
 }
 
 export function toolValue(slot) {
   if (!hasValue(slot)) return null;
   if (slot.kind === "rawbelt") return slot.value ?? null;
-  return slot.value ?? 0;
+  return slot.value ?? (slot.type === "button" ? BUTTON_DEFAULT_VALUE : 0);
 }
 
 // Whether flip means anything for this tool. Belts have no ports; a machine
@@ -149,7 +150,7 @@ export function toolArt(T, slot) {
   const td = typeOf(T, slot.type);
   if (!td) return "";
   const o = td.orient[`${d}${slot.flip ? 1 : 0}`];
-  const c = (slot.ascii ? ASCII_COLOUR : td.colour) || [0.5, 0.5, 0.5];
+  const c = (slot.ascii && td.name === "source" ? ASCII_COLOUR : td.colour) || [0.5, 0.5, 0.5];
   const ins = o.inputs.map(([x, y, f]) => port(x, y, f, true)).join("");
   const outs = o.outputs.map(([x, y, f]) => port(x, y, f, false)).join("");
   // The control overlay and the glyph, as on the board.
@@ -186,7 +187,7 @@ export function stampArt(T, stamp) {
     } else if (t.td.kind === "under") {
       body += `<rect x="${e.dx + 0.15}" y="${e.dy + 0.15}" width="0.7" height="0.7" fill="#6b7380"/>`;
     } else {
-      const c = (e.ascii ? ASCII_COLOUR : t.td.colour) || [0.5, 0.5, 0.5];
+      const c = (e.ascii && t.td.name === "source" ? ASCII_COLOUR : t.td.colour) || [0.5, 0.5, 0.5];
       body += `<rect x="${e.dx + 0.06}" y="${e.dy + 0.06}" width="${o.w - 0.12}" height="${o.h - 0.12}" fill="${css(c)}"/>`;
     }
   }
