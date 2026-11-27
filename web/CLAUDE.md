@@ -719,8 +719,8 @@ uses.
 
 ### Indexing
 
-Giving a set of Sources and belts a number each, then a value from a table
-by that number -- a Source's constant, a belt's seed. One-shot: the order is
+Giving a set of Sources, buttons and belts a number each, then a value from
+a table by that number -- a Source's or a button's value, a belt's seed. One-shot: the order is
 not stored once applied. [indexer.js](indexer.js) is the pure part (orders,
 tables, the file parser, `a*x+b`), tested in `tests/indexer.test.mjs`.
 
@@ -736,12 +736,24 @@ tables, the file parser, `a*x+b`), tested in `tests/indexer.test.mjs`.
   **Ascending** (0, 1, 2…), **Doubling** (1, 2, 4…, clamped at 2²⁴),
   **Alternating** (0, 1, 0, 1…),
   **Hack…** (below), or **File…** (numbers separated by commas or whitespace, repeated to fill
-  the index; `D` is the default: 0 for a Source, no seed for a belt; any
-  other token rejects the file with its line) -- then **a** and **b**
+  the index; `D` is the default: 0 for a Source, 1 for a button, no seed
+  for a belt; any other token rejects the file with its line) -- then **a** and **b**
   (1 and 0), so the value is `a*x + b`, float32, clamped; a default stays a
   default. A live preview lists the first dozen; **Apply to n** writes the
   values into the lifted entries and puts the selection down: one edit,
   one undo step.
+- **File… remembers the last 8 files** (`RECENT_FILES`; localStorage
+  `gates.web.indexFiles.v1`, the parsed values, cleaned on read). With
+  none, File… opens the browser's picker as before; with some, it takes
+  the most recent and shows a drop-down of them, newest first, ending in
+  **Browse…** for the picker. Loading or picking one moves it to the front;
+  a file loaded again under the same name replaces its old entry.
+- **Buttons** index like Sources: the value goes in their value, and the
+  sheet's **ASCII** box (named for what is indexed: Sources, buttons or
+  both) covers them too. A **mode** button beside it sets every indexed
+  button's mode at once, cycling Event, Hold, Toggle; it starts at their
+  shared mode, or **Mixed** (each keeps its own) until tapped. Fresh on
+  each opening, like the ASCII box.
 - **Position has three switches** on the bar while it is the order:
   **Transpose** (up each column, columns left to right), **Reverse X**
   and **Reverse Y**. Together they reach all eight ways a rectangle can be

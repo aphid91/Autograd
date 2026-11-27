@@ -11,7 +11,7 @@ import { icon } from "./icons.js";
 import { RATE_MAX, RATE_MIN, RATE_PRESETS } from "./sim.js";
 import { CW, CCW, canFlip, catalog, isKnown, labelFor, sameTool, stampArt, toolArt, toolValue } from "./tools.js";
 import { copyStamp, mirrored, rotated } from "./stamp.js";
-import { TABLES, TABLE_NAMES, parseTable } from "./indexer.js";
+import { TABLES, TABLE_NAMES, parseTable, loadRecentFiles, saveRecentFiles, pushRecentFile } from "./indexer.js";
 import { assemble, asciiCodes } from "./hack.js";
 import { listPrograms, getProgram } from "./hackstore.js";
 import { PALETTE, SIZE_NAMES, css as noteCss } from "./notes.js";
@@ -679,6 +679,9 @@ export class Shell {
     // its own kind; true or false turns them all into that kind. Fresh on
     // each opening, so it starts from the Sources as they are.
     st.asciiSources = null;
+    // The buttons' mode cycle (button.js): null until touched, meaning each
+    // keeps its own; else every indexed button is set to that mode.
+    st.buttonMode = null;
     const srcRow = m.querySelector("#index-src");
     const tables = m.querySelector("#index-tables"), extra = m.querySelector("#index-extra");
     const ain = m.querySelector("#index-a"), bin = m.querySelector("#index-b");
@@ -700,9 +703,9 @@ export class Shell {
     const opts = () => {
       if (st.kind === "hack") {
         const h = hackWords();
-        return { kind: "hack", ascii: st.ascii, file: h.words || null, hackError: h.error || null, hackName: st.hack, a: 1, b: 0, asciiSources: st.asciiSources };
+        return { kind: "hack", ascii: st.ascii, file: h.words || null, hackError: h.error || null, hackName: st.hack, a: 1, b: 0, asciiSources: st.asciiSources, buttonMode: st.buttonMode };
       }
-      return { kind: st.kind, file: st.file, seed: st.seed, a: num(ain, 1), b: num(bin, 0), asciiSources: st.asciiSources };
+      return { kind: st.kind, file: st.file, seed: st.seed, a: num(ain, 1), b: num(bin, 0), asciiSources: st.asciiSources, buttonMode: st.buttonMode };
     };
     const refresh = () => {
       tables.replaceChildren(...TABLES.map(k => {
@@ -710,8 +713,16 @@ export class Shell {
         b.type = "button"; b.className = "pick"; b.textContent = TABLE_NAMES[k];
         b.dataset.current = String(k === st.kind);
         b.onclick = () => {
-          if (k === "file") fileIn.click();
-          else {
+          // File…: straight to the browser's picker when nothing has been
+          // loaded before; otherwise the most recent file, with the rest
+          // (and Browse…) in a drop-down below.
+          if (k === "file") {
+            const recent = loadRecentFiles();
+            if (!recent.length) { fileIn.click(); return; }
+            if (!st.file) { st.file = recent[0].values; st.fileName = recent[0].name; }
+            st.kind = "file";
+            refresh();
+          } else {
             if (k === "hack" && !listPrograms().some(p => p.name === st.hack)) st.hack = listPrograms()[0]?.name || "";
             st.kind = k;
             refresh();
@@ -726,7 +737,33 @@ export class Shell {
         r.onclick = () => { st.seed = (st.seed * 1664525 + 1013904223) >>> 0; refresh(); };
         extra.append(r);
       } else if (st.kind === "file") {
-        extra.textContent = `${st.fileName} — ${st.file.length} value${st.file.length === 1 ? "" : "s"}, repeated to fill`;
+        // The recent files, newest first, and Browse… for the picker.
+        const recent = loadRecentFiles();
+        const pick = document.createElement("select");
+        pick.className = "idx-hack";
+        pick.setAttribute("aria-label", "Table file");
+        if (!recent.some(e => e.name === st.fileName)) recent.unshift({ name: st.fileName, values: st.file });
+        for (const e of recent) {
+          const o = document.createElement("option");
+          o.value = e.name; o.textContent = e.name; o.selected = e.name === st.fileName;
+          pick.append(o);
+        }
+        const browse = document.createElement("option");
+        browse.value = "\u0000browse"; browse.textContent = "Browse…";
+        pick.append(browse);
+        pick.onchange = () => {
+          if (pick.value === browse.value) { pick.value = st.fileName; fileIn.click(); return; }
+          const e = recent.find(r => r.name === pick.value);
+          if (!e) return;
+          st.file = e.values; st.fileName = e.name;
+          // Picking one is using it: it moves to the front.
+          saveRecentFiles(pushRecentFile(loadRecentFiles(), e));
+          refresh();
+        };
+        const note = document.createElement("span");
+        note.className = "idx-note";
+        note.textContent = `${st.file.length} value${st.file.length === 1 ? "" : "s"}, repeated to fill`;
+        extra.append(pick, note);
       } else if (st.kind === "hack") {
         const progs = listPrograms();
         if (progs.length) {
@@ -779,12 +816,38 @@ export class Shell {
         box.checked = st.asciiSources ?? (src.ascii && !src.mixed);
         box.indeterminate = st.asciiSources === null && src.mixed;
         box.onchange = () => { st.asciiSources = box.checked; refresh(); };
-        lab.append(box, ` ASCII sources`);
+        // Named for what is indexed: Sources, buttons, or both.
+        const what = src.buttons && src.sources ? "Sources and buttons" : src.buttons ? `button${src.n === 1 ? "" : "s"}` : `Source${src.n === 1 ? "" : "s"}`;
+        lab.append(box, src.buttons && !src.sources ? " ASCII buttons" : src.buttons ? " ASCII" : " ASCII sources");
         const note = document.createElement("span");
         note.className = "idx-note";
-        note.textContent = st.asciiSources === null && src.mixed ? `${src.n} Sources, mixed: each keeps its kind`
-          : `${src.n} Source${src.n === 1 ? "" : "s"} ${box.checked ? "drawn as characters" : "drawn as numbers"}`;
-        srcRow.append(lab, note);
+        note.textContent = st.asciiSources === null && src.mixed ? `${src.n} ${what}, mixed: each keeps its kind`
+          : `${src.n} ${what} ${box.checked ? "drawn as characters" : "drawn as numbers"}`;
+        const line = document.createElement("div");
+        line.className = "idx-line";
+        line.append(lab, note);
+        srcRow.append(line);
+      }
+      // The buttons' mode, all at once: a button that cycles Event, Hold,
+      // Toggle. Starts at their shared mode, or "mixed" (each keeps its own)
+      // until tapped.
+      const btn = res.buttons;
+      if (btn && btn.n) {
+        const cur = st.buttonMode ?? btn.mode;
+        const b = this.modeButton(cur ?? 0, () => {
+          st.buttonMode = cur === null ? 0 : nextMode(cur);
+          refresh();
+        });
+        b.classList.add("idx-mode");
+        if (cur === null) { b.querySelector(".conv-art").textContent = "±"; b.querySelector("span:last-child").textContent = "Mixed"; }
+        const note = document.createElement("span");
+        note.className = "idx-note";
+        note.textContent = cur === null ? `${btn.n} button${btn.n === 1 ? "" : "s"}, mixed: each keeps its mode`
+          : `${btn.n} button${btn.n === 1 ? "" : "s"} set to ${BUTTON_MODE_NAMES[cur]}`;
+        const line = document.createElement("div");
+        line.className = "idx-line";
+        line.append(b, note);
+        srcRow.append(line);
       }
       apply.disabled = !!res.error || !res.n;
       apply.textContent = res.n ? `Apply to ${res.n}` : "Apply";
@@ -797,6 +860,7 @@ export class Shell {
         st.file = parseTable(await f.text());
         st.fileName = f.name;
         st.kind = "file";
+        saveRecentFiles(pushRecentFile(loadRecentFiles(), { name: f.name, values: st.file }));
       } catch (e) {
         alert(`${f.name}: ${e.message}`);
       }

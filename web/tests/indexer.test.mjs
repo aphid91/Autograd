@@ -66,3 +66,22 @@ test("ascii: the text's character codes, then -1 for ever", () => {
   assert.deepEqual(tableValues("hack", 1, { file: asciiCodes("ok"), pad: END_OF_STREAM }), [111], "cut when short");
   assert.deepEqual(tableValues("hack", 3, { file: [5] }), [5, 0, 0], "machine code still pads with 0");
 });
+
+test("recent table files: newest first, one per name, at most eight, cleaned on read", async () => {
+  const { pushRecentFile, cleanRecentFiles, loadRecentFiles, saveRecentFiles, RECENT_FILES } = await import("../indexer.js");
+  let list = [];
+  for (let i = 0; i < 10; i++) list = pushRecentFile(list, { name: `f${i}.txt`, values: [i] });
+  assert.equal(list.length, RECENT_FILES);
+  assert.deepEqual(list.map(e => e.name).slice(0, 3), ["f9.txt", "f8.txt", "f7.txt"]);
+  list = pushRecentFile(list, { name: "f5.txt", values: [55, null] });
+  assert.equal(list[0].name, "f5.txt");
+  assert.deepEqual(list[0].values, [55, null], "a reload under the same name replaces it");
+  assert.equal(list.filter(e => e.name === "f5.txt").length, 1);
+  assert.deepEqual(cleanRecentFiles([{ name: "ok", values: [1, null] }, { name: 3, values: [1] }, { name: "bad", values: ["x"] }, null, { name: "empty", values: [] }]).map(e => e.name), ["ok"]);
+  assert.deepEqual(cleanRecentFiles("nope"), []);
+  const mem = new Map(), store = { getItem: (k) => mem.get(k) ?? null, setItem: (k, v) => mem.set(k, v) };
+  saveRecentFiles(list, store);
+  assert.deepEqual(loadRecentFiles(store), list);
+  mem.set("gates.web.indexFiles.v1", "{corrupt");
+  assert.deepEqual(loadRecentFiles(store), []);
+});

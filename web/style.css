@@ -503,9 +503,11 @@ html, body {
 .idx-check { flex: 0 0 auto; display: flex; align-items: center; gap: calc(4 * var(--u)); color: var(--ink); }
 .idx-note { flex: 0 1 auto; min-width: 0; }
 .idx-tables .pick { justify-content: center; height: calc(36 * var(--u)); }
-.idx-row { display: flex; gap: calc(8 * var(--u)); align-items: center; font-size: calc(11 * var(--u)); color: var(--ink-dim); }
+.idx-row { display: flex; gap: calc(8 * var(--u)); align-items: center; flex-wrap: wrap; font-size: calc(11 * var(--u)); color: var(--ink-dim); }
 .idx-row:empty { display: none; }
 .idx-row .sheet-btn { flex: 0 0 auto; }
+.idx-row .idx-mode { flex: 0 0 auto; }
+.idx-line { flex: 1 1 100%; display: flex; gap: calc(8 * var(--u)); align-items: center; min-width: 0; }
 .idx-ab { flex: 1 1 0; min-width: 0; display: flex; align-items: center; gap: calc(6 * var(--u)); color: var(--ink); }
 .idx-ab input {
   flex: 1; min-width: 0; height: calc(34 * var(--u)); box-sizing: border-box;

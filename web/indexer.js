@@ -104,3 +104,32 @@ export function finalValues(table, a, b, limit = 2 ** 24) {
     return v > limit ? limit : v < -limit ? -limit : v;
   });
 }
+
+// --- recent table files ------------------------------------------------------
+//
+// The File… table remembers the last RECENT_FILES files loaded, newest
+// first, so the same indices need not be browsed for again: { name, values }
+// each, values as parsed (DEFAULT as null). Kept in localStorage; a file
+// loaded again under the same name replaces its old entry and moves to the
+// front. Pure apart from the two storage calls, which take the store.
+export const RECENT_FILES = 8;
+export const RECENT_FILES_KEY = "gates.web.indexFiles.v1";
+
+export function pushRecentFile(list, entry, max = RECENT_FILES) {
+  return [entry, ...list.filter(e => e.name !== entry.name)].slice(0, max);
+}
+
+// Only well-formed entries: a name, and values that are numbers or null.
+export function cleanRecentFiles(v) {
+  if (!Array.isArray(v)) return [];
+  return v.filter(e => e && typeof e.name === "string" && Array.isArray(e.values) && e.values.length &&
+    e.values.every(x => x === DEFAULT || Number.isFinite(x))).slice(0, RECENT_FILES);
+}
+
+export function loadRecentFiles(store = globalThis.localStorage) {
+  try { return cleanRecentFiles(JSON.parse(store?.getItem(RECENT_FILES_KEY) || "null")); } catch { return []; }
+}
+
+export function saveRecentFiles(list, store = globalThis.localStorage) {
+  try { store?.setItem(RECENT_FILES_KEY, JSON.stringify(list)); } catch { /* full or absent: not kept */ }
+}

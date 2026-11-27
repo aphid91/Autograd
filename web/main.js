@@ -35,7 +35,7 @@ import { entrySize, typeByName } from "./stamp.js";
 import { Screen } from "./pixel.js";
 import { installWebTypes } from "./webtypes.js";
 import { KEY_QUEUE_MAX } from "./keyboard.js";
-import { BUTTON_MODE_NAMES, nextMode } from "./button.js";
+import { BUTTON_MODE_NAMES, BUTTON_DEFAULT_VALUE, nextMode } from "./button.js";
 import { KeyCapture } from "./keycapture.js";
 import { cropBox, evenDim, fitBox, frameBox, frameCount, viewBox } from "./video-params.js";
 import { presentationName, editName, startPresentation, fetchPresentation, presentationRecord, safeName } from "./present.js";
@@ -2511,12 +2511,18 @@ function removeNote(n) {
 // and puts the selection down: one edit, one undo step. Indexing is one-shot:
 // the order is not kept anywhere once applied.
 
+// What indexing writes a value into: a Source's emit value or a button's
+// (button.js), each with its ASCII flag; a belt's seed is the other kind.
+// A table's D (DEFAULT) gives each its type's own default.
+const emits = (e) => e.type === "source" || e.type === "button";
+const emitDefault = (e) => (e.type === "button" ? BUTTON_DEFAULT_VALUE : 0);
+
 // The indexed entries: { i (index into the selection), e (absolute entry) },
 // in index order.
 function indexed() {
   if (!sel || !shell.state.indexing) return [];
   const abs = selAbs();
-  const items = abs.map((e, i) => ({ i, e })).filter(({ e }) => e.type === "source" || e.type === "belt");
+  const items = abs.map((e, i) => ({ i, e })).filter(({ e }) => e.type === "source" || e.type === "button" || e.type === "belt");
   if (shell.state.indexing === "natural") {
     return naturalOrder(items.map(({ e }) => ({ x: e.dx, y: e.dy })), shell.state.indexOrder).map(k => items[k]);
   }
@@ -2544,20 +2550,28 @@ function indexValues(o) {
 
 function indexPreview(o) {
   const { list, values, cut } = indexValues(o);
-  if (!list.length) return { n: 0, error: "Nothing indexed: select some Sources or belts." };
+  if (!list.length) return { n: 0, error: "Nothing indexed: select some Sources, buttons or belts." };
   const fmt = (v) => (v === DEFAULT ? "default" : String(parseFloat(v.toPrecision(6))));
-  // The Sources: how many, and whether they are all ASCII sources now --
-  // what the sheet's ASCII sources box starts from.
-  const srcs = list.filter(({ e }) => e.type === "source");
+  // The Sources and buttons: how many, and whether they all draw as
+  // characters now -- what the sheet's ASCII box starts from.
+  const srcs = list.filter(({ e }) => emits(e));
   const sources = { n: srcs.length, ascii: srcs.length > 0 && srcs.every(({ e }) => e.ascii),
-                    mixed: srcs.some(({ e }) => e.ascii) && srcs.some(({ e }) => !e.ascii) };
+                    mixed: srcs.some(({ e }) => e.ascii) && srcs.some(({ e }) => !e.ascii),
+                    sources: srcs.filter(({ e }) => e.type === "source").length,
+                    buttons: srcs.filter(({ e }) => e.type === "button").length };
+  // The buttons: how many, and their mode if they all share one (null:
+  // mixed) -- what the sheet's mode cycle starts from.
+  const btns = list.filter(({ e }) => e.type === "button");
+  const modes = new Set(btns.map(({ e }) => e.mode ?? 0));
+  const buttons = { n: btns.length, mode: modes.size === 1 ? [...modes][0] : null };
   const asciiOut = o.asciiSources ?? (sources.ascii && !sources.mixed);
   // ASCII: each code with the character it is, so the stream can be read.
   const stream = o.kind === "hack" && o.ascii;
   const name = (v) => nameOf(v) ?? (v < 0 && nameOf(-v) ? `-${nameOf(-v)}` : null);
   const chr = (v, src) => (v === DEFAULT ? "" : stream && v === END_OF_STREAM ? "  end"
     : (stream || (asciiOut && src)) && name(v) ? `  ${name(v)}` : "");
-  const lines = list.slice(0, 12).map(({ e }, n) => `#${n}  ${e.type === "source" ? "Source" : "belt  "}  ${fmt(values[n])}${chr(values[n], e.type === "source")}`);
+  const kind = { source: "Source", button: "Button", belt: "belt  " };
+  const lines = list.slice(0, 12).map(({ e }, n) => `#${n}  ${kind[e.type]}  ${fmt(values[n])}${chr(values[n], emits(e))}`);
   if (list.length > 12) lines.push(`… and ${list.length - 12} more`);
   if (o.kind === "hack" && o.ascii) {
     // The stream is complete once its last character and one -1 are in:
@@ -2576,8 +2590,8 @@ function indexPreview(o) {
   // (whole part outside 0..127) is allowed -- they show the null glyph --
   // but said. The stream's end-of-stream -1s are deliberate, so exempt.
   const bad = asciiOut ? nonAscii(list, values, stream) : 0;
-  return { n: list.length, text: lines.join("\n"), sources,
-           warning: bad ? `${bad} Source${bad === 1 ? "" : "s"} would get a value that is not an ASCII character (0..127) or a negated one: ${bad === 1 ? "it shows" : "they show"} a hollow box.` : null };
+  return { n: list.length, text: lines.join("\n"), sources, buttons,
+           warning: bad ? `${bad} Source${bad === 1 ? "" : "s"} or button${bad === 1 ? "" : "s"} would get a value that is not an ASCII character (0..127) or a negated one: ${bad === 1 ? "it shows" : "they show"} a hollow box.` : null };
 }
 
 // How many indexed Sources get a value whose whole part is outside 0..127,
@@ -2586,8 +2600,8 @@ function nonAscii(list, values, stream) {
   let n = 0;
   list.forEach(({ e }, k) => {
     const v = values[k];
-    if (e.type !== "source") return;
-    const x = v === DEFAULT ? 0 : v;
+    if (!emits(e)) return;
+    const x = v === DEFAULT ? emitDefault(e) : v;
     if (stream && x === END_OF_STREAM) return;
     // A negated character shows as "-F": no hollow box, no warning.
     if (!isAscii(x) && !isAscii(-x)) n++;
@@ -2610,10 +2624,12 @@ function indexApply(o) {
   list.forEach(({ i, e }, n) => {
     const entry = sel.stamp.entries[i];
     const v = values[n];
-    if (e.type === "source") {
-      entry.emit = v === DEFAULT ? 0 : v;
+    if (emits(e)) {
+      entry.emit = v === DEFAULT ? emitDefault(e) : v;
       if (o.asciiSources === true) entry.ascii = true;
       else if (o.asciiSources === false) delete entry.ascii;
+      // The mode cycle: every indexed button set to it (null: each keeps).
+      if (e.type === "button" && o.buttonMode !== null && o.buttonMode !== undefined) entry.mode = o.buttonMode;
     }
     else entry.seed = v;                 // null: no seed
   });
