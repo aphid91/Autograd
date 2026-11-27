@@ -297,6 +297,8 @@ export async function startAudio(ctx, params, sim, onMeter) {
   rec.attach(sim);
   return {
     ctx, node, rec,
+    // A finger landing on (down) or leaving a button: its click, at once.
+    keyClick(down) { node.port.postMessage({ type: "key", down: !!down }); },
     setParams(p) { node.port.postMessage({ type: "params", p }); rec.setLengths(p.beltMinLen, p.beltCutoff); rec.setTruth(p.truthAudio); rec.setBeltsMuted(beltsMuted(p)); },
     // A bake's samples, as an AudioBuffer for this context.
     buffer(samples, sampleRate) {

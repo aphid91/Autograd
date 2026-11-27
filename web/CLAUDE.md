@@ -1059,7 +1059,7 @@ worker), put exactly those codes on the keyboard's belt.
 ### The button
 
 **Button** ([button.js](button.js)) is a third web-only machine (type id
-**14**): 3×3, a yellower beige than the keyboard, one input in the middle
+**14**): 3×3, a pale classic-keycap beige, one input in the middle
 of the west face and the output straight across on the east (facing +X; a
 3×3 is symmetric about that row, so flip is not offered; no pass-through
 overlay). It has a **value** and an **ASCII flag** like a Source, drawn the
@@ -1100,10 +1100,19 @@ consumed and answered with one token out -- the value while the button is
   the board's revision (a stale one is dropped), or into the mirror while
   this thread ticks or the clock is paused. Pressing needs no wake: a button
   acts only when polled, and a poll's arrival wakes it.
-- **Drawn lit** (a warm inset over its body, whatever the status colour)
-  while a finger is on it or it is toggled on (`Sim.buttonLit()`, read from
-  the mirror, so a press made while the worker ticks lights up a frame
-  later).
+- **Drawn sunk**: a strong dark shadow over the whole cap, whatever the
+  status colour, while a finger is on it or it is toggled on
+  (`Sim.buttonLit()`, read from the mirror, so a press made while the
+  worker ticks shows a frame later).
+- **A keycap's legend**: its value (or character) is **dark ink**
+  (`COL.buttonText`) and **sized to the button** -- half its height, or
+  narrower to fit the width (`emitSize()`), not the fixed per-cell size a
+  Source's number uses, which left it tiny in the middle of a 3×3. Below
+  the glyph zoom the type glyph shows instead, also dark (`COL.buttonMark`,
+  and on the swatch). With gate status colours on (the default) the body
+  takes the status colour, as every machine's does.
+- **It clicks** -- see "Button clicks" under Audio: one sound when a finger
+  lands on it, another when it leaves.
 - The Hand's bar: the value swatches and box, **Number/ASCII**, and the
   **mode** button (tap for the next). The placing bar has the same three for
   the tool (`tool.mode`).
@@ -2109,6 +2118,29 @@ ticks arrive, with no refill wait. A hold gives up after `HOLD_MAX_S`
 (0.5 s); a pause is still a stop. It is the realtime remedy for stutter at
 busy moments; baking is the thorough one.
 
+### Button clicks
+
+[audio-keys.js](audio-keys.js): a press (a finger landing on a button) and
+a release (leaving it) each play a click evoking a mechanical keyboard
+switch -- white noise under an attack/release envelope, rung through a
+short two-pole resonator at the **tone** (the tick), plus a sine at 0.3×
+the tone under the same envelope (the keycap's pop). Release is
+exponential, -60 dB at the release time, where the click ends.
+
+- **Not a tick sound.** `pressButton()` in main.js sends `{ type: "key",
+  down }` straight to the worklet (`audio.keyClick()`) and the synth adds
+  the click from the next block, outside the ticks' queue and latency, so
+  it is heard paused or playing, with sound on. Never in a bake or a
+  video's soundtrack: presses are not on the board.
+- **Audio > buttons**: press gain, tone, attack, release, and the same four
+  for the release. They ride saves and presets like any dial but are
+  `REALTIME_ONLY`, so changing them never makes a bake stale.
+- A click is the same every time (a per-click xorshift); at most 32 overlap.
+
+`tests/keys.test.mjs`: heard in the first block with nothing ticking, over
+by its release time; each half answers only to its own dials; repeatable,
+and two at once add; the folder's dials and the bake key.
+
 ### Realtime at high tick rates
 
 Above about 20k tps the realtime sound hiccuped where a bake of the same
@@ -2906,6 +2938,7 @@ largest JS span left.
 | `audio-bake.js` | baking: a stretch of ticks rendered offline, and the WAV writer; loaded on demand |
 | `pixel.js` | the Pixel machine (web-only, in Sink's id), its screen, and the overlay's drawing |
 | `keyboard.js` | the Keyboard machine (web-only, type id 13): a generator that emits what is typed |
+| `audio-keys.js` | the buttons' press and release clicks |
 | `button.js` | the Button machine (web-only, type id 14): answers each poll with its value while pressed, by mode |
 | `webtypes.js` | `installWebTypes()`: Pixel and Keyboard into a loaded types.json |
 | `keycapture.js` | the hidden field that takes a keyboard's keys, physical or on-screen |

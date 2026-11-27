@@ -21,6 +21,8 @@ const COL = {
   seedPos: "rgba(77,189,92,0.55)",
   seedNeg: "rgba(209,77,71,0.55)",
   label: "#fcfcff",
+  buttonText: "#1d1a14",       // a button's value: dark on its pale keycap
+  buttonMark: "#2a261d",       // a button's glyph, likewise
   select: "#e8a33d",
   handle: "rgba(232,163,61,0.28)",
   frustrated: "rgba(230,64,56,0.55)",
@@ -83,6 +85,8 @@ const EMIT_SCALE = 0.56;
 const OVERLAY_WIDTH = 0.28;
 function emitSize(s, z) {
   const text = sourceText(s);
+  // A button's value fills its keycap: sized to the body, not to a cell.
+  if (s.button) return TUNE.emitSize * Math.min(s.h * z * 0.5, (s.w * z * 0.8) / (Math.max(1, text.length) * 0.62));
   return TUNE.emitSize * Math.min(EMIT_SCALE * z, (s.w * z * 0.8) / (text.length * 0.62));
 }
 const emitShown = (s, z, labels) => s.emit !== null && labels && z >= LOD.marks;
@@ -612,7 +616,8 @@ function drawGhost(ctx, T, g, z, px, on, S, ports, labels, seedTint = true) {
 // The sim a button asks whether it is lit (a finger on it, or toggled on):
 // set per render() from view.sim.
 let litSim = null;
-const LIT = "rgba(255, 236, 150, 0.55)";
+// A pressed key sinks: a strong shadow over the whole cap.
+const PRESSED = "rgba(18, 14, 6, 0.58)";
 
 function drawStructs(ctx, T, structs, z, px, on, S, ports, labels, tint = null) {
   const types = T.types;
@@ -641,17 +646,17 @@ function drawStructs(ctx, T, structs, z, px, on, S, ports, labels, tint = null) 
     ctx.strokeStyle = shade(c, 0.6);
     ctx.stroke();
   }
-  // A pressed button lights up, over whatever colour its body took.
+  // A pressed button (or one toggled on) sinks into shadow, over whatever
+  // colour its body took.
   if (litSim) {
     ctx.beginPath();
     let any = false;
     for (const s of structs) {
       if (!s.button || s.row === undefined || !on(s.x, s.y, s.w, s.h) || !litSim.buttonLit(s.row)) continue;
-      const k = 0.18;
-      bodyRect(ctx, s.x + k, s.y + k, s.w - 2 * k, s.h - 2 * k);
+      bodyRect(ctx, s.x + inset, s.y + inset, s.w - 2 * inset, s.h - 2 * inset);
       any = true;
     }
-    if (any) { ctx.fillStyle = LIT; ctx.fill(); }
+    if (any) { ctx.fillStyle = PRESSED; ctx.fill(); }
   }
   end();
   if (z < LOD.marks) return;
@@ -697,21 +702,25 @@ function drawStructs(ctx, T, structs, z, px, on, S, ports, labels, tint = null) 
   // The glyph, centred on the footprint. A Source whose number is shown
   // wears the number instead.
   begin("glyphs");
-  let fills = "";
-  const widths = new Map();   // stroke width -> path data: footprints differ
+  // Two inks: the light mark every machine wears, and a button's dark one
+  // (a printed legend on a pale keycap).
+  const inks = [[COL.mark, "", new Map()], [COL.buttonMark, "", new Map()]];
   for (const s of structs) {
     if (!on(s.x, s.y, s.w, s.h)) continue;
     if (emitShown(s, z, labels)) continue;
     const g = structGlyph(types[s.type].glyph, s.x, s.y, s.w, s.h, TUNE.glyphScale, TUNE.glyphWeight);
-    if (g.stroke) widths.set(g.width, (widths.get(g.width) || "") + g.stroke);
-    fills += g.fill;
+    const ink = inks[s.button ? 1 : 0];
+    if (g.stroke) ink[2].set(g.width, (ink[2].get(g.width) || "") + g.stroke);   // by stroke width: footprints differ
+    ink[1] += g.fill;
   }
-  ctx.strokeStyle = COL.mark;
-  ctx.fillStyle = COL.mark;
   ctx.lineCap = "round";
   ctx.lineJoin = "round";
-  for (const [w, d] of widths) { ctx.lineWidth = w; ctx.stroke(new Path2D(d)); }
-  if (fills) ctx.fill(new Path2D(fills));
+  for (const [colour, fills, widths] of inks) {
+    ctx.strokeStyle = colour;
+    ctx.fillStyle = colour;
+    for (const [w, d] of widths) { ctx.lineWidth = w; ctx.stroke(new Path2D(d)); }
+    if (fills) ctx.fill(new Path2D(fills));
+  }
   ctx.lineCap = "butt";
   end();
 
@@ -771,8 +780,10 @@ function drawLabels(ctx, T, structs, cam, dpr, on, dimRows = null) {
     const [sx, sy] = cam.worldToScreen(s.x + s.w / 2, s.y + s.h / 2);
     ctx.globalAlpha = dimRows?.has(s.row) ? a0 * DIM_TEXT : a0;
     const t = sourceText(s);
+    // A button's legend is dark ink on its pale cap.
+    ctx.fillStyle = s.button ? COL.buttonText : COL.label;
     // A character on a lime body needs the item numbers' dark halo to read.
-    if (s.ascii) {
+    if (s.ascii && !s.button) {
       ctx.lineJoin = "round";
       ctx.lineWidth = Math.max(2, size * 0.16);
       ctx.strokeStyle = COL.itemHalo;

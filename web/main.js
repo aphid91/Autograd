@@ -2332,6 +2332,9 @@ function pressButton(row, delta) {
   sim.sync();
   if (W.ready && !W.failed && W.running) wpost({ type: "press", row, delta, revision: board.revision });
   else if (sim.press(row, delta)) mirrorMoved();
+  // The click of a key going down, or coming back up (audio-keys.js):
+  // straight to the synth, with sound on. Paused or playing alike.
+  audio?.keyClick?.(delta > 0);
   redraw();
 }
 const pressHooks = {

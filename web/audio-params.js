@@ -86,6 +86,10 @@ export const AUDIO_DEFAULTS = {
   camScale: 1,          // the screen box, about its centre, before it is heard
   spaceFringe: 0,       // fade-out distance, as a fraction of the box's longer side
   spaceLp: 0,           // how far the low-pass closes at the fringe's edge, 0..1
+  // Buttons (button.js, audio-keys.js): a click when a finger lands on one
+  // (press) and when it leaves (release). Played at once, never baked.
+  btnGain: 1, btnTone: 2200, btnAttackMs: 0.3, btnReleaseMs: 35,
+  btnUpGain: 0.6, btnUpTone: 3200, btnUpAttackMs: 0.3, btnUpReleaseMs: 20,
 };
 
 export const VOICE_LIMIT_MAX = 1024;
@@ -168,6 +172,15 @@ export const AUDIO_SPEC = [
   ["vibRateF", "falsy vibrato Hz", { min: 0.1, max: 30, step: 0.1 }],
   ["clickNoiseF", "falsy click noise", { min: 0, max: 1, step: 0.01 }],
   ["clickNoiseMsF", "falsy click noise ms", { min: 0.2, max: 100, step: 0.1 }],
+  ["---", "buttons"],
+  ["btnGain", "press gain", { min: 0, max: 4, step: 0.01 }],
+  ["btnTone", "press tone Hz", { min: 100, max: 12000, step: 10 }],
+  ["btnAttackMs", "press attack ms", { min: 0.05, max: 50, step: 0.05 }],
+  ["btnReleaseMs", "press release ms", { min: 1, max: 500, step: 1 }],
+  ["btnUpGain", "release gain", { min: 0, max: 4, step: 0.01 }],
+  ["btnUpTone", "release tone Hz", { min: 100, max: 12000, step: 10 }],
+  ["btnUpAttackMs", "release attack ms", { min: 0.05, max: 50, step: 0.05 }],
+  ["btnUpReleaseMs", "release release ms", { min: 1, max: 500, step: 1 }],
   ["---", "space"],
   ["camAudio", "camera-aware"],
   ["camScale", "screen scale", { min: 0.1, max: 3, step: 0.05 }],
@@ -201,7 +214,10 @@ export function audioGroupOf(cls) {
 
 // Dials that only steer realtime playback, so changing them leaves a bake
 // valid. Everything else changes what a bake would have rendered.
-export const REALTIME_ONLY = ["latencyMs", "holdUnderrun"];
+// The buttons' clicks are the player's touches, never in a bake, so their
+// dials are realtime-only too.
+export const REALTIME_ONLY = ["latencyMs", "holdUnderrun",
+  "btnGain", "btnTone", "btnAttackMs", "btnReleaseMs", "btnUpGain", "btnUpTone", "btnUpAttackMs", "btnUpReleaseMs"];
 export function bakeKey(p) {
   const o = {};
   for (const k of Object.keys(AUDIO_DEFAULTS)) if (!REALTIME_ONLY.includes(k)) o[k] = p[k];

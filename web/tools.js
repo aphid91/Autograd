@@ -159,13 +159,14 @@ export function toolArt(T, slot) {
     return `M${x + 0.5 - fx * 0.5} ${y + 0.5 - fy * 0.5}L${x + 0.5 + fx * 0.5} ${y + 0.5 + fy * 0.5}`;
   }).join("");
   const g = structGlyph(td.glyph, 0, 0, o.w, o.h);
+  const ink = td.name === "button" ? "#2a261d" : "#e0e6f0";   // a button's legend is dark (render.js)
   return frame(o.w, o.h,
     `<rect x="0.05" y="0.05" width="${o.w - 0.1}" height="${o.h - 0.1}" fill="${css(c)}" ` +
     `stroke="${css(c.map(v => v * 0.6))}" stroke-width="0.06"/>` +
     (pass ? `<path d="${pass}" fill="none" stroke="#000" stroke-width="0.34" stroke-linecap="butt"/>` +
             `<path d="${pass}" fill="none" stroke="#757885" stroke-width="0.28" stroke-linecap="butt"/>` : "") +
-    (g.stroke ? `<path d="${g.stroke}" fill="none" stroke="#e0e6f0" stroke-width="${g.width}" stroke-linecap="round" stroke-linejoin="round"/>` : "") +
-    (g.fill ? `<path d="${g.fill}" fill="#e0e6f0"/>` : "") +
+    (g.stroke ? `<path d="${g.stroke}" fill="none" stroke="${ink}" stroke-width="${g.width}" stroke-linecap="round" stroke-linejoin="round"/>` : "") +
+    (g.fill ? `<path d="${g.fill}" fill="${ink}"/>` : "") +
     `<path d="${ins}" fill="#5999f2" stroke="rgba(0,0,0,0.5)" stroke-width="0.025"/>` +
     `<path d="${outs}" fill="#f2594d" stroke="rgba(0,0,0,0.5)" stroke-width="0.025"/>`);
 }

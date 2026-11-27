@@ -34,6 +34,7 @@
 
 import { AUDIO_DEFAULTS, VOICE_LIMIT_MAX, GATE_REF_RATE, beltsMuted } from "./audio-params.js";
 import { scaleTable, scaleHz } from "./scale.js";
+import { KeyClicks, keyDials } from "./audio-keys.js";
 
 const TABLE = 2048;
 const MAX_QUEUE_S = 1;      // a stalled audio thread never builds more lag than this
@@ -191,6 +192,9 @@ export class GatesSynth {
     // Since the start, for the meter: realtime playback ran out of ticks
     // (an underrun: the ticks came late), or had a backlog skipped.
     this.underruns = 0; this.skips = 0;
+    // The buttons' press and release clicks (audio-keys.js): the player's
+    // touches, played at once, outside the ticks' queue.
+    this.keyClicks = new KeyClicks(sampleRate);
     this.applyParams();
   }
 
@@ -200,6 +204,7 @@ export class GatesSynth {
     else if (m.type === "space") this.setSpace(m);
     else if (m.type === "params") { Object.assign(this.p, m.p); this.applyParams(); }
     else if (m.type === "stop") this.stop();
+    else if (m.type === "key") this.keyClicks.trigger(keyDials(this.p, !!m.down));
   }
 
   applyParams() {
@@ -781,6 +786,8 @@ export class GatesSynth {
       }
     }
     if (!this.offline && !this.batch) for (let v = this.nv - 1; v >= 0; v--) if (!this.vOn[v] && this.vEnv[v] < 1e-4) this.free(v);
+    // The buttons' clicks, over whatever the ticks made (paused or not).
+    this.keyClicks.render(out, n);
     // The low cut, per sample (so a bake is the same however it is split).
     if (this.hpOn) {
       const b0 = this.hb0, b1 = this.hb1, b2 = this.hb2, a1 = this.ha1, a2 = this.ha2;

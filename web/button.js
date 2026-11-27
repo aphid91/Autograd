@@ -37,7 +37,8 @@ const FOOTPRINT = [3, 3];
 // [lx, ly, face] at facing +X; faces 0 +X, 1 +Y, 2 -X, 3 -Y.
 const IN = [[0, 1, 2]];
 const OUT = [[2, 1, 0]];
-export const BUTTON_COLOUR = [0.70, 0.63, 0.38];
+// A classic beige keycap: pale and warm.
+export const BUTTON_COLOUR = [0.87, 0.83, 0.70];
 
 export const F_BTN_VALUE = 25;
 export const F_BTN_MODE = 26;
