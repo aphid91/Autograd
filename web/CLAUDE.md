@@ -957,7 +957,8 @@ board, the picker, the index preview and the keyboard; tested in
   hollow box. With gate status colours on (the
   default) the status colour wins, as it does over every machine's own
   colour; the character still says which it is.
-- **While the Hand has an ASCII source inspected**, every value whose whole
+- **While the Hand has an ASCII source inspected** (or a keyboard with its
+  ASCII flag on -- see "The keyboard"), every value whose whole
   part is printable shows as its character instead of its number: the
   items' numbers and the other Sources' values (`view.asciiChars`,
   `sourceText()`/`valueText()` in render.js).
@@ -1054,13 +1055,26 @@ per tick at most, holding the rest under back pressure.
   keyboard while typing; deselecting the keyboard closes it.
   The Hand's bar shows **Type / Typing** (tap to raise the keyboard again)
   and the last code and how many are waiting.
+- **Number / ASCII**, on the Hand's bar beside those: purely cosmetic. A
+  keyboard carries the same **ASCII flag in slot 24** as a Source or a
+  button (`hasAsciiFlag()` in board.js), and while a keyboard with it on is
+  inspected, every printable value on the board shows as its character
+  (`asciiChars()` in main.js) -- the way an ASCII source does, without
+  having to inspect one. It is **on for a fresh keyboard**
+  (`asciiDefault()`: `spawnStructure()`'s `ascii: null` means the type's
+  default, and the tool passes null); a keyboard from a save made before the
+  flag has slot 24 clear and reads as off. Copies, stamps and undo carry it
+  (`entry.ascii`, explicit, so a copied Number keyboard pastes as Number).
+  Toggling is not an edit, and the keys are unchanged. The body stays beige:
+  only a Source turns lime.
 
 `tests/keyboard.test.mjs`: the type's geometry at every facing; typed codes
 come out in order, one a tick, and nothing without a key; back pressure
 holds the rest (nothing lost or made); a sleeping and a full timeline agree
 tick for tick with keys typed mid-run after quiet stretches; a forecast
 does not take a token, a clone owns its queue, Reset and an edit empty it;
-and keys sent to a ticking worker reach the mirror exactly as a reference
+the ASCII flag is on when fresh, survives a copy, is not an edit and leaves
+the emitted codes alone; and keys sent to a ticking worker reach the mirror exactly as a reference
 typed into directly, a stale key is dropped, and a full state carries the
 queue back. Mutation-tested: no wake on a key, the forecast taking the
 token, the delta without the queue, a stale key kept, and a flush that

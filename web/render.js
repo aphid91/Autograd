@@ -631,7 +631,7 @@ function drawStructs(ctx, T, structs, z, px, on, S, ports, labels, tint = null) 
   const byColour = new Map();   // css -> [colour, machines]
   for (const s of structs) {
     if (!on(s.x, s.y, s.w, s.h)) continue;
-    const c = (tint && s.row !== undefined && tint.get(s.row)) || (s.ascii && !s.button ? ASCII_COLOUR : types[s.type].colour) || GREY;
+    const c = (tint && s.row !== undefined && tint.get(s.row)) || (s.ascii && types[s.type].name === "source" ? ASCII_COLOUR : types[s.type].colour) || GREY;
     const key = cssOf(c);
     let g = byColour.get(key);
     if (!g) byColour.set(key, g = [c, []]);

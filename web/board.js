@@ -38,6 +38,15 @@ export function emitSlot(T, td) {
   return td?.name === "source" ? T.entity.F_EMIT : td?.name === "button" ? F_BTN_VALUE : null;
 }
 
+// Which machines carry the ASCII flag (F_ASCII): those with a value (Source,
+// Button) and the keyboard, whose flag says only how the board shows values
+// while it is inspected (main.js asciiChars()). A keyboard emits character
+// codes, so a fresh one starts with it on; everything else starts off.
+export function hasAsciiFlag(T, td) {
+  return emitSlot(T, td) !== null || td?.name === "keyboard";
+}
+export function asciiDefault(td) { return td?.name === "keyboard"; }
+
 export class Board {
   constructor(T, arrays) {
     this.T = T;            // types.json
@@ -204,7 +213,7 @@ export class Board {
       dir: this.field(row, E.F_DIR) | 0,
       flip: !!this.field(row, E.F_FLIPPED),
       emit: this.emitOf(row, td),
-      ascii: emitSlot(this.T, td) !== null ? !!this.field(row, F_ASCII) : null,
+      ascii: hasAsciiFlag(this.T, td) ? !!this.field(row, F_ASCII) : null,
       mode: this.modeOf(row, td),
       seedOn: td.kind === "belt" ? !!this.field(row, E.F_SEED_ON) : null,
       seedValue: td.kind === "belt" ? this.field(row, E.F_SEED_VALUE) : null,
@@ -357,7 +366,7 @@ export class Board {
   // Each cell's .y holds its offset within the PLACED footprint, which is
   // what Gameboard._stamp_footprint() writes and what the desktop renderer
   // un-places to find a port.
-  spawnStructure(type, origin, dir, flip, { emit = null, ascii = false, mode = null, derive = true, layer } = {}) {
+  spawnStructure(type, origin, dir, flip, { emit = null, ascii = null, mode = null, derive = true, layer } = {}) {
     const E = this.T.entity, C = this.T.cell, S = E.STRIDE;
     const { o, blocked } = this.footprint(type, origin, dir, flip);
     if (blocked.length) return -1;
@@ -373,9 +382,10 @@ export class Board {
     this.setField(row, E.F_H, o.h);
     this.setField(row, E.F_FLIPPED, flip ? 1 : 0);
     const es = emitSlot(this.T, this.T.types[type]);
+    // `ascii` null: the type's default (asciiDefault()).
+    if (hasAsciiFlag(this.T, this.T.types[type]) && (ascii ?? asciiDefault(this.T.types[type]))) this.setField(row, F_ASCII, 1);
     if (es !== null) {
       this.setField(row, es, emit ?? (es === F_BTN_VALUE ? BUTTON_DEFAULT_VALUE : 0));
-      if (ascii) this.setField(row, F_ASCII, 1);
       if (es === F_BTN_VALUE) this.setField(row, F_BTN_MODE, modeOf(mode));
     }
     this.tagLayer(row, layer);
@@ -486,7 +496,7 @@ export class Board {
         exit: type === C.TYPE_UNDER && !!this.field(r, E.F_UNDER_IS_EXIT),
         partner: partner && index.has(partner) ? index.get(partner) : null,
         emit: this.emitOf(r, td),
-        ascii: emitSlot(this.T, td) !== null && !!this.field(r, F_ASCII),
+        ascii: hasAsciiFlag(this.T, td) && !!this.field(r, F_ASCII),
         mode: this.modeOf(r, td),
         seed: td.kind === "belt" && this.field(r, E.F_SEED_ON) ? this.field(r, E.F_SEED_VALUE) : null,
         layer: this.field(r, F_LAYER) | 0,
@@ -706,7 +716,7 @@ export class Board {
       } else {
         structs.push({ row: r, type, x, y, dir, flip, w: o.w, h: o.h, o,
           emit: this.emitOf(r, td),
-          ascii: emitSlot(this.T, td) !== null && !!this.field(r, F_ASCII),
+          ascii: hasAsciiFlag(this.T, td) && !!this.field(r, F_ASCII),
           button: td.name === "button" });
         for (const [lx, ly, f] of o.outputs) {
           const k = (y + ly) * W + (x + lx);

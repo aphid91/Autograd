@@ -9,7 +9,7 @@ import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
-import { Board } from "../board.js";
+import { Board, F_ASCII } from "../board.js";
 import { Sim } from "../sim.js";
 import { installWebTypes } from "../webtypes.js";
 import { KEYBOARD_TYPE } from "../keyboard.js";
@@ -165,4 +165,42 @@ test("keys sent to the worker reach the mirror as typed into a reference", async
   mirror.inject(a.row, 33); mirror.inject(a.row, 34);
   send({ ...exportFull(mirror), epoch: ++epoch });
   assert.equal(host.sim.keysWaiting(a.row), 2, "a full state carries the queue to the worker");
+});
+
+// The ASCII flag (board.js F_ASCII, slot 24): cosmetic, as on a Source --
+// it says how the board shows values while this keyboard is inspected. A
+// fresh keyboard starts with it on; it travels through a copy and paste,
+// and toggling it is not an edit, so the keys flow the same either way.
+test("a keyboard carries an ASCII flag, on by default, that changes nothing it emits", async () => {
+  const { board, row, x, y } = await rig();
+  assert.equal(board.describe(row).ascii, true, "on for a fresh keyboard");
+  assert.equal(board.field(row, F_ASCII), 1);
+  const rev = board.revision;
+  assert.ok(board.setAscii(row, false));
+  assert.equal(board.describe(row).ascii, false);
+  assert.equal(board.revision, rev, "not an edit");
+  // Copied with the flag off, it pastes off: an explicit flag beats the default.
+  const [e] = board.capture([row]);
+  assert.equal(e.ascii, false);
+  const keyboards = () => { const out = []; for (let r = 1; r < board.rows; r++) if (board.describe(r)?.td.name === "keyboard") out.push(r); return out; };
+  const before = new Set(keyboards());
+  assert.equal(board.placeEntries([e], [[x, y - 20]], { derive: false }).size, 1);
+  const pasted = keyboards().filter(r => !before.has(r));
+  assert.equal(pasted.length, 1);
+  assert.equal(board.describe(pasted[0]).ascii, false);
+  board.setAscii(pasted[0], true);
+  assert.equal(board.capture([pasted[0]])[0].ascii, true);
+  // A row with slot 24 clear (an older save) reads as off.
+  board.setField(row, F_ASCII, 0);
+  assert.equal(board.describe(row).ascii, false);
+  // The keys are unchanged either way.
+  board.derive();
+  const sim = new Sim(T, board);
+  board.setAscii(row, false);
+  assert.ok(sim.inject(row, 65));
+  for (let t = 0; t < 3; t++) sim.step();
+  board.setAscii(row, true);
+  assert.ok(sim.inject(row, 66));
+  for (let t = 0; t < 12; t++) sim.step();
+  assert.deepEqual(itemsOf(sim, runOf(sim, x + 2, y + 3)), [65, 66]);
 });

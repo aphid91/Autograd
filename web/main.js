@@ -2272,7 +2272,7 @@ function handValueOf(row) {
   // An inactive layer's entities can be inspected but not edited.
   if (!info || !pickable(row)) return null;
   if (info.emit !== null) return { kind: "emit", ascii: info.ascii, values: VALUE_CHOICES, current: info.emit, mode: info.mode };
-  if (info.td.class === "Keyboard") return { kind: "keyboard", waiting: sim?.keysWaiting(row) ?? 0, last: lastKey, typing: !!capture?.active };
+  if (info.td.class === "Keyboard") return { kind: "keyboard", ascii: info.ascii, waiting: sim?.keysWaiting(row) ?? 0, last: lastKey, typing: !!capture?.active };
   if (info.seedOn !== null) return { kind: "seed", values: VALUE_CHOICES, current: info.seedOn ? info.seedValue : null };
   return null;
 }
@@ -2360,17 +2360,19 @@ const pressHooks = {
   },
 };
 
-// The Hand's convert button: a Source becomes an ASCII source and back. The
-// engine never reads the flag, so this is not an edit -- the simulation runs
-// on -- but it is an undo step (board.styleRev).
+// The Hand's convert button: a Source becomes an ASCII source and back (a
+// button or a keyboard: how its values show). The engine never reads the
+// flag, so this is not an edit -- the simulation runs on -- but it is an
+// undo step (board.styleRev).
 function convertSource() {
   const info = board?.describe(inspectRow);
-  if (!info || info.emit === null || !pickable(inspectRow)) return;
+  if (!info || info.ascii === null || !pickable(inspectRow)) return;
   board.setAscii(inspectRow, !info.ascii);
   syncInspect();
 }
 
-// While the Hand has an ASCII source inspected, every value on the board
+// While the Hand has an ASCII source (or button, or keyboard with its ASCII
+// flag) inspected, every value on the board
 // that is a printable character shows as that character (render.js
 // view.asciiChars): the items and the other Sources alike.
 function asciiChars() {
@@ -3059,7 +3061,7 @@ function placementAt(tool, origin) {
   const o = T.types[type].orient[`${dir}${flip ? 1 : 0}`];
   const { blocked } = board.footprint(type, origin, dir, flip);
   return { tool, kind: "structure", type, origin, dir, flip, w: o.w, h: o.h, o,
-           value: toolValue(tool), ascii: !!tool.ascii, mode: tool.mode ?? null, blocked };
+           value: toolValue(tool), ascii: tool.ascii ?? null, mode: tool.mode ?? null, blocked };
 }
 
 function placeGhost(pl) {

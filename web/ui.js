@@ -966,12 +966,15 @@ export class Shell {
 
   // The button that turns a Source into an ASCII source and back: it names
   // what it turns it into.
-  convertButton(ascii, fn, button = false) {
+  // `what`: true (or "button") for a button, "keyboard" for a keyboard.
+  convertButton(ascii, fn, what = false) {
+    const button = what === true || what === "button";
     const b = document.createElement("button");
     b.type = "button";
     b.className = "b planbtn compact convsrc";
     b.innerHTML = ascii ? `<span class="conv-art">12</span><span>Number</span>` : `<span class="conv-art">Ab</span><span>ASCII</span>`;
-    b.title = button ? (ascii ? "Show this button's value as a number" : "Show this button's value as a character")
+    b.title = what === "keyboard" ? (ascii ? "Show values as numbers while this keyboard is inspected" : "Show values as characters while this keyboard is inspected")
+      : button ? (ascii ? "Show this button's value as a number" : "Show this button's value as a character")
       : ascii ? "Make this a plain Source" : "Make this an ASCII source";
     b.addEventListener("click", fn);
     return b;
@@ -1115,7 +1118,9 @@ export class Shell {
     info.className = "rowlabel kbdinfo";
     const last = iv.last === null || iv.last === undefined ? "" : `last ${nameOf(iv.last) ?? iv.last} · `;
     info.textContent = `${last}${iv.waiting} waiting`;
-    row.append(b, info);
+    // Number / ASCII: how the board shows values while this keyboard is
+    // inspected (main.js asciiChars()); the keys are unchanged.
+    row.append(b, info, this.convertButton(!!iv.ascii, () => this.cb.onConvertSource?.(), "keyboard"));
   }
 
   setInspectValue(iv) {
